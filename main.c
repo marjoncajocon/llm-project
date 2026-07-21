@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 
 #include "tensor.h"
@@ -19,6 +20,7 @@
 #include "image.h"
 #include "patch.h"
 #include "video.h"
+#include "audio.h"
 
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
@@ -363,6 +365,75 @@ static int run_demo(void) {
   remove("vid_tmp/frame_0000.ppm");
   remove("vid_tmp/frame_0001.ppm");
   all_ok &= vid_ok;
+
+  // --------------------------------------------------------------------------
+  // Part 9: audio (Phase F) — waveform -> framed embeddings -> train
+  // --------------------------------------------------------------------------
+  FILE *awf = fopen("aud.wav.tmp", "wb");
+  if (awf) {
+    int nsamp = 256; uint32_t dsz = (uint32_t)(nsamp * 2), x; uint16_t u16;
+    fwrite("RIFF", 1, 4, awf); x = 36 + dsz; fwrite(&x, 4, 1, awf); fwrite("WAVE", 1, 4, awf);
+    fwrite("fmt ", 1, 4, awf); x = 16; fwrite(&x, 4, 1, awf);
+    u16 = 1; fwrite(&u16, 2, 1, awf); u16 = 1; fwrite(&u16, 2, 1, awf);     // PCM, mono
+    x = 8000; fwrite(&x, 4, 1, awf); x = 16000; fwrite(&x, 4, 1, awf);      // rate, byte rate
+    u16 = 2; fwrite(&u16, 2, 1, awf); u16 = 16; fwrite(&u16, 2, 1, awf);    // block align, bits
+    fwrite("data", 1, 4, awf); fwrite(&dsz, 4, 1, awf);
+    for (int i = 0; i < nsamp; i++) {
+      int16_t s = (int16_t)(sinf(i * 0.1f) * 10000.0f);
+      fwrite(&s, 2, 1, awf);
+    }
+    fclose(awf);
+  }
+  Audio aud = audio_load_wav("aud.wav.tmp");
+  int aud_ok = (aud.samples != NULL && aud.n == 256);
+  if (aud_ok) {
+    const int fsz = 64, hop = 64;
+    int afc = audio_frame_count(&aud, fsz, hop);        // (256-64)/64 + 1 = 4
+    int aws[2] = {fsz, d_model}; Tensor Wa = tensor_create(aws, 2); tensor_init_random(&Wa);
+    int abz[1] = {d_model};      Tensor bva = tensor_create(abz, 1);
+    int aez[2] = {afc, d_model}; Tensor aemb = tensor_create(aez, 2);
+
+    int acap[3] = {5, 7, 9};
+    int aseq = 3, atot = afc + aseq;                    // 4 + 3 = 7
+    int atgt[64];
+    for (int i = 0; i < atot; i++) atgt[i] = -1;
+    for (int t = 0; t < aseq - 1; t++) atgt[afc + t] = acap[t + 1];
+
+    GPTActs aa = gpt_acts_create(&model, atot);
+    int alz[2] = {atot, vocab};
+    Tensor alog = tensor_create(alz, 2), aprb = tensor_create(alz, 2);
+    Tensor *apar[64];
+    int nap = gpt_collect_params(&model, apar);
+    apar[nap++] = &Wa; apar[nap++] = &bva;
+    Adam aopt = adam_create(apar, nap, 0.02f);
+
+    float a0 = 0.0f, al = 0.0f;
+    for (int s = 0; s < 120; s++) {
+      audio_embed(&aud, fsz, hop, &Wa, &bva, &aemb);
+      gpt_forward_multimodal(&model, &aemb, acap, afc, aseq, &aa, &alog);
+      float loss = cross_entropy_forward(&alog, atgt, &aprb);
+      if (s == 0) a0 = loss;
+      al = loss;
+      tensor_zero_grad(&alog);
+      cross_entropy_backward(&aprb, atgt, &alog);
+      tensor_zero_grad(&Wa); tensor_zero_grad(&bva);
+      gpt_backward_multimodal(&model, acap, afc, aseq, &aa, &alog, &aemb);
+      audio_embed_backward(&aud, fsz, hop, &Wa, &bva, &aemb);
+      adam_step(&aopt, apar, nap);
+    }
+    aud_ok = (afc == 4) && (al < a0 * 0.5f);
+    printf("[8] Audio: %d frames + %d text | train loss %.4f -> %.4f -> %s\n\n",
+           afc, aseq, a0, al, aud_ok ? "OK" : "FAIL");
+
+    adam_free(&aopt);
+    tensor_free(&alog); tensor_free(&aprb); gpt_acts_free(&aa);
+    tensor_free(&Wa); tensor_free(&bva); tensor_free(&aemb);
+  } else {
+    printf("[8] Audio: load FAIL\n\n");
+  }
+  audio_free(&aud);
+  remove("aud.wav.tmp");
+  all_ok &= aud_ok;
 
   adam_free(&opt);
   tensor_free(&logits);

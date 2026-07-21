@@ -37,8 +37,9 @@ data/*
 # Agent demo artifact
 agent_demo.txt
 
-# Image/video frames (data, not source) + the smoke-test temp dir
+# Image/video/audio media (data, not source) + the smoke-test temp dir
 *.ppm
+*.wav
 vid_tmp/
 
 # NOTE: memory.md is intentionally TRACKED (committed) so it travels via git

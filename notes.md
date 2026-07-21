@@ -52,7 +52,11 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       `tools/video_to_frames.py` extracts PPM frames via ffmpeg.
 - [x] Step F2 — Per-frame patch embeddings (reuse Phase E `patch_embed`) + **sinusoidal
       temporal encoding** per frame; stacked into one `(n_frames*patches, d_model)` sequence.
-- [ ] Step F3 — Optional audio track → features (skipped for now).
+- [x] Step F3 — Audio: `audio.c` loads 16-bit PCM WAV (mono / stereo downmix), frames the
+      waveform into windows, projects each + sinusoidal temporal encoding → a sequence of
+      vectors; trained the same way (audio→caption, loss 7.30 -> 0.0017 in smoke `[8]`).
+      `tools/audio_to_wav.py` converts any audio via ffmpeg. (Raw-waveform framing, not
+      mel-spectrograms — cruder but dependency-free.)
 - [x] Step F4 — Video-text training: reuse `gpt_forward_multimodal`/`gpt_backward_multimodal`
       (video patches as the prefix) + `video_embed_backward`. Smoke `[7]`: 2-frame clip →
       caption, loss 5.998 -> 0.001.
@@ -99,9 +103,10 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
    at an API script (template in agent_mock.py).
 5. **Phase E — Images (multimodal)** *(large)* — decode → patch embeddings → multimodal
    input → image-text training.
-6. ✅ **Phase F — Video** — frames (`video.c` + `tools/video_to_frames.py`) → per-frame patches
-   + temporal encoding → video-text training (reuses the multimodal path). F3 audio skipped.
-   Smoke test trains a 2-frame clip → caption. DONE.
+6. ✅ **Phase F — Video + Audio** — video (`video.c` + `tools/video_to_frames.py`) and audio
+   (`audio.c` WAV framing + `tools/audio_to_wav.py`) → per-frame/window embeddings + temporal
+   encoding → train via the multimodal path. Smoke: video→caption and audio→caption both drop.
+   DONE (F1/F2/F3/F4). Text/image/video/audio all supported.
 
 Order rationale: text (1–4) is very achievable locally; images (5) and video (6) are big
 multimodal builds where the plumbing is feasible but real quality needs far more scale.
@@ -795,7 +800,12 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
 - **`tools/video_to_frames.py`** — ffmpeg → `frame_%04d.ppm` (`-start_number 0`).
 - **`main.c`** smoke `[7]`: 2-frame clip → video patches + caption → multimodal train; loss
   5.998 -> 0.001. Video is just [frame patches...] + [text] through `gpt_forward_multimodal`,
-  so E3/E4 did the heavy lifting. F3 (audio) skipped.
+  so E3/E4 did the heavy lifting.
+- **Audio (F3) DONE:** `audio.c` (WAV load, waveform framing → project + temporal encoding +
+  backward, reuses `matmul`/`bias_add`), `tools/audio_to_wav.py` (ffmpeg). Smoke `[8]`:
+  audio→caption train, loss 7.30 -> 0.0017. Same multimodal prefix trick — raw-waveform frames
+  (not mel-spectrograms) to stay dependency-free. So text/image/video/**audio** all train via
+  `gpt_forward_multimodal` + `gpt_backward_multimodal`.
 
 ## 🏁 Roadmap COMPLETE — all six phases done
 
