@@ -60,7 +60,12 @@ via `make cross`).
 2. ✅ Performance — persistent **matmul thread pool** in `matrix.c` (threads matmul +
    matmul_backward; bit-exact, verified; **2.68× on 8 threads**; Win32/pthreads/WASM;
    `$TF_THREADS` or CPU count). SIMD + int8 quant remain (later). DONE.
-3. **Real GPT-2 weights** (RECOMMENDED NEXT) — download → `tools/convert_gpt2.py` →
-   `gpt_load` + real GPT-2 BPE (biggest quality win).
-4. Real agent backend (wire a live LLM / local model into `agent.c`).
+3. ✅ Real GPT-2 — `tools/gpt2_setup.py` (download+convert → `model/gpt2/model.bin`) +
+   `tools/gpt2_tok.py` (tiktoken). Pure-C model generates **real coherent GPT-2 text**.
+   Added `model/<name>/` folder convention + `--name` for train/generate. DONE.
+4. **Real agent backend** (RECOMMENDED NEXT) — wire a live LLM / a loaded model (e.g.
+   `model/gpt2`) into `agent.c`, replacing the scripted `responses[]`.
 5. Phase E — images (multimodal). 6. Phase F — video. (Text-only today.)
+
+Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
+git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).

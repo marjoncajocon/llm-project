@@ -78,8 +78,11 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
    single-threaded), portable (Win32 / pthreads / WASM-single-thread). **Measured 2.68× on 8
    threads** (d_model 256, 4 layers). Threads = `$TF_THREADS` or CPU count. Remaining perf
    (later): SIMD + int8 quantization.
-3. **Real GPT-2 weights** *(medium)* — step-4b recipe (download → `convert_gpt2.py` →
-   `gpt_load`) + real GPT-2 BPE → coherent text without training from scratch.
+3. **Real GPT-2 weights** ✅ DONE — `tools/gpt2_setup.py` downloads GPT-2 124M + converts to
+   GPTC (→ `model/gpt2/model.bin`, 622 MB); `tools/gpt2_tok.py` bridges tiktoken. Verified:
+   the pure-C model generates **coherent real GPT-2 text** ("The meaning of life is not to be
+   confused with the fact of being reborn..."). Also added the `model/<name>/` folder
+   convention + `--name` for train/generate. (Bigger variants: `--model gpt2-medium` etc.)
 4. **Real agent backend** *(medium)* — wire a live LLM (or a locally-trained model) into
    `agent.c`, replacing the scripted responses.
 5. **Phase E — Images (multimodal)** *(large)* — decode → patch embeddings → multimodal
@@ -131,11 +134,13 @@ authorized; local only, don't push).
 2. ✅ DONE — **matmul thread pool** (`matrix.c`): persistent fork-join pool threads `matmul` +
    `matmul_backward`, bit-exact (verified), 2.68× on 8 threads, all 8 targets build. Threads =
    `$TF_THREADS` or CPU count. (SIMD + int8 quant remain, later.)
-3. **Real GPT-2** (RECOMMENDED NEXT) — run the step-4b recipe (download gpt2, `tools/convert_gpt2.py` →
-   `convert_to_gptc.py` → `gpt_load`) for genuinely good text; add the real GPT-2 BPE
-   (`encoder.json`/`vocab.bpe`) so text↔tokens match its weights.
-4. **Wire a real backend into `agent.c`** (replace the scripted `responses[]`) — a live LLM
-   API call, or one of the locally-trained models — to make the agent genuinely act.
+3. ✅ DONE — **Real GPT-2**: `tools/gpt2_setup.py` (download+convert) + `tools/gpt2_tok.py`
+   (tiktoken) → pure-C model generates real coherent GPT-2 text. `model/<name>/` folder
+   convention + `--name`. GPT-2 lives in `model/gpt2/` (git-ignored weights).
+4. **Wire a real backend into `agent.c`** (RECOMMENDED NEXT — replace the scripted
+   `responses[]`) — a live LLM API call, or a loaded model (e.g. `model/gpt2`) — so the agent
+   genuinely acts. Note `model/gpt2` is base GPT-2 (not instruction-tuned), so it won't follow
+   tool-call formats well; a small instruction-tuned model or an API is better for real use.
 5. **Phase E (images)** then **Phase F (video)** — see the roadmap above; big future builds.
 
 Not supported yet (asked about): **image training** and **video training** — text-only today;
@@ -715,9 +720,25 @@ resume continued from the saved loss (not from scratch); val loss tracks train l
 
 Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 quantization.
 
+## Phase #3 (real GPT-2) — DONE, generates real text
+
+- **`tools/gpt2_setup.py`** — downloads GPT-2 `model.safetensors` (huggingface_hub) and writes
+  a GPTC checkpoint directly (splits fused `c_attn`, ties `lm_head = wte^T`). One command →
+  `model/gpt2/model.bin` (vocab 50257, d_model 768, 12 layers, 622 MB).
+- **`tools/gpt2_tok.py`** — GPT-2 BPE via `tiktoken`: `encode "text"` → ids, `decode ids` →
+  text. (We use tiktoken instead of reimplementing GPT-2's regex+BPE in C.)
+- **`model/<name>/` convention + `--name`** — `main.c`: portable `ensure_dir` + `model_paths`;
+  `train --name X` saves `model/X/{model,tok}.bin`; `generate --name X` loads it (text mode if
+  `tok.bin` present, else token-ID mode — GPT-2 has none). `model/**/*.bin` git-ignored.
+- **Verified end-to-end** on this machine: pip install safetensors+tiktoken, downloaded +
+  converted GPT-2 (153 s), ran `echo <ids> | transformer generate --name gpt2` → **coherent
+  GPT-2 text** in ~5.6 s / 40 tokens. Deps present: python `D:\env\python`, ~1.5 GB RAM to load.
+- Remaining niceties: a `gpt2_chat.py` wrapper (encode→generate→decode in one), and threading
+  the M=1 decode-step matmuls over columns (currently single-threaded per token).
+
 ## Next steps (not started)
-- **Recommended next: #3 real GPT-2** (biggest quality win: download → `tools/convert_gpt2.py`
-  → `gpt_load` + real GPT-2 BPE). Then #4 agent backend, #5 images, #6 video.
+- #4 **real agent backend** — wire a live LLM (or a loaded model like `model/gpt2`) into
+  `agent.c`, replacing the scripted `responses[]`. Then #5 images, #6 video.
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.
 - Phase D — perf/quant + a genuinely capable model (real weights).

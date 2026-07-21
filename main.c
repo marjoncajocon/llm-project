@@ -17,6 +17,26 @@
 #include "train.h"
 #include "agent.h"
 
+// Portable "make directory if absent" (ignores already-exists).
+#if defined(_WIN32)
+#include <direct.h>
+static void ensure_dir(const char *p) { _mkdir(p); }
+#else
+#include <sys/stat.h>
+static void ensure_dir(const char *p) { mkdir(p, 0755); }
+#endif
+
+// A named model lives in model/<name>/ as model.bin + tok.bin. Fill the two
+// path buffers (and create the folder when `make` is set, i.e. for training).
+static void model_paths(const char *name, char *model_out, char *tok_out,
+                        int cap, int make) {
+  char dir[400];
+  snprintf(dir, sizeof(dir), "model/%s", name);
+  if (make) { ensure_dir("model"); ensure_dir(dir); }
+  snprintf(model_out, cap, "%s/model.bin", dir);
+  snprintf(tok_out, cap, "%s/tok.bin", dir);
+}
+
 // Full-model loss: training forward + cross-entropy. Fills logits and probs.
 static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
                       const int *targets, Tensor *logits, Tensor *probs) {
@@ -213,13 +233,27 @@ static int run_demo(void) {
 //   transformer generate                       -> random toy model, token IDs in
 //   transformer generate model.bin             -> loaded weights, token IDs in
 //   transformer generate model.bin tok.bin     -> TEXT in / TEXT out (tokenizer)
+//   transformer generate --name X              -> model/X/ (text if tok.bin present)
 // Reads one prompt per stdin line.
 // ============================================================================
 static int run_generate(int argc, char **argv) {
+  // Resolve model + optional tokenizer paths (supports --name <folder>).
+  const char *model_path = NULL, *tok_path = NULL;
+  static char nm[512], nt[512];
+  if (argc > 3 && strcmp(argv[2], "--name") == 0) {
+    model_paths(argv[3], nm, nt, sizeof(nm), 0);
+    model_path = nm;
+    FILE *tf = fopen(nt, "rb");           // text mode only if the tokenizer exists
+    if (tf) { fclose(tf); tok_path = nt; }
+  } else {
+    if (argc > 2) model_path = argv[2];
+    if (argc > 3) tok_path = argv[3];
+  }
+
   GPT model;
-  if (argc > 2) {
-    if (gpt_load(argv[2], &model) != 0) return 1;   // load trained weights
-    fprintf(stderr, "loaded %s\n", argv[2]);
+  if (model_path) {
+    if (gpt_load(model_path, &model) != 0) return 1;
+    fprintf(stderr, "loaded %s\n", model_path);
   } else {
     srand(42);
     model = gpt_create(16, 8, 2, 2, 32, 64);        // toy fallback (random weights)
@@ -229,14 +263,14 @@ static int run_generate(int argc, char **argv) {
   // Optional tokenizer -> text mode (stdin lines are text, not token IDs).
   Tokenizer tok;
   int text_mode = 0;
-  if (argc > 3) {
-    if (tokenizer_load(&tok, argv[3]) != 0) {
-      fprintf(stderr, "cannot load tokenizer %s\n", argv[3]);
+  if (tok_path) {
+    if (tokenizer_load(&tok, tok_path) != 0) {
+      fprintf(stderr, "cannot load tokenizer %s\n", tok_path);
       gpt_free(&model);
       return 1;
     }
     text_mode = 1;
-    fprintf(stderr, "text mode (tokenizer %s, vocab %d)\n", argv[3], tok.vocab_size);
+    fprintf(stderr, "text mode (tokenizer %s, vocab %d)\n", tok_path, tok.vocab_size);
   }
 
   const int vocab = model.vocab_size;
@@ -345,6 +379,7 @@ static void train_usage(void) {
   fprintf(stderr,
     "usage: transformer train <path> [flags]\n"
     "  <path> : text file OR directory of *.txt\n"
+    "  --name X      save to model/X/ (model.bin + tok.bin); use `generate --name X`\n"
     "  --out F       output model (default model.bin)   --tok F     output tokenizer (default tok.bin)\n"
     "  --merges N    BPE merges (default 300)            --steps N   Adam steps (default 1000)\n"
     "  --d-model N   model dim (default 128)             --layers N  blocks (default 3)\n"
@@ -358,12 +393,15 @@ static int run_train(int argc, char **argv) {
   if (argc < 3 || strncmp(argv[2], "--", 2) == 0) { train_usage(); return 2; }
   const char *data = argv[2];
   TrainConfig cfg = train_default_config();
+  const char *name = NULL;
+  static char name_model[512], name_tok[512];
 
   for (int i = 3; i < argc; i++) {
     const char *f = argv[i];
     int has_val = (i + 1 < argc);
 #define NEED_VAL() do { if (!has_val) { fprintf(stderr, "missing value for %s\n", f); return 2; } } while (0)
-    if      (strcmp(f, "--out") == 0)     { NEED_VAL(); cfg.out_model = argv[++i]; }
+    if      (strcmp(f, "--name") == 0)    { NEED_VAL(); name = argv[++i]; }
+    else if (strcmp(f, "--out") == 0)     { NEED_VAL(); cfg.out_model = argv[++i]; }
     else if (strcmp(f, "--tok") == 0)     { NEED_VAL(); cfg.out_tok = argv[++i]; }
     else if (strcmp(f, "--merges") == 0)  { NEED_VAL(); cfg.num_merges = atoi(argv[++i]); }
     else if (strcmp(f, "--steps") == 0)   { NEED_VAL(); cfg.steps = atoi(argv[++i]); }
@@ -379,6 +417,13 @@ static int run_train(int argc, char **argv) {
     else if (strcmp(f, "--val-frac") == 0){ NEED_VAL(); cfg.val_frac = (float)atof(argv[++i]); }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
+  }
+  // --name X saves to model/X/{model,tok}.bin (unless --out/--tok were given).
+  if (name) {
+    model_paths(name, name_model, name_tok, sizeof(name_model), 1);
+    cfg.out_model = name_model;
+    cfg.out_tok = name_tok;
+    printf("model dir: model/%s/\n", name);
   }
   return train_run(data, &cfg);
 }

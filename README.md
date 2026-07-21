@@ -39,7 +39,8 @@ defined in the matching `.c`.
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`)     |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
-| `tools/`                          | Non-C helpers: GPT-2 converters, `crawl_wikipedia.py`         |
+| `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
+| `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py` |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -369,15 +370,18 @@ The model is **GPT-2-architecture-compatible**: pre-norm blocks, multi-head caus
 positional embeddings, and a final LayerNorm. The output head is a separate `lm_head`, so
 GPT-2's tied head is written as `lm_head = wte^T` at conversion time.
 
-**Real GPT-2 (124M):**
+**Real GPT-2 (124M) — verified, generates real text:**
 ```sh
-pip install numpy safetensors
-huggingface-cli download gpt2 model.safetensors --local-dir gpt2/
-python tools/convert_gpt2.py gpt2/model.safetensors gpt2.npz     # HF -> our layout
-python tools/convert_to_gptc.py gpt2.npz gpt2.bin --n-heads 12   # -> GPTC checkpoint
+pip install numpy safetensors huggingface_hub tiktoken
+python tools/gpt2_setup.py --out model/gpt2/model.bin      # download + convert (~622 MB)
+
+ids=$(python tools/gpt2_tok.py encode "The meaning of life is")
+echo "$ids" | ./transformer generate --name gpt2           # runs GPT-2 in pure C
+python tools/gpt2_tok.py decode <the ids it printed>       # -> text
 ```
-Then in C: `GPT m; gpt_load("gpt2.bin", &m);` and `gpt_forward` / `gpt_generate`.
-(Config: vocab 50257, d_model 768, 12 layers, 12 heads, d_ff 3072, ctx 1024.)
+Actual output from that prompt: *"The meaning of life is not to be confused with the fact of
+being reborn. Rather, life is to be born and that is what the term means."* GPT-2 uses its own
+BPE (via `tiktoken`), so it runs in token-ID mode. See `model/gpt2/README.md`.
 
 **Your own weights:** assemble a `.npz` with the documented key names (incl. `b_q…b_o`) and
 run `convert_to_gptc.py` directly. The GPTC format is **v2** (adds the attention biases).
