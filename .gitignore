@@ -35,5 +35,5 @@ data/*
 # Agent demo artifact
 agent_demo.txt
 
-# Personal portable memory snapshot (carried by the user, not committed)
-memory.md
+# NOTE: memory.md is intentionally TRACKED (committed) so it travels via git
+# across machines — see it in the repo root.
