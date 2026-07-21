@@ -22,7 +22,7 @@ static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
   return cross_entropy_forward(logits, targets, probs);
 }
 
-int main() {
+static int run_demo(void) {
   printf("=== Minimal GPT-2 Style Transformer Demo ===\n\n");
   int all_ok = 1;
   srand(42);
@@ -188,4 +188,84 @@ int main() {
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;
+}
+
+// ============================================================================
+// `generate` subcommand: a token-level REPL driven by the KV cache + sampler.
+// Reads lines of space-separated token IDs from stdin (the prompt) and streams
+// generated tokens. Pipe-testable, e.g.:  echo "1 5 9" | transformer generate
+// With a checkpoint:  transformer generate model.bin
+// (Becomes text-in/text-out once a real tokenizer is wired — see notes.md A1.)
+// ============================================================================
+static int run_generate(int argc, char **argv) {
+  GPT model;
+  if (argc > 2) {
+    if (gpt_load(argv[2], &model) != 0) return 1;   // load real weights
+    fprintf(stderr, "loaded %s\n", argv[2]);
+  } else {
+    srand(42);
+    model = gpt_create(16, 8, 2, 2, 32, 64);        // toy fallback (random weights)
+    fprintf(stderr, "no checkpoint given; using a random toy model (vocab=16)\n");
+  }
+
+  const int vocab = model.vocab_size;
+  const int max_seq = model.max_seq_len;
+  const int n_new = 20;                   // tokens to generate per prompt
+  const float temperature = 0.8f;
+  const int top_k = 40;
+  const float top_p = 0.95f;
+  Rng rng = rng_create(1234);
+
+  int lshape[2] = {1, vocab};
+  Tensor logits = tensor_create(lshape, 2);
+  int *prompt = (int*)malloc(max_seq * sizeof(int));
+
+  char line[8192];
+  while (fgets(line, sizeof(line), stdin)) {
+    char *p = line;
+    // Strip a leading UTF-8 BOM (common when piping on Windows) so the first
+    // token doesn't get mangled.
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+        (unsigned char)p[2] == 0xBF) {
+      p += 3;
+    }
+    // Parse space/newline-separated token IDs (bounds-checked to [0, vocab)).
+    int n = 0;
+    for (char *t = strtok(p, " \t\r\n"); t && n < max_seq; t = strtok(NULL, " \t\r\n")) {
+      int id = atoi(t);
+      if (id < 0 || id >= vocab) {
+        fprintf(stderr, "skipping out-of-range token %d (vocab=%d)\n", id, vocab);
+        continue;
+      }
+      prompt[n++] = id;
+    }
+    if (n == 0) continue;
+
+    KVCache kv = gpt_kvcache_create(&model);
+    printf("gen:");
+    for (int i = 0; i < n; i++) {                 // feed the prompt
+      gpt_decode_step(&model, &kv, prompt[i], &logits);
+      printf(" %d", prompt[i]);
+    }
+    for (int s = 0; s < n_new && kv.len < max_seq; s++) {  // autoregress
+      int next = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
+      printf(" [%d]", next);                       // brackets mark generated tokens
+      gpt_decode_step(&model, &kv, next, &logits);
+    }
+    printf("\n");
+    fflush(stdout);
+    gpt_kvcache_free(&kv);
+  }
+
+  free(prompt);
+  tensor_free(&logits);
+  gpt_free(&model);
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "generate") == 0) {
+    return run_generate(argc, argv);
+  }
+  return run_demo();
 }

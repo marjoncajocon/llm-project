@@ -89,6 +89,24 @@ Exit code is `0` when all checks pass, `1` otherwise — handy in scripts:
 ./transformer && echo "smoke test ok"
 ```
 
+### `transformer generate [checkpoint.bin]` (token-level REPL)
+
+A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`).
+It reads lines of space-separated **token IDs** from stdin (the prompt) and streams the
+generated tokens (bracketed). With no checkpoint it uses a random toy model; pass a GPTC
+`.bin` to generate from loaded weights.
+
+```sh
+echo "1 5 9" | ./transformer generate
+# gen: 1 5 9 [15] [15] [5] [15] [9] ...   (bracketed tokens are generated)
+
+./transformer generate gpt2.bin   # then type token IDs, one prompt per line
+```
+
+Defaults: 20 new tokens, temperature 0.8, top-k 40, top-p 0.95 (edit `run_generate` in
+`main.c`). Out-of-range IDs are skipped. This is **token-in/token-out** today; it becomes
+text-in/text-out once a real tokenizer is wired (see `notes.md`, step A1).
+
 ### `tools/convert_to_gptc.py` (weight importer)
 
 Converts a `.npz` of named weight arrays into the C checkpoint format so `gpt_load()`

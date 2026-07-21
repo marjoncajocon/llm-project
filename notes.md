@@ -22,7 +22,7 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
 - [x] Step B2 — KV cache (incremental decode; verified bit-exact vs full forward)
-- [ ] Step B3 — REPL front-end: `you>` loop (stdin → tokenize → generate → stream out)
+- [x] Step B3 — `generate` subcommand: token-in/token-out REPL (KV cache + sampler)
 - [ ] Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization
 
 **Phase C — The agent layer (tools + approval), pure C:**
@@ -393,11 +393,28 @@ and stays at 9.28e-04 — bias backward is correct; training convergence corrobo
   (bit-exact) — the cache is correct, and generation is now O(n) per token instead of
   re-running the whole prefix.
 
+## Step B3 — `generate` subcommand (token-level REPL)
+
+**Status: DONE — pipe-tested.**
+
+- **`main.c`** — split into `run_demo()` (the default smoke test) and `run_generate()`,
+  dispatched by `main(argc, argv)`: `transformer generate [checkpoint.bin]`.
+  Reads lines of space-separated **token IDs** from stdin, feeds them through the KV cache
+  (`gpt_decode_step`), then autoregressively samples `n_new` tokens (`sample_token`,
+  temp 0.8 / top-k 40 / top-p 0.95, seed 1234) and streams them (bracketed). Loads real
+  weights if a `.bin` is given, else a random toy model. Out-of-range IDs are skipped; a
+  leading UTF-8 BOM is stripped (Windows pipe robustness).
+- **Verified:** `echo "1 5 9" | transformer generate` → `gen: 1 5 9 [15] [15] [5] ...`;
+  multi-line input loops; `99` (>= vocab 16) is skipped. Default `transformer` still
+  `PASSED`. Build `-Wall` clean.
+- This is the CLI skeleton: **token-in/token-out** now, **text-in/text-out** once A1 (real
+  BPE) + real weights land.
+
 ## Next steps (not started)
-- Step B3 — REPL front-end: token-in/token-out generation loop using `gpt_decode_step` +
-  `sample_token` (pipe-testable), then wire real text once A1 lands.
 - Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex.
-- Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization.
+  Then `generate` can take/emit text and drive loaded GPT-2 weights.
+- Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization (needed for 124M).
+- Phase C — agent layer (tool protocol, executor, approval gate, agent loop).
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
 - Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.
