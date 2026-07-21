@@ -62,6 +62,26 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       caption, loss 5.998 -> 0.001.
       (Honest: research-scale for real quality; this is a correct, runnable pipeline.)
 
+**Phase G — GENERATE media (image / audio / video). Approach: discrete-token autoregressive,
+reusing the GPT + KV cache + sampler + cross-entropy (like DALL·E 1 / ImageGPT / audio codec
+LMs). Diffusion is the SOTA alternative but a much bigger, different build — not chosen.**
+- [ ] Step G0 — Generation foundation: discrete tokens per modality; media vocab / special
+      tokens (BOS/EOS); a decode+stop path. (Minimal versions need NO VQ-VAE — see below.)
+- [x] Step GI1 — Image quantizer (`imagegen.c`): `image_to_tokens`/`tokens_to_image` via a
+      **color-cube** (levels^3 tokens; levels=4 → 64), deterministic, no training. (Later: VQ-VAE.)
+- [x] Step GI2 — Train GPT to autoregressively predict image tokens (smoke `[10]`: overfit an
+      8×8 image, loss 4.53 → 0.0003). (Text→image conditioning = next; prefix the caption.)
+- [x] Step GI3 — Generate: greedy autoregressive sampling of image tokens (KV cache +
+      `sample_argmax`) → **64/64 tokens reproduced** → `tokens_to_image` → pixels. Minimal image
+      generation works end-to-end. (CLI subcommand + real dataset + upscaling = polish.)
+- [ ] Step GA1–GA3 — Audio generation: **µ-law 256-level** quantize (WaveNet-style) → predict
+      next audio token → decode → WAV. (Later: learned audio codec.)
+- [ ] Step GV1–GV3 — Video generation: reuse the image codec per frame + temporal; predict
+      next frame's tokens → decode frames → ffmpeg → video.
+      (Honest: pipeline reuses ~80% of the stack; the quantizer/decoder is the quality
+      bottleneck — palette/µ-law give tiny/blocky output; real quality needs a trained
+      VQ-VAE or diffusion + big data + compute.)
+
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
 - [x] Step B2 — KV cache (incremental decode; verified bit-exact vs full forward)

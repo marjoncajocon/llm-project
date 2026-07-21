@@ -74,11 +74,17 @@ via `make cross`).
    `tools/audio_to_wav.py` (ffmpeg). Smoke trains video→caption (6.0→0.001) and audio→caption
    (7.3→0.0017). Audio is raw-waveform frames (not mel-spectrograms).
 
-🏁 **ALL modalities done: text, image, video, audio** — all train via `gpt_forward_multimodal`
-+ `gpt_backward_multimodal`. Pure C11, 8 platforms, every step green. Ceiling: pipelines
-correct/runnable, but real quality needs real datasets + far bigger models.
-Optional future: mel-spectrogram audio, real datasets, SIMD/int8 quant, real-LLM
-`tools/agent_llm.py`, instruction-tuning, `gpt2-medium/large/xl`.
+🏁 **All modalities UNDERSTOOD: text, image, video, audio** — multimodal fwd/bwd.
+
+**GENERATION (Phase G) IN PROGRESS** — approach: discrete-token autoregressive (reuse GPT +
+KV cache + sampler + cross-entropy; NOT diffusion). ✅ **GI image-gen minimal DONE**:
+`imagegen.c` color-cube quantizer (pixels↔tokens); smoke `[10]` overfits an 8×8 image and
+autoregressively regenerates it (64/64 tokens) → decode → pixels. NEXT: GA (audio µ-law), GV
+(video); then text→image conditioning, a CLI subcommand, real datasets, VQ-VAE for quality.
+
+Pure C11, 8 platforms, every step green. Ceiling: pipelines correct/runnable; real quality
+needs real datasets + far bigger models (palette/µ-law codecs are crude). Optional future:
+VQ-VAE/diffusion, mel-spectrogram audio, SIMD/int8 quant, real-LLM `tools/agent_llm.py`.
 
 Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).

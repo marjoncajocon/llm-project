@@ -21,6 +21,7 @@
 #include "patch.h"
 #include "video.h"
 #include "audio.h"
+#include "imagegen.h"
 
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
@@ -434,6 +435,71 @@ static int run_demo(void) {
   audio_free(&aud);
   remove("aud.wav.tmp");
   all_ok &= aud_ok;
+
+  // --------------------------------------------------------------------------
+  // Part 10: image GENERATION (Phase G, GI minimal) — pixels -> tokens, train a
+  // GPT to autoregress them, then generate and decode back to pixels.
+  // --------------------------------------------------------------------------
+  {
+    const int LV = 4;                          // 4 levels/channel -> 64 color tokens
+    int gv = imagegen_vocab(LV);
+    const int giw = 8, gih = 8, P = giw * gih; // 64 pixels = 64 tokens
+    Image gim; gim.h = gih; gim.w = giw; gim.c = 3;
+    gim.data = (float*)malloc((size_t)P * 3 * sizeof(float));
+    for (int y = 0; y < gih; y++)
+      for (int x = 0; x < giw; x++) {
+        int i = y * giw + x;
+        gim.data[i * 3 + 0] = (float)x / (giw - 1);   // R gradient across x
+        gim.data[i * 3 + 1] = (float)y / (gih - 1);   // G gradient across y
+        gim.data[i * 3 + 2] = 0.5f;
+      }
+    int itok[64];
+    image_to_tokens(&gim, LV, itok);
+
+    // Train a small GPT to memorize the image's token sequence.
+    GPT gg = gpt_create(gv, 32, 2, 2, 128, P);
+    GPTActs ga = gpt_acts_create(&gg, P);
+    int ilz[2] = {P, gv};
+    Tensor ilog = tensor_create(ilz, 2), iprb = tensor_create(ilz, 2);
+    int itgt[64];
+    for (int i = 0; i < P; i++) itgt[i] = (i < P - 1) ? itok[i + 1] : -1;
+    Tensor *ipar[128];
+    int nip = gpt_collect_params(&gg, ipar);
+    Adam iopt = adam_create(ipar, nip, 0.01f);
+    float i0 = 0.0f, il = 0.0f;
+    for (int s = 0; s < 400; s++) {
+      gpt_forward_train(&gg, itok, P, &ga, &ilog);
+      float loss = cross_entropy_forward(&ilog, itgt, &iprb);
+      if (s == 0) i0 = loss;
+      il = loss;
+      tensor_zero_grad(&ilog);
+      cross_entropy_backward(&iprb, itgt, &ilog);
+      gpt_backward(&gg, itok, P, &ga, &ilog);
+      adam_step(&iopt, ipar, nip);
+    }
+
+    // Autoregressively GENERATE the image tokens (greedy) from the first pixel.
+    KVCache ikv = gpt_kvcache_create(&gg);
+    int gtok[64]; gtok[0] = itok[0];
+    int glz[2] = {1, gv};
+    Tensor gl = tensor_create(glz, 2);
+    gpt_decode_step(&gg, &ikv, itok[0], &gl);
+    for (int i = 1; i < P; i++) {
+      gtok[i] = sample_argmax(&gl, 0);
+      gpt_decode_step(&gg, &ikv, gtok[i], &gl);
+    }
+    int match = 0;
+    for (int i = 0; i < P; i++) if (gtok[i] == itok[i]) match++;
+    Image gout = tokens_to_image(gtok, giw, gih, LV);   // decode -> pixels
+    int gen_ok = (match == P) && (gout.data != NULL);
+    printf("[10] Image GEN: train loss %.4f -> %.4f | generated %d/%d tokens match -> %s\n\n",
+           i0, il, match, P, gen_ok ? "OK" : "FAIL");
+
+    image_free(&gout); tensor_free(&gl); gpt_kvcache_free(&ikv);
+    adam_free(&iopt); tensor_free(&ilog); tensor_free(&iprb); gpt_acts_free(&ga);
+    gpt_free(&gg); image_free(&gim);
+    all_ok &= gen_ok;
+  }
 
   adam_free(&opt);
   tensor_free(&logits);

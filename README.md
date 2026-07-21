@@ -39,6 +39,7 @@ defined in the matching `.c`.
 | `patch.h` / `patch.c`             | ViT-style patch embedding + backward (trainable image front-end) |
 | `video.h` / `video.c`             | Video = frames → per-frame patches + temporal encoding (Phase F) |
 | `audio.h` / `audio.c`             | Audio = WAV → windowed frames → embeddings + temporal encoding (Phase F) |
+| `imagegen.h` / `imagegen.c`       | Image ↔ tokens (color-cube) for autoregressive image **generation** (Phase G) |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`)     |
