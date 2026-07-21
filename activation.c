@@ -43,3 +43,18 @@ void gelu(const Tensor *input, Tensor *output) {
     output->data[i] = 0.5f * x * (1.0f + tanhf(inner));
   }
 }
+
+// Backward of GELU: input->grad += output->grad * d gelu/dx
+void gelu_backward(const Tensor *input, const Tensor *output) {
+  const float k = 0.7978845608028654f;  // sqrt(2/pi)
+  const float a = 0.044715f;
+  for (int i = 0; i < input->size; i++) {
+    float x = input->data[i];
+    float inner = k * (x + a * x * x * x);
+    float t = tanhf(inner);
+    float d_inner = k * (1.0f + 3.0f * a * x * x);
+    // d/dx [0.5 x (1 + tanh(inner))]
+    float dgelu = 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * d_inner;
+    input->grad[i] += output->grad[i] * dgelu;
+  }
+}

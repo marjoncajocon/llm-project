@@ -13,4 +13,8 @@ void softmax_rowwise(const Tensor *input, Tensor *output);
 // gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 void gelu(const Tensor *input, Tensor *output);
 
+// Backward of GELU: input->grad += output->grad * d gelu/dx (reads input->data,
+// output->grad). Uses the analytic derivative of the tanh approximation.
+void gelu_backward(const Tensor *input, const Tensor *output);
+
 #endif // ACTIVATION_H

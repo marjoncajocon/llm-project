@@ -71,6 +71,11 @@ void tensor_init_random(Tensor *t) {
   }
 }
 
+// Zero the gradient array (call before accumulating grads for a new step)
+void tensor_zero_grad(Tensor *t) {
+  memset(t->grad, 0, t->size * sizeof(float));
+}
+
 // Print tensor (for debugging)
 void tensor_print(const Tensor *t, const char *name) {
   printf("%s shape: (", name);

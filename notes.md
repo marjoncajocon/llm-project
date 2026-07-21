@@ -185,7 +185,53 @@ Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean. Tokenizer round-trips
 `tools/` converter was also verified: a random numpy `.npz` -> `convert_to_gptc.py` ->
 GPTC `.bin` -> C `gpt_load` -> forward pass ran clean (no NaN/Inf).
 
+## Step 5a — Training foundation (backprop core + loss + Adam), gradient-checked
+
+**Status: DONE — smoke test passed (gradient check + loss drop).**
+
+### What changed
+The `Tensor.grad` array is finally used. Manual backprop (explicit `*_backward` siblings,
+no autograd engine); each accumulates into input/param grads, so callers zero grads per
+step (`tensor_zero_grad`, new in `tensor.c`).
+
+- **`matrix.c`** — `matmul_backward` (`dA += dC·Bᵀ`, `dB += Aᵀ·dC`), `matadd_backward`,
+  plus `bias_add` / `bias_add_backward` (row-broadcast bias, reusable by the FFN).
+- **`activation.c`** — `gelu_backward` (analytic derivative of the tanh-approx GELU).
+- **`layernorm.c`** — `layernorm_backward` (per-row `dgamma`, `dbeta`, `dx`).
+- **`loss.h/.c`** (NEW) — `cross_entropy_forward` (mean loss + fills softmax `probs`,
+  reuses `softmax_rowwise`) and `cross_entropy_backward` (`(probs - onehot)/N`).
+- **`optim.h/.c`** (NEW) — `Adam` (bias-corrected, per-param m/v state).
+- **`main.c`** — rewritten around a tiny trainable MLP
+  `logits = LayerNorm(GELU(x·W1+b1))·W2 + b2` that exercises every new backward op:
+  - **Gradient check**: analytic grad vs numerical `(L(+ε)-L(-ε))/2ε`, sampled across all
+    params; asserts max relative error < 1e-2.
+  - **Training**: Adam overfits 8 synthetic examples; asserts the loss collapses.
+  - Keeps condensed tokenizer + checkpoint round-trips (step-4 code still exercised).
+
+### Notes
+- Gradient checking is the correctness proof here — a wrong gradient still "runs" but won't
+  learn; the numeric check catches it.
+- Scope boundary held: attention/embedding backward = step 5b (below).
+
+### Progress checklist
+- [x] `tensor_zero_grad` (`tensor.c`)
+- [x] `matmul_backward`, `matadd_backward`, `bias_add`/`bias_add_backward` (`matrix.c`)
+- [x] `gelu_backward` (`activation.c`)
+- [x] `layernorm_backward` (`layernorm.c`)
+- [x] Cross-entropy forward/backward (`loss.h`/`.c`)
+- [x] Adam optimizer (`optim.h`/`.c`)
+- [x] `main.c`: trainable MLP + gradient check + training loop
+- [x] `Makefile` + `README.md` (module rows + Training subsection)
+- [x] Smoke test (build `-Wall` clean; grad check + loss drop PASS; exit 0)
+
+### Smoke test result (2026-07-21)
+Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean.
+- Gradient check: **max relative error 2.37e-03** (tol 1e-2) — all backward ops correct.
+- Training: loss **2.5848 -> 0.0001** over 300 Adam steps.
+- Tokenizer + checkpoint round-trips still OK. `Output validation: PASSED`.
+
 ## Next steps (not started)
+- Step 5b: backward for multi-head attention + embeddings (+ FFN wiring) so the full `GPT`
+  trains end-to-end on a next-token task. Plugs onto this foundation.
 - Step 4b: load real GPT-2 files — attention biases + fused QKV + weight-tied head,
   GPT-2 BPE (`encoder.json` / `vocab.bpe`), and a HF/TF -> `.npz` converter in `tools/`.
-- Step 5: backprop + training (uses the unused `Tensor.grad` field).

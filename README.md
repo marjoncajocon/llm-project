@@ -27,6 +27,8 @@ defined in the matching `.c`.
 | `model.h` / `model.c`             | `GPT` model: embeddings, stacked blocks, output head, generation |
 | `checkpoint.h` / `checkpoint.c`   | Save/load model weights (`gpt_save` / `gpt_load`, GPTC format) |
 | `tokenizer.h` / `tokenizer.c`     | Self-contained byte-level BPE (`encode` / `decode`)           |
+| `loss.h` / `loss.c`               | Softmax cross-entropy (forward + backward)                    |
+| `optim.h` / `optim.c`             | Adam optimizer                                                |
 | `main.c`                          | Demo entry point                                              |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
@@ -156,6 +158,37 @@ gpt_save("model.bin", &m);        // persist weights
 GPT loaded;
 gpt_load("model.bin", &loaded);   // rebuilds config + weights; free with gpt_free
 ```
+
+### Training (backprop + Adam)
+
+Every forward op has a matching `*_backward` that **accumulates** into the `grad` array of
+its inputs/parameters (call `tensor_zero_grad` before each step). Cross-entropy is in
+`loss.c`, the optimizer in `optim.c`. A training step looks like:
+
+```c
+#include "loss.h"
+#include "optim.h"
+
+Tensor *params[] = {&W1, &b1, &W2, &b2};
+Adam opt = adam_create(params, 4, /*lr=*/0.05f);
+
+for (int step = 0; step < n_steps; step++) {
+  // forward: ... -> logits
+  float loss = cross_entropy_forward(&logits, targets, &probs);
+
+  // backward: zero grads, then propagate from the loss back to every parameter
+  cross_entropy_backward(&probs, targets, &logits);
+  // ... matmul_backward / bias_add_backward / gelu_backward / layernorm_backward ...
+
+  adam_step(&opt, params, 4);   // updates params using their .grad
+}
+adam_free(&opt);
+```
+
+Gradients are verified in `main.c` by **numerical gradient checking** (analytic `grad` vs
+`(L(+ε) − L(−ε)) / 2ε`). The demo trains a tiny MLP that exercises every backward op and
+overfits it to ~0 loss. Backward for multi-head attention + embeddings (so the full `GPT`
+trains end-to-end) is the next milestone — see `notes.md`.
 
 ### Importing external weights (e.g. GPT-2) — end-to-end
 

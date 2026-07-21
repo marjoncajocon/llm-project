@@ -26,6 +26,9 @@ void tensor_free(Tensor *t);
 // Fill tensor with random values (Xavier initialization)
 void tensor_init_random(Tensor *t);
 
+// Zero the gradient array (call before accumulating grads for a new step)
+void tensor_zero_grad(Tensor *t);
+
 // Print tensor (for debugging)
 void tensor_print(const Tensor *t, const char *name);
 

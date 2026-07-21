@@ -14,4 +14,21 @@ void matadd(const Tensor *A, const Tensor *B, Tensor *C);
 // Scale matrix: C = A * scalar
 void matscale(const Tensor *A, float scalar, Tensor *C);
 
+// Row-broadcast bias add: out[i,j] = x[i,j] + bias[j]
+// x: (M, N), bias: (N), out: (M, N)
+void bias_add(const Tensor *x, const Tensor *bias, Tensor *out);
+
+// ---------------------------------------------------------------------------
+// Backward passes (accumulate into the inputs' grad arrays; read out->grad)
+// ---------------------------------------------------------------------------
+
+// Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC (reads C->grad).
+void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C);
+
+// Backward of C = A + B: dA += dC, dB += dC (reads C->grad).
+void matadd_backward(const Tensor *C, Tensor *A, Tensor *B);
+
+// Backward of bias_add: bias_grad[j] += sum_i out->grad[i,j] (reads out->grad).
+void bias_add_backward(const Tensor *out, Tensor *bias_grad);
+
 #endif // MATRIX_H
