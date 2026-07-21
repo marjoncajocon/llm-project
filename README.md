@@ -230,15 +230,24 @@ The model emits tool blocks; each approved call runs and its result is fed back:
 <done>summary</done>
 ```
 
-`transformer agent` runs a **scripted** model (the built-in transformer is far too small to
-emit valid tool calls — a real LLM backend plugs in where the script is) and auto-approves;
-`transformer agent --ask` prompts `y/N` before each action. The pieces:
-`toolcall.c` (parse) · `toolexec.c` (write/read/run) · `approval.c` (gate) · `agent.c` (loop).
+The **model backend is pluggable** (`AgentBackend` interface in `agent.h`):
 
 ```sh
-transformer agent          # scripted demo, auto-approved
-transformer agent --ask    # approve each tool action interactively
+transformer agent                                   # built-in scripted demo (auto-approve)
+transformer agent --ask                             # approve each tool action interactively
+transformer agent --cmd "python tools/agent_mock.py"  # external program IS the model
+transformer agent --cmd "python tools/agent_mock.py" --goal "make hello.txt"
 ```
+
+With `--cmd`, the agent writes the running transcript to a temp file, passes its path to the
+program, and uses the program's **stdout** as the model's next response — so you can plug in a
+real LLM with a small script (see `tools/agent_mock.py`, which shows the Anthropic/OpenAI call
+to drop in). The pieces: `toolcall.c` (parse) · `toolexec.c` (write/read/run) · `approval.c`
+(gate) · `agent.c` (loop + scripted/command backends).
+
+> The built-in transformer is far too small to emit valid tool calls, and `model/gpt2` is base
+> (not instruction-tuned) — for a genuinely acting agent, point `--cmd` at an instruction-tuned
+> model or an LLM API.
 
 ### `tools/convert_to_gptc.py` (weight importer)
 

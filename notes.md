@@ -83,8 +83,11 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
    the pure-C model generates **coherent real GPT-2 text** ("The meaning of life is not to be
    confused with the fact of being reborn..."). Also added the `model/<name>/` folder
    convention + `--name` for train/generate. (Bigger variants: `--model gpt2-medium` etc.)
-4. **Real agent backend** *(medium)* — wire a live LLM (or a locally-trained model) into
-   `agent.c`, replacing the scripted responses.
+4. **Real agent backend** ✅ DONE — `agent.c` now has a pluggable `AgentBackend` interface:
+   a **scripted** backend (demo/tests) and a **command** backend (`agent --cmd "<prog>"` runs
+   an external program whose stdout is each response; transcript passed as a file arg). Verified
+   with `tools/agent_mock.py` driving write→read→done. Plug in a real LLM by pointing `--cmd`
+   at an API script (template in agent_mock.py).
 5. **Phase E — Images (multimodal)** *(large)* — decode → patch embeddings → multimodal
    input → image-text training.
 6. **Phase F — Video** *(research-scale)* — frames → per-frame patches + temporal encoding →
@@ -137,10 +140,10 @@ authorized; local only, don't push).
 3. ✅ DONE — **Real GPT-2**: `tools/gpt2_setup.py` (download+convert) + `tools/gpt2_tok.py`
    (tiktoken) → pure-C model generates real coherent GPT-2 text. `model/<name>/` folder
    convention + `--name`. GPT-2 lives in `model/gpt2/` (git-ignored weights).
-4. **Wire a real backend into `agent.c`** (RECOMMENDED NEXT — replace the scripted
-   `responses[]`) — a live LLM API call, or a loaded model (e.g. `model/gpt2`) — so the agent
-   genuinely acts. Note `model/gpt2` is base GPT-2 (not instruction-tuned), so it won't follow
-   tool-call formats well; a small instruction-tuned model or an API is better for real use.
+4. ✅ DONE — **pluggable agent backend** (`agent.c`): scripted + command backends;
+   `agent --cmd "<prog>"` uses an external program as the model (`tools/agent_mock.py`).
+   For a genuinely acting agent, point `--cmd` at an instruction-tuned model or an LLM API
+   (base `model/gpt2` won't follow tool-call formats well).
 5. **Phase E (images)** then **Phase F (video)** — see the roadmap above; big future builds.
 
 Not supported yet (asked about): **image training** and **video training** — text-only today;
@@ -736,9 +739,23 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
 - Remaining niceties: a `gpt2_chat.py` wrapper (encode→generate→decode in one), and threading
   the M=1 decode-step matmuls over columns (currently single-threaded per token).
 
+## Phase #4 (pluggable agent backend) — DONE
+
+- **`agent.h/.c`** — `AgentBackend` interface (struct + `respond` fn ptr; concrete backends
+  embed it as the first field → no `void *`). Two backends: `scripted_backend` (fixed
+  responses) and `command_backend` (runs an external program; transcript written to a temp
+  file passed as argv, program stdout = response). `agent_run(goal, AgentBackend*, mode)` keeps
+  a running transcript, capped at `AGENT_MAX_STEPS`. Portable popen (Win32/POSIX; WASM disabled;
+  `_POSIX_C_SOURCE` for glibc/musl under -std=c11).
+- **`main.c`** — `agent [--ask] [--cmd "<prog>"] [--goal "..."]`.
+- **`tools/agent_mock.py`** — example backend that drives write→read→done (reads the transcript
+  to know the step), with a commented Anthropic/OpenAI call to swap in a real LLM.
+- Verified: scripted + command backends both run; all 8 targets build; smoke test PASSED.
+
 ## Next steps (not started)
-- #4 **real agent backend** — wire a live LLM (or a loaded model like `model/gpt2`) into
-  `agent.c`, replacing the scripted `responses[]`. Then #5 images, #6 video.
+- #5 **images** (Phase E) then #6 **video** (Phase F) — see roadmap. Big multimodal builds.
+- Optional real agent: write a `tools/agent_llm.py` that calls a real LLM API and use
+  `agent --cmd "python tools/agent_llm.py"` (needs an API key).
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.
 - Phase D — perf/quant + a genuinely capable model (real weights).

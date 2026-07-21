@@ -63,9 +63,10 @@ via `make cross`).
 3. ✅ Real GPT-2 — `tools/gpt2_setup.py` (download+convert → `model/gpt2/model.bin`) +
    `tools/gpt2_tok.py` (tiktoken). Pure-C model generates **real coherent GPT-2 text**.
    Added `model/<name>/` folder convention + `--name` for train/generate. DONE.
-4. **Real agent backend** (RECOMMENDED NEXT) — wire a live LLM / a loaded model (e.g.
-   `model/gpt2`) into `agent.c`, replacing the scripted `responses[]`.
-5. Phase E — images (multimodal). 6. Phase F — video. (Text-only today.)
+4. ✅ Real agent backend — `agent.c` pluggable `AgentBackend`: scripted + **command** backend
+   (`agent --cmd "<prog>"`, program stdout = model response; `tools/agent_mock.py` example).
+   Plug in a real LLM via an API script. DONE.
+5. **Phase E — images (multimodal)** (RECOMMENDED NEXT). 6. Phase F — video. (Text-only today.)
 
 Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).

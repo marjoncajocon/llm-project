@@ -344,26 +344,40 @@ static int run_generate(int argc, char **argv) {
 }
 
 // ============================================================================
-// `agent` subcommand: demo the parse -> approve -> execute -> observe loop with
-// a scripted "model" (the toy GPT can't emit tool calls; a real LLM backend
-// would replace the `responses` script). Use `agent --ask` for interactive
-// approval; default auto-approves so it runs non-interactively.
+// `agent` subcommand: the parse -> approve -> execute -> observe loop with a
+// pluggable model backend.
+//   transformer agent                 -> built-in scripted backend (demo)
+//   transformer agent --cmd "<prog>"  -> run <prog> as the model; its stdout is
+//                                        each response (the transcript is passed
+//                                        as a file arg). Plug in a real LLM here.
+//   --ask   approve each tool action interactively   --goal "..."  set the goal
 // ============================================================================
 static int run_agent(int argc, char **argv) {
   const char *goal = "Create a note file, then read it back to verify.";
-  const char *responses[] = {
-    "I'll create the file.\n"
-    "<tool name=\"write_file\" path=\"agent_demo.txt\">Hello from the C agent!\n</tool>",
-    "Now I'll read it back.\n"
-    "<tool name=\"read_file\" path=\"agent_demo.txt\"></tool>",
-    "<done>Created agent_demo.txt and verified its contents.</done>"
-  };
-  int n = 3;
-
+  const char *cmd = NULL;
   ApprovalMode mode = APPROVAL_AUTO;
-  if (argc > 2 && strcmp(argv[2], "--ask") == 0) mode = APPROVAL_ASK;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--ask") == 0) mode = APPROVAL_ASK;
+    else if (strcmp(argv[i], "--cmd") == 0 && i + 1 < argc) cmd = argv[++i];
+    else if (strcmp(argv[i], "--goal") == 0 && i + 1 < argc) goal = argv[++i];
+  }
 
-  int rc = agent_run(goal, responses, n, mode);
+  int rc;
+  if (cmd) {
+    CommandBackend b = command_backend(cmd);
+    rc = agent_run(goal, &b.base, mode);
+  } else {
+    // Built-in scripted "model" (the toy GPT can't emit tool calls).
+    const char *responses[] = {
+      "I'll create the file.\n"
+      "<tool name=\"write_file\" path=\"agent_demo.txt\">Hello from the C agent!\n</tool>",
+      "Now I'll read it back.\n"
+      "<tool name=\"read_file\" path=\"agent_demo.txt\"></tool>",
+      "<done>Created agent_demo.txt and verified its contents.</done>"
+    };
+    ScriptedBackend b = scripted_backend(responses, 3);
+    rc = agent_run(goal, &b.base, mode);
+  }
   remove("agent_demo.txt");  // clean up the demo artifact
   return rc;
 }
