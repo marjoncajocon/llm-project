@@ -14,6 +14,7 @@
 #include "model.h"
 #include "checkpoint.h"
 #include "tokenizer.h"
+#include "agent.h"
 
 // Full-model loss: training forward + cross-entropy. Fills logits and probs.
 static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
@@ -279,9 +280,33 @@ static int run_generate(int argc, char **argv) {
   return 0;
 }
 
+// ============================================================================
+// `agent` subcommand: demo the parse -> approve -> execute -> observe loop with
+// a scripted "model" (the toy GPT can't emit tool calls; a real LLM backend
+// would replace the `responses` script). Use `agent --ask` for interactive
+// approval; default auto-approves so it runs non-interactively.
+// ============================================================================
+static int run_agent(int argc, char **argv) {
+  const char *goal = "Create a note file, then read it back to verify.";
+  const char *responses[] = {
+    "I'll create the file.\n"
+    "<tool name=\"write_file\" path=\"agent_demo.txt\">Hello from the C agent!\n</tool>",
+    "Now I'll read it back.\n"
+    "<tool name=\"read_file\" path=\"agent_demo.txt\"></tool>",
+    "<done>Created agent_demo.txt and verified its contents.</done>"
+  };
+  int n = 3;
+
+  ApprovalMode mode = APPROVAL_AUTO;
+  if (argc > 2 && strcmp(argv[2], "--ask") == 0) mode = APPROVAL_ASK;
+
+  int rc = agent_run(goal, responses, n, mode);
+  remove("agent_demo.txt");  // clean up the demo artifact
+  return rc;
+}
+
 int main(int argc, char **argv) {
-  if (argc > 1 && strcmp(argv[1], "generate") == 0) {
-    return run_generate(argc, argv);
-  }
+  if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);
   return run_demo();
 }

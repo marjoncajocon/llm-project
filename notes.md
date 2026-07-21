@@ -27,13 +27,14 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 - [~] Step B4 — Performance: cache-friendly `ikj` matmul done; threads/SIMD/int8 quant TODO
 
 **Phase C — The agent layer (tools + approval), pure C:**
-- [ ] Step C1 — Tool protocol the model emits (parseable `<tool …>` blocks)
-- [ ] Step C2 — Tool executor: read_file / write_file / list_dir / run_command (`tools.c`)
-- [ ] Step C3 — Approval gate: diff/preview + `y/n/a` on stdin (`approval.c`)
-- [ ] Step C4 — Agent loop: prompt → generate → parse tool → approve → execute → feed back (`agent.c`)
+- [x] Step C1 — Tool protocol: parse `<tool …>` / `<done>` blocks (`toolcall.c`)
+- [x] Step C2 — Tool executor: write_file / read_file / run_command (`toolexec.c`)
+- [x] Step C3 — Approval gate: `y/N` on stdin, or auto (`approval.c`)
+- [x] Step C4 — Agent loop: parse → approve → execute → observe (`agent.c`, `agent` subcommand)
 
 **Phase D — Quality track (as needed):**
 - [ ] Step D1 — Run a small quantized code model (1–3B) for genuinely useful output
+      (needs B4 threads/SIMD/quant + real weights; not implementable in this environment)
 
 > Honest note: the *pipeline* is 100% doable in pure C and local; agent *quality* is capped by
 > the model you can run. Loading pretrained weights (4b) is the fastest path to real output.
@@ -438,9 +439,42 @@ and stays at 9.28e-04 — bias backward is correct; training convergence corrobo
 - **Remaining (needed only at 124M+ scale):** multi-threading (OpenMP/pthreads), SIMD
   intrinsics, and int8 weight quantization. Tracked under Phase D.
 
+## Phase C — Agent layer (parse → approve → execute → observe)
+
+**Status: DONE — both approval modes tested; loop creates and reads a real file.**
+
+Four small flat C modules build a local coding-agent loop (pure C, no external deps):
+
+- **`toolcall.c/.h`** — `toolcall_parse` extracts the first `<tool name=… path=… command=…>
+  body</tool>` or `<done>…</done>` block into a `ToolCall` (kind + attrs + body). Plain text
+  with no block = final answer.
+- **`toolexec.c/.h`** — `toolexec_run` executes a call and returns an observation string:
+  `write_file` (fopen/fwrite), `read_file` (fopen/fread), `run_command` (portable
+  `popen`/`_popen`).
+- **`approval.c/.h`** — `approval_confirm(mode, action)`: `APPROVAL_ASK` prompts `y/N` on
+  stdin, `APPROVAL_AUTO` auto-approves. BOM-robust (Windows piped input).
+- **`agent.c/.h`** — `agent_run(goal, responses[], n, mode)`: the loop. For each model
+  response: parse → (if tool) describe + approve → execute → print observation; `<done>` or
+  plain text ends it. `responses[]` is the pluggable "model backend" — a fixed script here;
+  a real LLM integration replaces it with live calls that see the observations.
+- **`main.c`** — `agent` subcommand: `transformer agent` (scripted demo, auto-approve),
+  `transformer agent --ask` (interactive approval). The demo writes `agent_demo.txt`, reads
+  it back, then cleans it up.
+
+**Verified:** `transformer agent` runs write→read→done, actually creating/reading the file;
+`transformer agent --ask` (piped `y`) approves and does the same; denying (or no input)
+blocks the action. Default `transformer` smoke test still `PASSED`; `-Wall` clean.
+
+**Honest limitation:** the built-in transformer is far too small/weak to emit valid tool
+calls, so the agent is driven by a scripted model here. The loop, tools, and approval gate
+are real and reusable; plugging in a capable model (a real LLM API, or a much larger locally
+-run model — Phase D) is what makes it genuinely useful.
+
 ## Next steps (not started)
 - Step A2 — Scale config to a real architecture; wire the trained tokenizer into `generate`
   (text-in/text-out) once model vocab == tokenizer vocab.
+- Wire a real model backend into `agent.c` (replace the scripted `responses[]`): either a
+  live LLM API call, or a large locally-run model once Phase D (perf/quant) lands.
 - Phase D — run a genuinely capable model (needs B4 threads/SIMD/quant + real weights).
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).

@@ -28,10 +28,14 @@ defined in the matching `.c`.
 | `sampler.h` / `sampler.c`         | Token sampling: greedy argmax + temperature / top-k / top-p (seeded RNG) |
 | `model.h` / `model.c`             | `GPT` model: embeddings, stacked blocks, output head, training, KV-cache decode |
 | `checkpoint.h` / `checkpoint.c`   | Save/load model weights (`gpt_save` / `gpt_load`, GPTC format) |
-| `tokenizer.h` / `tokenizer.c`     | Self-contained byte-level BPE (`encode` / `decode`)           |
 | `loss.h` / `loss.c`               | Softmax cross-entropy (forward + backward)                    |
 | `optim.h` / `optim.c`             | Adam optimizer                                                |
-| `main.c`                          | Demo entry point                                              |
+| `tokenizer.h` / `tokenizer.c`     | Byte-level BPE: encode/decode + merge-learning (train) + save/load |
+| `toolcall.h` / `toolcall.c`       | Parse `<tool …>`/`<done>` blocks from model output (agent)    |
+| `toolexec.h` / `toolexec.c`       | Execute a tool call: write_file / read_file / run_command     |
+| `approval.h` / `approval.c`       | Approval gate for tool actions (ask y/N, or auto)             |
+| `agent.h` / `agent.c`             | Agent loop: parse → approve → execute → observe               |
+| `main.c`                          | Entry point + subcommands (`generate`, `agent`)              |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -106,6 +110,28 @@ echo "1 5 9" | ./transformer generate
 Defaults: 20 new tokens, temperature 0.8, top-k 40, top-p 0.95 (edit `run_generate` in
 `main.c`). Out-of-range IDs are skipped. This is **token-in/token-out** today; it becomes
 text-in/text-out once a real tokenizer is wired (see `notes.md`, step A1).
+
+### `transformer agent [--ask]` (agent loop demo)
+
+Demonstrates the coding-agent loop in pure C: **parse → approve → execute → observe**.
+The model emits tool blocks; each approved call runs and its result is fed back:
+
+```
+<tool name="write_file" path="a.txt">...body...</tool>
+<tool name="read_file" path="a.txt"></tool>
+<tool name="run_command" command="ls"></tool>
+<done>summary</done>
+```
+
+`transformer agent` runs a **scripted** model (the built-in transformer is far too small to
+emit valid tool calls — a real LLM backend plugs in where the script is) and auto-approves;
+`transformer agent --ask` prompts `y/N` before each action. The pieces:
+`toolcall.c` (parse) · `toolexec.c` (write/read/run) · `approval.c` (gate) · `agent.c` (loop).
+
+```sh
+transformer agent          # scripted demo, auto-approved
+transformer agent --ask    # approve each tool action interactively
+```
 
 ### `tools/convert_to_gptc.py` (weight importer)
 
