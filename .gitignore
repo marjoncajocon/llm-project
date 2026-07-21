@@ -34,3 +34,6 @@ data/*
 
 # Agent demo artifact
 agent_demo.txt
+
+# Personal portable memory snapshot (carried by the user, not committed)
+memory.md
