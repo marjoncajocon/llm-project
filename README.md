@@ -214,13 +214,27 @@ noise floor for tiny gradients, so the check trusts well-conditioned entries; se
 
 ### Importing external weights (e.g. GPT-2) — end-to-end
 
-1. In Python, assemble the model's weights into a `.npz` with the key names above.
-2. Convert: `python tools/convert_to_gptc.py weights.npz model.bin --n-heads N`.
-3. In C: `GPT m; gpt_load("model.bin", &m);` then `gpt_forward` / `gpt_generate`.
+The model is **GPT-2-architecture-compatible**: pre-norm blocks, multi-head causal attention
+**with biases** (`b_q/b_k/b_v/b_o`, matching GPT-2's `c_attn`/`c_proj`), GELU FFN, learned
+positional embeddings, and a final LayerNorm. The output head is a separate `lm_head`, so
+GPT-2's tied head is written as `lm_head = wte^T` at conversion time.
 
-> Note: loading *real* GPT-2 additionally requires matching its exact parameterization
-> (attention biases, fused QKV, weight-tied output head). That is tracked as a follow-up
-> in `notes.md`; the pieces above are the transport layer it will use.
+**Real GPT-2 (124M):**
+```sh
+pip install numpy safetensors
+huggingface-cli download gpt2 model.safetensors --local-dir gpt2/
+python tools/convert_gpt2.py gpt2/model.safetensors gpt2.npz     # HF -> our layout
+python tools/convert_to_gptc.py gpt2.npz gpt2.bin --n-heads 12   # -> GPTC checkpoint
+```
+Then in C: `GPT m; gpt_load("gpt2.bin", &m);` and `gpt_forward` / `gpt_generate`.
+(Config: vocab 50257, d_model 768, 12 layers, 12 heads, d_ff 3072, ctx 1024.)
+
+**Your own weights:** assemble a `.npz` with the documented key names (incl. `b_q…b_o`) and
+run `convert_to_gptc.py` directly. The GPTC format is **v2** (adds the attention biases).
+
+> Not yet wired: GPT-2's real BPE tokenizer (`encoder.json` / `vocab.bpe`) — the byte-level
+> BPE here is self-contained. That plus running the full 124M weights is the next milestone
+> in `notes.md`.
 
 ---
 

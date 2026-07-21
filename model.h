@@ -7,6 +7,7 @@
 // Learnable weights for a single transformer block.
 typedef struct {
   Tensor W_q, W_k, W_v, W_o;      // attention projections (d_model, d_model)
+  Tensor b_q, b_k, b_v, b_o;      // attention biases (d_model) — GPT-2 c_attn/c_proj
   Tensor gamma1, beta1;           // LayerNorm 1 params (d_model)
   Tensor gamma2, beta2;           // LayerNorm 2 params (d_model)
   Tensor ff_W1, ff_b1;            // feed-forward layer 1 (d_model, d_ff), (d_ff)

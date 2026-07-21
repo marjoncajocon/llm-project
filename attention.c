@@ -17,6 +17,7 @@ void multihead_attention_forward(
     const Tensor *W_k,            // (d_model, d_model)
     const Tensor *W_v,            // (d_model, d_model)
     const Tensor *W_o,            // (d_model, d_model)
+    const Tensor *b_q, const Tensor *b_k, const Tensor *b_v, const Tensor *b_o,
     Tensor *output,               // (seq_len, d_model)
     int n_heads                   // Number of attention heads (must divide d_model)
 ) {
@@ -25,16 +26,16 @@ void multihead_attention_forward(
   const int head_dim = d_model / n_heads;
   const float scale = 1.0f / sqrtf((float)head_dim);
 
-  // Full projections (all heads at once): Q,K,V = X @ W_{q,k,v}  -> (seq_len, d_model)
+  // Full projections (all heads at once): Q,K,V = X @ W_{q,k,v} + b_{q,k,v}
   int shape_proj[2] = {seq_len, d_model};
   Tensor Q = tensor_create(shape_proj, 2);
   Tensor K = tensor_create(shape_proj, 2);
   Tensor V = tensor_create(shape_proj, 2);
   Tensor concat = tensor_create(shape_proj, 2);  // concatenated per-head outputs
 
-  matmul(input, W_q, &Q);
-  matmul(input, W_k, &K);
-  matmul(input, W_v, &V);
+  matmul(input, W_q, &Q); bias_add(&Q, b_q, &Q);
+  matmul(input, W_k, &K); bias_add(&K, b_k, &K);
+  matmul(input, W_v, &V); bias_add(&V, b_v, &V);
 
   // Per-head scratch buffers for scores and softmax weights
   int shape_scores[2] = {seq_len, seq_len};
@@ -74,8 +75,9 @@ void multihead_attention_forward(
     }
   }
 
-  // Output projection: output = concat @ W_o
+  // Output projection: output = concat @ W_o + b_o
   matmul(&concat, W_o, output);
+  bias_add(output, b_o, output);
 
   tensor_free(&Q);
   tensor_free(&K);
@@ -89,6 +91,7 @@ void multihead_attention_forward(
 void multihead_attention_train(
     const Tensor *input,
     const Tensor *W_q, const Tensor *W_k, const Tensor *W_v, const Tensor *W_o,
+    const Tensor *b_q, const Tensor *b_k, const Tensor *b_v, const Tensor *b_o,
     Tensor *Q, Tensor *K, Tensor *V, Tensor *weights, Tensor *concat,
     Tensor *output,
     int n_heads) {
@@ -97,9 +100,9 @@ void multihead_attention_train(
   const int head_dim = d_model / n_heads;
   const float scale = 1.0f / sqrtf((float)head_dim);
 
-  matmul(input, W_q, Q);
-  matmul(input, W_k, K);
-  matmul(input, W_v, V);
+  matmul(input, W_q, Q); bias_add(Q, b_q, Q);
+  matmul(input, W_k, K); bias_add(K, b_k, K);
+  matmul(input, W_v, V); bias_add(V, b_v, V);
 
   int shape_scores[2] = {seq_len, seq_len};
   Tensor scores = tensor_create(shape_scores, 2);
@@ -139,6 +142,7 @@ void multihead_attention_train(
   }
 
   matmul(concat, W_o, output);
+  bias_add(output, b_o, output);
 
   tensor_free(&scores);
   tensor_free(&w);
@@ -148,6 +152,7 @@ void multihead_attention_train(
 void multihead_attention_backward(
     const Tensor *input,
     const Tensor *W_q, const Tensor *W_k, const Tensor *W_v, const Tensor *W_o,
+    const Tensor *b_q, const Tensor *b_k, const Tensor *b_v, const Tensor *b_o,
     Tensor *Q, Tensor *K, Tensor *V, Tensor *weights, Tensor *concat,
     Tensor *output,
     int n_heads) {
@@ -156,7 +161,8 @@ void multihead_attention_backward(
   const int head_dim = d_model / n_heads;
   const float scale = 1.0f / sqrtf((float)head_dim);
 
-  // output = concat @ W_o
+  // output = concat @ W_o + b_o
+  bias_add_backward(output, b_o);        // b_o->grad
   matmul_backward(concat, W_o, output);  // concat->grad, W_o->grad
 
   int shape_scores[2] = {seq_len, seq_len};
@@ -221,7 +227,10 @@ void multihead_attention_backward(
     }
   }
 
-  // Projections: Q/K/V = input @ W_{q,k,v}
+  // Projections: Q/K/V = input @ W_{q,k,v} + b_{q,k,v}
+  bias_add_backward(Q, b_q);   // b_q->grad += sum rows dQ
+  bias_add_backward(K, b_k);
+  bias_add_backward(V, b_v);
   matmul_backward(input, W_q, Q);
   matmul_backward(input, W_k, K);
   matmul_backward(input, W_v, V);
@@ -236,6 +245,7 @@ void multihead_attention_backward(
 void transformer_block_forward(
     const Tensor *input,
     const Tensor *W_q, const Tensor *W_k, const Tensor *W_v, const Tensor *W_o,
+    const Tensor *b_q, const Tensor *b_k, const Tensor *b_v, const Tensor *b_o,
     const Tensor *gamma1, const Tensor *beta1,
     const Tensor *gamma2, const Tensor *beta2,
     const Tensor *ff_W1, const Tensor *ff_b1,
@@ -252,7 +262,8 @@ void transformer_block_forward(
 
   // Sub-layer 1: attn_residual = input + MultiHeadAttention(LN1(input))
   layernorm(input, gamma1, beta1, &norm1_out, 1e-5f);
-  multihead_attention_forward(&norm1_out, W_q, W_k, W_v, W_o, &attn_out, n_heads);
+  multihead_attention_forward(&norm1_out, W_q, W_k, W_v, W_o,
+                              b_q, b_k, b_v, b_o, &attn_out, n_heads);
   matadd(input, &attn_out, &attn_residual);
 
   // Sub-layer 2: output = attn_residual + FFN(LN2(attn_residual))

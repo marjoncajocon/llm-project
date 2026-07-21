@@ -23,6 +23,22 @@ python tools/convert_to_gptc.py <weights.npz> <model.bin> --n-heads <N>
 - `--n-heads N` — number of attention heads (not inferable from shapes).
 
 Requires Python 3 + NumPy. See the script's docstring for the full key/shape list.
+The GPTC format is **v2** (includes attention biases `b_q/b_k/b_v/b_o`).
+
+### `convert_gpt2.py`
+
+Converts HuggingFace GPT-2 `model.safetensors` into an `.npz` laid out for this model
+(splits the fused `c_attn` QKV, maps `ln_*` to gamma/beta, ties `lm_head = wte^T`). Chain
+it into `convert_to_gptc.py`:
+
+```sh
+pip install numpy safetensors
+huggingface-cli download gpt2 model.safetensors --local-dir gpt2/
+python tools/convert_gpt2.py gpt2/model.safetensors gpt2.npz
+python tools/convert_to_gptc.py gpt2.npz gpt2.bin --n-heads 12
+```
+
+Requires Python 3 + NumPy + safetensors, and a downloaded GPT-2 checkpoint.
 
 ## Adding a tool
 

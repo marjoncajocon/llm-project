@@ -70,6 +70,10 @@ GPT gpt_create(int vocab_size, int d_model, int n_heads,
     b->W_k = make_weight2d(d_model, d_model);
     b->W_v = make_weight2d(d_model, d_model);
     b->W_o = make_weight2d(d_model, d_model);
+    b->b_q = make_zeros1d(d_model);
+    b->b_k = make_zeros1d(d_model);
+    b->b_v = make_zeros1d(d_model);
+    b->b_o = make_zeros1d(d_model);
     b->gamma1 = make_ones1d(d_model);
     b->beta1 = make_zeros1d(d_model);
     b->gamma2 = make_ones1d(d_model);
@@ -96,6 +100,10 @@ void gpt_free(GPT *m) {
     tensor_free(&b->W_k);
     tensor_free(&b->W_v);
     tensor_free(&b->W_o);
+    tensor_free(&b->b_q);
+    tensor_free(&b->b_k);
+    tensor_free(&b->b_v);
+    tensor_free(&b->b_o);
     tensor_free(&b->gamma1);
     tensor_free(&b->beta1);
     tensor_free(&b->gamma2);
@@ -130,6 +138,7 @@ void gpt_forward(const GPT *m, const int *token_ids, int seq_len, Tensor *logits
     transformer_block_forward(
         &x,
         &b->W_q, &b->W_k, &b->W_v, &b->W_o,
+        &b->b_q, &b->b_k, &b->b_v, &b->b_o,
         &b->gamma1, &b->beta1,
         &b->gamma2, &b->beta2,
         &b->ff_W1, &b->ff_b1,
@@ -257,6 +266,7 @@ void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
 
     layernorm(inp, &b->gamma1, &b->beta1, &a->ln1[l], LN_EPS);
     multihead_attention_train(&a->ln1[l], &b->W_q, &b->W_k, &b->W_v, &b->W_o,
+                              &b->b_q, &b->b_k, &b->b_v, &b->b_o,
                               &a->Q[l], &a->K[l], &a->V[l], &a->weights[l], &a->concat[l],
                               &a->attn_out[l], m->n_heads);
     matadd(inp, &a->attn_out[l], &a->a_resid[l]);
@@ -298,6 +308,7 @@ void gpt_backward(GPT *m, const int *token_ids, int seq_len,
     matadd_backward(&a->a_resid[l], inp, &a->attn_out[l]);
     // attn_out[l] = MHA(ln1[l])
     multihead_attention_backward(&a->ln1[l], &b->W_q, &b->W_k, &b->W_v, &b->W_o,
+                                 &b->b_q, &b->b_k, &b->b_v, &b->b_o,
                                  &a->Q[l], &a->K[l], &a->V[l], &a->weights[l], &a->concat[l],
                                  &a->attn_out[l], m->n_heads);
     // ln1[l] = LN1(inp)
@@ -317,6 +328,10 @@ int gpt_collect_params(GPT *m, Tensor **list) {
     list[n++] = &b->W_k;
     list[n++] = &b->W_v;
     list[n++] = &b->W_o;
+    list[n++] = &b->b_q;
+    list[n++] = &b->b_k;
+    list[n++] = &b->b_v;
+    list[n++] = &b->b_o;
     list[n++] = &b->gamma1;
     list[n++] = &b->beta1;
     list[n++] = &b->gamma2;
@@ -333,7 +348,7 @@ int gpt_collect_params(GPT *m, Tensor **list) {
 }
 
 void gpt_zero_grad(GPT *m) {
-  int cap = 2 + 12 * m->n_layers + 3;
+  int cap = 2 + 16 * m->n_layers + 3;
   Tensor **list = (Tensor**)malloc(cap * sizeof(Tensor*));
   int n = gpt_collect_params(m, list);
   for (int i = 0; i < n; i++) tensor_zero_grad(list[i]);

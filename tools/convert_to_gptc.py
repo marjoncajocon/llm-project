@@ -10,6 +10,7 @@ Expected .npz keys (float arrays, C/row-major):
     wte              (vocab_size, d_model)
     wpe              (max_seq_len, d_model)
     blocks.{l}.W_q   (d_model, d_model)      # same for W_k, W_v, W_o
+    blocks.{l}.b_q   (d_model,)              # same for b_k, b_v, b_o (attention biases)
     blocks.{l}.gamma1 (d_model,)             # same for beta1, gamma2, beta2
     blocks.{l}.ff_W1 (d_model, d_ff)
     blocks.{l}.ff_b1 (d_ff,)
@@ -31,11 +32,12 @@ import sys
 import numpy as np
 
 MAGIC = 0x43545047  # 'GPTC' little-endian
-VERSION = 1
+VERSION = 2         # v2 adds attention biases
 
 # Per-block tensor names, in the exact order checkpoint.c writes them.
 BLOCK_KEYS = [
     "W_q", "W_k", "W_v", "W_o",
+    "b_q", "b_k", "b_v", "b_o",
     "gamma1", "beta1", "gamma2", "beta2",
     "ff_W1", "ff_b1", "ff_W2", "ff_b2",
 ]

@@ -1,5 +1,44 @@
 # Project Notes
 
+## Roadmap — all steps & phases
+
+Goal: grow this pure-C transformer into a **fully local coding-agent CLI**. Every step ends
+green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
+
+**Foundations (DONE):**
+- [x] Step 1 — Transformer block: FFN + GELU + pre-norm
+- [x] Step 2 — Multi-head attention + causal masking
+- [x] Step 3 — Full model: embeddings, stacked blocks, output head, greedy sampler
+- [x] Step 4 — Checkpoint save/load (GPTC) + byte-level BPE tokenizer + `tools/` converter
+- [x] Step 5a — Training foundation: backward core + cross-entropy + Adam, gradient-checked
+- [x] Step 5b — End-to-end GPT training (attention/FFN/embedding backward)
+
+**Phase A — Make the model produce real text:**
+- [x] Step 4b — Load real GPT-2 weights: GPT-2-compatible architecture (attention biases,
+      tied output head), converter (HF safetensors → GPTC), verified on GPT-2-shaped weights
+- [ ] Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex
+- [ ] Step A2 — Scale config to a real architecture (dims/layers/heads/context)
+
+**Phase B — A local generation CLI:**
+- [ ] Step B1 — Better sampling: temperature + top-k/top-p + stop conditions (`sampler.c`)
+- [ ] Step B2 — KV cache (generation O(n) not O(n²))
+- [ ] Step B3 — REPL front-end: `you>` loop (stdin → tokenize → generate → stream out)
+- [ ] Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization
+
+**Phase C — The agent layer (tools + approval), pure C:**
+- [ ] Step C1 — Tool protocol the model emits (parseable `<tool …>` blocks)
+- [ ] Step C2 — Tool executor: read_file / write_file / list_dir / run_command (`tools.c`)
+- [ ] Step C3 — Approval gate: diff/preview + `y/n/a` on stdin (`approval.c`)
+- [ ] Step C4 — Agent loop: prompt → generate → parse tool → approve → execute → feed back (`agent.c`)
+
+**Phase D — Quality track (as needed):**
+- [ ] Step D1 — Run a small quantized code model (1–3B) for genuinely useful output
+
+> Honest note: the *pipeline* is 100% doable in pure C and local; agent *quality* is capped by
+> the model you can run. Loading pretrained weights (4b) is the fastest path to real output.
+
+---
+
 ## Step 1 — Complete the transformer block (FFN + GELU + pre-norm)
 
 **Status: DONE — smoke test passed.**
@@ -276,8 +315,57 @@ Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean.
   memorizes the sequence).
 - Tokenizer + checkpoint round-trips still OK. `Output validation: PASSED`.
 
+## Step 4b — GPT-2-compatible architecture + weight loading
+
+**Status: DONE — smoke test passed; loader verified on GPT-2-shaped weights.**
+
+### What changed
+Made the model able to *represent and load* real GPT-2 weights. The one true architecture
+gap was **attention biases** (GPT-2 has `c_attn`/`c_proj` biases; we had none).
+
+- **`attention.c/.h`** — `multihead_attention_forward/train/backward` and
+  `transformer_block_forward` now take `b_q/b_k/b_v/b_o` (each d_model). Forward adds them
+  after the Q/K/V and output projections (`bias_add`); backward accumulates via
+  `bias_add_backward`.
+- **`model.h/.c`** — `BlockWeights` gained `b_q/b_k/b_v/b_o` (zero-init); threaded through
+  `gpt_create/free`, `gpt_forward`, `gpt_forward_train`, `gpt_backward`,
+  `gpt_collect_params`, and `gpt_zero_grad` (per-layer count 12 → 16).
+- **`checkpoint.c`** — canonical tensor order includes the biases; **format bumped to v2**
+  (`TENSORS_PER_LAYER` 12 → 16).
+- **Output head tying** — kept a separate `lm_head`; GPT-2's tied head is emitted as
+  `lm_head = wte^T` by the converter, so no forward change was needed.
+- **`tools/convert_to_gptc.py`** — added the bias keys; writes v2.
+- **`tools/convert_gpt2.py`** (NEW) — HuggingFace GPT-2 `model.safetensors` → `.npz`:
+  splits fused `c_attn` into W_q/W_k/W_v + b_q/b_k/b_v, maps `ln_*` → gamma/beta, ties
+  `lm_head = wte^T`. (GPT-2 `Conv1D` weights are already `(in,out)` = matches our matmul, no
+  transpose needed.)
+
+### Verified vs. not
+- **Verified:** `main.c` smoke test passes with biases — gradient check conditioned
+  (`|grad|>1e-2`) **9.28e-04**, training still 2.8787 → 0.0002. And the full loader path with
+  the **v2 format incl. biases**: random GPT-2-shaped `.npz` → `convert_to_gptc.py` →
+  C `gpt_load` → forward runs clean (no NaN/Inf).
+- **Not verified in-session:** `convert_gpt2.py` needs `pip install safetensors` + the ~500MB
+  GPT-2 download (neither available here). Its HF→npz mapping is straightforward and matches
+  HF's layout; the bit-exact `.npz`→GPTC→C part *is* tested.
+
+### Gradient-check note
+With zero-init biases, the "all" rel-error metric hits ~1.0 (biases sit at the float32
+noise floor with near-zero gradients). The **conditioned** metric (`|grad|>1e-2`) is the gate
+and stays at 9.28e-04 — bias backward is correct; training convergence corroborates.
+
+### Progress checklist
+- [x] Attention biases in forward/train/backward + block (`attention.c/.h`)
+- [x] `BlockWeights` biases threaded through `model.c` (create/free/forward/backward/params)
+- [x] Checkpoint v2 (biases in canonical order) (`checkpoint.c`)
+- [x] `convert_to_gptc.py` bias keys + v2
+- [x] `convert_gpt2.py` HF GPT-2 → npz importer
+- [x] Docs: README (GPT-2 import recipe) + `tools/README.md`
+- [x] Smoke test (build `-Wall` clean; grad check + training PASS)
+- [x] Loader verified on GPT-2-shaped weights (npz → GPTC → C load → clean forward)
+
 ## Next steps (not started)
-- Real data + tokenizer training: train on actual text via the byte-level BPE (add merge
-  learning), batching, and a train/val split.
-- Step 4b: load real GPT-2 files — attention biases + fused QKV + weight-tied head,
-  GPT-2 BPE (`encoder.json` / `vocab.bpe`), and a HF/TF -> `.npz` converter in `tools/`.
+- Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex.
+- Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
+  `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
+- Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.

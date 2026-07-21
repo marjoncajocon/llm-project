@@ -6,11 +6,11 @@
 #include <stdint.h>
 
 #define CKPT_MAGIC   0x43545047u  // 'GPTC' (little-endian bytes G,P,T,C)
-#define CKPT_VERSION 1u
+#define CKPT_VERSION 2u           // v2 adds attention biases (b_q/b_k/b_v/b_o)
 
-// Maximum number of weight tensors we ever collect: 2 embeddings + 12 per layer
+// Maximum number of weight tensors we ever collect: 2 embeddings + 16 per layer
 // + 2 final-LayerNorm + 1 output head.
-#define TENSORS_PER_LAYER 12
+#define TENSORS_PER_LAYER 16
 
 // List every weight tensor of the model, in a fixed canonical order shared by
 // save and load (so the two can never drift). Returns the tensor count.
@@ -24,6 +24,10 @@ static int collect_tensors(const GPT *m, const Tensor **list) {
     list[n++] = &b->W_k;
     list[n++] = &b->W_v;
     list[n++] = &b->W_o;
+    list[n++] = &b->b_q;
+    list[n++] = &b->b_k;
+    list[n++] = &b->b_v;
+    list[n++] = &b->b_o;
     list[n++] = &b->gamma1;
     list[n++] = &b->beta1;
     list[n++] = &b->gamma2;
