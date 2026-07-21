@@ -7,7 +7,7 @@ LDLIBS  = -lm
 
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
-          embedding.o sampler.o model.o main.o
+          embedding.o sampler.o model.o checkpoint.o tokenizer.o main.o
 
 all: $(TARGET)
 
@@ -28,7 +28,9 @@ attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward
 embedding.o:  embedding.h tensor.h
 sampler.o:    sampler.h tensor.h
 model.o:      model.h tensor.h embedding.h attention.h layernorm.h matrix.h sampler.h
-main.o:       tensor.h model.h
+checkpoint.o: checkpoint.h model.h tensor.h
+tokenizer.o:  tokenizer.h
+main.o:       tensor.h model.h checkpoint.h tokenizer.h
 
 clean:
 	rm -f $(OBJS) $(TARGET)

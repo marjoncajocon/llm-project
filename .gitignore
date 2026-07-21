@@ -12,3 +12,6 @@ transformer      # the Linux/macOS binary produced by `make`
 # Debug / linker artifacts
 *.pdb        # e.g. transformer.pdb (MSVC debug symbols)
 *.ilk        # e.g. transformer.ilk (MSVC incremental-link file)
+
+# Model checkpoints (generated weights, not source)
+*.bin        # e.g. model.bin (GPTC checkpoint)

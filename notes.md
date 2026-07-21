@@ -126,6 +126,66 @@ Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean. Prompt `1 5 9` generated
 `11 6 11 14 14` (arbitrary - the model is untrained), logits validated PASSED, all
 memory freed.
 
+## Step 4 (Option A) — Checkpoint save/load + byte-level BPE tokenizer
+
+**Status: DONE — smoke test passed (incl. the `tools/` converter).**
+
+### What changed
+Built the two pieces of infrastructure that real-weight loading depends on, both
+self-contained and testable without a large download:
+
+- **`checkpoint.h/.c`** — `gpt_save` / `gpt_load` in a flat binary format (GPTC):
+  `magic 'GPTC' + version + 6-int config + every weight's raw float32` in a fixed
+  canonical order. A shared `collect_tensors` helper drives both save and load so their
+  order can't drift. `gpt_load` reuses `gpt_create` then reads weights in.
+- **`tokenizer.h/.c`** — self-contained byte-level BPE: 256 base byte tokens + merges
+  (`256 + rank`), binary-safe, no external files. `encode`/`decode`/`add_merge`/
+  `create`/`free`.
+- **`main.c`** — rewritten demo validates three things: tokenizer round-trip
+  (`decoded == original`, encoded shorter than bytes), model generation + NaN/Inf check,
+  and checkpoint round-trip (reloaded logits **bitwise identical**). Exit code reflects
+  pass/fail.
+- **`tools/convert_to_gptc.py`** — NEW helper (Python) that converts a `.npz` of named
+  weight arrays into a GPTC `.bin`, matching `collect_tensors` order exactly. This is the
+  bridge for importing external weights.
+- **`README.md`** — added the two module rows, a **CLI guide** (the `transformer` binary,
+  the converter tool with args) and a **programmatic API guide** (tokenizer, model,
+  checkpoints, external-weight import). Coding rules updated: source root is **C-only and
+  flat**; non-C helper/third-party scripts go in **`tools/`**.
+- **`.gitignore`** — ignore `*.bin` checkpoints.
+
+### Repo layout rule (updated)
+- Root: C source only, flat, no subfolders.
+- `tools/`: helper/third-party scripts in other languages (Python/Go/…). The only allowed
+  directory.
+
+### Notes / simplifications
+- Byte-level BPE is self-contained (no `encoder.json`/`vocab.bpe` yet); the GPT-2 regex
+  pre-tokenization and file loading are a later add-on.
+- Checkpoint format is our own simple binary (host-endian float32), not safetensors.
+- Loading **real** GPT-2 weights (step 4b) still needs the model to match GPT-2's exact
+  parameterization: attention biases, fused QKV projection, and a weight-tied `lm_head`.
+  The converter + loader are the transport layer that work will plug into.
+
+### Progress checklist
+- [x] Checkpoint format + `gpt_save`/`gpt_load` (`checkpoint.h`/`.c`)
+- [x] Shared `collect_tensors` (save/load order can't drift)
+- [x] Byte-level BPE tokenizer (`tokenizer.h`/`.c`)
+- [x] `main.c` demo: tokenizer + generation + checkpoint round-trips
+- [x] `tools/convert_to_gptc.py` weight importer
+- [x] `Makefile` + `.gitignore` updated
+- [x] `README.md`: CLI guide + API guide + `tools/` / C-only rules
+- [x] Smoke test (build `-Wall` clean; all three round-trips PASS; exit 0)
+- [x] Converter verified end-to-end (npz -> convert -> C `gpt_load` -> forward, no NaN/Inf)
+
+### Smoke test result (2026-07-21)
+Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean. Tokenizer round-trips
+`"hello hello"` (11 bytes -> 5 tokens -> original); model generates `1 5 9 -> 11 6 11 14
+14`; reloaded checkpoint logits bitwise identical; `Output validation: PASSED`. The
+`tools/` converter was also verified: a random numpy `.npz` -> `convert_to_gptc.py` ->
+GPTC `.bin` -> C `gpt_load` -> forward pass ran clean (no NaN/Inf).
+
 ## Next steps (not started)
-- Step 4: BPE tokenizer + load real GPT-2 weights.
+- Step 4b: load real GPT-2 files — attention biases + fused QKV + weight-tied head,
+  GPT-2 BPE (`encoder.json` / `vocab.bpe`), and a HF/TF -> `.npz` converter in `tools/`.
 - Step 5: backprop + training (uses the unused `Tensor.grad` field).
