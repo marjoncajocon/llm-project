@@ -1,0 +1,14 @@
+# Build artifacts — never commit compiled output, only source stays in the repo.
+
+# Object files (from `make` / `cc -c`)
+*.o          # e.g. tensor.o, attention.o
+*.obj        # MSVC object files
+
+# Built binaries
+transformer      # the Linux/macOS binary produced by `make`
+*.exe            # e.g. transformer.exe (Windows)
+*.out            # e.g. a.out (default compiler output)
+
+# Debug / linker artifacts
+*.pdb        # e.g. transformer.pdb (MSVC debug symbols)
+*.ilk        # e.g. transformer.ilk (MSVC incremental-link file)

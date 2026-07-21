@@ -7,11 +7,23 @@
 #include <math.h>
 #include <stdalign.h>
 
+// Portable 64-byte aligned allocation. C11 aligned_alloc() is not available in
+// the Windows CRT (which uses _aligned_malloc, and whose blocks must be released
+// with _aligned_free, never plain free()), so pick the right pair per platform.
+#if defined(_WIN32)
+#include <malloc.h>
+#define ALIGNED_ALLOC(align, size) _aligned_malloc((size), (align))
+#define ALIGNED_FREE(ptr)          _aligned_free(ptr)
+#else
+#define ALIGNED_ALLOC(align, size) aligned_alloc((align), (size))
+#define ALIGNED_FREE(ptr)          free(ptr)
+#endif
+
 // Allocate aligned memory for cache-line optimization (64-byte alignment)
-static inline void* aligned_malloc(size_t size) {
-  void *ptr = aligned_alloc(64, size);
+static inline float* aligned_malloc(size_t size) {
+  float *ptr = (float*)ALIGNED_ALLOC(64, size);
   if (!ptr) {
-    fprintf(stderr, "Error: aligned_alloc failed\n");
+    fprintf(stderr, "Error: aligned allocation failed\n");
     exit(EXIT_FAILURE);
   }
   return ptr;
@@ -43,9 +55,9 @@ Tensor tensor_create(int *shape, int ndim) {
 
 // Free tensor memory
 void tensor_free(Tensor *t) {
-  free(t->data);
-  free(t->grad);
-  free(t->shape);
+  ALIGNED_FREE(t->data);  // data/grad came from the aligned allocator
+  ALIGNED_FREE(t->grad);
+  free(t->shape);         // shape came from plain malloc
   t->data = NULL;
   t->grad = NULL;
   t->shape = NULL;

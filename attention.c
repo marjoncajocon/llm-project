@@ -6,6 +6,7 @@
 #include "matrix.h"
 #include "activation.h"
 #include "layernorm.h"
+#include "feedforward.h"
 
 // Single-head Self-Attention forward pass
 // Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
@@ -70,33 +71,39 @@ void self_attention_forward(
   tensor_free(&attn_output);
 }
 
-// Complete Transformer block: Self-Attention + LayerNorm
+// Complete Transformer block (pre-norm): Self-Attention + FFN with residuals
+//   a = input + Attention(LN1(input))
+//   output = a + FFN(LN2(a))
 void transformer_block_forward(
     const Tensor *input,
     const Tensor *W_q, const Tensor *W_k, const Tensor *W_v, const Tensor *W_o,
     const Tensor *gamma1, const Tensor *beta1,
     const Tensor *gamma2, const Tensor *beta2,
+    const Tensor *ff_W1, const Tensor *ff_b1,
+    const Tensor *ff_W2, const Tensor *ff_b2,
     Tensor *output,
-    int d_k
+    int d_k, int d_ff
 ) {
   int shape[2] = {input->shape[0], input->shape[1]};
-  Tensor attn_out = tensor_create(shape, 2);
   Tensor norm1_out = tensor_create(shape, 2);
-  Tensor residual1 = tensor_create(shape, 2);
+  Tensor attn_out = tensor_create(shape, 2);
+  Tensor attn_residual = tensor_create(shape, 2);
   Tensor norm2_out = tensor_create(shape, 2);
+  Tensor ff_out = tensor_create(shape, 2);
 
-  // Self-attention
-  self_attention_forward(input, W_q, W_k, W_v, W_o, &attn_out, d_k);
+  // Sub-layer 1: attn_residual = input + Attention(LN1(input))
+  layernorm(input, gamma1, beta1, &norm1_out, 1e-5f);
+  self_attention_forward(&norm1_out, W_q, W_k, W_v, W_o, &attn_out, d_k);
+  matadd(input, &attn_out, &attn_residual);
 
-  // Residual connection + LayerNorm 1
-  matadd(input, &attn_out, &residual1);
-  layernorm(&residual1, gamma1, beta1, &norm1_out, 1e-5f);
+  // Sub-layer 2: output = attn_residual + FFN(LN2(attn_residual))
+  layernorm(&attn_residual, gamma2, beta2, &norm2_out, 1e-5f);
+  feedforward(&norm2_out, ff_W1, ff_b1, ff_W2, ff_b2, &ff_out, d_ff);
+  matadd(&attn_residual, &ff_out, output);
 
-  // LayerNorm 2 (simplified - just another normalization)
-  layernorm(&norm1_out, gamma2, beta2, output, 1e-5f);
-
-  tensor_free(&attn_out);
   tensor_free(&norm1_out);
-  tensor_free(&residual1);
+  tensor_free(&attn_out);
+  tensor_free(&attn_residual);
   tensor_free(&norm2_out);
+  tensor_free(&ff_out);
 }

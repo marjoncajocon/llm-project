@@ -17,9 +17,10 @@ int main() {
   printf("=== Minimal GPT-2 Style Transformer Demo ===\n\n");
 
   // Parameters
-  const int seq_len = 4;    // Sequence length (number of tokens)
-  const int d_model = 8;    // Model dimension
-  const int d_k = 4;        // Key/Query dimension
+  const int seq_len = 4;         // Sequence length (number of tokens)
+  const int d_model = 8;         // Model dimension
+  const int d_k = 4;             // Key/Query dimension
+  const int d_ff = 4 * d_model;  // Feed-forward hidden dimension
 
   // Seed random number generator for reproducibility
   srand(42);
@@ -62,6 +63,22 @@ int main() {
     beta2.data[i] = 0.0f;
   }
 
+  // Create feed-forward network weights: (d_model -> d_ff -> d_model)
+  int ff_w1_shape[2] = {d_model, d_ff};
+  int ff_b1_shape[1] = {d_ff};
+  int ff_w2_shape[2] = {d_ff, d_model};
+  int ff_b2_shape[1] = {d_model};
+
+  Tensor ff_W1 = tensor_create(ff_w1_shape, 2);
+  Tensor ff_b1 = tensor_create(ff_b1_shape, 1);
+  Tensor ff_W2 = tensor_create(ff_w2_shape, 2);
+  Tensor ff_b2 = tensor_create(ff_b2_shape, 1);
+
+  tensor_init_random(&ff_W1);
+  tensor_init_random(&ff_b1);
+  tensor_init_random(&ff_W2);
+  tensor_init_random(&ff_b2);
+
   // Output tensor
   int output_shape[2] = {seq_len, d_model};
   Tensor output = tensor_create(output_shape, 2);
@@ -73,8 +90,10 @@ int main() {
       &W_q, &W_k, &W_v, &W_o,
       &gamma1, &beta1,
       &gamma2, &beta2,
+      &ff_W1, &ff_b1,
+      &ff_W2, &ff_b2,
       &output,
-      d_k
+      d_k, d_ff
   );
 
   // Print results
@@ -102,6 +121,10 @@ int main() {
   tensor_free(&beta1);
   tensor_free(&gamma2);
   tensor_free(&beta2);
+  tensor_free(&ff_W1);
+  tensor_free(&ff_b1);
+  tensor_free(&ff_W2);
+  tensor_free(&ff_b2);
   tensor_free(&output);
 
   printf("Done! All memory freed successfully.\n");

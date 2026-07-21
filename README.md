@@ -17,6 +17,7 @@ and defined in the matching `.c`.
 | `matrix.h` / `matrix.c`      | `matmul`, `matadd`, `matscale`                     |
 | `activation.h` / `activation.c` | `softmax_rowwise`                               |
 | `layernorm.h` / `layernorm.c`   | `layernorm`                                     |
+| `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear |
 | `attention.h` / `attention.c`   | `self_attention_forward`, `transformer_block_forward` |
 | `main.c`                     | Demo entry point                                   |
 | `Makefile`                   | Build rules                                        |
@@ -45,6 +46,9 @@ gcc -std=c11 -O3 -march=native -o transformer *.c -lm
 3. **One concern per module.** Declare the public API in the `.h`, define it in the
    matching `.c`, and give every header an include guard (`#ifndef MODULE_H`).
 4. Keep helpers that are used by only one file `static` inside that `.c`.
-5. Code must compile cleanly under `-std=c11 -Wall` (no warnings).
-6. When you add a new module, add its `.o` to `OBJS` in the `Makefile` and list its
+5. **Never use untyped `void *` parameters** in a function's public API. Pass concrete,
+   typed pointers (`Tensor *`, `float *`, …) instead — untyped pointers defeat the
+   compiler's type checking and lead to slow, hard-to-predict runtime errors.
+6. Code must compile cleanly under `-std=c11 -Wall` (no warnings).
+7. When you add a new module, add its `.o` to `OBJS` in the `Makefile` and list its
    header dependencies there.

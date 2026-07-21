@@ -16,14 +16,18 @@ void self_attention_forward(
     int d_k                       // Dimension of key/query
 );
 
-// Complete Transformer block: Self-Attention + LayerNorm
+// Complete Transformer block (pre-norm): Self-Attention + FFN with residuals
+//   a = input + Attention(LN1(input))
+//   output = a + FFN(LN2(a))
 void transformer_block_forward(
     const Tensor *input,
     const Tensor *W_q, const Tensor *W_k, const Tensor *W_v, const Tensor *W_o,
     const Tensor *gamma1, const Tensor *beta1,
     const Tensor *gamma2, const Tensor *beta2,
+    const Tensor *ff_W1, const Tensor *ff_b1,
+    const Tensor *ff_W2, const Tensor *ff_b2,
     Tensor *output,
-    int d_k
+    int d_k, int d_ff
 );
 
 #endif // ATTENTION_H
