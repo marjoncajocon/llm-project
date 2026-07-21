@@ -559,6 +559,27 @@ are real and reusable; plugging in a capable model (a real LLM API, or a much la
 GPT-2) would make encode near-instant on large corpora; current whole-sequence encode is
 fine for MBs, slow for GBs.
 
+## Cross-platform portability (Linux / macOS / Windows / WebAssembly)
+
+**Status: DONE — all 8 targets build `-Wall` clean; Windows + WASM verified running.**
+
+Cross-compiled every source with `zig cc -target <triple>`:
+- Linux `x86_64/aarch64-linux-gnu`, `x86_64-linux-musl`; Windows `x86_64/aarch64-windows-gnu`;
+  macOS `x86_64/aarch64-macos`; **WebAssembly `wasm32-wasi`** — all build.
+- Native Windows runs (smoke test PASSED); the **WASM binary runs via Node's WASI** and
+  passes the full smoke test (tokenizer, gradient check, KV cache bit-exact, PASSED) — file
+  I/O works through WASI preopens.
+
+Fixes this required (the Windows-only build had never exercised these paths):
+- **`toolexec.c`** — `popen`/`pclose` are POSIX; glibc/musl hide them under `-std=c11` unless
+  `_POSIX_C_SOURCE` is defined. Added it (non-Windows). WASM has no process model, so
+  `run_command` is `#ifdef`-stubbed to "not supported on WebAssembly" there.
+- **`corpus.c`** — same `_POSIX_C_SOURCE` guard for `opendir`/`readdir`/`stat`.
+- **`tensor.c`** — `RAND_MAX` exceeds float's exact range on Linux/macOS; divide in `double`
+  to silence `-Wimplicit-const-int-float-conversion` and keep init precise everywhere.
+
+See README "Supported platforms" for the target list + build/run commands.
+
 ## Next steps (not started)
 - Scale training: bigger model config in `train.c` + many more steps for coherent Wikipedia
   text; consider a train/val split + loss reporting on held-out text.

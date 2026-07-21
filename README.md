@@ -60,6 +60,41 @@ gcc -std=c11 -O3 -march=native -o transformer *.c -lm
 `clang` works as a drop-in replacement for `gcc`. On a machine without gcc/clang, the
 project also builds with `zig cc -std=c11 -O2 -Wall -o transformer *.c -lm`.
 
+## Supported platforms
+
+Portable C11 with the platform-specific bits guarded (`_WIN32` / POSIX / WASM). Verified by
+cross-compiling every source with `zig cc -target <triple>` (all `-Wall`-clean):
+
+| Platform | Target triple | Status |
+| --- | --- | --- |
+| Linux x86-64 (glibc) | `x86_64-linux-gnu` | builds |
+| Linux ARM64 (glibc) | `aarch64-linux-gnu` | builds |
+| Linux x86-64 (musl) | `x86_64-linux-musl` | builds |
+| Windows x86-64 | `x86_64-windows-gnu` | builds + **runs** (smoke test PASSED) |
+| Windows ARM64 | `aarch64-windows-gnu` | builds |
+| macOS Intel | `x86_64-macos` | builds |
+| macOS Apple Silicon | `aarch64-macos` | builds |
+| **WebAssembly (WASI)** | `wasm32-wasi` | builds + **runs** (via Node WASI, PASSED) |
+
+Cross-compile for any target (no OS-specific toolchain needed — `zig` bundles them):
+
+```sh
+zig cc -target x86_64-linux-gnu  -std=c11 -O2 -o transformer      *.c -lm   # Linux
+zig cc -target aarch64-macos     -std=c11 -O2 -o transformer      *.c       # macOS (libm in libSystem)
+zig cc -target wasm32-wasi       -std=c11 -O2 -o transformer.wasm *.c       # WebAssembly
+```
+
+Run the WebAssembly build with any WASI runtime (grant filesystem access for `train`):
+
+```sh
+wasmtime --dir=. transformer.wasm                       # or wasmer
+node --experimental-wasi-unstable-preview1 run.js transformer.wasm   # Node's built-in WASI
+```
+
+> WASM note: WebAssembly has no process model, so the agent's `run_command` tool is disabled
+> under WASM (it returns "not supported"); `write_file`/`read_file`, training, and generation
+> all work.
+
 ---
 
 ## CLI guide

@@ -8,6 +8,8 @@
 transformer      # the Linux/macOS binary produced by `make`
 *.exe            # e.g. transformer.exe (Windows)
 *.out            # e.g. a.out (default compiler output)
+*.wasm           # WebAssembly build
+xbuild_*         # cross-compile test outputs
 
 # Debug / linker artifacts
 *.pdb        # e.g. transformer.pdb (MSVC debug symbols)

@@ -1,4 +1,10 @@
 // corpus.c - Read training text from a file or a directory tree
+
+// opendir/readdir/stat are POSIX; enable them under strict -std=c11 (non-Windows).
+#if !defined(_WIN32)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "corpus.h"
 
 #include <stdio.h>

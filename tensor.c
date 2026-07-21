@@ -67,7 +67,10 @@ void tensor_free(Tensor *t) {
 void tensor_init_random(Tensor *t) {
   float scale = sqrtf(2.0f / t->shape[t->ndim - 1]);
   for (int i = 0; i < t->size; i++) {
-    t->data[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * scale;
+    // Divide in double so RAND_MAX (which may exceed float's exact range on
+    // some platforms) doesn't lose precision. Result r is in [0, 1].
+    float r = (float)((double)rand() / (double)RAND_MAX);
+    t->data[i] = (r * 2.0f - 1.0f) * scale;
   }
 }
 
