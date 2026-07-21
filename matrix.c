@@ -3,19 +3,27 @@
 
 // Matrix Multiplication: C = A @ B
 // A: (M x K), B: (K x N), C: (M x N)
+// Uses ikj loop order: the inner loop streams over a row of B and a row of C
+// sequentially (cache-friendly, and auto-vectorizable), instead of walking a
+// column of B with stride N. Same result as the naive i-j-k form.
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   const int M = A->shape[0];
   const int K = A->shape[1];
   const int N = B->shape[1];
+  const float *Ad = A->data;
+  const float *Bd = B->data;
+  float *Cd = C->data;
 
-  // GEMM: C[i,j] = sum(A[i,k] * B[k,j]) for k=0..K-1
   for (int i = 0; i < M; i++) {
-    for (int j = 0; j < N; j++) {
-      float sum = 0.0f;
-      for (int k = 0; k < K; k++) {
-        sum += A->data[i * K + k] * B->data[k * N + j];
+    float *Ci = &Cd[i * N];
+    for (int j = 0; j < N; j++) Ci[j] = 0.0f;
+    const float *Ai = &Ad[i * K];
+    for (int k = 0; k < K; k++) {
+      const float a = Ai[k];
+      const float *Bk = &Bd[k * N];
+      for (int j = 0; j < N; j++) {
+        Ci[j] += a * Bk[j];
       }
-      C->data[i * N + j] = sum;
     }
   }
 }

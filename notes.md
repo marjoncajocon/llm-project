@@ -24,7 +24,7 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
 - [x] Step B2 — KV cache (incremental decode; verified bit-exact vs full forward)
 - [x] Step B3 — `generate` subcommand: token-in/token-out REPL (KV cache + sampler)
-- [ ] Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization
+- [~] Step B4 — Performance: cache-friendly `ikj` matmul done; threads/SIMD/int8 quant TODO
 
 **Phase C — The agent layer (tools + approval), pure C:**
 - [ ] Step C1 — Tool protocol the model emits (parseable `<tool …>` blocks)
@@ -426,10 +426,22 @@ and stays at 9.28e-04 — bias backward is correct; training convergence corrobo
   pretokenization regex + byte→unicode map) is a separate extension needed only to feed text
   to real GPT-2 weights — text↔token vocab must also match the model's vocab (see A2).
 
+## Step B4 (partial) — cache-friendly matmul
+
+**Status: matmul reorder DONE; threads/SIMD/quant remain.**
+
+- **`matrix.c`** — `matmul` rewritten from `i-j-k` to **`i-k-j`** order: the inner loop
+  streams a row of B and a row of C sequentially (cache-friendly, auto-vectorizable)
+  instead of striding down a column of B. Same math.
+- **Verified:** KV-cache logits still bit-exact (0.00e+00), gradient check + training
+  unchanged (2.8787 → 0.0002) — the reorder is correct.
+- **Remaining (needed only at 124M+ scale):** multi-threading (OpenMP/pthreads), SIMD
+  intrinsics, and int8 weight quantization. Tracked under Phase D.
+
 ## Next steps (not started)
 - Step A2 — Scale config to a real architecture; wire the trained tokenizer into `generate`
   (text-in/text-out) once model vocab == tokenizer vocab.
-- Phase D — run a genuinely capable model (needs B4 perf/quant + real weights).
+- Phase D — run a genuinely capable model (needs B4 threads/SIMD/quant + real weights).
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
 - Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.
