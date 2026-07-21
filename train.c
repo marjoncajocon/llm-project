@@ -11,27 +11,13 @@
 #include "loss.h"
 #include "optim.h"
 #include "checkpoint.h"
-
-// Read an entire text file into a NUL-terminated heap buffer (caller frees).
-static char *read_file(const char *path, long *out_len) {
-  FILE *f = fopen(path, "rb");
-  if (!f) return NULL;
-  fseek(f, 0, SEEK_END);
-  long len = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = (char*)malloc(len + 1);
-  if (!buf) { fclose(f); return NULL; }
-  long n = (long)fread(buf, 1, len, f);
-  buf[n] = '\0';
-  fclose(f);
-  if (out_len) *out_len = n;
-  return buf;
-}
+#include "corpus.h"
 
 int train_run(const char *data_path, const char *out_model, const char *out_tok,
               int num_merges, int steps) {
   long text_len = 0;
-  char *text = read_file(data_path, &text_len);
+  // Accepts a single file or a directory tree of *.txt files.
+  char *text = corpus_read(data_path, &text_len);
   if (!text) { fprintf(stderr, "error: cannot read '%s'\n", data_path); return 1; }
   if (text_len < 8) { fprintf(stderr, "error: '%s' is too small\n", data_path); free(text); return 1; }
 

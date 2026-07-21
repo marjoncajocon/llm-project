@@ -35,9 +35,11 @@ defined in the matching `.c`.
 | `toolexec.h` / `toolexec.c`       | Execute a tool call: write_file / read_file / run_command     |
 | `approval.h` / `approval.c`       | Approval gate for tool actions (ask y/N, or auto)             |
 | `agent.h` / `agent.c`             | Agent loop: parse → approve → execute → observe               |
-| `train.h` / `train.c`             | Train a GPT on a text file (tokenizer + model + Adam loop)    |
+| `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
+| `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`)     |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
+| `tools/`                          | Non-C helpers: GPT-2 converters, `crawl_wikipedia.py`         |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -95,22 +97,34 @@ Exit code is `0` when all checks pass, `1` otherwise — handy in scripts:
 ./transformer && echo "smoke test ok"
 ```
 
-### `transformer train <data.txt> [model.bin] [tok.bin] [merges] [steps]`
+### `transformer train <path> [model.bin] [tok.bin] [merges] [steps]`
 
-Train the model on **your own text**. Put a UTF-8 text file in `data/`, then:
+Train the model on **your own text**. `<path>` may be a single file **or a directory** —
+a directory is read **recursively**, concatenating every `.txt` under it (including
+subfolders like `data/wiki/`).
 
 ```sh
-transformer train data/train.txt model.bin tok.bin 200 2000
-#   data/train.txt : your corpus            merges : BPE merges (default 200)
-#   model.bin      : output model           steps  : Adam steps (default 500)
-#   tok.bin        : output tokenizer
+transformer train data/train.txt model.bin tok.bin 200 2000   # one file
+transformer train data/          model.bin tok.bin 400 3000   # whole data/ tree
+#   merges : BPE merges (default 200)      steps : Adam steps (default 500)
 ```
 
 It learns a byte-level BPE on the text, sizes a small GPT (d_model 64, 2 layers, 4 heads,
 context 32) to that vocab, trains with Adam, and saves the model + tokenizer. Then generate
-text from it (below). This is CPU-only and small, so it learns your corpus's *patterns/style*
-(great for overfitting a small set) — not a substitute for a large pretrained model. Bigger,
-cleaner text and more `steps` help; to scale up, edit the config in `train.c`.
+text from it (below). CPU-only and small, so it learns your corpus's *patterns/style* — not a
+substitute for a large pretrained model. Bigger/cleaner text and **many more `steps`** help;
+to scale up, edit the config in `train.c`.
+
+**Build a real corpus by crawling** (see `tools/crawl_wikipedia.py`):
+
+```sh
+python tools/crawl_wikipedia.py "Machine learning" --max-pages 50   # -> data/wiki/*.txt
+transformer train data/wiki model.bin tok.bin 400 5000
+echo "machine learning is" | transformer generate model.bin tok.bin
+```
+
+The crawler fetches plain-text Wikipedia extracts and follows article links (breadth-first)
+so the text stays topically *connected*. Then `train` ingests the whole `data/wiki/` folder.
 
 ### `transformer generate [model.bin] [tok.bin]`
 

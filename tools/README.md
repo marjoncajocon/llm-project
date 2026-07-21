@@ -40,6 +40,22 @@ python tools/convert_to_gptc.py gpt2.npz gpt2.bin --n-heads 12
 
 Requires Python 3 + NumPy + safetensors, and a downloaded GPT-2 checkpoint.
 
+### `crawl_wikipedia.py`
+
+Build a training corpus by crawling **connected** Wikipedia articles (plain-text extracts
+via the Wikipedia API, following article links breadth-first). Saves one `.txt` per article
+under `data/wiki/`, which `transformer train data/wiki` then ingests.
+
+```sh
+python tools/crawl_wikipedia.py "Machine learning" --max-pages 50
+#   --max-pages N   how many articles      --out DIR   output dir (default data/wiki)
+#   --delay S       seconds between requests (be polite)  --min-chars N  skip stubs
+transformer train data/wiki model.bin tok.bin 400 5000
+```
+
+Standard library only (urllib); needs internet. Sets a descriptive User-Agent and rate-limits
+per Wikipedia's guidelines.
+
 ## Adding a tool
 
 Drop your script in this folder, keep it self-contained, and document its usage here.

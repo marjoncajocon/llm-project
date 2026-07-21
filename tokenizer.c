@@ -85,25 +85,31 @@ int tokenizer_encode(const Tokenizer *t, const char *text, int *ids, int max_ids
     ids[i] = (unsigned char)text[i];
   }
 
-  // Repeatedly merge the adjacent pair with the lowest (best) rank
+  // Standard BPE: each round, find the lowest-rank applicable pair, then merge
+  // ALL of its occurrences in a single pass. Same result as one-at-a-time, but
+  // O(rounds) instead of O(merge-operations) passes — essential for large text.
   while (n >= 2) {
     int best_rank = -1;
-    int best_pos = -1;
     for (int i = 0; i < n - 1; i++) {
       int r = merge_rank(t, ids[i], ids[i + 1]);
-      if (r != -1 && (best_rank == -1 || r < best_rank)) {
-        best_rank = r;
-        best_pos = i;
+      if (r != -1 && (best_rank == -1 || r < best_rank)) best_rank = r;
+    }
+    if (best_rank == -1) break;  // no applicable merges remain
+
+    const int a = t->merge_a[best_rank];
+    const int b = t->merge_b[best_rank];
+    const int new_id = 256 + best_rank;
+    int w = 0;
+    for (int i = 0; i < n; ) {
+      if (i < n - 1 && ids[i] == a && ids[i + 1] == b) {
+        ids[w++] = new_id;
+        i += 2;
+      } else {
+        ids[w++] = ids[i];
+        i += 1;
       }
     }
-    if (best_pos == -1) break;  // no more applicable merges
-
-    // Merge the pair at best_pos into its combined token, shift the tail left
-    ids[best_pos] = 256 + best_rank;
-    for (int i = best_pos + 1; i < n - 1; i++) {
-      ids[i] = ids[i + 1];
-    }
-    n--;
+    n = w;
   }
 
   return n;

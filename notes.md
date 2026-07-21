@@ -534,7 +534,34 @@ are real and reusable; plugging in a capable model (a real LLM API, or a much la
   data/yourfile.txt model.bin tok.bin 200 2000`, then `echo "prompt" | transformer generate
   model.bin tok.bin`. More/cleaner text + more steps = better; scale the config in `train.c`.
 
+## Data crawler + directory training + faster BPE encode
+
+**Status: DONE — crawl → train → generate verified on real Wikipedia text.**
+
+- **`tools/crawl_wikipedia.py`** (NEW) — crawls *connected* Wikipedia articles via the API
+  (plain-text extracts + breadth-first link following), saving `data/wiki/<title>.txt`.
+  Stdlib `urllib` only; needs internet. Verified live: fetched "Machine learning" (58.7K
+  chars) → linked "15.ai" (28.3K).
+- **`corpus.h/.c`** (NEW) — `corpus_read(path)` reads a file, **or a directory tree
+  recursively** (every `.txt`, portable dir-walk: Win32 `FindFirstFile` / POSIX `dirent`).
+- **`train.c`** — now uses `corpus_read`, so **`transformer train data/`** (a directory)
+  trains on all `.txt` under it. Answers "does data/ support subdirectories?" → **yes**.
+- **`tokenizer.c`** — `tokenizer_encode` rewritten to standard BPE (merge *all* occurrences
+  of the lowest-rank pair per round, not one). Same result, hugely faster: an 87KB corpus
+  went from >120s (timeout) to **2.7s**. Essential for real corpora.
+- **Verified end-to-end:** crawled 87KB of Wikipedia → `transformer train data/wiki` (300
+  merges, 200 steps, 2.7s) → `generate` runs. Output is undertrained gibberish at 200 steps
+  (tiny model) — needs many more steps + a bigger model for coherence; the *pipeline* is the
+  deliverable. Directory training also verified on `data/` (sample.txt + a `wiki/` subdir).
+  Default smoke test still `PASSED`; `-Wall` clean.
+
+**Further BPE speedup (future):** word-level pretokenization (BPE within each word, like
+GPT-2) would make encode near-instant on large corpora; current whole-sequence encode is
+fine for MBs, slow for GBs.
+
 ## Next steps (not started)
+- Scale training: bigger model config in `train.c` + many more steps for coherent Wikipedia
+  text; consider a train/val split + loss reporting on held-out text.
 - Phase E (images) — see the roadmap: image decode → patch embeddings → multimodal input →
   paired training. Large build; plumbing is feasible, quality needs real scale.
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
