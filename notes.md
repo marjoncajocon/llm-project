@@ -22,13 +22,32 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       `transformer generate model.bin tok.bin` (text-in/text-out). Verified: learns a small
       corpus (loss 5.9 → ~0.1) and generates coherent in-style text.
 
+**Phase B/scaling:**
+- [x] Configurable model via CLI flags (`transformer train ... --d-model --layers --heads
+      --d-ff --ctx --merges --steps --lr --seed`). Defaults: d_model 128, 3 layers, 4 heads,
+      ctx 64. Each `model.bin`+`tok.bin` is a self-contained model (→ many role-specific AIs).
+- [ ] Train/val split + held-out loss reporting; checkpoint-every-N; resume-from-checkpoint.
+- [ ] B4 remainder — threaded/SIMD matmul + int8 quant (needed for big models to train fast).
+
 **Phase E — Multimodal (images), the big future build (user goal: understand/describe images):**
-- [ ] Step E1 — Image decode (PNG/JPG → pixel tensor); `data/images/`
-- [ ] Step E2 — Patch embedding front-end (ViT-style): image → sequence of embeddings
-- [ ] Step E3 — Multimodal input: prepend image embeddings to the token sequence
-- [ ] Step E4 — Image-text paired training data + training loop
-      (Honest: a genuinely useful vision-language model needs far more model+data+compute
-      than is feasible locally from scratch; this builds the plumbing, quality needs scale.)
+- [ ] Step E1 — Image decode (PNG/JPG → pixel tensor). Use `stb_image.h` (single-header,
+      vendored in root or `tools/`) or a PPM/BMP reader first. Store images in `data/images/`.
+- [ ] Step E2 — Patch embedding front-end (ViT-style): split image into patches, linear-embed
+      each patch → a sequence of vectors (new module `patch.c`).
+- [ ] Step E3 — Multimodal input: prepend image-patch embeddings to the token embeddings so
+      one `GPT` consumes `[image patches] + [text tokens]` (extend `embedding.c`/`model.c`).
+- [ ] Step E4 — Image-text paired data (`data/pairs/` with image+caption) + a training loop
+      that predicts the caption from the image.
+      (Honest: a genuinely useful vision-language model needs far more model+data+compute than
+      is feasible locally from scratch; this builds the plumbing, quality needs real scale.)
+
+**Phase F — Video (even larger, farthest future):**
+- [ ] Step F1 — Decode video to frames (via a `tools/` script using ffmpeg → `data/video/<clip>/frame_*.png`).
+- [ ] Step F2 — Per-frame patch embeddings (reuse Phase E) + temporal position encoding.
+- [ ] Step F3 — Optional audio track → features; fuse with the frame/text sequence.
+- [ ] Step F4 — Video-text training (caption/describe a clip).
+      (Honest: this is research-scale; treat as a very-long-horizon goal. Text (done) →
+      images (Phase E) → video (Phase F) is the right order.)
 
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
@@ -48,6 +67,57 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 
 > Honest note: the *pipeline* is 100% doable in pure C and local; agent *quality* is capped by
 > the model you can run. Loading pretrained weights (4b) is the fastest path to real output.
+
+## ▶ CONTINUATION GUIDE — resume here (read this first)
+
+**If a session ran out of usage / you're picking this up fresh, start here.**
+
+**Repo state:** pure-C GPT that trains on text, generates text, has a token/text CLI, a
+scripted agent loop, cross-platform builds (incl. WASM). Work is on branch **`agent-1`**
+(several commits ahead of `master`). Tree should be clean — run `git status` and `git log
+--oneline -12` to confirm where you are.
+
+**Environment (this Windows machine):** no gcc/clang/make. Use **`zig`** (`D:\env\zig\zig.exe`)
+and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
+`D:\env\node\...` (has WASI). `git` works; user identity Marjon Cajocon.
+
+**Build + smoke test (do this after any change):**
+```
+zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
+  feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
+  optim.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c main.c -lm
+.\transformer.exe            # must print: Output validation: PASSED
+```
+Then clean: `Remove-Item transformer.exe,*.o,*.bin,*.wasm,xbuild_* -ErrorAction SilentlyContinue`.
+Cross-compile all platforms: `make cross` (POSIX shell) or the `zig cc -target ...` loop.
+
+**Subcommands:** `train <path> [--d-model N --layers N --heads N --ctx N --steps N --lr F
+--out F --tok F ...]` · `generate model.bin tok.bin` (text) or `generate model.bin` (token IDs)
+· `agent [--ask]`. Crawl a corpus: `python tools/crawl_wikipedia.py "Topic" --max-pages N`.
+
+**Conventions (enforced):** source root is **C-only and flat**; non-C scripts in `tools/`;
+data in `data/` (git-ignored); cross binaries in `build/` (git-ignored except *.md/*.txt);
+**2-space indent**, `-std=c11 -Wall` clean, no untyped `void *` params. **Any change to
+training/backprop must keep the gradient check green** (main.c: conditioned rel err < 1e-2)
+and the **KV-cache bit-exact** check (0.00e+00). Commit per logical step (auto-commit is
+authorized; local only, don't push).
+
+**Recommended next tasks (in priority order):**
+1. **Better training UX** — train/val split (hold out ~10% of the corpus), print held-out
+   loss; `--checkpoint-every N` to save periodically; `--resume model.bin` to continue
+   training a saved model (load weights + keep training).
+2. **Speed for big models** — B4 remainder: multi-thread the `matmul` inner loop
+   (pthreads/OpenMP or a simple thread pool) and/or SIMD; then int8 weight quantization.
+   Guard correctness with the existing gradient-check + KV bit-exact tests.
+3. **Real GPT-2** — run the step-4b recipe (download gpt2, `tools/convert_gpt2.py` →
+   `convert_to_gptc.py` → `gpt_load`) for genuinely good text; add the real GPT-2 BPE
+   (`encoder.json`/`vocab.bpe`) so text↔tokens match its weights.
+4. **Wire a real backend into `agent.c`** (replace the scripted `responses[]`) — a live LLM
+   API call, or one of the locally-trained models — to make the agent genuinely act.
+5. **Phase E (images)** then **Phase F (video)** — see the roadmap above; big future builds.
+
+Not supported yet (asked about): **image training** and **video training** — text-only today;
+they are Phase E / Phase F (multimodal), documented with concrete steps in the roadmap.
 
 ## Session summary (2026-07-21, autonomous run)
 
@@ -582,11 +652,19 @@ Fixes this required (the Windows-only build had never exercised these paths):
 `build/` is git-ignored except text/markdown (`build/README.md` documents the outputs).
 See README "Supported platforms" for the target list + build/run commands.
 
+## Configurable model (CLI flags) — DONE
+
+`train` is now fully configurable (no editing `train.c`): `TrainConfig` in `train.h`,
+`train_default_config()` + `train_run(data, cfg)` in `train.c`, flag parsing in `main.c`'s
+`run_train`. Flags: `--d-model --layers --heads --d-ff --ctx --merges --steps --lr --seed
+--out --tok`. Validates `d_model % heads == 0`. Defaults are a small-but-real model (d_model
+128, 3 layers, 4 heads, ctx 64). Verified: small config trains+generates; bad `--heads`
+errors. Each trained `model.bin`+`tok.bin` is a standalone model → build many role-specific
+AIs. See the CONTINUATION GUIDE above for the prioritized backlog.
+
 ## Next steps (not started)
-- Scale training: bigger model config in `train.c` + many more steps for coherent Wikipedia
-  text; consider a train/val split + loss reporting on held-out text.
-- Phase E (images) — see the roadmap: image decode → patch embeddings → multimodal input →
-  paired training. Large build; plumbing is feasible, quality needs real scale.
+- Training UX: train/val split + held-out loss; `--checkpoint-every`; `--resume`.
+- Phase E (images) → Phase F (video) — see roadmap. Big future builds; text-only today.
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.
 - Phase D — perf/quant + a genuinely capable model (real weights).

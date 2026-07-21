@@ -1,15 +1,18 @@
 # Build artifacts — never commit compiled output, only source stays in the repo.
+# NOTE: .gitignore does NOT support trailing/inline comments; keep comments on
+# their own lines so the patterns below actually match.
 
 # Object files (from `make` / `cc -c`)
-*.o          # e.g. tensor.o, attention.o
-*.obj        # MSVC object files
+*.o
+*.obj
 
 # Built binaries
-transformer      # the Linux/macOS binary produced by `make`
-*.exe            # e.g. transformer.exe (Windows)
-*.out            # e.g. a.out (default compiler output)
-*.wasm           # WebAssembly build
-xbuild_*         # cross-compile test outputs
+transformer
+*.exe
+*.out
+*.wasm
+# cross-compile test outputs
+xbuild_*
 
 # Cross-compile output dir: ignore binaries, keep text/markdown docs
 build/*
@@ -17,15 +20,16 @@ build/*
 !build/*.txt
 
 # Debug / linker artifacts
-*.pdb        # e.g. transformer.pdb (MSVC debug symbols)
-*.ilk        # e.g. transformer.ilk (MSVC incremental-link file)
+*.pdb
+*.ilk
 
 # Model checkpoints (generated weights, not source)
-*.bin        # e.g. model.bin (GPTC checkpoint)
+*.bin
 
 # Training data — keep the README + sample, ignore your own datasets
 data/*
 !data/README.md
+!data/README.MD
 !data/sample.txt
 
 # Agent demo artifact

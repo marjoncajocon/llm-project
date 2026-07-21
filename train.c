@@ -13,8 +13,30 @@
 #include "checkpoint.h"
 #include "corpus.h"
 
-int train_run(const char *data_path, const char *out_model, const char *out_tok,
-              int num_merges, int steps) {
+TrainConfig train_default_config(void) {
+  TrainConfig c;
+  c.out_model = "model.bin";
+  c.out_tok = "tok.bin";
+  c.num_merges = 300;
+  c.steps = 1000;
+  c.d_model = 128;
+  c.n_heads = 4;
+  c.n_layers = 3;
+  c.d_ff = 0;          // 0 => 4 * d_model
+  c.ctx = 64;
+  c.lr = 3e-4f;
+  c.seed = 1234;
+  return c;
+}
+
+int train_run(const char *data_path, const TrainConfig *cfg) {
+  if (cfg->d_model % cfg->n_heads != 0) {
+    fprintf(stderr, "error: d_model (%d) must be divisible by heads (%d)\n",
+            cfg->d_model, cfg->n_heads);
+    return 1;
+  }
+  const int d_ff = (cfg->d_ff > 0) ? cfg->d_ff : 4 * cfg->d_model;
+
   long text_len = 0;
   // Accepts a single file or a directory tree of *.txt files.
   char *text = corpus_read(data_path, &text_len);
@@ -23,7 +45,7 @@ int train_run(const char *data_path, const char *out_model, const char *out_tok,
 
   // 1. Learn a BPE tokenizer on the corpus.
   Tokenizer tok = tokenizer_create_bytelevel();
-  tokenizer_train(&tok, text, num_merges);
+  tokenizer_train(&tok, text, cfg->num_merges);
   const int vocab = tok.vocab_size;
 
   // 2. Encode the whole corpus into a token stream.
@@ -31,32 +53,31 @@ int train_run(const char *data_path, const char *out_model, const char *out_tok,
   int n_toks = tokenizer_encode(&tok, text, toks, (int)text_len);
   free(text);
   printf("corpus: %ld bytes -> %d tokens | vocab %d (%d merges)\n",
-         text_len, n_toks, vocab, num_merges);
+         text_len, n_toks, vocab, cfg->num_merges);
 
-  // 3. Build the model (small, CPU-friendly). Context window <= tokens available.
-  const int d_model = 64, n_heads = 4, n_layers = 2, d_ff = 256, max_seq = 128;
-  int ctx = 32;
+  // 3. Build the model. Context window is capped by the tokens available.
+  int ctx = cfg->ctx;
   if (n_toks <= ctx + 1) ctx = n_toks - 1;
   if (ctx < 2) { fprintf(stderr, "error: corpus too short to train\n"); free(toks); tokenizer_free(&tok); return 1; }
 
-  srand(1234);
-  GPT model = gpt_create(vocab, d_model, n_heads, n_layers, d_ff, max_seq);
-  printf("model: d_model=%d heads=%d layers=%d d_ff=%d ctx=%d\n",
-         d_model, n_heads, n_layers, d_ff, ctx);
+  srand(cfg->seed);
+  GPT model = gpt_create(vocab, cfg->d_model, cfg->n_heads, cfg->n_layers, d_ff, ctx);
+  printf("model: d_model=%d heads=%d layers=%d d_ff=%d ctx=%d lr=%g\n",
+         cfg->d_model, cfg->n_heads, cfg->n_layers, d_ff, ctx, cfg->lr);
 
   GPTActs acts = gpt_acts_create(&model, ctx);
   int lshape[2] = {ctx, vocab};
   Tensor logits = tensor_create(lshape, 2);
   Tensor probs = tensor_create(lshape, 2);
-  Tensor *params[512];
+  Tensor *params[1024];
   int n_params = gpt_collect_params(&model, params);
-  Adam opt = adam_create(params, n_params, 1e-3f);
+  Adam opt = adam_create(params, n_params, cfg->lr);
 
   int *inp = (int*)malloc(ctx * sizeof(int));
   int *tgt = (int*)malloc(ctx * sizeof(int));
 
   // 4. Train on random context windows: predict each token from the previous ones.
-  float running = 0.0f;
+  const int steps = cfg->steps;
   int report = steps < 10 ? 1 : steps / 10;
   for (int s = 0; s < steps; s++) {
     int start = rand() % (n_toks - ctx);
@@ -71,18 +92,16 @@ int train_run(const char *data_path, const char *out_model, const char *out_tok,
     gpt_backward(&model, inp, ctx, &acts, &logits);
     adam_step(&opt, params, n_params);
 
-    running += loss;
     if (s % report == 0 || s == steps - 1) {
       printf("  step %5d/%d  loss %.4f\n", s, steps, loss);
     }
   }
-  (void)running;
 
   // 5. Save the trained model + tokenizer.
   int rc = 0;
-  if (gpt_save(out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
-  if (tokenizer_save(&tok, out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
-  if (rc == 0) printf("saved model -> %s, tokenizer -> %s\n", out_model, out_tok);
+  if (gpt_save(cfg->out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
+  if (tokenizer_save(&tok, cfg->out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
+  if (rc == 0) printf("saved model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
 
   free(inp); free(tgt); free(toks);
   adam_free(&opt);

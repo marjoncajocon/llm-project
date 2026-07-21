@@ -335,21 +335,48 @@ static int run_agent(int argc, char **argv) {
 }
 
 // ============================================================================
-// `train` subcommand: train on a text file.
-//   transformer train <data.txt> [out_model.bin] [out_tok.bin] [num_merges] [steps]
+// `train` subcommand: train on a text file or directory, configured by flags.
+//   transformer train <path> [--out F] [--tok F] [--merges N] [--steps N]
+//                            [--d-model N] [--layers N] [--heads N] [--d-ff N]
+//                            [--ctx N] [--lr F] [--seed N]
+// Scale up (bigger/slower/better):  --d-model 256 --layers 6 --heads 8 --ctx 128 --steps 20000
 // ============================================================================
+static void train_usage(void) {
+  fprintf(stderr,
+    "usage: transformer train <path> [flags]\n"
+    "  <path> : text file OR directory of *.txt\n"
+    "  --out F       output model (default model.bin)   --tok F     output tokenizer (default tok.bin)\n"
+    "  --merges N    BPE merges (default 300)            --steps N   Adam steps (default 1000)\n"
+    "  --d-model N   model dim (default 128)             --layers N  blocks (default 3)\n"
+    "  --heads N     attention heads (default 4)         --d-ff N    FFN dim (default 4*d_model)\n"
+    "  --ctx N       context window (default 64)         --lr F      learning rate (default 3e-4)\n"
+    "  --seed N      RNG seed (default 1234)\n");
+}
+
 static int run_train(int argc, char **argv) {
-  if (argc < 3) {
-    fprintf(stderr, "usage: transformer train <data.txt> [model.bin] [tok.bin] "
-                    "[num_merges] [steps]\n");
-    return 2;
-  }
+  if (argc < 3 || strncmp(argv[2], "--", 2) == 0) { train_usage(); return 2; }
   const char *data = argv[2];
-  const char *out_model = (argc > 3) ? argv[3] : "model.bin";
-  const char *out_tok = (argc > 4) ? argv[4] : "tok.bin";
-  int num_merges = (argc > 5) ? atoi(argv[5]) : 200;
-  int steps = (argc > 6) ? atoi(argv[6]) : 500;
-  return train_run(data, out_model, out_tok, num_merges, steps);
+  TrainConfig cfg = train_default_config();
+
+  for (int i = 3; i < argc; i++) {
+    const char *f = argv[i];
+    int has_val = (i + 1 < argc);
+#define NEED_VAL() do { if (!has_val) { fprintf(stderr, "missing value for %s\n", f); return 2; } } while (0)
+    if      (strcmp(f, "--out") == 0)     { NEED_VAL(); cfg.out_model = argv[++i]; }
+    else if (strcmp(f, "--tok") == 0)     { NEED_VAL(); cfg.out_tok = argv[++i]; }
+    else if (strcmp(f, "--merges") == 0)  { NEED_VAL(); cfg.num_merges = atoi(argv[++i]); }
+    else if (strcmp(f, "--steps") == 0)   { NEED_VAL(); cfg.steps = atoi(argv[++i]); }
+    else if (strcmp(f, "--d-model") == 0) { NEED_VAL(); cfg.d_model = atoi(argv[++i]); }
+    else if (strcmp(f, "--layers") == 0)  { NEED_VAL(); cfg.n_layers = atoi(argv[++i]); }
+    else if (strcmp(f, "--heads") == 0)   { NEED_VAL(); cfg.n_heads = atoi(argv[++i]); }
+    else if (strcmp(f, "--d-ff") == 0)    { NEED_VAL(); cfg.d_ff = atoi(argv[++i]); }
+    else if (strcmp(f, "--ctx") == 0)     { NEED_VAL(); cfg.ctx = atoi(argv[++i]); }
+    else if (strcmp(f, "--lr") == 0)      { NEED_VAL(); cfg.lr = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
+    else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
+#undef NEED_VAL
+  }
+  return train_run(data, &cfg);
 }
 
 int main(int argc, char **argv) {

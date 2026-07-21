@@ -138,30 +138,39 @@ Exit code is `0` when all checks pass, `1` otherwise — handy in scripts:
 ./transformer && echo "smoke test ok"
 ```
 
-### `transformer train <path> [model.bin] [tok.bin] [merges] [steps]`
+### `transformer train <path> [flags]`
 
 Train the model on **your own text**. `<path>` may be a single file **or a directory** —
 a directory is read **recursively**, concatenating every `.txt` under it (including
-subfolders like `data/wiki/`).
+subfolders like `data/wiki/`). The model size is fully configurable via flags:
 
 ```sh
-transformer train data/train.txt model.bin tok.bin 200 2000   # one file
-transformer train data/          model.bin tok.bin 400 3000   # whole data/ tree
-#   merges : BPE merges (default 200)      steps : Adam steps (default 500)
+transformer train data/wiki                       # defaults (d_model 128, 3 layers, ...)
+transformer train data/wiki --steps 20000 --out ai.bin --tok ai.tok
+
+# Scale the model up (bigger = slower but better):
+transformer train data/wiki --d-model 256 --layers 6 --heads 8 --ctx 128 --steps 30000
 ```
 
-It learns a byte-level BPE on the text, sizes a small GPT (d_model 64, 2 layers, 4 heads,
-context 32) to that vocab, trains with Adam, and saves the model + tokenizer. Then generate
-text from it (below). CPU-only and small, so it learns your corpus's *patterns/style* — not a
-substitute for a large pretrained model. Bigger/cleaner text and **many more `steps`** help;
-to scale up, edit the config in `train.c`.
+| Flag | Meaning (default) | | Flag | Meaning (default) |
+| --- | --- | --- | --- | --- |
+| `--out F`   | model out (`model.bin`) | | `--d-model N` | model dim (128) |
+| `--tok F`   | tokenizer out (`tok.bin`) | | `--layers N` | transformer blocks (3) |
+| `--merges N`| BPE merges (300) | | `--heads N`  | attention heads (4) |
+| `--steps N` | Adam steps (1000) | | `--d-ff N`   | FFN dim (4·d_model) |
+| `--lr F`    | learning rate (3e-4) | | `--ctx N`    | context window (64) |
+| `--seed N`  | RNG seed (1234) | | | |
+
+`--d-model` must be divisible by `--heads`. CPU-only, so it learns your corpus's
+*patterns/style* — bigger/cleaner text and **many more `steps`** help. Each trained
+`model.bin`+`tok.bin` pair is a self-contained model you can keep for a specific role.
 
 **Build a real corpus by crawling** (see `tools/crawl_wikipedia.py`):
 
 ```sh
 python tools/crawl_wikipedia.py "Machine learning" --max-pages 50   # -> data/wiki/*.txt
-transformer train data/wiki model.bin tok.bin 400 5000
-echo "machine learning is" | transformer generate model.bin tok.bin
+transformer train data/wiki --out ml.bin --tok ml.tok --steps 10000
+echo "machine learning is" | transformer generate ml.bin ml.tok
 ```
 
 The crawler fetches plain-text Wikipedia extracts and follows article links (breadth-first)

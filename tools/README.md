@@ -50,7 +50,7 @@ under `data/wiki/`, which `transformer train data/wiki` then ingests.
 python tools/crawl_wikipedia.py "Machine learning" --max-pages 50
 #   --max-pages N   how many articles      --out DIR   output dir (default data/wiki)
 #   --delay S       seconds between requests (be polite)  --min-chars N  skip stubs
-transformer train data/wiki model.bin tok.bin 400 5000
+transformer train data/wiki --out ml.bin --tok ml.tok --steps 10000
 ```
 
 Standard library only (urllib); needs internet. Sets a descriptive User-Agent and rate-limits
