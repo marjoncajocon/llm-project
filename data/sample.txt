@@ -1,0 +1,12 @@
+the cat sat on the mat.
+the dog sat on the log.
+the cat ran to the mat.
+the dog ran to the log.
+a cat and a dog sat together.
+the cat likes the mat. the dog likes the log.
+the quick cat sat. the quick dog ran.
+the cat sat on the mat. the dog sat on the log.
+cats sit on mats. dogs sit on logs.
+the cat and the dog are friends.
+the cat sat. the dog sat. the cat ran. the dog ran.
+on the mat sat the cat. on the log sat the dog.

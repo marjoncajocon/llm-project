@@ -14,6 +14,7 @@
 #include "model.h"
 #include "checkpoint.h"
 #include "tokenizer.h"
+#include "train.h"
 #include "agent.h"
 
 // Full-model loss: training forward + cross-entropy. Fills logits and probs.
@@ -208,16 +209,16 @@ static int run_demo(void) {
 }
 
 // ============================================================================
-// `generate` subcommand: a token-level REPL driven by the KV cache + sampler.
-// Reads lines of space-separated token IDs from stdin (the prompt) and streams
-// generated tokens. Pipe-testable, e.g.:  echo "1 5 9" | transformer generate
-// With a checkpoint:  transformer generate model.bin
-// (Becomes text-in/text-out once a real tokenizer is wired — see notes.md A1.)
+// `generate` subcommand: autoregressive generation driven by KV cache + sampler.
+//   transformer generate                       -> random toy model, token IDs in
+//   transformer generate model.bin             -> loaded weights, token IDs in
+//   transformer generate model.bin tok.bin     -> TEXT in / TEXT out (tokenizer)
+// Reads one prompt per stdin line.
 // ============================================================================
 static int run_generate(int argc, char **argv) {
   GPT model;
   if (argc > 2) {
-    if (gpt_load(argv[2], &model) != 0) return 1;   // load real weights
+    if (gpt_load(argv[2], &model) != 0) return 1;   // load trained weights
     fprintf(stderr, "loaded %s\n", argv[2]);
   } else {
     srand(42);
@@ -225,9 +226,22 @@ static int run_generate(int argc, char **argv) {
     fprintf(stderr, "no checkpoint given; using a random toy model (vocab=16)\n");
   }
 
+  // Optional tokenizer -> text mode (stdin lines are text, not token IDs).
+  Tokenizer tok;
+  int text_mode = 0;
+  if (argc > 3) {
+    if (tokenizer_load(&tok, argv[3]) != 0) {
+      fprintf(stderr, "cannot load tokenizer %s\n", argv[3]);
+      gpt_free(&model);
+      return 1;
+    }
+    text_mode = 1;
+    fprintf(stderr, "text mode (tokenizer %s, vocab %d)\n", argv[3], tok.vocab_size);
+  }
+
   const int vocab = model.vocab_size;
   const int max_seq = model.max_seq_len;
-  const int n_new = 20;                   // tokens to generate per prompt
+  const int n_new = 40;                   // tokens to generate per prompt
   const float temperature = 0.8f;
   const int top_k = 40;
   const float top_p = 0.95f;
@@ -236,46 +250,61 @@ static int run_generate(int argc, char **argv) {
   int lshape[2] = {1, vocab};
   Tensor logits = tensor_create(lshape, 2);
   int *prompt = (int*)malloc(max_seq * sizeof(int));
+  int *gen = (int*)malloc(max_seq * sizeof(int));
 
   char line[8192];
   while (fgets(line, sizeof(line), stdin)) {
     char *p = line;
-    // Strip a leading UTF-8 BOM (common when piping on Windows) so the first
-    // token doesn't get mangled.
+    // Strip a leading UTF-8 BOM (common when piping on Windows).
     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
         (unsigned char)p[2] == 0xBF) {
       p += 3;
     }
-    // Parse space/newline-separated token IDs (bounds-checked to [0, vocab)).
+
     int n = 0;
-    for (char *t = strtok(p, " \t\r\n"); t && n < max_seq; t = strtok(NULL, " \t\r\n")) {
-      int id = atoi(t);
-      if (id < 0 || id >= vocab) {
-        fprintf(stderr, "skipping out-of-range token %d (vocab=%d)\n", id, vocab);
-        continue;
+    if (text_mode) {
+      size_t L = strlen(p);                 // strip trailing newline
+      while (L > 0 && (p[L - 1] == '\n' || p[L - 1] == '\r')) p[--L] = '\0';
+      n = tokenizer_encode(&tok, p, prompt, max_seq);
+    } else {
+      for (char *t = strtok(p, " \t\r\n"); t && n < max_seq; t = strtok(NULL, " \t\r\n")) {
+        int id = atoi(t);
+        if (id < 0 || id >= vocab) {
+          fprintf(stderr, "skipping out-of-range token %d (vocab=%d)\n", id, vocab);
+          continue;
+        }
+        prompt[n++] = id;
       }
-      prompt[n++] = id;
     }
     if (n == 0) continue;
 
     KVCache kv = gpt_kvcache_create(&model);
-    printf("gen:");
-    for (int i = 0; i < n; i++) {                 // feed the prompt
-      gpt_decode_step(&model, &kv, prompt[i], &logits);
-      printf(" %d", prompt[i]);
-    }
-    for (int s = 0; s < n_new && kv.len < max_seq; s++) {  // autoregress
+    for (int i = 0; i < n; i++) gpt_decode_step(&model, &kv, prompt[i], &logits);
+    int ng = 0;
+    for (int s = 0; s < n_new && kv.len < max_seq; s++) {
       int next = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
-      printf(" [%d]", next);                       // brackets mark generated tokens
+      gen[ng++] = next;
       gpt_decode_step(&model, &kv, next, &logits);
     }
-    printf("\n");
+
+    if (text_mode) {
+      char out[8192];
+      tokenizer_decode(&tok, gen, ng, out, sizeof(out));
+      printf("%s%s\n", p, out);                    // prompt text + continuation
+    } else {
+      printf("gen:");
+      for (int i = 0; i < n; i++) printf(" %d", prompt[i]);
+      for (int i = 0; i < ng; i++) printf(" [%d]", gen[i]);
+      printf("\n");
+    }
     fflush(stdout);
     gpt_kvcache_free(&kv);
   }
 
   free(prompt);
+  free(gen);
   tensor_free(&logits);
+  if (text_mode) tokenizer_free(&tok);
   gpt_free(&model);
   return 0;
 }
@@ -305,8 +334,27 @@ static int run_agent(int argc, char **argv) {
   return rc;
 }
 
+// ============================================================================
+// `train` subcommand: train on a text file.
+//   transformer train <data.txt> [out_model.bin] [out_tok.bin] [num_merges] [steps]
+// ============================================================================
+static int run_train(int argc, char **argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: transformer train <data.txt> [model.bin] [tok.bin] "
+                    "[num_merges] [steps]\n");
+    return 2;
+  }
+  const char *data = argv[2];
+  const char *out_model = (argc > 3) ? argv[3] : "model.bin";
+  const char *out_tok = (argc > 4) ? argv[4] : "tok.bin";
+  int num_merges = (argc > 5) ? atoi(argv[5]) : 200;
+  int steps = (argc > 6) ? atoi(argv[6]) : 500;
+  return train_run(data, out_model, out_tok, num_merges, steps);
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "train") == 0) return run_train(argc, argv);
   return run_demo();
 }

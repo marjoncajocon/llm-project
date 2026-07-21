@@ -15,3 +15,11 @@ transformer      # the Linux/macOS binary produced by `make`
 
 # Model checkpoints (generated weights, not source)
 *.bin        # e.g. model.bin (GPTC checkpoint)
+
+# Training data — keep the README + sample, ignore your own datasets
+data/*
+!data/README.md
+!data/sample.txt
+
+# Agent demo artifact
+agent_demo.txt

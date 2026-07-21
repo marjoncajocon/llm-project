@@ -18,7 +18,17 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       tied output head), converter (HF safetensors → GPTC), verified on GPT-2-shaped weights
 - [x] Step A1 — Trainable BPE tokenizer: merge-learning + save/load (self-trained BPE).
       (Loading GPT-2's exact `encoder.json`/`vocab.bpe` + pretok regex = future extension.)
-- [ ] Step A2 — Scale config to a real architecture (dims/layers/heads/context)
+- [x] Step A2 — Train-on-your-data pipeline: `data/` folder + `transformer train` +
+      `transformer generate model.bin tok.bin` (text-in/text-out). Verified: learns a small
+      corpus (loss 5.9 → ~0.1) and generates coherent in-style text.
+
+**Phase E — Multimodal (images), the big future build (user goal: understand/describe images):**
+- [ ] Step E1 — Image decode (PNG/JPG → pixel tensor); `data/images/`
+- [ ] Step E2 — Patch embedding front-end (ViT-style): image → sequence of embeddings
+- [ ] Step E3 — Multimodal input: prepend image embeddings to the token sequence
+- [ ] Step E4 — Image-text paired training data + training loop
+      (Honest: a genuinely useful vision-language model needs far more model+data+compute
+      than is feasible locally from scratch; this builds the plumbing, quality needs scale.)
 
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
@@ -501,12 +511,35 @@ calls, so the agent is driven by a scripted model here. The loop, tools, and app
 are real and reusable; plugging in a capable model (a real LLM API, or a much larger locally
 -run model — Phase D) is what makes it genuinely useful.
 
+## Step A2 — Train-on-your-data pipeline
+
+**Status: DONE — trains on a text file and generates coherent in-style text.**
+
+- **`data/`** — where your training data goes (git-ignored except `README.md` + `sample.txt`).
+  This folder is data, not code, so it's exempt from the C-only-flat-root rule.
+- **`train.c/.h`** — `train_run(data, out_model, out_tok, num_merges, steps)`: reads the text
+  file, trains a byte-level BPE (`tokenizer_train`), sizes a GPT to that vocab (d_model 64,
+  2 layers, 4 heads, d_ff 256, ctx 32), then trains on random context windows
+  (`gpt_forward_train` → `cross_entropy` → `gpt_backward` → Adam), and saves the model +
+  tokenizer.
+- **`main.c`** — `train` subcommand: `transformer train <data.txt> [model.bin] [tok.bin]
+  [merges] [steps]`. And `generate` now has a **text mode**: `transformer generate model.bin
+  tok.bin` encodes stdin text → generates → decodes back to text (token-ID mode still works
+  without a tokenizer).
+- **Verified:** `transformer train data/sample.txt model.bin tok.bin 150 400` → 427 bytes →
+  83 tokens, vocab 312, loss **5.95 → ~0.1**; then `echo "the cat" | transformer generate
+  model.bin tok.bin` produced coherent corpus-style text ("the cat sat on the mat. the dog
+  sat on the log. ..."). Default `transformer` smoke test still `PASSED`; `-Wall` clean.
+- **How to use your own data:** put a `.txt` in `data/`, run `transformer train
+  data/yourfile.txt model.bin tok.bin 200 2000`, then `echo "prompt" | transformer generate
+  model.bin tok.bin`. More/cleaner text + more steps = better; scale the config in `train.c`.
+
 ## Next steps (not started)
-- Step A2 — Scale config to a real architecture; wire the trained tokenizer into `generate`
-  (text-in/text-out) once model vocab == tokenizer vocab.
-- Wire a real model backend into `agent.c` (replace the scripted `responses[]`): either a
-  live LLM API call, or a large locally-run model once Phase D (perf/quant) lands.
-- Phase D — run a genuinely capable model (needs B4 threads/SIMD/quant + real weights).
+- Phase E (images) — see the roadmap: image decode → patch embeddings → multimodal input →
+  paired training. Large build; plumbing is feasible, quality needs real scale.
+- Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
+  or a large locally-run model.
+- Phase D — perf/quant + a genuinely capable model (real weights).
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
 - Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.

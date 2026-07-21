@@ -35,7 +35,9 @@ defined in the matching `.c`.
 | `toolexec.h` / `toolexec.c`       | Execute a tool call: write_file / read_file / run_command     |
 | `approval.h` / `approval.c`       | Approval gate for tool actions (ask y/N, or auto)             |
 | `agent.h` / `agent.c`             | Agent loop: parse → approve → execute → observe               |
-| `main.c`                          | Entry point + subcommands (`generate`, `agent`)              |
+| `train.h` / `train.c`             | Train a GPT on a text file (tokenizer + model + Adam loop)    |
+| `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`)     |
+| `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -93,23 +95,44 @@ Exit code is `0` when all checks pass, `1` otherwise — handy in scripts:
 ./transformer && echo "smoke test ok"
 ```
 
-### `transformer generate [checkpoint.bin]` (token-level REPL)
+### `transformer train <data.txt> [model.bin] [tok.bin] [merges] [steps]`
 
-A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`).
-It reads lines of space-separated **token IDs** from stdin (the prompt) and streams the
-generated tokens (bracketed). With no checkpoint it uses a random toy model; pass a GPTC
-`.bin` to generate from loaded weights.
+Train the model on **your own text**. Put a UTF-8 text file in `data/`, then:
 
 ```sh
-echo "1 5 9" | ./transformer generate
-# gen: 1 5 9 [15] [15] [5] [15] [9] ...   (bracketed tokens are generated)
-
-./transformer generate gpt2.bin   # then type token IDs, one prompt per line
+transformer train data/train.txt model.bin tok.bin 200 2000
+#   data/train.txt : your corpus            merges : BPE merges (default 200)
+#   model.bin      : output model           steps  : Adam steps (default 500)
+#   tok.bin        : output tokenizer
 ```
 
-Defaults: 20 new tokens, temperature 0.8, top-k 40, top-p 0.95 (edit `run_generate` in
-`main.c`). Out-of-range IDs are skipped. This is **token-in/token-out** today; it becomes
-text-in/text-out once a real tokenizer is wired (see `notes.md`, step A1).
+It learns a byte-level BPE on the text, sizes a small GPT (d_model 64, 2 layers, 4 heads,
+context 32) to that vocab, trains with Adam, and saves the model + tokenizer. Then generate
+text from it (below). This is CPU-only and small, so it learns your corpus's *patterns/style*
+(great for overfitting a small set) — not a substitute for a large pretrained model. Bigger,
+cleaner text and more `steps` help; to scale up, edit the config in `train.c`.
+
+### `transformer generate [model.bin] [tok.bin]`
+
+A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`),
+one prompt per stdin line:
+
+```sh
+# TEXT in / TEXT out — pass a trained model AND its tokenizer:
+echo "the cat" | ./transformer generate model.bin tok.bin
+# the cat sat on the mat. the dog sat on the log. ...
+
+# Token IDs — loaded weights, no tokenizer:
+echo "1 5 9" | ./transformer generate model.bin
+# gen: 1 5 9 [15] [15] [5] ...            (bracketed tokens are generated)
+
+# No args -> random toy model (token IDs in):
+echo "1 5 9" | ./transformer generate
+```
+
+Passing a tokenizer switches to **text-in/text-out**. Defaults: 40 new tokens, temperature
+0.8, top-k 40, top-p 0.95 (edit `run_generate` in `main.c`). Pair with `train` above to
+generate from a model trained on your own data.
 
 ### `transformer agent [--ask]` (agent loop demo)
 
