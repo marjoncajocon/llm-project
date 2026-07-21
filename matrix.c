@@ -6,6 +6,9 @@
 // Uses ikj loop order: the inner loop streams over a row of B and a row of C
 // sequentially (cache-friendly, and auto-vectorizable), instead of walking a
 // column of B with stride N. Same result as the naive i-j-k form.
+// NOTE: multi-threading was tried (Win32/pthreads, per-call) and measured SLOWER
+// at these matmul sizes (thread-spawn overhead > benefit; backward is unthreaded).
+// The correct fix is a persistent thread pool + threaded backward — see notes.md #2.
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   const int M = A->shape[0];
   const int K = A->shape[1];
