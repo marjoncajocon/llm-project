@@ -68,6 +68,24 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 > Honest note: the *pipeline* is 100% doable in pure C and local; agent *quality* is capped by
 > the model you can run. Loading pretrained weights (4b) is the fastest path to real output.
 
+## Next phases (priority order)
+
+1. **Training UX** — train/val split + **held-out loss**; `--checkpoint-every N`;
+   `--resume model.bin` (keep training across sessions).  ✅ DONE
+2. **Performance (B4 remainder)** *(medium)* — threaded/SIMD `matmul`, then int8 quant;
+   needed to train bigger models in reasonable time.
+3. **Real GPT-2 weights** *(medium)* — step-4b recipe (download → `convert_gpt2.py` →
+   `gpt_load`) + real GPT-2 BPE → coherent text without training from scratch.
+4. **Real agent backend** *(medium)* — wire a live LLM (or a locally-trained model) into
+   `agent.c`, replacing the scripted responses.
+5. **Phase E — Images (multimodal)** *(large)* — decode → patch embeddings → multimodal
+   input → image-text training.
+6. **Phase F — Video** *(research-scale)* — frames → per-frame patches + temporal encoding →
+   audio fusion → video-text training.
+
+Order rationale: text (1–4) is very achievable locally; images (5) and video (6) are big
+multimodal builds where the plumbing is feasible but real quality needs far more scale.
+
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
 **If a session ran out of usage / you're picking this up fresh, start here.**
@@ -103,10 +121,10 @@ and the **KV-cache bit-exact** check (0.00e+00). Commit per logical step (auto-c
 authorized; local only, don't push).
 
 **Recommended next tasks (in priority order):**
-1. **Better training UX** — train/val split (hold out ~10% of the corpus), print held-out
-   loss; `--checkpoint-every N` to save periodically; `--resume model.bin` to continue
-   training a saved model (load weights + keep training).
-2. **Speed for big models** — B4 remainder: multi-thread the `matmul` inner loop
+1. ✅ DONE — **Training UX**: train/val split + held-out `val` loss, `--checkpoint-every N`,
+   `--resume model.bin` (continue a saved model; loads its config + tokenizer). In `train.c`
+   (`eval_split`, resume/checkpoint logic) + `main.c` flags.
+2. **Speed for big models** (NEXT) — B4 remainder: multi-thread the `matmul` inner loop
    (pthreads/OpenMP or a simple thread pool) and/or SIMD; then int8 weight quantization.
    Guard correctness with the existing gradient-check + KV bit-exact tests.
 3. **Real GPT-2** — run the step-4b recipe (download gpt2, `tools/convert_gpt2.py` →
@@ -662,9 +680,18 @@ See README "Supported platforms" for the target list + build/run commands.
 errors. Each trained `model.bin`+`tok.bin` is a standalone model → build many role-specific
 AIs. See the CONTINUATION GUIDE above for the prioritized backlog.
 
+## Training UX (train/val + checkpoint + resume) — DONE
+
+`train.c`: train/val split (val = tail `val_frac` of the token stream; auto-disabled if the
+corpus is too small to hold out a window), `eval_split()` prints held-out `val` loss each
+report, `--checkpoint-every N` saves mid-run, and `--resume model.bin` loads a saved model +
+its tokenizer (`--tok`) and continues training (config comes from the checkpoint, not flags).
+`main.c` flags: `--val-frac --checkpoint-every --resume`. Verified: checkpoint saved mid-run;
+resume continued from the saved loss (not from scratch); val loss tracks train loss.
+
 ## Next steps (not started)
-- Training UX: train/val split + held-out loss; `--checkpoint-every`; `--resume`.
-- Phase E (images) → Phase F (video) — see roadmap. Big future builds; text-only today.
+- #2 Performance (threaded/SIMD matmul + int8 quant), then #3 real GPT-2, #4 real agent
+  backend, #5 images, #6 video — see "Next phases (priority order)" above.
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.
 - Phase D — perf/quant + a genuinely capable model (real weights).

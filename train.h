@@ -15,6 +15,9 @@ typedef struct {
   int ctx;                 // context window = model max_seq_len
   float lr;                // Adam learning rate
   unsigned seed;           // RNG seed for reproducibility
+  const char *resume;      // NULL => fresh model; else path to a checkpoint to continue
+  int checkpoint_every;    // save every N steps (0 => only at the end)
+  float val_frac;          // fraction of tokens held out for validation loss (e.g. 0.1)
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).

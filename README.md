@@ -159,11 +159,21 @@ transformer train data/wiki --d-model 256 --layers 6 --heads 8 --ctx 128 --steps
 | `--merges N`| BPE merges (300) | | `--heads N`  | attention heads (4) |
 | `--steps N` | Adam steps (1000) | | `--d-ff N`   | FFN dim (4·d_model) |
 | `--lr F`    | learning rate (3e-4) | | `--ctx N`    | context window (64) |
-| `--seed N`  | RNG seed (1234) | | | |
+| `--seed N`  | RNG seed (1234) | | `--val-frac F` | held-out fraction (0.1) |
+| `--checkpoint-every N` | save every N steps | | `--resume F` | continue a saved model |
 
-`--d-model` must be divisible by `--heads`. CPU-only, so it learns your corpus's
-*patterns/style* — bigger/cleaner text and **many more `steps`** help. Each trained
+`--d-model` must be divisible by `--heads`. Training prints **train + held-out `val`** loss
+(so you can tell learning from memorizing); `--checkpoint-every` saves periodically, and
+`--resume model.bin` continues training a saved model across sessions (keeps its config +
+tokenizer). CPU-only, so bigger/cleaner text and **many more `steps`** help. Each trained
 `model.bin`+`tok.bin` pair is a self-contained model you can keep for a specific role.
+
+```sh
+# train, checkpointing every 500 steps, holding out 10% for validation:
+transformer train data/wiki --out ml.bin --tok ml.tok --steps 5000 --checkpoint-every 500
+# later, continue where it left off:
+transformer train data/wiki --resume ml.bin --out ml.bin --tok ml.tok --steps 5000
+```
 
 **Build a real corpus by crawling** (see `tools/crawl_wikipedia.py`):
 

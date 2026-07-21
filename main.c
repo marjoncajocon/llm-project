@@ -350,7 +350,8 @@ static void train_usage(void) {
     "  --d-model N   model dim (default 128)             --layers N  blocks (default 3)\n"
     "  --heads N     attention heads (default 4)         --d-ff N    FFN dim (default 4*d_model)\n"
     "  --ctx N       context window (default 64)         --lr F      learning rate (default 3e-4)\n"
-    "  --seed N      RNG seed (default 1234)\n");
+    "  --seed N      RNG seed (default 1234)             --val-frac F  held-out fraction (default 0.1)\n"
+    "  --resume F    continue training a saved model     --checkpoint-every N  save every N steps\n");
 }
 
 static int run_train(int argc, char **argv) {
@@ -373,6 +374,9 @@ static int run_train(int argc, char **argv) {
     else if (strcmp(f, "--ctx") == 0)     { NEED_VAL(); cfg.ctx = atoi(argv[++i]); }
     else if (strcmp(f, "--lr") == 0)      { NEED_VAL(); cfg.lr = (float)atof(argv[++i]); }
     else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
+    else if (strcmp(f, "--resume") == 0)  { NEED_VAL(); cfg.resume = argv[++i]; }
+    else if (strcmp(f, "--checkpoint-every") == 0) { NEED_VAL(); cfg.checkpoint_every = atoi(argv[++i]); }
+    else if (strcmp(f, "--val-frac") == 0){ NEED_VAL(); cfg.val_frac = (float)atof(argv[++i]); }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }
