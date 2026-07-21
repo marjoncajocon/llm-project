@@ -76,7 +76,13 @@ cross-compiling every source with `zig cc -target <triple>` (all `-Wall`-clean):
 | macOS Apple Silicon | `aarch64-macos` | builds |
 | **WebAssembly (WASI)** | `wasm32-wasi` | builds + **runs** (via Node WASI, PASSED) |
 
-Cross-compile for any target (no OS-specific toolchain needed — `zig` bundles them):
+Build **all** targets at once into `build/` (needs `zig` + a POSIX shell):
+
+```sh
+make cross          # -> build/transformer-<target>[.exe|.wasm] for every platform
+```
+
+Or cross-compile one target by hand (no OS-specific toolchain needed — `zig` bundles them):
 
 ```sh
 zig cc -target x86_64-linux-gnu  -std=c11 -O2 -o transformer      *.c -lm   # Linux

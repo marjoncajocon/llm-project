@@ -11,6 +11,11 @@ transformer      # the Linux/macOS binary produced by `make`
 *.wasm           # WebAssembly build
 xbuild_*         # cross-compile test outputs
 
+# Cross-compile output dir: ignore binaries, keep text/markdown docs
+build/*
+!build/*.md
+!build/*.txt
+
 # Debug / linker artifacts
 *.pdb        # e.g. transformer.pdb (MSVC debug symbols)
 *.ilk        # e.g. transformer.ilk (MSVC incremental-link file)

@@ -10,6 +10,14 @@ OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o \
           toolcall.o toolexec.o approval.o agent.o corpus.o train.o main.o
 
+# --- Cross-compilation (uses `zig cc`; outputs to build/) ---
+ZIG            ?= zig
+BUILDDIR        = build
+SRCS            = $(OBJS:.o=.c)
+CROSS_TARGETS   = x86_64-linux-gnu aarch64-linux-gnu x86_64-linux-musl \
+                  x86_64-windows-gnu aarch64-windows-gnu \
+                  x86_64-macos aarch64-macos wasm32-wasi
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
@@ -41,7 +49,25 @@ corpus.o:     corpus.h
 train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h
 main.o:       tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h
 
+# Cross-compile a binary for every target in CROSS_TARGETS into build/.
+# Requires `zig` and a POSIX shell (Linux/macOS/WSL). No per-OS toolchain needed.
+cross:
+	@mkdir -p $(BUILDDIR)
+	@for t in $(CROSS_TARGETS); do \
+	  ext=""; lm="-lm"; \
+	  case $$t in \
+	    *windows*) ext=".exe" ;; \
+	    wasm*)     ext=".wasm"; lm="" ;; \
+	    *macos*)   lm="" ;; \
+	  esac; \
+	  out="$(BUILDDIR)/transformer-$$t$$ext"; \
+	  echo "  [$$t] -> $$out"; \
+	  $(ZIG) cc -target $$t -std=c11 -O2 -Wall -o "$$out" $(SRCS) $$lm || exit 1; \
+	done
+	@echo "cross builds written to $(BUILDDIR)/"
+
 clean:
 	rm -f $(OBJS) $(TARGET)
+	rm -f $(BUILDDIR)/transformer-*
 
-.PHONY: all clean
+.PHONY: all clean cross

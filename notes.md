@@ -578,6 +578,8 @@ Fixes this required (the Windows-only build had never exercised these paths):
 - **`tensor.c`** — `RAND_MAX` exceeds float's exact range on Linux/macOS; divide in `double`
   to silence `-Wimplicit-const-int-float-conversion` and keep init precise everywhere.
 
+**`make cross`** builds every target into `build/` (via `zig cc`; needs a POSIX shell).
+`build/` is git-ignored except text/markdown (`build/README.md` documents the outputs).
 See README "Supported platforms" for the target list + build/run commands.
 
 ## Next steps (not started)
