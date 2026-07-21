@@ -76,11 +76,14 @@ via `make cross`).
 
 🏁 **All modalities UNDERSTOOD: text, image, video, audio** — multimodal fwd/bwd.
 
-**GENERATION (Phase G) IN PROGRESS** — approach: discrete-token autoregressive (reuse GPT +
-KV cache + sampler + cross-entropy; NOT diffusion). ✅ **GI image-gen minimal DONE**:
-`imagegen.c` color-cube quantizer (pixels↔tokens); smoke `[10]` overfits an 8×8 image and
-autoregressively regenerates it (64/64 tokens) → decode → pixels. NEXT: GA (audio µ-law), GV
-(video); then text→image conditioning, a CLI subcommand, real datasets, VQ-VAE for quality.
+**GENERATION (Phase G) — image/audio/video ALL work** (discrete-token autoregressive; reuse
+GPT + KV cache + sampler + cross-entropy; NOT diffusion). Codecs: `imagegen.c` (color-cube,
+64 tokens) + `audiogen.c` (µ-law, 256). ✅ GI unconditional (`[10]` regenerate 8×8 image
+64/64). ✅ **text→image / text→audio / text→video** (`cond_gen` in main.c: combined vocab =
+media+text, text ids offset above media; predict media after the text prefix; smoke `[11]`
+16/16, 32/32, 32/32). Video-gen = concatenated per-frame image tokens. Remaining polish: a
+`generate-*` CLI subcommand + PPM/WAV output files, real datasets, VQ-VAE/diffusion for
+quality (palette/µ-law are crude).
 
 Pure C11, 8 platforms, every step green. Ceiling: pipelines correct/runnable; real quality
 needs real datasets + far bigger models (palette/µ-law codecs are crude). Optional future:

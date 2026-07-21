@@ -74,13 +74,17 @@ LMs). Diffusion is the SOTA alternative but a much bigger, different build — n
 - [x] Step GI3 — Generate: greedy autoregressive sampling of image tokens (KV cache +
       `sample_argmax`) → **64/64 tokens reproduced** → `tokens_to_image` → pixels. Minimal image
       generation works end-to-end. (CLI subcommand + real dataset + upscaling = polish.)
-- [ ] Step GA1–GA3 — Audio generation: **µ-law 256-level** quantize (WaveNet-style) → predict
-      next audio token → decode → WAV. (Later: learned audio codec.)
-- [ ] Step GV1–GV3 — Video generation: reuse the image codec per frame + temporal; predict
-      next frame's tokens → decode frames → ffmpeg → video.
-      (Honest: pipeline reuses ~80% of the stack; the quantizer/decoder is the quality
-      bottleneck — palette/µ-law give tiny/blocky output; real quality needs a trained
-      VQ-VAE or diffusion + big data + compute.)
+- [x] Step GA — Audio generation: `audiogen.c` **µ-law 256-level** codec
+      (`audio_to_tokens`/`tokens_to_audio`, WaveNet-style). Generated via text→audio (below).
+- [x] Step GV — Video generation: reuse `imagegen` per frame (a clip = concatenated frame
+      tokens). Generated via text→video (below).
+- [x] Step G-cond — **text→image / text→audio / text→video** (`cond_gen` in `main.c`): combined
+      vocab = media + text (text ids offset above media); train to predict media tokens after
+      the text prefix; generate = feed text, autoregress media, decode. Smoke `[11]`:
+      text→image 16/16, text→audio 32/32, text→video 32/32 tokens reproduced.
+      (Honest: pipeline reuses ~80% of the stack; the codec is the quality bottleneck —
+      palette/µ-law give tiny/blocky output; real quality needs a trained VQ-VAE or diffusion
+      + big data + compute. Unconditional gen = empty text prefix.)
 
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)

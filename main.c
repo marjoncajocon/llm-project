@@ -22,6 +22,7 @@
 #include "video.h"
 #include "audio.h"
 #include "imagegen.h"
+#include "audiogen.h"
 
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
@@ -41,6 +42,64 @@ static void model_paths(const char *name, char *model_out, char *tok_out,
   if (make) { ensure_dir("model"); ensure_dir(dir); }
   snprintf(model_out, cap, "%s/model.bin", dir);
   snprintf(tok_out, cap, "%s/tok.bin", dir);
+}
+
+// Conditional generation, minimal: train a GPT on the sequence
+// [text tokens (offset by v_media)] ++ [media tokens], supervising the media
+// positions (predict the next media token given the text prefix). Then feed the
+// text prefix and autoregressively GENERATE the media tokens. Returns 1 if all M
+// media tokens were reproduced. Used for text->image / text->audio / text->video
+// (the only difference between modalities is the media codec).
+static int cond_gen(const char *label, const int *text, int T,
+                    const int *media, int M, int v_media, int v_text, int steps) {
+  const int V = v_media + v_text;
+  const int total = T + M;
+  int *seq = (int*)malloc(total * sizeof(int));
+  int *tgt = (int*)malloc(total * sizeof(int));
+  for (int i = 0; i < T; i++) seq[i] = text[i] + v_media;   // text tokens live above media ids
+  for (int j = 0; j < M; j++) seq[T + j] = media[j];
+  for (int i = 0; i < total; i++) tgt[i] = -1;
+  for (int k = 0; k < M; k++) tgt[T - 1 + k] = media[k];    // predict media_k after the prefix
+
+  GPT g = gpt_create(V, 48, 3, 2, 192, total);
+  GPTActs a = gpt_acts_create(&g, total);
+  int lz[2] = {total, V};
+  Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
+  Tensor *par[256];
+  int np = gpt_collect_params(&g, par);
+  Adam opt = adam_create(par, np, 0.01f);
+
+  float l0 = 0.0f, lN = 0.0f;
+  for (int s = 0; s < steps; s++) {
+    gpt_forward_train(&g, seq, total, &a, &lo);
+    float loss = cross_entropy_forward(&lo, tgt, &pr);
+    if (s == 0) l0 = loss;
+    lN = loss;
+    tensor_zero_grad(&lo);
+    cross_entropy_backward(&pr, tgt, &lo);
+    gpt_backward(&g, seq, total, &a, &lo);
+    adam_step(&opt, par, np);
+  }
+
+  // Generate: feed the text prefix, then decode M media tokens greedily.
+  KVCache kv = gpt_kvcache_create(&g);
+  int gz[2] = {1, V};
+  Tensor gl = tensor_create(gz, 2);
+  for (int i = 0; i < T; i++) gpt_decode_step(&g, &kv, seq[i], &gl);
+  int *gen = (int*)malloc(M * sizeof(int));
+  for (int k = 0; k < M; k++) {
+    gen[k] = sample_argmax(&gl, 0);
+    if (k < M - 1) gpt_decode_step(&g, &kv, gen[k], &gl);
+  }
+  int match = 0;
+  for (int k = 0; k < M; k++) if (gen[k] == media[k]) match++;
+  printf("    %-12s loss %.4f -> %.4f | generated %d/%d media tokens -> %s\n",
+         label, l0, lN, match, M, match == M ? "OK" : "FAIL");
+
+  free(gen); tensor_free(&gl); gpt_kvcache_free(&kv);
+  adam_free(&opt); tensor_free(&lo); tensor_free(&pr); gpt_acts_free(&a); gpt_free(&g);
+  free(seq); free(tgt);
+  return match == M;
 }
 
 // Full-model loss: training forward + cross-entropy. Fills logits and probs.
@@ -500,6 +559,64 @@ static int run_demo(void) {
     gpt_free(&gg); image_free(&gim);
     all_ok &= gen_ok;
   }
+
+  // --------------------------------------------------------------------------
+  // Part 11: CONDITIONAL generation (Phase G) — text -> image / audio / video.
+  // Same mechanism for all three; only the media codec differs.
+  // --------------------------------------------------------------------------
+  printf("[11] Conditional generation (text -> media)\n");
+  int cg_ok = 1;
+  const int LV = 4, IMG_V = imagegen_vocab(LV);   // 64 color tokens
+  const int TXT_V = 16;
+
+  // text -> image: a 4x4 image = 16 tokens
+  {
+    Image im4; im4.h = 4; im4.w = 4; im4.c = 3;
+    im4.data = (float*)malloc(16 * 3 * sizeof(float));
+    for (int y = 0; y < 4; y++)
+      for (int x = 0; x < 4; x++) {
+        int i = y * 4 + x;
+        im4.data[i * 3 + 0] = (float)x / 3.0f;
+        im4.data[i * 3 + 1] = (float)y / 3.0f;
+        im4.data[i * 3 + 2] = 0.3f;
+      }
+    int mt[16]; image_to_tokens(&im4, LV, mt);
+    int txt[2] = {1, 2};
+    cg_ok &= cond_gen("text->image", txt, 2, mt, 16, IMG_V, TXT_V, 300);
+    image_free(&im4);
+  }
+  // text -> audio: 32 mu-law samples = 32 tokens
+  {
+    Audio a32; a32.n = 32; a32.sample_rate = 8000;
+    a32.samples = (float*)malloc(32 * sizeof(float));
+    for (int i = 0; i < 32; i++) a32.samples[i] = sinf(i * 0.3f) * 0.7f;
+    int mt[32]; audio_to_tokens(&a32, mt);
+    int txt[2] = {3, 4};
+    cg_ok &= cond_gen("text->audio", txt, 2, mt, 32, audiogen_vocab(), TXT_V, 300);
+    audio_free(&a32);
+  }
+  // text -> video: 2 frames of 4x4 = 32 image tokens
+  {
+    int mt[32];
+    for (int f = 0; f < 2; f++) {
+      Image fr; fr.h = 4; fr.w = 4; fr.c = 3;
+      fr.data = (float*)malloc(16 * 3 * sizeof(float));
+      for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+          int i = y * 4 + x;
+          fr.data[i * 3 + 0] = (float)x / 3.0f;
+          fr.data[i * 3 + 1] = (float)(f) / 1.0f;   // frame differs over time
+          fr.data[i * 3 + 2] = (float)y / 3.0f;
+        }
+      int ft[16]; image_to_tokens(&fr, LV, ft);
+      for (int i = 0; i < 16; i++) mt[f * 16 + i] = ft[i];
+      image_free(&fr);
+    }
+    int txt[2] = {5, 6};
+    cg_ok &= cond_gen("text->video", txt, 2, mt, 32, IMG_V, TXT_V, 300);
+  }
+  printf("\n");
+  all_ok &= cg_ok;
 
   adam_free(&opt);
   tensor_free(&logits);
