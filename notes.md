@@ -35,11 +35,14 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 - [x] Step E2 — Patch embedding (ViT-style): `patch.c` splits the image into patches, flattens
       each, and projects with W+b (reuses `matmul`/`bias_add`) → `(n_patches, d_model)`.
       Verified in the smoke test (`[5] Image`).
-- [ ] Step E3 — Multimodal input: prepend image-patch embeddings to the token embeddings so
-      one `GPT` consumes `[image patches] + [text tokens]` (extend `embedding.c`/`model.c` +
-      the training forward to accept precomputed embeddings + a projection to d_model).
+- [x] Step E3 — Multimodal input: `gpt_forward_multimodal` prepends `n_img` precomputed
+      image-patch embeddings before the text tokens, adds positions over the combined sequence,
+      and runs the transformer (`gpt_run_from_emb` refactor shared with the text forward).
+      Verified: `[5] Image: 4 patches + 3 text -> logits (7,16)`.
 - [ ] Step E4 — Image-text paired data (`data/pairs/` image+caption) + a training loop that
-      predicts the caption from the image.
+      predicts the caption from the image. Needs: backward through the multimodal embeddings
+      (scatter to `wte` for text positions + `patch_embed` backward to learn the patch
+      projection) and a loss over the caption/text positions only.
       (Honest: a genuinely useful vision-language model needs far more model+data+compute than
       is feasible locally from scratch; this builds the plumbing, quality needs real scale.)
 
@@ -756,7 +759,7 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
   to know the step), with a commented Anthropic/OpenAI call to swap in a real LLM.
 - Verified: scripted + command backends both run; all 8 targets build; smoke test PASSED.
 
-## Phase #5 / E1+E2 (image plumbing) — DONE; E3+E4 remain
+## Phase #5 / E1+E2+E3 (image plumbing + into GPT) — DONE; E4 remains
 
 - **`image.c/.h`** — loads binary **PPM (P6)** into an `Image` (h,w,c=3; HWC floats [0,1]),
   pure C (skip whitespace/#comments in the header). `tools/img_to_ppm.py` (Pillow) converts
@@ -765,13 +768,17 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
   by W (patch·patch·C, d_model) + `bias_add` → `(n_patches, d_model)`. `patch_count`/`patch_dim`.
 - **`main.c`** smoke test `[5]`: writes a 4×4 PPM, loads it, patch-embeds (patch 2 → 4 patches),
   checks shape + finiteness. All 8 targets build; PASSED.
-- **Next (E3):** feed patch embeddings into the `GPT` — prepend `[image patches]` to the token
-  embeddings in the training forward (project patches to d_model, add a modality/position
-  signal), so the model attends over image+text. Then **E4**: image-caption pairs + a loop that
-  predicts the caption. Honest: useful VLM quality needs far more scale than local-from-scratch.
+- **E3 DONE:** `model.c` `gpt_forward_multimodal(m, img_emb, ids, n_img, seq_len, a, logits)`
+  builds `emb = [patch_emb + wpe] ++ [wte[tok] + wpe]` then calls the shared `gpt_run_from_emb`
+  (refactored out of `gpt_forward_train`, so the text path is unchanged/bit-exact). Causal
+  attention over the combined sequence (text sees the image patches). `a` sized to
+  `n_img+seq_len` (<= max_seq_len). Verified `[5] Image: 4 patches + 3 text -> logits (7,16)`.
+- **Next (E4):** image-caption pairs + a loop predicting the caption. Needs multimodal backward
+  (text positions → `wte`, `patch_embed` backward → patch-projection W) + loss over text
+  positions only. Honest: useful VLM quality needs far more scale than local-from-scratch.
 
 ## Next steps (not started)
-- #5 E3+E4 (multimodal into GPT + image-text training) then #6 **video** (Phase F).
+- #5 **E4** (image-text training) then #6 **video** (Phase F).
 - Optional real agent: a `tools/agent_llm.py` calling a real LLM API (`agent --cmd ...`).
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.

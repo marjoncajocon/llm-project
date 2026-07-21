@@ -257,10 +257,10 @@ static void gpt_acts_zero_grad(GPTActs *a) {
 // Training: forward, backward, parameter helpers
 // ---------------------------------------------------------------------------
 
-void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
-                       GPTActs *a, Tensor *logits) {
-  embed_tokens(token_ids, seq_len, &m->wte, &m->wpe, &a->emb);
-
+// Run the stacked blocks -> final LayerNorm -> output head, starting from the
+// embeddings already in a->emb. The sequence length is a->emb.shape[0], so this
+// works for both plain text and multimodal (image+text) inputs.
+static void gpt_run_from_emb(GPT *m, GPTActs *a, Tensor *logits) {
   for (int l = 0; l < m->n_layers; l++) {
     BlockWeights *b = &m->blocks[l];
     const Tensor *inp = (l == 0) ? &a->emb : &a->block_out[l - 1];
@@ -280,6 +280,38 @@ void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
   layernorm(&a->block_out[m->n_layers - 1], &m->ln_f_gamma, &m->ln_f_beta,
             &a->ln_f_out, LN_EPS);
   matmul(&a->ln_f_out, &m->lm_head, logits);
+}
+
+void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
+                       GPTActs *a, Tensor *logits) {
+  embed_tokens(token_ids, seq_len, &m->wte, &m->wpe, &a->emb);
+  gpt_run_from_emb(m, a, logits);
+}
+
+// Multimodal forward: a sequence of `n_img` precomputed image-patch embeddings
+// (img_emb: (n_img, d_model)) followed by `seq_len` text tokens. Positional
+// embeddings are added over the whole combined sequence; the transformer then
+// attends over [image patches] + [text tokens]. a must be sized for the total
+// length (n_img + seq_len), which must not exceed max_seq_len. logits is
+// (n_img + seq_len, vocab_size).
+void gpt_forward_multimodal(GPT *m, const Tensor *img_emb, const int *token_ids,
+                            int n_img, int seq_len, GPTActs *a, Tensor *logits) {
+  const int dm = m->d_model;
+  // Image positions 0..n_img-1: patch embedding + positional embedding.
+  for (int i = 0; i < n_img; i++) {
+    for (int j = 0; j < dm; j++) {
+      a->emb.data[i * dm + j] = img_emb->data[i * dm + j] + m->wpe.data[i * dm + j];
+    }
+  }
+  // Text positions n_img..n_img+seq_len-1: token embedding + positional embedding.
+  for (int t = 0; t < seq_len; t++) {
+    int tok = token_ids[t];
+    int pos = n_img + t;
+    for (int j = 0; j < dm; j++) {
+      a->emb.data[pos * dm + j] = m->wte.data[tok * dm + j] + m->wpe.data[pos * dm + j];
+    }
+  }
+  gpt_run_from_emb(m, a, logits);
 }
 
 void gpt_backward(GPT *m, const int *token_ids, int seq_len,

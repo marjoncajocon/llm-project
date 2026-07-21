@@ -237,13 +237,24 @@ static int run_demo(void) {
     Tensor Wp = tensor_create(ws, 2); tensor_init_random(&Wp);
     int bs[1] = {d_model};  Tensor bp = tensor_create(bs, 1);
     int os[2] = {np, d_model}; Tensor pemb = tensor_create(os, 2);
-    patch_embed(&im, patch, &Wp, &bp, &pemb);
+    patch_embed(&im, patch, &Wp, &bp, &pemb);      // (np, d_model)
+
+    // E3: run [image patches] + [text tokens] through the GPT.
+    int mm_tok[3] = {1, 2, 3};
+    int mm_seq = 3, total = np + mm_seq;
+    GPTActs amm = gpt_acts_create(&model, total);
+    int mmls[2] = {total, vocab};
+    Tensor mmlog = tensor_create(mmls, 2);
+    gpt_forward_multimodal(&model, &pemb, mm_tok, np, mm_seq, &amm, &mmlog);
+
     int finite = 1;
-    for (int i = 0; i < pemb.size; i++)
-      if (isnan(pemb.data[i]) || isinf(pemb.data[i])) { finite = 0; break; }
-    img_ok = (pemb.size == np * d_model) && finite;
-    printf("[5] Image: 4x4 PPM -> %d patches x d_model %d -> %s\n\n",
-           np, d_model, img_ok ? "OK" : "FAIL");
+    for (int i = 0; i < mmlog.size; i++)
+      if (isnan(mmlog.data[i]) || isinf(mmlog.data[i])) { finite = 0; break; }
+    img_ok = (pemb.size == np * d_model) && (mmlog.size == total * vocab) && finite;
+    printf("[5] Image: %d patches + %d text -> GPT multimodal logits (%d, %d) -> %s\n\n",
+           np, mm_seq, total, vocab, img_ok ? "OK" : "FAIL");
+
+    tensor_free(&mmlog); gpt_acts_free(&amm);
     tensor_free(&Wp); tensor_free(&bp); tensor_free(&pemb);
   } else {
     printf("[5] Image: load FAIL\n\n");

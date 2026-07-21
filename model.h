@@ -78,6 +78,14 @@ void gpt_acts_free(GPTActs *a);
 void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
                        GPTActs *a, Tensor *logits);
 
+// Multimodal forward: `n_img` precomputed image-patch embeddings (img_emb, shape
+// (n_img, d_model)) prefixed before `seq_len` text tokens. Adds positional
+// embeddings over the combined sequence and runs the transformer. `a` must be
+// created for length (n_img + seq_len) (<= max_seq_len); logits is
+// (n_img + seq_len, vocab_size).
+void gpt_forward_multimodal(GPT *m, const Tensor *img_emb, const int *token_ids,
+                            int n_img, int seq_len, GPTActs *a, Tensor *logits);
+
 // Backward pass. Expects logits->grad to already hold dL/dlogits (from
 // cross_entropy_backward). Zeros parameter and activation grads, then accumulates
 // gradients into every model parameter.
