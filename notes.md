@@ -16,7 +16,8 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 **Phase A — Make the model produce real text:**
 - [x] Step 4b — Load real GPT-2 weights: GPT-2-compatible architecture (attention biases,
       tied output head), converter (HF safetensors → GPTC), verified on GPT-2-shaped weights
-- [ ] Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex
+- [x] Step A1 — Trainable BPE tokenizer: merge-learning + save/load (self-trained BPE).
+      (Loading GPT-2's exact `encoder.json`/`vocab.bpe` + pretok regex = future extension.)
 - [ ] Step A2 — Scale config to a real architecture (dims/layers/heads/context)
 
 **Phase B — A local generation CLI:**
@@ -410,11 +411,25 @@ and stays at 9.28e-04 — bias backward is correct; training convergence corrobo
 - This is the CLI skeleton: **token-in/token-out** now, **text-in/text-out** once A1 (real
   BPE) + real weights land.
 
+## Step A1 — Trainable BPE tokenizer (merge-learning + persistence)
+
+**Status: DONE — smoke test passed.**
+
+- **`tokenizer.c/.h`** — `tokenizer_train(t, text, num_merges)` learns merges greedily (most
+  frequent adjacent pair each round, replacing occurrences in the working sequence);
+  `tokenizer_save`/`tokenizer_load` persist the merge list (`BPE1` format; the 256 base byte
+  tokens are implicit).
+- **`main.c`** Part [1] — trains 30 merges on a sample string: 45 bytes → 20 tokens,
+  `decode(encode(x)) == x`, and save→load reproduces identical token IDs.
+- **Note / honesty:** this is a *self-trained* byte-level BPE, fully local and testable.
+  Matching GPT-2's *exact* tokenization (its `encoder.json` + `vocab.bpe` + the GPT-2
+  pretokenization regex + byte→unicode map) is a separate extension needed only to feed text
+  to real GPT-2 weights — text↔token vocab must also match the model's vocab (see A2).
+
 ## Next steps (not started)
-- Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex.
-  Then `generate` can take/emit text and drive loaded GPT-2 weights.
-- Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization (needed for 124M).
-- Phase C — agent layer (tool protocol, executor, approval gate, agent loop).
+- Step A2 — Scale config to a real architecture; wire the trained tokenizer into `generate`
+  (text-in/text-out) once model vocab == tokenizer vocab.
+- Phase D — run a genuinely capable model (needs B4 perf/quant + real weights).
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
 - Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.

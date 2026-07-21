@@ -27,6 +27,16 @@ Tokenizer tokenizer_create_bytelevel(void);
 // Add a merge rule combining tokens a and b. Returns the new token's id.
 int tokenizer_add_merge(Tokenizer *t, int a, int b);
 
+// Learn up to num_merges BPE merges from a training text: repeatedly merge the
+// most frequent adjacent token pair. Call on a fresh byte-level tokenizer.
+void tokenizer_train(Tokenizer *t, const char *text, int num_merges);
+
+// Persist / load learned merges (the 256 base byte tokens are implicit).
+// tokenizer_load fills *t (like create + the saved merges); free with tokenizer_free.
+// Both return 0 on success, nonzero on error.
+int tokenizer_save(const Tokenizer *t, const char *path);
+int tokenizer_load(Tokenizer *t, const char *path);
+
 // Encode text into token ids (greedy lowest-rank-pair merging over the bytes).
 // Writes at most max_ids ids into ids[]; returns the number of tokens produced.
 int tokenizer_encode(const Tokenizer *t, const char *text, int *ids, int max_ids);

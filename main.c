@@ -31,14 +31,30 @@ static int run_demo(void) {
   // Part 1: tokenizer + checkpoint round-trips (step 4 code, condensed)
   // --------------------------------------------------------------------------
   printf("[1] Tokenizer + checkpoint round-trips\n");
+  // Train BPE on a sample text, check round-trip + compression, then save/load.
+  const char *sample = "the cat sat on the mat the cat ran to the cat";
   Tokenizer tok = tokenizer_create_bytelevel();
-  int ll = tokenizer_add_merge(&tok, 'l', 'l');
-  tokenizer_add_merge(&tok, 'e', ll);
-  int tids[64];
-  int n_tids = tokenizer_encode(&tok, "hello hello", tids, 64);
-  char decoded[128];
+  tokenizer_train(&tok, sample, 30);
+  int tids[256], tids2[256];
+  int n_tids = tokenizer_encode(&tok, sample, tids, 256);
+  char decoded[512];
   tokenizer_decode(&tok, tids, n_tids, decoded, sizeof(decoded));
-  int tok_ok = (strcmp("hello hello", decoded) == 0);
+  int rt_ok = (strcmp(sample, decoded) == 0);
+  int comp_ok = (n_tids < (int)strlen(sample));
+
+  int save_load_ok = (tokenizer_save(&tok, "tok.bin") == 0);
+  Tokenizer tok2;
+  save_load_ok = save_load_ok && (tokenizer_load(&tok2, "tok.bin") == 0);
+  if (save_load_ok) {
+    int n2 = tokenizer_encode(&tok2, sample, tids2, 256);
+    save_load_ok = (n2 == n_tids) && (memcmp(tids, tids2, n_tids * sizeof(int)) == 0);
+    tokenizer_free(&tok2);
+  }
+  remove("tok.bin");
+  int tok_ok = rt_ok && comp_ok && save_load_ok;
+  printf("    tokenizer: train %d bytes -> %d tokens | round-trip %s | save/load %s\n",
+         (int)strlen(sample), n_tids, rt_ok ? "OK" : "FAIL",
+         save_load_ok ? "OK" : "FAIL");
   tokenizer_free(&tok);
   all_ok &= tok_ok;
 
@@ -56,8 +72,8 @@ static int run_demo(void) {
     gpt_free(&probe2);
   }
   tensor_free(&pla); tensor_free(&plb); gpt_free(&probe); remove("model.bin");
-  printf("    tokenizer: %s | checkpoint: %s\n\n",
-         tok_ok ? "OK" : "FAIL", ckpt_ok ? "OK" : "FAIL");
+  printf("    checkpoint: save/load logits identical -> %s\n\n",
+         ckpt_ok ? "OK" : "FAIL");
   all_ok &= ckpt_ok;
 
   // --------------------------------------------------------------------------

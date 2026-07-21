@@ -1,6 +1,7 @@
 // tokenizer.c - Self-contained byte-level BPE tokenizer
 #include "tokenizer.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -123,6 +124,91 @@ int tokenizer_decode(const Tokenizer *t, const int *ids, int n, char *out, int m
   }
   out[pos] = '\0';
   return pos;
+}
+
+// Learn up to num_merges BPE merges: greedily merge the most frequent adjacent pair.
+void tokenizer_train(Tokenizer *t, const char *text, int num_merges) {
+  int len = (int)strlen(text);
+  if (len < 2 || num_merges <= 0) return;
+
+  int *seq = (int*)malloc(len * sizeof(int));
+  for (int i = 0; i < len; i++) seq[i] = (unsigned char)text[i];
+
+  const int maxV = 256 + num_merges;         // upper bound on token ids we create
+  long *count = (long*)malloc((size_t)maxV * maxV * sizeof(long));
+
+  for (int m = 0; m < num_merges && len >= 2; m++) {
+    memset(count, 0, (size_t)maxV * maxV * sizeof(long));
+    for (int i = 0; i < len - 1; i++) {
+      int a = seq[i], b = seq[i + 1];
+      if (a < maxV && b < maxV) count[(size_t)a * maxV + b]++;
+    }
+    // Most frequent adjacent pair
+    long best = 1;  // require the pair to occur at least twice to be worth merging
+    int ba = -1, bb = -1;
+    for (int a = 0; a < maxV; a++) {
+      for (int b = 0; b < maxV; b++) {
+        long c = count[(size_t)a * maxV + b];
+        if (c > best) { best = c; ba = a; bb = b; }
+      }
+    }
+    if (ba < 0) break;  // no repeated pair left
+
+    int new_id = tokenizer_add_merge(t, ba, bb);
+    // Replace every occurrence of (ba,bb) in the sequence with the merged token
+    int w = 0;
+    for (int i = 0; i < len; ) {
+      if (i < len - 1 && seq[i] == ba && seq[i + 1] == bb) {
+        seq[w++] = new_id;
+        i += 2;
+      } else {
+        seq[w++] = seq[i];
+        i += 1;
+      }
+    }
+    len = w;
+  }
+
+  free(seq);
+  free(count);
+}
+
+int tokenizer_save(const Tokenizer *t, const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return 1;
+  const char magic[4] = {'B', 'P', 'E', '1'};
+  int ok = 1;
+  ok &= (fwrite(magic, 1, 4, f) == 4);
+  ok &= (fwrite(&t->n_merges, sizeof(int), 1, f) == 1);
+  ok &= (fwrite(t->merge_a, sizeof(int), t->n_merges, f) == (size_t)t->n_merges);
+  ok &= (fwrite(t->merge_b, sizeof(int), t->n_merges, f) == (size_t)t->n_merges);
+  fclose(f);
+  return ok ? 0 : 1;
+}
+
+int tokenizer_load(Tokenizer *t, const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 1;
+  char magic[4];
+  int n_merges = 0;
+  if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "BPE1", 4) != 0 ||
+      fread(&n_merges, sizeof(int), 1, f) != 1) {
+    fclose(f);
+    return 1;
+  }
+  int *a = (int*)malloc(n_merges * sizeof(int));
+  int *b = (int*)malloc(n_merges * sizeof(int));
+  int ok = (fread(a, sizeof(int), n_merges, f) == (size_t)n_merges) &&
+           (fread(b, sizeof(int), n_merges, f) == (size_t)n_merges);
+  fclose(f);
+
+  *t = tokenizer_create_bytelevel();
+  if (ok) {
+    for (int i = 0; i < n_merges; i++) tokenizer_add_merge(t, a[i], b[i]);
+  }
+  free(a);
+  free(b);
+  return ok ? 0 : 1;
 }
 
 void tokenizer_free(Tokenizer *t) {
