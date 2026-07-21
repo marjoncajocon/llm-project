@@ -407,12 +407,12 @@ GPT-2's tied head is written as `lm_head = wte^T` at conversion time.
 **Real GPT-2 (124M) — verified, generates real text:**
 ```sh
 pip install numpy safetensors huggingface_hub tiktoken
-python tools/gpt2_setup.py --out model/gpt2/model.bin      # download + convert (~622 MB)
+python tools/gpt2_setup.py --out model/gpt2/model.bin      # download + convert (~622 MB), once
 
-ids=$(python tools/gpt2_tok.py encode "The meaning of life is")
-echo "$ids" | ./transformer generate --name gpt2           # runs GPT-2 in pure C
-python tools/gpt2_tok.py decode <the ids it printed>       # -> text
+python tools/gpt2_chat.py "The meaning of life is"         # one command: tokenize -> C -> text
 ```
+(`gpt2_chat.py` wraps tokenize → `transformer generate --name gpt2` → detokenize. The manual
+3-step form — `gpt2_tok.py encode` → `generate` → `gpt2_tok.py decode` — still works too.)
 Actual output from that prompt: *"The meaning of life is not to be confused with the fact of
 being reborn. Rather, life is to be born and that is what the term means."* GPT-2 uses its own
 BPE (via `tiktoken`), so it runs in token-ID mode. See `model/gpt2/README.md`.

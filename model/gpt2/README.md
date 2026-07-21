@@ -14,12 +14,17 @@ python tools/gpt2_setup.py --out model/gpt2/model.bin
 ## Run it
 
 GPT-2 uses its own byte-level BPE (via `tiktoken`), not this project's C tokenizer, so there
-is **no `tok.bin`** here — drive it in **token-ID mode**:
+is **no `tok.bin`** here — drive it in **token-ID mode**. Easiest is the one-command wrapper:
+
+```sh
+python tools/gpt2_chat.py "The meaning of life is"
+```
+
+or the manual token-ID form:
 
 ```sh
 ids=$(python tools/gpt2_tok.py encode "The meaning of life is")
 echo "$ids" | transformer generate --name gpt2 > out.txt      # prints "gen: <ids> [<gen>]..."
-# then decode the ids it printed:
 python tools/gpt2_tok.py decode <ids from out.txt>
 ```
 

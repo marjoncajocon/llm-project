@@ -99,3 +99,5 @@ VQ-VAE/diffusion, mel-spectrogram audio, SIMD/int8 quant, real-LLM `tools/agent_
 
 Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).
+One-command GPT-2: `python tools/gpt2_chat.py "prompt"` (tokenize → C generate → detokenize;
+resolves the exe to an abspath so it runs from cwd on Windows).
