@@ -7,126 +7,71 @@
 #include <math.h>
 
 #include "tensor.h"
-#include "attention.h"
+#include "model.h"
 
 // ============================================================================
-// Main Function: Demo with sample data
+// Main Function: build a tiny GPT and greedily generate tokens
 // ============================================================================
 
 int main() {
   printf("=== Minimal GPT-2 Style Transformer Demo ===\n\n");
 
-  // Parameters
-  const int seq_len = 4;         // Sequence length (number of tokens)
-  const int d_model = 8;         // Model dimension
-  const int n_heads = 2;         // Number of attention heads (head_dim = d_model / n_heads)
-  const int d_ff = 4 * d_model;  // Feed-forward hidden dimension
+  // Model configuration (tiny, randomly initialized - untrained)
+  const int vocab_size = 16;      // Vocabulary size
+  const int d_model = 8;          // Model dimension
+  const int n_heads = 2;          // Attention heads (head_dim = d_model / n_heads)
+  const int n_layers = 2;         // Number of stacked transformer blocks
+  const int d_ff = 4 * d_model;   // Feed-forward hidden dimension
+  const int max_seq_len = 16;     // Maximum supported sequence length
 
   // Seed random number generator for reproducibility
   srand(42);
 
-  // Create input tensor (seq_len x d_model)
-  int input_shape[2] = {seq_len, d_model};
-  Tensor input = tensor_create(input_shape, 2);
-  tensor_init_random(&input);
-  printf("Input sequence:\n");
-  tensor_print(&input, "Input");
+  // Build the model
+  GPT model = gpt_create(vocab_size, d_model, n_heads, n_layers, d_ff, max_seq_len);
+  printf("Model: vocab=%d d_model=%d heads=%d layers=%d d_ff=%d\n\n",
+         vocab_size, d_model, n_heads, n_layers, d_ff);
 
-  // Create weight matrices for multi-head attention (all square: d_model x d_model)
-  int wq_shape[2] = {d_model, d_model};
-  int wk_shape[2] = {d_model, d_model};
-  int wv_shape[2] = {d_model, d_model};
-  int wo_shape[2] = {d_model, d_model};
+  // Prompt: a short sequence of token IDs, plus room to append generated tokens
+  const int prompt_len = 3;
+  const int n_new = 5;
+  int ids[16];  // capacity == max_seq_len
+  ids[0] = 1;
+  ids[1] = 5;
+  ids[2] = 9;
 
-  Tensor W_q = tensor_create(wq_shape, 2);
-  Tensor W_k = tensor_create(wk_shape, 2);
-  Tensor W_v = tensor_create(wv_shape, 2);
-  Tensor W_o = tensor_create(wo_shape, 2);
+  printf("Prompt tokens:  ");
+  for (int i = 0; i < prompt_len; i++) printf("%d ", ids[i]);
+  printf("\n");
 
-  tensor_init_random(&W_q);
-  tensor_init_random(&W_k);
-  tensor_init_random(&W_v);
-  tensor_init_random(&W_o);
+  // Autoregressive greedy generation
+  printf("Generating %d tokens (greedy argmax)...\n", n_new);
+  gpt_generate(&model, ids, prompt_len, n_new);
 
-  // Create LayerNorm parameters
-  int norm_shape[1] = {d_model};
-  Tensor gamma1 = tensor_create(norm_shape, 1);
-  Tensor beta1 = tensor_create(norm_shape, 1);
-  Tensor gamma2 = tensor_create(norm_shape, 1);
-  Tensor beta2 = tensor_create(norm_shape, 1);
+  printf("Full sequence:  ");
+  for (int i = 0; i < prompt_len + n_new; i++) printf("%d ", ids[i]);
+  printf("\n\n");
 
-  // Initialize gamma to 1, beta to 0
-  for (int i = 0; i < d_model; i++) {
-    gamma1.data[i] = 1.0f;
-    gamma2.data[i] = 1.0f;
-    beta1.data[i] = 0.0f;
-    beta2.data[i] = 0.0f;
-  }
+  // Validate logits from a full forward pass (no NaN or Inf)
+  int total_len = prompt_len + n_new;
+  int logits_shape[2] = {total_len, vocab_size};
+  Tensor logits = tensor_create(logits_shape, 2);
+  gpt_forward(&model, ids, total_len, &logits);
 
-  // Create feed-forward network weights: (d_model -> d_ff -> d_model)
-  int ff_w1_shape[2] = {d_model, d_ff};
-  int ff_b1_shape[1] = {d_ff};
-  int ff_w2_shape[2] = {d_ff, d_model};
-  int ff_b2_shape[1] = {d_model};
-
-  Tensor ff_W1 = tensor_create(ff_w1_shape, 2);
-  Tensor ff_b1 = tensor_create(ff_b1_shape, 1);
-  Tensor ff_W2 = tensor_create(ff_w2_shape, 2);
-  Tensor ff_b2 = tensor_create(ff_b2_shape, 1);
-
-  tensor_init_random(&ff_W1);
-  tensor_init_random(&ff_b1);
-  tensor_init_random(&ff_W2);
-  tensor_init_random(&ff_b2);
-
-  // Output tensor
-  int output_shape[2] = {seq_len, d_model};
-  Tensor output = tensor_create(output_shape, 2);
-
-  // Execute forward pass through transformer block
-  printf("Executing forward pass...\n\n");
-  transformer_block_forward(
-      &input,
-      &W_q, &W_k, &W_v, &W_o,
-      &gamma1, &beta1,
-      &gamma2, &beta2,
-      &ff_W1, &ff_b1,
-      &ff_W2, &ff_b2,
-      &output,
-      n_heads, d_ff
-  );
-
-  // Print results
-  printf("Transformer block output:\n");
-  tensor_print(&output, "Output");
-
-  // Verify outputs are valid (no NaN or Inf)
   int valid = 1;
-  for (int i = 0; i < output.size; i++) {
-    if (isnan(output.data[i]) || isinf(output.data[i])) {
+  for (int i = 0; i < logits.size; i++) {
+    if (isnan(logits.data[i]) || isinf(logits.data[i])) {
       valid = 0;
       break;
     }
   }
-  printf("Output validation: %s\n\n", valid ? "PASSED (no NaN/Inf)" : "FAILED (contains NaN/Inf)");
+  printf("Output validation: %s\n\n",
+         valid ? "PASSED (no NaN/Inf)" : "FAILED (contains NaN/Inf)");
 
-  // Clean up all allocated memory
+  // Clean up
   printf("Cleaning up memory...\n");
-  tensor_free(&input);
-  tensor_free(&W_q);
-  tensor_free(&W_k);
-  tensor_free(&W_v);
-  tensor_free(&W_o);
-  tensor_free(&gamma1);
-  tensor_free(&beta1);
-  tensor_free(&gamma2);
-  tensor_free(&beta2);
-  tensor_free(&ff_W1);
-  tensor_free(&ff_b1);
-  tensor_free(&ff_W2);
-  tensor_free(&ff_b2);
-  tensor_free(&output);
-
+  tensor_free(&logits);
+  gpt_free(&model);
   printf("Done! All memory freed successfully.\n");
 
   return 0;

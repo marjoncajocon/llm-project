@@ -6,7 +6,8 @@ CFLAGS  = -std=c11 -O3 -march=native -Wall
 LDLIBS  = -lm
 
 TARGET  = transformer
-OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o main.o
+OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
+          embedding.o sampler.o model.o main.o
 
 all: $(TARGET)
 
@@ -24,7 +25,10 @@ activation.o: activation.h tensor.h
 layernorm.o:  layernorm.h tensor.h
 feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h
-main.o:       tensor.h attention.h
+embedding.o:  embedding.h tensor.h
+sampler.o:    sampler.h tensor.h
+model.o:      model.h tensor.h embedding.h attention.h layernorm.h matrix.h sampler.h
+main.o:       tensor.h model.h
 
 clean:
 	rm -f $(OBJS) $(TARGET)

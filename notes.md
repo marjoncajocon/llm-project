@@ -81,7 +81,51 @@ Single-head `self_attention_forward` was replaced by
 Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean, ran to completion with
 `Output validation: PASSED (no NaN/Inf)`.
 
+## Step 3 — Full model: embeddings, stacked blocks, output head, sampler
+
+**Status: DONE — smoke test passed.**
+
+### What changed
+The demo is now an actual (tiny, untrained) autoregressive language model instead of a
+single block on random input. Three new flat modules plus a rewritten `main.c`:
+
+- **`embedding.h/.c`** — `embed_tokens`: `output[i] = wte[token_ids[i]] + wpe[i]`
+  (token + positional embeddings).
+- **`sampler.h/.c`** — `sample_argmax`: greedy next-token pick from a logits row.
+- **`model.h/.c`** — introduces two structs to bundle weights:
+  - `BlockWeights` — all learnable tensors of one transformer block.
+  - `GPT` — config + `wte`, `wpe`, an array of `n_layers` `BlockWeights`, final
+    LayerNorm params, and `lm_head` output projection.
+  - `gpt_create` / `gpt_free` — allocate + randomly initialize / release all weights.
+  - `gpt_forward` — embeddings -> stacked blocks -> final LayerNorm -> `@ lm_head`
+    logits `(seq_len, vocab_size)`.
+  - `gpt_generate` — autoregressive greedy loop, appending tokens in place.
+
+`main.c` builds a `GPT` (vocab=16, d_model=8, heads=2, layers=2, d_ff=32), generates 5
+tokens from a 3-token prompt, and validates the logits (no NaN/Inf).
+
+### Notes / simplifications
+- Output head `lm_head` is a **separate** weight, not tied to `wte` (real GPT-2 ties
+  them: `logits = hidden @ wte^T`). Tying can come later once a transpose-matmul exists.
+- No KV cache: each generation step re-runs the full forward over the current sequence.
+  Fine for a reference model; a cache is a later optimization.
+- Only greedy sampling; temperature / top-k / top-p can extend `sampler.c`.
+
+### Progress checklist
+- [x] Token + positional embeddings (`embedding.h` / `embedding.c`)
+- [x] Greedy sampler (`sampler.h` / `sampler.c`)
+- [x] `GPT` + `BlockWeights` structs, create/free (`model.h` / `model.c`)
+- [x] `gpt_forward`: embed -> N blocks -> final LayerNorm -> logits
+- [x] `gpt_generate`: autoregressive greedy loop
+- [x] `main.c` rewritten to build + run the model
+- [x] `Makefile` + `README.md` updated (3 new modules)
+- [x] Smoke test (build + run -> generates tokens, `Output validation: PASSED`, `-Wall` clean)
+
+### Smoke test result (2026-07-21)
+Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean. Prompt `1 5 9` generated
+`11 6 11 14 14` (arbitrary - the model is untrained), logits validated PASSED, all
+memory freed.
+
 ## Next steps (not started)
-- Step 3: token + positional embeddings, stacked blocks, output projection, sampler.
 - Step 4: BPE tokenizer + load real GPT-2 weights.
 - Step 5: backprop + training (uses the unused `Tensor.grad` field).
