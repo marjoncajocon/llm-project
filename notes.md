@@ -39,10 +39,11 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       image-patch embeddings before the text tokens, adds positions over the combined sequence,
       and runs the transformer (`gpt_run_from_emb` refactor shared with the text forward).
       Verified: `[5] Image: 4 patches + 3 text -> logits (7,16)`.
-- [ ] Step E4 — Image-text paired data (`data/pairs/` image+caption) + a training loop that
-      predicts the caption from the image. Needs: backward through the multimodal embeddings
-      (scatter to `wte` for text positions + `patch_embed` backward to learn the patch
-      projection) and a loss over the caption/text positions only.
+- [x] Step E4 — Image→caption **training**: `gpt_backward_multimodal` (scatters to `wte`/`wpe`
+      and writes the image-embedding gradient) + `patch_embed_backward` (learns the patch
+      projection) + cross-entropy with an **ignore index** (target < 0) so only caption
+      positions are supervised. Verified: `[6] Multimodal train: loss 4.69 -> 0.0001` (overfits
+      one image→caption). Real image-caption *datasets* + a bigger model = the quality frontier.
       (Honest: a genuinely useful vision-language model needs far more model+data+compute than
       is feasible locally from scratch; this builds the plumbing, quality needs real scale.)
 
@@ -149,12 +150,13 @@ authorized; local only, don't push).
    `agent --cmd "<prog>"` uses an external program as the model (`tools/agent_mock.py`).
    For a genuinely acting agent, point `--cmd` at an instruction-tuned model or an LLM API
    (base `model/gpt2` won't follow tool-call formats well).
-5. **Phase E (images)** — E1 (PPM load) + E2 (patch embedding) DONE; **E3 (patches into GPT) +
-   E4 (image-text training) remain (RECOMMENDED NEXT)**. Then **Phase F (video)**.
+5. ✅ **Phase E (images) COMPLETE** — E1 load, E2 patch-embed, E3 into-GPT
+   (`gpt_forward_multimodal`), E4 image→caption training (`gpt_backward_multimodal` +
+   `patch_embed_backward` + loss ignore-index). Then **Phase F (video)** is next.
 
-Not supported yet (asked about): image/video *understanding* — image **plumbing** exists
-(load + patch-embed), but feeding it into the model (E3) and training on image-text (E4) are
-not done; video is Phase F. Real multimodal quality needs far more scale than local-from-scratch.
+Multimodal (asked about): **images now train end-to-end** (forward + backward + patch
+projection learned; smoke test overfits image→caption). Real *quality* still needs real
+image-caption datasets + a much bigger model. **Video is Phase F** (#6), the frontier.
 
 ## Session summary (2026-07-21, autonomous run)
 
@@ -759,7 +761,7 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
   to know the step), with a commented Anthropic/OpenAI call to swap in a real LLM.
 - Verified: scripted + command backends both run; all 8 targets build; smoke test PASSED.
 
-## Phase #5 / E1+E2+E3 (image plumbing + into GPT) — DONE; E4 remains
+## Phase #5 / Phase E (multimodal images) — COMPLETE (E1–E4)
 
 - **`image.c/.h`** — loads binary **PPM (P6)** into an `Image` (h,w,c=3; HWC floats [0,1]),
   pure C (skip whitespace/#comments in the header). `tools/img_to_ppm.py` (Pillow) converts
@@ -773,12 +775,15 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
   (refactored out of `gpt_forward_train`, so the text path is unchanged/bit-exact). Causal
   attention over the combined sequence (text sees the image patches). `a` sized to
   `n_img+seq_len` (<= max_seq_len). Verified `[5] Image: 4 patches + 3 text -> logits (7,16)`.
-- **Next (E4):** image-caption pairs + a loop predicting the caption. Needs multimodal backward
-  (text positions → `wte`, `patch_embed` backward → patch-projection W) + loss over text
-  positions only. Honest: useful VLM quality needs far more scale than local-from-scratch.
+- **E4 DONE:** `gpt_backward_multimodal` (block backward → scatter text grads to `wte`/`wpe`,
+  write image grad to `img_emb->grad`) + `patch.c` `patch_embed_backward` (learns W_patch) +
+  `loss.c` ignore-index (target < 0 skips). Smoke `[6]` overfits image→caption (loss 4.69 →
+  ~0). Refactored `gpt_backward_to_emb` shared by text + multimodal backward.
+  Honest: useful VLM quality needs real image-caption datasets + far more scale.
 
 ## Next steps (not started)
-- #5 **E4** (image-text training) then #6 **video** (Phase F).
+- #6 **video** (Phase F) — frames → per-frame patches (reuse Phase E) + temporal encoding →
+  video-text training. Research-scale; text (done), images (done), video is the frontier.
 - Optional real agent: a `tools/agent_llm.py` calling a real LLM API (`agent --cmd ...`).
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.

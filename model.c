@@ -314,8 +314,9 @@ void gpt_forward_multimodal(GPT *m, const Tensor *img_emb, const int *token_ids,
   gpt_run_from_emb(m, a, logits);
 }
 
-void gpt_backward(GPT *m, const int *token_ids, int seq_len,
-                  GPTActs *a, Tensor *logits) {
+// Backward through the output head + blocks down to a->emb.grad (the gradient of
+// the input embeddings). Shared by the text and multimodal backward paths.
+static void gpt_backward_to_emb(GPT *m, GPTActs *a, Tensor *logits) {
   gpt_zero_grad(m);
   gpt_acts_zero_grad(a);
 
@@ -329,26 +330,48 @@ void gpt_backward(GPT *m, const int *token_ids, int seq_len,
     BlockWeights *b = &m->blocks[l];
     const Tensor *inp = (l == 0) ? &a->emb : &a->block_out[l - 1];
 
-    // block_out[l] = a_resid[l] + ff_out[l]
     matadd_backward(&a->block_out[l], &a->a_resid[l], &a->ff_out[l]);
-    // ff_out[l] = FFN(ln2[l])
     feedforward_backward(&a->ln2[l], &b->ff_W1, &b->ff_b1, &b->ff_W2, &b->ff_b2,
                          &a->ff_h1b[l], &a->ff_act[l], &a->ff_out[l], m->d_ff);
-    // ln2[l] = LN2(a_resid[l])
     layernorm_backward(&a->a_resid[l], &b->gamma2, &a->ln2[l],
                        &b->gamma2, &b->beta2, LN_EPS);
-    // a_resid[l] = inp + attn_out[l]
     matadd_backward(&a->a_resid[l], inp, &a->attn_out[l]);
-    // attn_out[l] = MHA(ln1[l])
     multihead_attention_backward(&a->ln1[l], &b->W_q, &b->W_k, &b->W_v, &b->W_o,
                                  &b->b_q, &b->b_k, &b->b_v, &b->b_o,
                                  &a->Q[l], &a->K[l], &a->V[l], &a->weights[l], &a->concat[l],
                                  &a->attn_out[l], m->n_heads);
-    // ln1[l] = LN1(inp)
     layernorm_backward(inp, &b->gamma1, &a->ln1[l], &b->gamma1, &b->beta1, LN_EPS);
   }
+}
 
+void gpt_backward(GPT *m, const int *token_ids, int seq_len,
+                  GPTActs *a, Tensor *logits) {
+  gpt_backward_to_emb(m, a, logits);
   embedding_backward(token_ids, seq_len, &a->emb, &m->wte, &m->wpe);
+}
+
+void gpt_backward_multimodal(GPT *m, const int *token_ids, int n_img, int seq_len,
+                             GPTActs *a, Tensor *logits, Tensor *img_emb) {
+  gpt_backward_to_emb(m, a, logits);
+  const int dm = m->d_model;
+  // Image positions: dL/d(patch embedding) = a->emb.grad rows; also update wpe.
+  for (int i = 0; i < n_img; i++) {
+    for (int j = 0; j < dm; j++) {
+      float g = a->emb.grad[i * dm + j];
+      img_emb->grad[i * dm + j] = g;
+      m->wpe.grad[i * dm + j] += g;
+    }
+  }
+  // Text positions: scatter into wte (by token) and wpe (by position).
+  for (int t = 0; t < seq_len; t++) {
+    int tok = token_ids[t];
+    int pos = n_img + t;
+    for (int j = 0; j < dm; j++) {
+      float g = a->emb.grad[pos * dm + j];
+      m->wte.grad[tok * dm + j] += g;
+      m->wpe.grad[pos * dm + j] += g;
+    }
+  }
 }
 
 int gpt_collect_params(GPT *m, Tensor **list) {

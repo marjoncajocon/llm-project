@@ -92,6 +92,13 @@ void gpt_forward_multimodal(GPT *m, const Tensor *img_emb, const int *token_ids,
 void gpt_backward(GPT *m, const int *token_ids, int seq_len,
                   GPTActs *a, Tensor *logits);
 
+// Backward for gpt_forward_multimodal. Expects logits->grad set. Accumulates
+// gradients into the model params and, for the image positions, writes the patch
+// embedding gradient into img_emb->grad (feed that to patch_embed_backward to
+// learn the patch projection).
+void gpt_backward_multimodal(GPT *m, const int *token_ids, int n_img, int seq_len,
+                             GPTActs *a, Tensor *logits, Tensor *img_emb);
+
 // Fill list[] with pointers to all learnable parameter tensors, in canonical
 // order. Returns the count (== 2 + 16*n_layers + 3). list must have room for that.
 int gpt_collect_params(GPT *m, Tensor **list);

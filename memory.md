@@ -66,10 +66,11 @@ via `make cross`).
 4. ✅ Real agent backend — `agent.c` pluggable `AgentBackend`: scripted + **command** backend
    (`agent --cmd "<prog>"`, program stdout = model response; `tools/agent_mock.py` example).
    Plug in a real LLM via an API script. DONE.
-5. Phase E images — **E1+E2+E3 DONE** (`image.c` PPM load, `patch.c` ViT patch embedding,
-   `model.c` `gpt_forward_multimodal` feeds [image patches]+[text] through the GPT;
-   `tools/img_to_ppm.py`). **E4 (image-text training loop) remains** — RECOMMENDED NEXT.
-   6. Phase F — video. (Image is forward-plumbing only; no multimodal training yet.)
+5. ✅ Phase E images COMPLETE (E1–E4): `image.c` (PPM), `patch.c` (ViT patch embed +
+   backward), `model.c` `gpt_forward_multimodal`/`gpt_backward_multimodal`, `loss.c` ignore
+   index; smoke test overfits image→caption (loss ~4.7 → ~0). `tools/img_to_ppm.py`.
+6. **Phase F — video** (RECOMMENDED NEXT / research-scale): frames → per-frame patches
+   (reuse Phase E) + temporal encoding → video-text training.
 
 Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).

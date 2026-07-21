@@ -11,13 +11,13 @@ int patch_dim(const Image *im, int patch) {
   return patch * patch * im->c;
 }
 
-void patch_embed(const Image *im, int patch, const Tensor *W, const Tensor *b, Tensor *out) {
+// Build the flattened patch matrix (np, pdim) from the image (HWC order).
+static Tensor build_flat(const Image *im, int patch) {
   const int gh = im->h / patch, gw = im->w / patch;
   const int np = gh * gw;
   const int pdim = patch * patch * im->c;
   const int C = im->c, W_img = im->w;
 
-  // Build the flattened patch matrix (np, pdim), then project it.
   int shape[2] = {np, pdim};
   Tensor flat = tensor_create(shape, 2);
   int row = 0;
@@ -35,8 +35,21 @@ void patch_embed(const Image *im, int patch, const Tensor *W, const Tensor *b, T
       row++;
     }
   }
+  return flat;
+}
 
+void patch_embed(const Image *im, int patch, const Tensor *W, const Tensor *b, Tensor *out) {
+  Tensor flat = build_flat(im, patch);
   matmul(&flat, W, out);      // (np, pdim) @ (pdim, d_model) -> (np, d_model)
   bias_add(out, b, out);
+  tensor_free(&flat);
+}
+
+void patch_embed_backward(const Image *im, int patch, const Tensor *W,
+                          const Tensor *b, const Tensor *out) {
+  Tensor flat = build_flat(im, patch);
+  // out = flat @ W + b, with out->grad already set.
+  bias_add_backward(out, b);        // b->grad += sum rows out->grad
+  matmul_backward(&flat, W, out);   // W->grad += flat^T @ out->grad
   tensor_free(&flat);
 }

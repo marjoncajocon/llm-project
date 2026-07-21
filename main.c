@@ -234,27 +234,60 @@ static int run_demo(void) {
     int np = patch_count(&im, patch);              // 4 patches
     int pd = patch_dim(&im, patch);                // 2*2*3 = 12
     int ws[2] = {pd, d_model};
-    Tensor Wp = tensor_create(ws, 2); tensor_init_random(&Wp);
+    Tensor Wp = tensor_create(ws, 2); tensor_init_random(&Wp);  // patch projection
     int bs[1] = {d_model};  Tensor bp = tensor_create(bs, 1);
     int os[2] = {np, d_model}; Tensor pemb = tensor_create(os, 2);
-    patch_embed(&im, patch, &Wp, &bp, &pemb);      // (np, d_model)
 
-    // E3: run [image patches] + [text tokens] through the GPT.
-    int mm_tok[3] = {1, 2, 3};
+    // Caption tokens; supervise text positions to predict the NEXT caption token
+    // (image positions + the last position are ignored via target -1).
+    int cap[3] = {2, 3, 5};
     int mm_seq = 3, total = np + mm_seq;
+    int tgt[64];
+    for (int i = 0; i < total; i++) tgt[i] = -1;
+    for (int t = 0; t < mm_seq - 1; t++) tgt[np + t] = cap[t + 1];
+
     GPTActs amm = gpt_acts_create(&model, total);
     int mmls[2] = {total, vocab};
     Tensor mmlog = tensor_create(mmls, 2);
-    gpt_forward_multimodal(&model, &pemb, mm_tok, np, mm_seq, &amm, &mmlog);
+    Tensor mmprobs = tensor_create(mmls, 2);
 
+    // E3: forward [image patches] + [text tokens] through the GPT.
+    patch_embed(&im, patch, &Wp, &bp, &pemb);
+    gpt_forward_multimodal(&model, &pemb, cap, np, mm_seq, &amm, &mmlog);
     int finite = 1;
     for (int i = 0; i < mmlog.size; i++)
       if (isnan(mmlog.data[i]) || isinf(mmlog.data[i])) { finite = 0; break; }
-    img_ok = (pemb.size == np * d_model) && (mmlog.size == total * vocab) && finite;
-    printf("[5] Image: %d patches + %d text -> GPT multimodal logits (%d, %d) -> %s\n\n",
-           np, mm_seq, total, vocab, img_ok ? "OK" : "FAIL");
+    int e3_ok = (mmlog.size == total * vocab) && finite;
+    printf("[5] Image: %d patches + %d text -> GPT multimodal logits (%d, %d) -> %s\n",
+           np, mm_seq, total, vocab, e3_ok ? "OK" : "FAIL");
 
-    tensor_free(&mmlog); gpt_acts_free(&amm);
+    // E4: overfit this image -> caption (trains GPT params + patch projection).
+    Tensor *pm[64];
+    int npar = gpt_collect_params(&model, pm);
+    pm[npar++] = &Wp; pm[npar++] = &bp;
+    Adam mopt = adam_create(pm, npar, 0.02f);
+    float first = 0.0f, last = 0.0f;
+    const int msteps = 150;
+    for (int s = 0; s < msteps; s++) {
+      patch_embed(&im, patch, &Wp, &bp, &pemb);    // recompute (Wp changes)
+      gpt_forward_multimodal(&model, &pemb, cap, np, mm_seq, &amm, &mmlog);
+      float loss = cross_entropy_forward(&mmlog, tgt, &mmprobs);
+      if (s == 0) first = loss;
+      last = loss;
+      tensor_zero_grad(&mmlog);
+      cross_entropy_backward(&mmprobs, tgt, &mmlog);
+      tensor_zero_grad(&Wp); tensor_zero_grad(&bp);
+      gpt_backward_multimodal(&model, cap, np, mm_seq, &amm, &mmlog, &pemb);
+      patch_embed_backward(&im, patch, &Wp, &bp, &pemb);
+      adam_step(&mopt, pm, npar);
+    }
+    int e4_ok = (last < first * 0.5f);
+    printf("[6] Multimodal train: image->caption loss %.4f -> %.4f -> %s\n\n",
+           first, last, e4_ok ? "OK" : "FAIL");
+    img_ok = e3_ok && e4_ok;
+
+    adam_free(&mopt);
+    tensor_free(&mmprobs); tensor_free(&mmlog); gpt_acts_free(&amm);
     tensor_free(&Wp); tensor_free(&bp); tensor_free(&pemb);
   } else {
     printf("[5] Image: load FAIL\n\n");
