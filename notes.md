@@ -39,6 +39,37 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 > Honest note: the *pipeline* is 100% doable in pure C and local; agent *quality* is capped by
 > the model you can run. Loading pretrained weights (4b) is the fastest path to real output.
 
+## Session summary (2026-07-21, autonomous run)
+
+Built out the whole pipeline in green, committed steps (newest first):
+`Phase C agent` · `B4 matmul` · `A1 tokenizer` · `B3 generate` · `B2 KV cache` ·
+`B1 sampling` · `4b GPT-2 compat`. Everything builds `-Wall` clean and the default
+`transformer` smoke test prints `Output validation: PASSED`.
+
+**What works now (pure C, local, flat modules):**
+- A GPT-2-architecture model (attention biases, pre-norm, GELU FFN, learned pos-emb, tied
+  head via converter) that **trains end-to-end** (backprop gradient-checked; loss → ~0).
+- Checkpoint save/load (GPTC v2) + Python converters (`tools/convert_gpt2.py`,
+  `convert_to_gptc.py`) to import real GPT-2.
+- Trainable byte-level BPE tokenizer (train/save/load).
+- Generation: temperature/top-k/top-p sampling + **bit-exact KV cache** + a `generate` CLI.
+- A **coding-agent loop** CLI (`agent`): parse tool calls → approval gate → execute
+  (write/read/run) → observe.
+
+**What's left (and why it's not buildable here):**
+- **A2 / real text output** — needs the model's vocab to equal the tokenizer's *and* a
+  trained (or loaded) model; otherwise output is meaningless bytes. Blocked on real weights.
+- **Real agent usefulness** — the loop is driven by a scripted model; a capable backend
+  (real LLM API, or a large locally-run model) is required. The built-in transformer is far
+  too small to emit valid tool calls.
+- **B4 perf (threads/SIMD/int8 quant)** and **D1 (run a 1–3B model)** — large systems work,
+  only matters at real scale; can't be exercised on this toy model here.
+
+The honest bottom line: **all the machinery/plumbing for a local coding-agent CLI is built
+and tested**; turning it into something genuinely useful is gated on running a real,
+capable model — either download+convert GPT-2 (step 4b recipe) or wire a real LLM backend
+into `agent.c`.
+
 ---
 
 ## Step 1 — Complete the transformer block (FFN + GELU + pre-norm)
