@@ -18,6 +18,7 @@
 #include "agent.h"
 #include "image.h"
 #include "patch.h"
+#include "video.h"
 
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
@@ -295,6 +296,73 @@ static int run_demo(void) {
   image_free(&im);
   remove("img.ppm.tmp");
   all_ok &= img_ok;
+
+  // --------------------------------------------------------------------------
+  // Part 8: video (Phase F) — frames -> temporal patch embeddings -> train
+  // --------------------------------------------------------------------------
+  ensure_dir("vid_tmp");
+  for (int fr = 0; fr < 2; fr++) {
+    char vp[64];
+    snprintf(vp, sizeof(vp), "vid_tmp/frame_%04d.ppm", fr);
+    FILE *vfp = fopen(vp, "wb");
+    if (vfp) {
+      fprintf(vfp, "P6\n4 4\n255\n");
+      for (int i = 0; i < 4 * 4 * 3; i++) fputc((unsigned char)(((i * 7) + fr * 40) & 0xFF), vfp);
+      fclose(vfp);
+    }
+  }
+  Video vid = video_load("vid_tmp");
+  int vid_ok = (vid.n == 2);
+  if (vid_ok) {
+    const int patch = 2;
+    int vpc = video_patch_count(&vid, patch);          // 2 frames * 4 = 8
+    int vpd = patch_dim(&vid.frames[0], patch);        // 12
+    int vws[2] = {vpd, d_model}; Tensor Wv = tensor_create(vws, 2); tensor_init_random(&Wv);
+    int vbs[1] = {d_model};      Tensor bv = tensor_create(vbs, 1);
+    int ves[2] = {vpc, d_model}; Tensor vemb = tensor_create(ves, 2);
+
+    int vcap[3] = {4, 6, 8};
+    int vseq = 3, vtot = vpc + vseq;                   // 8 + 3 = 11 <= max_seq 16
+    int vtgt[64];
+    for (int i = 0; i < vtot; i++) vtgt[i] = -1;
+    for (int t = 0; t < vseq - 1; t++) vtgt[vpc + t] = vcap[t + 1];
+
+    GPTActs va = gpt_acts_create(&model, vtot);
+    int vls[2] = {vtot, vocab};
+    Tensor vlog = tensor_create(vls, 2), vprb = tensor_create(vls, 2);
+    Tensor *vpar[64];
+    int nvp = gpt_collect_params(&model, vpar);
+    vpar[nvp++] = &Wv; vpar[nvp++] = &bv;
+    Adam vopt = adam_create(vpar, nvp, 0.02f);
+
+    float v0 = 0.0f, vl = 0.0f;
+    for (int s = 0; s < 120; s++) {
+      video_embed(&vid, patch, &Wv, &bv, &vemb);
+      gpt_forward_multimodal(&model, &vemb, vcap, vpc, vseq, &va, &vlog);
+      float loss = cross_entropy_forward(&vlog, vtgt, &vprb);
+      if (s == 0) v0 = loss;
+      vl = loss;
+      tensor_zero_grad(&vlog);
+      cross_entropy_backward(&vprb, vtgt, &vlog);
+      tensor_zero_grad(&Wv); tensor_zero_grad(&bv);
+      gpt_backward_multimodal(&model, vcap, vpc, vseq, &va, &vlog, &vemb);
+      video_embed_backward(&vid, patch, &Wv, &bv, &vemb);
+      adam_step(&vopt, vpar, nvp);
+    }
+    vid_ok = (vpc == 8) && (vl < v0 * 0.5f);
+    printf("[7] Video: %d frames -> %d patches + %d text | train loss %.4f -> %.4f -> %s\n\n",
+           vid.n, vpc, vseq, v0, vl, vid_ok ? "OK" : "FAIL");
+
+    adam_free(&vopt);
+    tensor_free(&vlog); tensor_free(&vprb); gpt_acts_free(&va);
+    tensor_free(&Wv); tensor_free(&bv); tensor_free(&vemb);
+  } else {
+    printf("[7] Video: load FAIL\n\n");
+  }
+  video_free(&vid);
+  remove("vid_tmp/frame_0000.ppm");
+  remove("vid_tmp/frame_0001.ppm");
+  all_ok &= vid_ok;
 
   adam_free(&opt);
   tensor_free(&logits);

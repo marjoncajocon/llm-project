@@ -47,13 +47,16 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       (Honest: a genuinely useful vision-language model needs far more model+data+compute than
       is feasible locally from scratch; this builds the plumbing, quality needs real scale.)
 
-**Phase F — Video (even larger, farthest future):**
-- [ ] Step F1 — Decode video to frames (via a `tools/` script using ffmpeg → `data/video/<clip>/frame_*.png`).
-- [ ] Step F2 — Per-frame patch embeddings (reuse Phase E) + temporal position encoding.
-- [ ] Step F3 — Optional audio track → features; fuse with the frame/text sequence.
-- [ ] Step F4 — Video-text training (caption/describe a clip).
-      (Honest: this is research-scale; treat as a very-long-horizon goal. Text (done) →
-      images (Phase E) → video (Phase F) is the right order.)
+**Phase F — Video:**
+- [x] Step F1 — Frame loading: `video.c` reads `dir/frame_0000.ppm, 0001, ...` into a `Video`;
+      `tools/video_to_frames.py` extracts PPM frames via ffmpeg.
+- [x] Step F2 — Per-frame patch embeddings (reuse Phase E `patch_embed`) + **sinusoidal
+      temporal encoding** per frame; stacked into one `(n_frames*patches, d_model)` sequence.
+- [ ] Step F3 — Optional audio track → features (skipped for now).
+- [x] Step F4 — Video-text training: reuse `gpt_forward_multimodal`/`gpt_backward_multimodal`
+      (video patches as the prefix) + `video_embed_backward`. Smoke `[7]`: 2-frame clip →
+      caption, loss 5.998 -> 0.001.
+      (Honest: research-scale for real quality; this is a correct, runnable pipeline.)
 
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
@@ -96,8 +99,9 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
    at an API script (template in agent_mock.py).
 5. **Phase E — Images (multimodal)** *(large)* — decode → patch embeddings → multimodal
    input → image-text training.
-6. **Phase F — Video** *(research-scale)* — frames → per-frame patches + temporal encoding →
-   audio fusion → video-text training.
+6. ✅ **Phase F — Video** — frames (`video.c` + `tools/video_to_frames.py`) → per-frame patches
+   + temporal encoding → video-text training (reuses the multimodal path). F3 audio skipped.
+   Smoke test trains a 2-frame clip → caption. DONE.
 
 Order rationale: text (1–4) is very achievable locally; images (5) and video (6) are big
 multimodal builds where the plumbing is feasible but real quality needs far more scale.
@@ -781,9 +785,29 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
   ~0). Refactored `gpt_backward_to_emb` shared by text + multimodal backward.
   Honest: useful VLM quality needs real image-caption datasets + far more scale.
 
-## Next steps (not started)
-- #6 **video** (Phase F) — frames → per-frame patches (reuse Phase E) + temporal encoding →
-  video-text training. Research-scale; text (done), images (done), video is the frontier.
+## Phase #6 / Phase F (video) — COMPLETE (F1, F2, F4)
+
+- **`video.c/.h`** — `Video` = sequence of frames. `video_load(dir)` reads
+  `frame_0000.ppm, 0001, ...` sequentially. `video_embed` patch-embeds each frame (shared
+  W/b, reuses `patch_embed`) + adds a **sinusoidal temporal encoding** per frame, stacking
+  into `(n_frames*patches, d_model)`. `video_embed_backward` distributes the grad per frame
+  (temporal term is constant → passes through). `video_patch_count`.
+- **`tools/video_to_frames.py`** — ffmpeg → `frame_%04d.ppm` (`-start_number 0`).
+- **`main.c`** smoke `[7]`: 2-frame clip → video patches + caption → multimodal train; loss
+  5.998 -> 0.001. Video is just [frame patches...] + [text] through `gpt_forward_multimodal`,
+  so E3/E4 did the heavy lifting. F3 (audio) skipped.
+
+## 🏁 Roadmap COMPLETE — all six phases done
+
+#1 Training UX · #2 Thread pool · #3 Real GPT-2 · #4 Agent backend · #5 Images (E1–E4) ·
+#6 Video (F1/F2/F4). Pure C11, all 8 platforms (Linux/macOS/Windows/WASM), every step green
+(smoke test PASSED, gradient-checked, bit-exact where claimed). Honest ceiling: the pipelines
+are correct and runnable; *quality* for real image/video understanding needs real datasets +
+far larger models than a from-scratch CPU build.
+
+**Possible future work (optional):** F3 audio; real image-caption/video datasets; SIMD/int8
+quant (#2 remainder); a `tools/agent_llm.py` real-LLM agent backend; instruction-tuning; a
+`gpt2_chat.py` one-command wrapper; larger GPT-2 variants (`gpt2-medium/large/xl`).
 - Optional real agent: a `tools/agent_llm.py` calling a real LLM API (`agent --cmd ...`).
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.

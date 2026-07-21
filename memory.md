@@ -69,8 +69,14 @@ via `make cross`).
 5. ✅ Phase E images COMPLETE (E1–E4): `image.c` (PPM), `patch.c` (ViT patch embed +
    backward), `model.c` `gpt_forward_multimodal`/`gpt_backward_multimodal`, `loss.c` ignore
    index; smoke test overfits image→caption (loss ~4.7 → ~0). `tools/img_to_ppm.py`.
-6. **Phase F — video** (RECOMMENDED NEXT / research-scale): frames → per-frame patches
-   (reuse Phase E) + temporal encoding → video-text training.
+6. ✅ Phase F video COMPLETE (F1/F2/F4): `video.c` (frame load + patch embed + sinusoidal
+   temporal encoding + backward), `tools/video_to_frames.py` (ffmpeg); smoke test trains a
+   2-frame clip → caption (loss 6.0 → 0.001). F3 audio skipped.
+
+🏁 **ALL SIX ROADMAP PHASES DONE.** Pure C11, 8 platforms, every step green. Ceiling: pipelines
+correct/runnable, but real image/video quality needs real datasets + far bigger models.
+Optional future: F3 audio, real datasets, SIMD/int8 quant, a real-LLM `tools/agent_llm.py`,
+instruction-tuning, `gpt2-medium/large/xl`.
 
 Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).
