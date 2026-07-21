@@ -25,7 +25,7 @@ defined in the matching `.c`.
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |
-| `sampler.h` / `sampler.c`         | Token sampling from logits (greedy argmax)                    |
+| `sampler.h` / `sampler.c`         | Token sampling: greedy argmax + temperature / top-k / top-p (seeded RNG) |
 | `model.h` / `model.c`             | `GPT` model: embeddings, stacked blocks, output head, generation |
 | `checkpoint.h` / `checkpoint.c`   | Save/load model weights (`gpt_save` / `gpt_load`, GPTC format) |
 | `tokenizer.h` / `tokenizer.c`     | Self-contained byte-level BPE (`encode` / `decode`)           |

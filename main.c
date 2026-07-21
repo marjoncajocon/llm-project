@@ -10,6 +10,7 @@
 #include "tensor.h"
 #include "loss.h"
 #include "optim.h"
+#include "sampler.h"
 #include "model.h"
 #include "checkpoint.h"
 #include "tokenizer.h"
@@ -134,6 +135,27 @@ int main() {
   printf("    start %.4f -> final %.4f -> %s\n\n",
          first_loss, final_loss, train_ok ? "OK (loss dropped)" : "FAIL");
   all_ok &= train_ok;
+
+  // --------------------------------------------------------------------------
+  // Part 5: sampling sanity checks (deterministic)
+  // --------------------------------------------------------------------------
+  Rng rng = rng_create(123);
+  int topk1_ok = 1;
+  for (int r = 0; r < seq_len; r++) {
+    // top_k=1 must always select the argmax token
+    if (sample_token(&logits, r, 1.0f, 1, 1.0f, &rng) != sample_argmax(&logits, r)) {
+      topk1_ok = 0;
+      break;
+    }
+  }
+  // Same seed -> same token (reproducibility)
+  Rng ra = rng_create(7), rb = rng_create(7);
+  int seed_ok = (sample_token(&logits, 0, 0.8f, 8, 0.95f, &ra) ==
+                 sample_token(&logits, 0, 0.8f, 8, 0.95f, &rb));
+  int sample_ok = topk1_ok && seed_ok;
+  printf("[3] Sampling: top_k=1==argmax %s | seeded reproducible %s\n\n",
+         topk1_ok ? "OK" : "FAIL", seed_ok ? "OK" : "FAIL");
+  all_ok &= sample_ok;
 
   adam_free(&opt);
   tensor_free(&logits);

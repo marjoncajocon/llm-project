@@ -20,7 +20,7 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 - [ ] Step A2 — Scale config to a real architecture (dims/layers/heads/context)
 
 **Phase B — A local generation CLI:**
-- [ ] Step B1 — Better sampling: temperature + top-k/top-p + stop conditions (`sampler.c`)
+- [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
 - [ ] Step B2 — KV cache (generation O(n) not O(n²))
 - [ ] Step B3 — REPL front-end: `you>` loop (stdin → tokenize → generate → stream out)
 - [ ] Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization
@@ -364,7 +364,24 @@ and stays at 9.28e-04 — bias backward is correct; training convergence corrobo
 - [x] Smoke test (build `-Wall` clean; grad check + training PASS)
 - [x] Loader verified on GPT-2-shaped weights (npz → GPTC → C load → clean forward)
 
+## Step B1 — Sampling (temperature / top-k / top-p)
+
+**Status: DONE — smoke test passed.**
+
+- **`sampler.c/.h`** — added a small reproducible RNG (`Rng`, xorshift64; `rng_create`,
+  `rng_uniform`) and `sample_token(logits, row, temperature, top_k, top_p, rng)`:
+  temperature-scaled stable softmax → sort by prob → apply top-k then top-p (nucleus) →
+  sample from the renormalized kept mass. `temperature <= 0` falls back to greedy.
+  Kept the existing `sample_argmax`.
+- **`main.c`** — Part [3] sampling checks: `top_k=1` selects the argmax for every row, and
+  the same seed reproduces the same token. Both pass.
+- Model-agnostic: drives the toy model now, real GPT-2 later. Next: KV cache (B2) and a REPL
+  front-end (B3).
+
 ## Next steps (not started)
+- Step B3 — REPL front-end: token-in/token-out generation loop (pipe-testable), then wire
+  real text once A1 lands.
+- Step B2 — KV cache: verify cached generation matches the non-cached forward bit-for-bit.
 - Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex.
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
