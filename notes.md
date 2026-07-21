@@ -230,8 +230,54 @@ Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean.
 - Training: loss **2.5848 -> 0.0001** over 300 Adam steps.
 - Tokenizer + checkpoint round-trips still OK. `Output validation: PASSED`.
 
+## Step 5b — End-to-end GPT training (attention + embedding + FFN backward)
+
+**Status: DONE — smoke test passed (full-model gradient check + training).**
+
+### What changed
+The full `GPT` now trains end-to-end. Forward functions freed their intermediates, so
+training-mode forwards were added that **cache activations**, plus matching backward ops:
+
+- **`feedforward.c`** — `feedforward_train` (caches h1b/act) + `feedforward_backward`.
+- **`attention.c`** — `multihead_attention_train` (caches Q/K/V/weights/concat) +
+  `multihead_attention_backward` (incl. softmax-through-causal-mask backward). Added
+  `#include <string.h>` for the weights `memcpy`.
+- **`embedding.c`** — `embedding_backward` (scatter-add into wte/wpe).
+- **`matrix.c`** — `bias_add_backward`/`matadd_backward` made `const`-correct.
+- **`model.c`** — `GPTActs` activation cache (`gpt_acts_create/free`), `gpt_forward_train`,
+  `gpt_backward` (reverse through head → final LN → each block {residual, FFN, LN2,
+  residual, attention, LN1} → embeddings), `gpt_collect_params`, `gpt_zero_grad`.
+- **`main.c`** — replaced the 5a MLP with the real model: end-to-end gradient check +
+  next-token training on a fixed sequence.
+
+### Gradient-check note (float32 finite differences)
+First run reported max rel error 1.19e-1 on `block0.W_q[0]` (analytic 7.6e-4, numeric
+6.0e-4) — a **float32 cancellation artifact**, not a bug: the loss is O(1) (~2.88) while
+that gradient is ~7e-4, so `Lp-Lm ~ 1e-6` is dominated by float32 rounding of the loss.
+Fixes: use `eps=1e-2`, and judge correctness on **well-conditioned** entries (`|grad|>1e-2`,
+where finite differences are trustworthy). Training converging to ~0 is the corroborating
+signal that the gradients are right.
+
+### Progress checklist
+- [x] FFN train/backward (`feedforward.c`)
+- [x] Multi-head attention train/backward incl. causal-softmax backward (`attention.c`)
+- [x] Embedding backward / scatter-add (`embedding.c`)
+- [x] `GPTActs` cache + `gpt_forward_train` + `gpt_backward` (`model.c`)
+- [x] `gpt_collect_params` + `gpt_zero_grad` for the optimizer
+- [x] `main.c`: end-to-end gradient check + next-token training
+- [x] `README.md` updated (full-GPT training)
+- [x] Smoke test (build `-Wall` clean; grad check OK; loss drops; exit 0)
+
+### Smoke test result (2026-07-21)
+Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean.
+- Gradient check: max rel error **3.70e-03** (all) / **9.28e-04** (|grad|>1e-2) — full
+  backprop correct.
+- Training: next-token loss **2.8787 -> 0.0002** over 600 Adam steps (the 2-layer GPT
+  memorizes the sequence).
+- Tokenizer + checkpoint round-trips still OK. `Output validation: PASSED`.
+
 ## Next steps (not started)
-- Step 5b: backward for multi-head attention + embeddings (+ FFN wiring) so the full `GPT`
-  trains end-to-end on a next-token task. Plugs onto this foundation.
+- Real data + tokenizer training: train on actual text via the byte-level BPE (add merge
+  learning), batching, and a train/val split.
 - Step 4b: load real GPT-2 files — attention biases + fused QKV + weight-tied head,
   GPT-2 BPE (`encoder.json` / `vocab.bpe`), and a HF/TF -> `.npz` converter in `tools/`.

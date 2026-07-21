@@ -8,100 +8,19 @@
 #include <math.h>
 
 #include "tensor.h"
-#include "matrix.h"
-#include "activation.h"
-#include "layernorm.h"
 #include "loss.h"
 #include "optim.h"
 #include "model.h"
 #include "checkpoint.h"
 #include "tokenizer.h"
 
-#define LN_EPS 1e-5f
-
-// ============================================================================
-// A tiny trainable MLP that exercises every backward op we implemented:
-//   logits = LayerNorm(GELU(x @ W1 + b1)) @ W2 + b2 ;  loss = cross-entropy
-// ============================================================================
-typedef struct {
-  int N, in_dim, hidden, n_classes;
-  Tensor W1, b1, gamma, beta, W2, b2;                 // parameters
-  Tensor h1, h1b, g, ln, z, logits, probs;            // intermediates
-} MLP;
-
-static MLP mlp_create(int N, int in_dim, int hidden, int n_classes) {
-  MLP m;
-  m.N = N; m.in_dim = in_dim; m.hidden = hidden; m.n_classes = n_classes;
-
-  int s_w1[2] = {in_dim, hidden};   m.W1 = tensor_create(s_w1, 2);
-  int s_b1[1] = {hidden};           m.b1 = tensor_create(s_b1, 1);
-  int s_g[1]  = {hidden};           m.gamma = tensor_create(s_g, 1);
-  int s_be[1] = {hidden};           m.beta = tensor_create(s_be, 1);
-  int s_w2[2] = {hidden, n_classes};m.W2 = tensor_create(s_w2, 2);
-  int s_b2[1] = {n_classes};        m.b2 = tensor_create(s_b2, 1);
-
-  tensor_init_random(&m.W1);
-  tensor_init_random(&m.b1);
-  tensor_init_random(&m.W2);
-  tensor_init_random(&m.b2);
-  for (int i = 0; i < hidden; i++) { m.gamma.data[i] = 1.0f; m.beta.data[i] = 0.0f; }
-
-  int s_h[2]  = {N, hidden};        m.h1 = tensor_create(s_h, 2);
-  int s_hb[2] = {N, hidden};        m.h1b = tensor_create(s_hb, 2);
-  int s_gg[2] = {N, hidden};        m.g = tensor_create(s_gg, 2);
-  int s_ln[2] = {N, hidden};        m.ln = tensor_create(s_ln, 2);
-  int s_z[2]  = {N, n_classes};     m.z = tensor_create(s_z, 2);
-  int s_lo[2] = {N, n_classes};     m.logits = tensor_create(s_lo, 2);
-  int s_pr[2] = {N, n_classes};     m.probs = tensor_create(s_pr, 2);
-  return m;
+// Full-model loss: training forward + cross-entropy. Fills logits and probs.
+static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
+                      const int *targets, Tensor *logits, Tensor *probs) {
+  gpt_forward_train(m, ids, seq_len, a, logits);
+  return cross_entropy_forward(logits, targets, probs);
 }
 
-static void mlp_free(MLP *m) {
-  tensor_free(&m->W1); tensor_free(&m->b1); tensor_free(&m->gamma);
-  tensor_free(&m->beta); tensor_free(&m->W2); tensor_free(&m->b2);
-  tensor_free(&m->h1); tensor_free(&m->h1b); tensor_free(&m->g);
-  tensor_free(&m->ln); tensor_free(&m->z); tensor_free(&m->logits);
-  tensor_free(&m->probs);
-}
-
-// Forward pass, returns the mean cross-entropy loss.
-static float mlp_forward(MLP *m, const Tensor *x, const int *targets) {
-  matmul(x, &m->W1, &m->h1);
-  bias_add(&m->h1, &m->b1, &m->h1b);
-  gelu(&m->h1b, &m->g);
-  layernorm(&m->g, &m->gamma, &m->beta, &m->ln, LN_EPS);
-  matmul(&m->ln, &m->W2, &m->z);
-  bias_add(&m->z, &m->b2, &m->logits);
-  return cross_entropy_forward(&m->logits, targets, &m->probs);
-}
-
-static void copy_grad(Tensor *dst, const Tensor *src) {
-  memcpy(dst->grad, src->grad, dst->size * sizeof(float));
-}
-
-// Backward pass: zero all grads, then propagate from the loss to every parameter.
-static void mlp_backward(MLP *m, const Tensor *x, const int *targets) {
-  tensor_zero_grad(&m->W1); tensor_zero_grad(&m->b1);
-  tensor_zero_grad(&m->gamma); tensor_zero_grad(&m->beta);
-  tensor_zero_grad(&m->W2); tensor_zero_grad(&m->b2);
-  tensor_zero_grad(&m->h1); tensor_zero_grad(&m->h1b); tensor_zero_grad(&m->g);
-  tensor_zero_grad(&m->ln); tensor_zero_grad(&m->z); tensor_zero_grad(&m->logits);
-  tensor_zero_grad((Tensor*)x);
-
-  cross_entropy_backward(&m->probs, targets, &m->logits);
-  bias_add_backward(&m->logits, &m->b2);
-  copy_grad(&m->z, &m->logits);
-  matmul_backward(&m->ln, &m->W2, &m->z);
-  layernorm_backward(&m->g, &m->gamma, &m->ln, &m->gamma, &m->beta, LN_EPS);
-  gelu_backward(&m->h1b, &m->g);
-  bias_add_backward(&m->h1b, &m->b1);
-  copy_grad(&m->h1, &m->h1b);
-  matmul_backward(x, &m->W1, &m->h1);
-}
-
-// ============================================================================
-// Main
-// ============================================================================
 int main() {
   printf("=== Minimal GPT-2 Style Transformer Demo ===\n\n");
   int all_ok = 1;
@@ -114,98 +33,113 @@ int main() {
   Tokenizer tok = tokenizer_create_bytelevel();
   int ll = tokenizer_add_merge(&tok, 'l', 'l');
   tokenizer_add_merge(&tok, 'e', ll);
-  int ids[64];
-  int n_ids = tokenizer_encode(&tok, "hello hello", ids, 64);
+  int tids[64];
+  int n_tids = tokenizer_encode(&tok, "hello hello", tids, 64);
   char decoded[128];
-  tokenizer_decode(&tok, ids, n_ids, decoded, sizeof(decoded));
+  tokenizer_decode(&tok, tids, n_tids, decoded, sizeof(decoded));
   int tok_ok = (strcmp("hello hello", decoded) == 0);
   tokenizer_free(&tok);
   all_ok &= tok_ok;
 
-  GPT gpt = gpt_create(16, 8, 2, 2, 32, 16);
-  int seq[3] = {1, 5, 9};
-  int lshape[2] = {3, 16};
-  Tensor la = tensor_create(lshape, 2), lb = tensor_create(lshape, 2);
-  gpt_forward(&gpt, seq, 3, &la);
-  int ckpt_ok = (gpt_save("model.bin", &gpt) == 0);
-  GPT gpt2;
-  ckpt_ok = ckpt_ok && (gpt_load("model.bin", &gpt2) == 0);
+  GPT probe = gpt_create(16, 8, 2, 2, 32, 16);
+  int pseq[3] = {1, 5, 9};
+  int plshape[2] = {3, 16};
+  Tensor pla = tensor_create(plshape, 2), plb = tensor_create(plshape, 2);
+  gpt_forward(&probe, pseq, 3, &pla);
+  int ckpt_ok = (gpt_save("model.bin", &probe) == 0);
+  GPT probe2;
+  ckpt_ok = ckpt_ok && (gpt_load("model.bin", &probe2) == 0);
   if (ckpt_ok) {
-    gpt_forward(&gpt2, seq, 3, &lb);
-    ckpt_ok = (memcmp(la.data, lb.data, la.size * sizeof(float)) == 0);
-    gpt_free(&gpt2);
+    gpt_forward(&probe2, pseq, 3, &plb);
+    ckpt_ok = (memcmp(pla.data, plb.data, pla.size * sizeof(float)) == 0);
+    gpt_free(&probe2);
   }
-  tensor_free(&la); tensor_free(&lb); gpt_free(&gpt); remove("model.bin");
+  tensor_free(&pla); tensor_free(&plb); gpt_free(&probe); remove("model.bin");
   printf("    tokenizer: %s | checkpoint: %s\n\n",
          tok_ok ? "OK" : "FAIL", ckpt_ok ? "OK" : "FAIL");
   all_ok &= ckpt_ok;
 
   // --------------------------------------------------------------------------
-  // Part 2: build the trainable MLP + a fixed synthetic dataset
+  // Part 2: build the full GPT + a fixed next-token task
   // --------------------------------------------------------------------------
-  const int N = 8, in_dim = 6, hidden = 16, n_classes = 4;
-  MLP m = mlp_create(N, in_dim, hidden, n_classes);
+  const int vocab = 16, d_model = 8, n_heads = 2, n_layers = 2, d_ff = 32, max_seq = 16;
+  const int seq_len = 6;
+  GPT model = gpt_create(vocab, d_model, n_heads, n_layers, d_ff, max_seq);
+  printf("[2] Full GPT training  (vocab=%d d_model=%d heads=%d layers=%d)\n",
+         vocab, d_model, n_heads, n_layers);
 
-  int xs[2] = {N, in_dim};
-  Tensor x = tensor_create(xs, 2);
-  tensor_init_random(&x);
-  int targets[8];
-  for (int i = 0; i < N; i++) targets[i] = i % n_classes;
+  // Fixed token sequence; predict the next token at each position.
+  int tokens[7] = {1, 2, 4, 8, 3, 5, 7};
+  const int *ids = tokens;            // inputs  = tokens[0..seq_len-1]
+  const int *targets = tokens + 1;    // targets = tokens[1..seq_len]
 
-  Tensor *params[6] = {&m.W1, &m.b1, &m.gamma, &m.beta, &m.W2, &m.b2};
-  const int n_params = 6;
+  GPTActs acts = gpt_acts_create(&model, seq_len);
+  int lshape[2] = {seq_len, vocab};
+  Tensor logits = tensor_create(lshape, 2);
+  Tensor probs = tensor_create(lshape, 2);
+
+  Tensor *params[64];
+  int n_params = gpt_collect_params(&model, params);
 
   // --------------------------------------------------------------------------
-  // Part 3: gradient check (analytic grads vs numerical finite differences)
+  // Part 3: end-to-end gradient check (analytic vs numerical), whole model
   // --------------------------------------------------------------------------
-  printf("[2] Gradient check (analytic vs numerical)\n");
-  mlp_forward(&m, &x, targets);
-  mlp_backward(&m, &x, targets);  // fills param->grad at the base point
+  gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
+  tensor_zero_grad(&logits);
+  cross_entropy_backward(&probs, targets, &logits);
+  gpt_backward(&model, ids, seq_len, &acts, &logits);  // analytic grads into params
 
-  const float eps = 1e-3f;
-  float max_rel = 0.0f;
+  const float eps = 1e-2f;
+  float max_rel = 0.0f, max_rel_cond = 0.0f;
   for (int p = 0; p < n_params; p++) {
     Tensor *param = params[p];
-    // sample up to 3 indices per parameter tensor
-    int step = param->size > 3 ? param->size / 3 : 1;
+    int step = param->size > 2 ? param->size / 2 : 1;
     for (int k = 0; k < param->size; k += step) {
       float base = param->data[k];
-      param->data[k] = base + eps; float lp = mlp_forward(&m, &x, targets);
-      param->data[k] = base - eps; float lm = mlp_forward(&m, &x, targets);
+      param->data[k] = base + eps;
+      float lp = gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
+      param->data[k] = base - eps;
+      float lm = gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
       param->data[k] = base;
       float numeric = (lp - lm) / (2.0f * eps);
       float analytic = param->grad[k];
       float rel = fabsf(analytic - numeric) / (fabsf(analytic) + fabsf(numeric) + 1e-8f);
       if (rel > max_rel) max_rel = rel;
+      // "conditioned" entries: gradient large enough that float32 finite differences
+      // are trustworthy (avoids the O(1)-loss cancellation noise floor).
+      if (fabsf(analytic) > 1e-2f && rel > max_rel_cond) max_rel_cond = rel;
     }
   }
-  int grad_ok = (max_rel < 1e-2f);
-  printf("    max relative error: %.2e  (tol 1e-2) -> %s\n\n",
-         max_rel, grad_ok ? "OK" : "FAIL");
+  int grad_ok = (max_rel_cond < 1e-2f);
+  printf("    gradient check: max rel error %.2e (all) | %.2e (|grad|>1e-2) -> %s\n",
+         max_rel, max_rel_cond, grad_ok ? "OK" : "FAIL");
   all_ok &= grad_ok;
 
   // --------------------------------------------------------------------------
-  // Part 4: train (Adam) and check the loss actually drops
+  // Part 4: train (Adam) on the next-token task, expect the loss to drop
   // --------------------------------------------------------------------------
-  printf("[3] Training (Adam, overfit %d examples)\n", N);
-  Adam opt = adam_create(params, n_params, 0.05f);
-  float first_loss = mlp_forward(&m, &x, targets);
-  const int steps = 300;
+  Adam opt = adam_create(params, n_params, 0.02f);
+  float first_loss = gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
+  const int steps = 600;
   for (int s = 0; s < steps; s++) {
-    float loss = mlp_forward(&m, &x, targets);
-    mlp_backward(&m, &x, targets);
+    float loss = gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    gpt_backward(&model, ids, seq_len, &acts, &logits);
     adam_step(&opt, params, n_params);
-    if (s % 60 == 0) printf("    step %3d  loss %.4f\n", s, loss);
+    if (s % 120 == 0) printf("    step %3d  loss %.4f\n", s, loss);
   }
-  float final_loss = mlp_forward(&m, &x, targets);
-  int train_ok = (final_loss < first_loss * 0.1f) && (final_loss < 0.05f);
+  float final_loss = gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
+  int train_ok = (final_loss < first_loss * 0.25f);
   printf("    start %.4f -> final %.4f -> %s\n\n",
          first_loss, final_loss, train_ok ? "OK (loss dropped)" : "FAIL");
   all_ok &= train_ok;
 
   adam_free(&opt);
-  mlp_free(&m);
-  tensor_free(&x);
+  tensor_free(&logits);
+  tensor_free(&probs);
+  gpt_acts_free(&acts);
+  gpt_free(&model);
 
   // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");

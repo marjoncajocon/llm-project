@@ -12,4 +12,10 @@
 void embed_tokens(const int *token_ids, int seq_len,
                   const Tensor *wte, const Tensor *wpe, Tensor *output);
 
+// Backward of embed_tokens (scatter-add): reads output->grad and accumulates
+//   wte->grad[token_ids[i]] += output->grad[i]
+//   wpe->grad[i]            += output->grad[i]
+void embedding_backward(const int *token_ids, int seq_len,
+                        const Tensor *output, const Tensor *wte, const Tensor *wpe);
+
 #endif // EMBEDDING_H

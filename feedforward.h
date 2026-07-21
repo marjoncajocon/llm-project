@@ -14,4 +14,25 @@ void feedforward(
     int d_ff                             // Hidden dimension (typically 4 * d_model)
 );
 
+// Training-mode forward: same result as feedforward(), but also fills the caches
+// h1b (pre-activation = input@W1 + b1) and act (= gelu(h1b)) that backward needs.
+void feedforward_train(
+    const Tensor *input,
+    const Tensor *W1, const Tensor *b1,
+    const Tensor *W2, const Tensor *b2,
+    Tensor *h1b, Tensor *act,            // caches (seq_len, d_ff)
+    Tensor *output,
+    int d_ff);
+
+// Backward. Reads output->grad; accumulates into input->grad and every param grad
+// (W1, b1, W2, b2). h1b/act are the caches from feedforward_train and their grad
+// arrays are used as scratch (zero them beforehand).
+void feedforward_backward(
+    const Tensor *input,
+    const Tensor *W1, const Tensor *b1,
+    const Tensor *W2, const Tensor *b2,
+    Tensor *h1b, Tensor *act,
+    Tensor *output,
+    int d_ff);
+
 #endif // FEEDFORWARD_H

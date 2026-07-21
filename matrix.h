@@ -26,9 +26,10 @@ void bias_add(const Tensor *x, const Tensor *bias, Tensor *out);
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C);
 
 // Backward of C = A + B: dA += dC, dB += dC (reads C->grad).
-void matadd_backward(const Tensor *C, Tensor *A, Tensor *B);
+void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B);
 
-// Backward of bias_add: bias_grad[j] += sum_i out->grad[i,j] (reads out->grad).
-void bias_add_backward(const Tensor *out, Tensor *bias_grad);
+// Backward of bias_add: bias_grad[j] += sum_i out->grad[i,j] (reads out->grad,
+// accumulates into bias_grad->grad).
+void bias_add_backward(const Tensor *out, const Tensor *bias_grad);
 
 #endif // MATRIX_H

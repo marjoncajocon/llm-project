@@ -5,8 +5,10 @@ as a readable reference — every piece (tensors, matrix math, softmax, GELU, La
 multi-head causal attention, feed-forward, embeddings, sampling, checkpointing, and a
 byte-level BPE tokenizer) is small enough to read in one sitting.
 
-The model is currently **untrained** (weights are random) — the point is a correct,
-end-to-end forward/generation pipeline you can build on. See `notes.md` for the roadmap.
+The model starts from random weights and now **trains end-to-end** — full backpropagation
+through attention, feed-forward, LayerNorm and embeddings, with Adam and a cross-entropy
+loss, verified by numerical gradient checking. The demo overfits a tiny next-token task to
+~0 loss. See `notes.md` for the roadmap.
 
 ## Project layout
 
@@ -185,10 +187,30 @@ for (int step = 0; step < n_steps; step++) {
 adam_free(&opt);
 ```
 
-Gradients are verified in `main.c` by **numerical gradient checking** (analytic `grad` vs
-`(L(+ε) − L(−ε)) / 2ε`). The demo trains a tiny MLP that exercises every backward op and
-overfits it to ~0 loss. Backward for multi-head attention + embeddings (so the full `GPT`
-trains end-to-end) is the next milestone — see `notes.md`.
+The **full `GPT` trains end-to-end**: `gpt_forward_train` (in `model.c`) caches activations,
+`gpt_backward` propagates through the output head, final LayerNorm, every stacked block
+(multi-head causal attention + FFN + residuals), and the embeddings, and `gpt_collect_params`
+feeds Adam. A training step:
+
+```c
+#include "model.h"
+Tensor *params[64];
+int n = gpt_collect_params(&m, params);
+Adam opt = adam_create(params, n, 0.02f);
+GPTActs acts = gpt_acts_create(&m, seq_len);
+
+gpt_forward_train(&m, ids, seq_len, &acts, &logits);
+float loss = cross_entropy_forward(&logits, targets, &probs);
+tensor_zero_grad(&logits);
+cross_entropy_backward(&probs, targets, &logits);
+gpt_backward(&m, ids, seq_len, &acts, &logits);   // grads into every parameter
+adam_step(&opt, params, n);
+```
+
+Gradients are verified in `main.c` by **end-to-end numerical gradient checking** (analytic
+`grad` vs `(L(+ε) − L(−ε)) / 2ε`) across the whole model, then it trains the GPT on a
+next-token task and overfits it to ~0 loss. (Note: float32 finite-difference checking has a
+noise floor for tiny gradients, so the check trusts well-conditioned entries; see `notes.md`.)
 
 ### Importing external weights (e.g. GPT-2) — end-to-end
 

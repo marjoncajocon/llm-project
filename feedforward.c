@@ -43,3 +43,38 @@ void feedforward(
   tensor_free(&hidden);
   tensor_free(&activated);
 }
+
+// Training-mode forward: caches h1b (pre-activation) and act (= gelu(h1b)).
+void feedforward_train(
+    const Tensor *input,
+    const Tensor *W1, const Tensor *b1,
+    const Tensor *W2, const Tensor *b2,
+    Tensor *h1b, Tensor *act,
+    Tensor *output,
+    int d_ff) {
+  (void)d_ff;
+  matmul(input, W1, h1b);        // h1b = input @ W1
+  bias_add(h1b, b1, h1b);        // h1b += b1 (in place)
+  gelu(h1b, act);               // act = gelu(h1b)
+  matmul(act, W2, output);       // output = act @ W2
+  bias_add(output, b2, output);  // output += b2 (in place)
+}
+
+// Backward. Reads output->grad; accumulates input->grad and W1/b1/W2/b2 grads.
+void feedforward_backward(
+    const Tensor *input,
+    const Tensor *W1, const Tensor *b1,
+    const Tensor *W2, const Tensor *b2,
+    Tensor *h1b, Tensor *act,
+    Tensor *output,
+    int d_ff) {
+  (void)d_ff;
+  // output = (act @ W2) + b2  ->  d(act@W2) == output->grad
+  bias_add_backward(output, b2);
+  matmul_backward(act, W2, output);      // act->grad, W2->grad
+  // act = gelu(h1b)
+  gelu_backward(h1b, act);               // h1b->grad
+  // h1b = (input @ W1) + b1  ->  d(input@W1) == h1b->grad
+  bias_add_backward(h1b, b1);
+  matmul_backward(input, W1, h1b);       // input->grad, W1->grad
+}

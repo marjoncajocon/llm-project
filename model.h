@@ -46,4 +46,48 @@ void gpt_forward(const GPT *m, const int *token_ids, int seq_len, Tensor *logits
 // (prompt_len + n_new) must not exceed max_seq_len.
 void gpt_generate(const GPT *m, int *token_ids, int prompt_len, int n_new);
 
+// ---------------------------------------------------------------------------
+// Training: cached activations, training forward/backward, parameter helpers
+// ---------------------------------------------------------------------------
+
+// Activations cached during a training forward pass, consumed by gpt_backward.
+typedef struct {
+  int seq_len;
+  int n_layers;
+  Tensor emb;         // (seq_len, d_model) token+positional embeddings
+  Tensor ln_f_out;    // (seq_len, d_model) final LayerNorm output
+  // Per-layer arrays (length n_layers):
+  Tensor *ln1;        // (seq_len, d_model)
+  Tensor *Q, *K, *V;  // (seq_len, d_model)
+  Tensor *weights;    // (n_heads*seq_len, seq_len) attention weights
+  Tensor *concat;     // (seq_len, d_model) concatenated head outputs
+  Tensor *attn_out;   // (seq_len, d_model)
+  Tensor *a_resid;    // (seq_len, d_model) input + attention (residual)
+  Tensor *ln2;        // (seq_len, d_model)
+  Tensor *ff_h1b;     // (seq_len, d_ff) FFN pre-activation
+  Tensor *ff_act;     // (seq_len, d_ff) FFN post-GELU
+  Tensor *ff_out;     // (seq_len, d_model)
+  Tensor *block_out;  // (seq_len, d_model) block output (input to next layer)
+} GPTActs;
+
+GPTActs gpt_acts_create(const GPT *m, int seq_len);
+void gpt_acts_free(GPTActs *a);
+
+// Training-mode forward: fills the activation cache and logits (seq_len, vocab_size).
+void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
+                       GPTActs *a, Tensor *logits);
+
+// Backward pass. Expects logits->grad to already hold dL/dlogits (from
+// cross_entropy_backward). Zeros parameter and activation grads, then accumulates
+// gradients into every model parameter.
+void gpt_backward(GPT *m, const int *token_ids, int seq_len,
+                  GPTActs *a, Tensor *logits);
+
+// Fill list[] with pointers to all learnable parameter tensors, in canonical
+// order. Returns the count (== 2 + 12*n_layers + 3). list must have room for that.
+int gpt_collect_params(GPT *m, Tensor **list);
+
+// Zero the gradient of every parameter.
+void gpt_zero_grad(GPT *m);
+
 #endif // MODEL_H

@@ -8,7 +8,10 @@
 #include "attention.h"
 #include "layernorm.h"
 #include "matrix.h"
+#include "feedforward.h"
 #include "sampler.h"
+
+#define LN_EPS 1e-5f
 
 // ---------------------------------------------------------------------------
 // Small init helpers
@@ -158,4 +161,181 @@ void gpt_generate(const GPT *m, int *token_ids, int prompt_len, int n_new) {
 
     tensor_free(&logits);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Training: activation cache
+// ---------------------------------------------------------------------------
+
+static Tensor *make_layer_tensors(int n_layers, int rows, int cols) {
+  Tensor *arr = (Tensor*)malloc(n_layers * sizeof(Tensor));
+  int shape[2] = {rows, cols};
+  for (int l = 0; l < n_layers; l++) arr[l] = tensor_create(shape, 2);
+  return arr;
+}
+
+GPTActs gpt_acts_create(const GPT *m, int seq_len) {
+  GPTActs a;
+  a.seq_len = seq_len;
+  a.n_layers = m->n_layers;
+  const int dm = m->d_model, df = m->d_ff, nh = m->n_heads, L = m->n_layers;
+
+  int s2[2] = {seq_len, dm};
+  a.emb = tensor_create(s2, 2);
+  a.ln_f_out = tensor_create(s2, 2);
+
+  a.ln1 = make_layer_tensors(L, seq_len, dm);
+  a.Q = make_layer_tensors(L, seq_len, dm);
+  a.K = make_layer_tensors(L, seq_len, dm);
+  a.V = make_layer_tensors(L, seq_len, dm);
+  a.weights = make_layer_tensors(L, nh * seq_len, seq_len);
+  a.concat = make_layer_tensors(L, seq_len, dm);
+  a.attn_out = make_layer_tensors(L, seq_len, dm);
+  a.a_resid = make_layer_tensors(L, seq_len, dm);
+  a.ln2 = make_layer_tensors(L, seq_len, dm);
+  a.ff_h1b = make_layer_tensors(L, seq_len, df);
+  a.ff_act = make_layer_tensors(L, seq_len, df);
+  a.ff_out = make_layer_tensors(L, seq_len, dm);
+  a.block_out = make_layer_tensors(L, seq_len, dm);
+  return a;
+}
+
+static void free_layer_tensors(Tensor *arr, int n_layers) {
+  for (int l = 0; l < n_layers; l++) tensor_free(&arr[l]);
+  free(arr);
+}
+
+void gpt_acts_free(GPTActs *a) {
+  tensor_free(&a->emb);
+  tensor_free(&a->ln_f_out);
+  free_layer_tensors(a->ln1, a->n_layers);
+  free_layer_tensors(a->Q, a->n_layers);
+  free_layer_tensors(a->K, a->n_layers);
+  free_layer_tensors(a->V, a->n_layers);
+  free_layer_tensors(a->weights, a->n_layers);
+  free_layer_tensors(a->concat, a->n_layers);
+  free_layer_tensors(a->attn_out, a->n_layers);
+  free_layer_tensors(a->a_resid, a->n_layers);
+  free_layer_tensors(a->ln2, a->n_layers);
+  free_layer_tensors(a->ff_h1b, a->n_layers);
+  free_layer_tensors(a->ff_act, a->n_layers);
+  free_layer_tensors(a->ff_out, a->n_layers);
+  free_layer_tensors(a->block_out, a->n_layers);
+}
+
+static void gpt_acts_zero_grad(GPTActs *a) {
+  tensor_zero_grad(&a->emb);
+  tensor_zero_grad(&a->ln_f_out);
+  for (int l = 0; l < a->n_layers; l++) {
+    tensor_zero_grad(&a->ln1[l]);
+    tensor_zero_grad(&a->Q[l]);
+    tensor_zero_grad(&a->K[l]);
+    tensor_zero_grad(&a->V[l]);
+    tensor_zero_grad(&a->weights[l]);
+    tensor_zero_grad(&a->concat[l]);
+    tensor_zero_grad(&a->attn_out[l]);
+    tensor_zero_grad(&a->a_resid[l]);
+    tensor_zero_grad(&a->ln2[l]);
+    tensor_zero_grad(&a->ff_h1b[l]);
+    tensor_zero_grad(&a->ff_act[l]);
+    tensor_zero_grad(&a->ff_out[l]);
+    tensor_zero_grad(&a->block_out[l]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Training: forward, backward, parameter helpers
+// ---------------------------------------------------------------------------
+
+void gpt_forward_train(GPT *m, const int *token_ids, int seq_len,
+                       GPTActs *a, Tensor *logits) {
+  embed_tokens(token_ids, seq_len, &m->wte, &m->wpe, &a->emb);
+
+  for (int l = 0; l < m->n_layers; l++) {
+    BlockWeights *b = &m->blocks[l];
+    const Tensor *inp = (l == 0) ? &a->emb : &a->block_out[l - 1];
+
+    layernorm(inp, &b->gamma1, &b->beta1, &a->ln1[l], LN_EPS);
+    multihead_attention_train(&a->ln1[l], &b->W_q, &b->W_k, &b->W_v, &b->W_o,
+                              &a->Q[l], &a->K[l], &a->V[l], &a->weights[l], &a->concat[l],
+                              &a->attn_out[l], m->n_heads);
+    matadd(inp, &a->attn_out[l], &a->a_resid[l]);
+    layernorm(&a->a_resid[l], &b->gamma2, &b->beta2, &a->ln2[l], LN_EPS);
+    feedforward_train(&a->ln2[l], &b->ff_W1, &b->ff_b1, &b->ff_W2, &b->ff_b2,
+                      &a->ff_h1b[l], &a->ff_act[l], &a->ff_out[l], m->d_ff);
+    matadd(&a->a_resid[l], &a->ff_out[l], &a->block_out[l]);
+  }
+
+  layernorm(&a->block_out[m->n_layers - 1], &m->ln_f_gamma, &m->ln_f_beta,
+            &a->ln_f_out, LN_EPS);
+  matmul(&a->ln_f_out, &m->lm_head, logits);
+}
+
+void gpt_backward(GPT *m, const int *token_ids, int seq_len,
+                  GPTActs *a, Tensor *logits) {
+  gpt_zero_grad(m);
+  gpt_acts_zero_grad(a);
+
+  // logits = ln_f_out @ lm_head
+  matmul_backward(&a->ln_f_out, &m->lm_head, logits);
+  // ln_f_out = LN_f(block_out[L-1])
+  layernorm_backward(&a->block_out[m->n_layers - 1], &m->ln_f_gamma, &a->ln_f_out,
+                     &m->ln_f_gamma, &m->ln_f_beta, LN_EPS);
+
+  for (int l = m->n_layers - 1; l >= 0; l--) {
+    BlockWeights *b = &m->blocks[l];
+    const Tensor *inp = (l == 0) ? &a->emb : &a->block_out[l - 1];
+
+    // block_out[l] = a_resid[l] + ff_out[l]
+    matadd_backward(&a->block_out[l], &a->a_resid[l], &a->ff_out[l]);
+    // ff_out[l] = FFN(ln2[l])
+    feedforward_backward(&a->ln2[l], &b->ff_W1, &b->ff_b1, &b->ff_W2, &b->ff_b2,
+                         &a->ff_h1b[l], &a->ff_act[l], &a->ff_out[l], m->d_ff);
+    // ln2[l] = LN2(a_resid[l])
+    layernorm_backward(&a->a_resid[l], &b->gamma2, &a->ln2[l],
+                       &b->gamma2, &b->beta2, LN_EPS);
+    // a_resid[l] = inp + attn_out[l]
+    matadd_backward(&a->a_resid[l], inp, &a->attn_out[l]);
+    // attn_out[l] = MHA(ln1[l])
+    multihead_attention_backward(&a->ln1[l], &b->W_q, &b->W_k, &b->W_v, &b->W_o,
+                                 &a->Q[l], &a->K[l], &a->V[l], &a->weights[l], &a->concat[l],
+                                 &a->attn_out[l], m->n_heads);
+    // ln1[l] = LN1(inp)
+    layernorm_backward(inp, &b->gamma1, &a->ln1[l], &b->gamma1, &b->beta1, LN_EPS);
+  }
+
+  embedding_backward(token_ids, seq_len, &a->emb, &m->wte, &m->wpe);
+}
+
+int gpt_collect_params(GPT *m, Tensor **list) {
+  int n = 0;
+  list[n++] = &m->wte;
+  list[n++] = &m->wpe;
+  for (int l = 0; l < m->n_layers; l++) {
+    BlockWeights *b = &m->blocks[l];
+    list[n++] = &b->W_q;
+    list[n++] = &b->W_k;
+    list[n++] = &b->W_v;
+    list[n++] = &b->W_o;
+    list[n++] = &b->gamma1;
+    list[n++] = &b->beta1;
+    list[n++] = &b->gamma2;
+    list[n++] = &b->beta2;
+    list[n++] = &b->ff_W1;
+    list[n++] = &b->ff_b1;
+    list[n++] = &b->ff_W2;
+    list[n++] = &b->ff_b2;
+  }
+  list[n++] = &m->ln_f_gamma;
+  list[n++] = &m->ln_f_beta;
+  list[n++] = &m->lm_head;
+  return n;
+}
+
+void gpt_zero_grad(GPT *m) {
+  int cap = 2 + 12 * m->n_layers + 3;
+  Tensor **list = (Tensor**)malloc(cap * sizeof(Tensor*));
+  int n = gpt_collect_params(m, list);
+  for (int i = 0; i < n; i++) tensor_zero_grad(list[i]);
+  free(list);
 }

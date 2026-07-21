@@ -79,7 +79,7 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
 }
 
 // Backward of C = A + B: dA += dC, dB += dC
-void matadd_backward(const Tensor *C, Tensor *A, Tensor *B) {
+void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B) {
   for (int i = 0; i < C->size; i++) {
     A->grad[i] += C->grad[i];
     B->grad[i] += C->grad[i];
@@ -87,7 +87,7 @@ void matadd_backward(const Tensor *C, Tensor *A, Tensor *B) {
 }
 
 // Backward of bias_add: bias_grad[j] += sum_i out->grad[i,j]
-void bias_add_backward(const Tensor *out, Tensor *bias_grad) {
+void bias_add_backward(const Tensor *out, const Tensor *bias_grad) {
   const int M = out->shape[0];
   const int N = out->shape[1];
   for (int j = 0; j < N; j++) {

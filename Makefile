@@ -27,12 +27,12 @@ feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h
 embedding.o:  embedding.h tensor.h
 sampler.o:    sampler.h tensor.h
-model.o:      model.h tensor.h embedding.h attention.h layernorm.h matrix.h sampler.h
+model.o:      model.h tensor.h embedding.h attention.h layernorm.h matrix.h feedforward.h sampler.h
 checkpoint.o: checkpoint.h model.h tensor.h
 tokenizer.o:  tokenizer.h
 loss.o:       loss.h tensor.h activation.h
 optim.o:      optim.h tensor.h
-main.o:       tensor.h matrix.h activation.h layernorm.h loss.h optim.h model.h checkpoint.h tokenizer.h
+main.o:       tensor.h loss.h optim.h model.h checkpoint.h tokenizer.h
 
 clean:
 	rm -f $(OBJS) $(TARGET)
