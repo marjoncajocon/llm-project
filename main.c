@@ -157,6 +157,27 @@ int main() {
          topk1_ok ? "OK" : "FAIL", seed_ok ? "OK" : "FAIL");
   all_ok &= sample_ok;
 
+  // --------------------------------------------------------------------------
+  // Part 6: KV-cache decode must match the non-cached forward (logits row t)
+  // --------------------------------------------------------------------------
+  KVCache kv = gpt_kvcache_create(&model);
+  int slog_shape[2] = {1, vocab};
+  Tensor slog = tensor_create(slog_shape, 2);
+  float kv_max_diff = 0.0f;
+  for (int t = 0; t < seq_len; t++) {
+    gpt_decode_step(&model, &kv, ids[t], &slog);
+    for (int j = 0; j < vocab; j++) {
+      float diff = fabsf(slog.data[j] - logits.data[t * vocab + j]);
+      if (diff > kv_max_diff) kv_max_diff = diff;
+    }
+  }
+  int kv_ok = (kv_max_diff < 1e-3f);
+  printf("[4] KV cache: max |logit diff| vs full forward = %.2e -> %s\n\n",
+         kv_max_diff, kv_ok ? "OK" : "FAIL");
+  all_ok &= kv_ok;
+  tensor_free(&slog);
+  gpt_kvcache_free(&kv);
+
   adam_free(&opt);
   tensor_free(&logits);
   tensor_free(&probs);

@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "embedding.h"
 #include "attention.h"
@@ -353,4 +354,96 @@ void gpt_zero_grad(GPT *m) {
   int n = gpt_collect_params(m, list);
   for (int i = 0; i < n; i++) tensor_zero_grad(list[i]);
   free(list);
+}
+
+// ---------------------------------------------------------------------------
+// KV cache + incremental decode
+// ---------------------------------------------------------------------------
+
+KVCache gpt_kvcache_create(const GPT *m) {
+  KVCache kv;
+  kv.n_layers = m->n_layers;
+  kv.d_model = m->d_model;
+  kv.n_heads = m->n_heads;
+  kv.max_seq_len = m->max_seq_len;
+  kv.len = 0;
+  kv.K = make_layer_tensors(m->n_layers, m->max_seq_len, m->d_model);
+  kv.V = make_layer_tensors(m->n_layers, m->max_seq_len, m->d_model);
+  return kv;
+}
+
+void gpt_kvcache_free(KVCache *kv) {
+  free_layer_tensors(kv->K, kv->n_layers);
+  free_layer_tensors(kv->V, kv->n_layers);
+  kv->K = NULL;
+  kv->V = NULL;
+  kv->len = 0;
+}
+
+void gpt_decode_step(const GPT *m, KVCache *kv, int token, Tensor *logits) {
+  const int dm = m->d_model, nh = m->n_heads, hd = dm / nh;
+  const int pos = kv->len;
+  const float scale = 1.0f / sqrtf((float)hd);
+
+  int s1[2] = {1, dm};
+  Tensor x = tensor_create(s1, 2), ln1 = tensor_create(s1, 2);
+  Tensor q = tensor_create(s1, 2), k = tensor_create(s1, 2), v = tensor_create(s1, 2);
+  Tensor concat = tensor_create(s1, 2), attn = tensor_create(s1, 2);
+  Tensor ln2 = tensor_create(s1, 2), ff = tensor_create(s1, 2), lnf = tensor_create(s1, 2);
+
+  // Embed the new token at its position
+  for (int j = 0; j < dm; j++) {
+    x.data[j] = m->wte.data[token * dm + j] + m->wpe.data[pos * dm + j];
+  }
+
+  float *scores = (float*)malloc((pos + 1) * sizeof(float));
+  for (int l = 0; l < m->n_layers; l++) {
+    const BlockWeights *b = &m->blocks[l];
+
+    layernorm(&x, &b->gamma1, &b->beta1, &ln1, LN_EPS);
+    matmul(&ln1, &b->W_q, &q); bias_add(&q, &b->b_q, &q);
+    matmul(&ln1, &b->W_k, &k); bias_add(&k, &b->b_k, &k);
+    matmul(&ln1, &b->W_v, &v); bias_add(&v, &b->b_v, &v);
+
+    // Append this position's K/V to the cache
+    memcpy(&kv->K[l].data[pos * dm], k.data, dm * sizeof(float));
+    memcpy(&kv->V[l].data[pos * dm], v.data, dm * sizeof(float));
+
+    // Single-query attention over cached positions 0..pos, per head
+    for (int h = 0; h < nh; h++) {
+      const int off = h * hd;
+      float mx = -INFINITY;
+      for (int j = 0; j <= pos; j++) {
+        float dot = 0.0f;
+        for (int d = 0; d < hd; d++) {
+          dot += q.data[off + d] * kv->K[l].data[j * dm + off + d];
+        }
+        scores[j] = dot * scale;
+        if (scores[j] > mx) mx = scores[j];
+      }
+      float sum = 0.0f;
+      for (int j = 0; j <= pos; j++) { scores[j] = expf(scores[j] - mx); sum += scores[j]; }
+      for (int d = 0; d < hd; d++) {
+        float acc = 0.0f;
+        for (int j = 0; j <= pos; j++) {
+          acc += (scores[j] / sum) * kv->V[l].data[j * dm + off + d];
+        }
+        concat.data[off + d] = acc;
+      }
+    }
+
+    matmul(&concat, &b->W_o, &attn); bias_add(&attn, &b->b_o, &attn);
+    matadd(&x, &attn, &x);  // residual (in place)
+    layernorm(&x, &b->gamma2, &b->beta2, &ln2, LN_EPS);
+    feedforward(&ln2, &b->ff_W1, &b->ff_b1, &b->ff_W2, &b->ff_b2, &ff, m->d_ff);
+    matadd(&x, &ff, &x);    // residual (in place)
+  }
+  free(scores);
+
+  layernorm(&x, &m->ln_f_gamma, &m->ln_f_beta, &lnf, LN_EPS);
+  matmul(&lnf, &m->lm_head, logits);
+  kv->len++;
+
+  tensor_free(&x); tensor_free(&ln1); tensor_free(&q); tensor_free(&k); tensor_free(&v);
+  tensor_free(&concat); tensor_free(&attn); tensor_free(&ln2); tensor_free(&ff); tensor_free(&lnf);
 }

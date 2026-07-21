@@ -85,10 +85,29 @@ void gpt_backward(GPT *m, const int *token_ids, int seq_len,
                   GPTActs *a, Tensor *logits);
 
 // Fill list[] with pointers to all learnable parameter tensors, in canonical
-// order. Returns the count (== 2 + 12*n_layers + 3). list must have room for that.
+// order. Returns the count (== 2 + 16*n_layers + 3). list must have room for that.
 int gpt_collect_params(GPT *m, Tensor **list);
 
 // Zero the gradient of every parameter.
 void gpt_zero_grad(GPT *m);
+
+// ---------------------------------------------------------------------------
+// Incremental decoding with a key/value cache (fast autoregressive generation)
+// ---------------------------------------------------------------------------
+
+// Per-layer cache of the K and V projections for every generated position.
+typedef struct {
+  int n_layers, d_model, n_heads, max_seq_len;
+  int len;       // number of positions currently cached
+  Tensor *K;     // per layer: (max_seq_len, d_model)
+  Tensor *V;     // per layer: (max_seq_len, d_model)
+} KVCache;
+
+KVCache gpt_kvcache_create(const GPT *m);
+void gpt_kvcache_free(KVCache *kv);
+
+// Decode one token at the next cached position: appends its K/V to the cache and
+// writes the next-token logits (shape (1, vocab_size)). Advances kv->len.
+void gpt_decode_step(const GPT *m, KVCache *kv, int token, Tensor *logits);
 
 #endif // MODEL_H

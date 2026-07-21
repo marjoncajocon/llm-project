@@ -26,7 +26,7 @@ defined in the matching `.c`.
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |
 | `sampler.h` / `sampler.c`         | Token sampling: greedy argmax + temperature / top-k / top-p (seeded RNG) |
-| `model.h` / `model.c`             | `GPT` model: embeddings, stacked blocks, output head, generation |
+| `model.h` / `model.c`             | `GPT` model: embeddings, stacked blocks, output head, training, KV-cache decode |
 | `checkpoint.h` / `checkpoint.c`   | Save/load model weights (`gpt_save` / `gpt_load`, GPTC format) |
 | `tokenizer.h` / `tokenizer.c`     | Self-contained byte-level BPE (`encode` / `decode`)           |
 | `loss.h` / `loss.c`               | Softmax cross-entropy (forward + backward)                    |

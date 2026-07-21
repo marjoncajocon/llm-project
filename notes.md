@@ -21,7 +21,7 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
-- [ ] Step B2 — KV cache (generation O(n) not O(n²))
+- [x] Step B2 — KV cache (incremental decode; verified bit-exact vs full forward)
 - [ ] Step B3 — REPL front-end: `you>` loop (stdin → tokenize → generate → stream out)
 - [ ] Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization
 
@@ -378,11 +378,26 @@ and stays at 9.28e-04 — bias backward is correct; training convergence corrobo
 - Model-agnostic: drives the toy model now, real GPT-2 later. Next: KV cache (B2) and a REPL
   front-end (B3).
 
+## Step B2 — KV cache (incremental decode)
+
+**Status: DONE — verified bit-exact vs the full forward.**
+
+- **`model.h/.c`** — `KVCache` (per-layer `(max_seq_len, d_model)` K and V buffers) with
+  `gpt_kvcache_create` / `gpt_kvcache_free`, and `gpt_decode_step(m, kv, token, logits)`:
+  embeds one token, and per layer does LN1 → q/k/v (append k,v to cache) →
+  single-query attention over cached positions 0..pos → W_o+bias → residual → LN2 → FFN →
+  residual, then final LN → `@ lm_head`. Reuses `layernorm`/`matmul`/`bias_add`/`matadd`/
+  `feedforward`; attention-over-cache is a small inline loop. Advances `kv->len`.
+- **`main.c`** — Part [4] feeds the sequence one token at a time and compares each step's
+  logits to the non-cached forward (`logits` row t). Result: **max |diff| = 0.00e+00**
+  (bit-exact) — the cache is correct, and generation is now O(n) per token instead of
+  re-running the whole prefix.
+
 ## Next steps (not started)
-- Step B3 — REPL front-end: token-in/token-out generation loop (pipe-testable), then wire
-  real text once A1 lands.
-- Step B2 — KV cache: verify cached generation matches the non-cached forward bit-for-bit.
+- Step B3 — REPL front-end: token-in/token-out generation loop using `gpt_decode_step` +
+  `sample_token` (pipe-testable), then wire real text once A1 lands.
 - Step A1 — Real GPT-2 BPE tokenizer: load `encoder.json` + `vocab.bpe` + pretok regex.
+- Step B4 — Performance: blocked/threaded/SIMD matmul + int8 quantization.
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
 - Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.
