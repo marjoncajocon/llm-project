@@ -14,6 +14,10 @@ typedef struct {
 // Load a 16-bit PCM WAV (mono, or stereo downmixed to mono). Returns
 // {NULL,0,0} on error. Use tools/audio_to_wav.py to convert other formats.
 Audio audio_load_wav(const char *path);
+
+// Write an Audio clip as a 16-bit PCM mono WAV. Returns 0 on success.
+int audio_save_wav(const char *path, const Audio *a);
+
 void audio_free(Audio *a);
 
 // Number of frames: windows of `frame_size` samples advanced by `hop`.

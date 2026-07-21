@@ -43,7 +43,7 @@ defined in the matching `.c`.
 | `audiogen.h` / `audiogen.c`       | Audio ↔ tokens (µ-law) for autoregressive audio **generation** (Phase G) |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
-| `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`)     |
+| `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
 | `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py` |
@@ -254,6 +254,25 @@ to drop in). The pieces: `toolcall.c` (parse) · `toolexec.c` (write/read/run) �
 > The built-in transformer is far too small to emit valid tool calls, and `model/gpt2` is base
 > (not instruction-tuned) — for a genuinely acting agent, point `--cmd` at an instruction-tuned
 > model or an LLM API.
+
+### `transformer imggen` / `audgen` (generate media to a file)
+
+Discrete-token media generation (Phase G): quantize the input to tokens, train a small GPT to
+model that sequence, then autoregressively regenerate it and decode to a real file.
+
+```sh
+python tools/img_to_ppm.py cat.png cat.ppm 32     # any image -> small PPM (<= ~32x32)
+transformer imggen cat.ppm out.ppm 4 500          # -> out.ppm   (levels=4, steps=500)
+
+python tools/audio_to_wav.py clip.mp3 clip.wav    # any audio -> 16-bit mono WAV (short)
+transformer audgen clip.wav out.wav 500           # -> out.wav
+```
+
+Image uses a **color-cube** codec (`levels³` tokens); audio uses **µ-law** (256). These are
+single-example generative models (they overfit the input) with O(n²) attention, so keep inputs
+small (≤ ~32×32 image, ≤ ~1024 audio samples). Text-conditioned generation (text→image/audio/
+video) and captioning (media→text) are demonstrated in the default smoke test — see `notes.md`
+(Phase G). Real quality needs a trained VQ-VAE/diffusion + a dataset.
 
 ### `tools/convert_to_gptc.py` (weight importer)
 

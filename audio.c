@@ -57,6 +57,29 @@ Audio audio_load_wav(const char *path) {
   return a;
 }
 
+int audio_save_wav(const char *path, const Audio *a) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return 1;
+  uint32_t dsz = (uint32_t)(a->n * 2), x;
+  uint16_t u16;
+  fwrite("RIFF", 1, 4, f); x = 36 + dsz; fwrite(&x, 4, 1, f); fwrite("WAVE", 1, 4, f);
+  fwrite("fmt ", 1, 4, f); x = 16; fwrite(&x, 4, 1, f);
+  u16 = 1; fwrite(&u16, 2, 1, f); u16 = 1; fwrite(&u16, 2, 1, f);           // PCM, mono
+  x = a->sample_rate; fwrite(&x, 4, 1, f);
+  x = a->sample_rate * 2; fwrite(&x, 4, 1, f);                             // byte rate
+  u16 = 2; fwrite(&u16, 2, 1, f); u16 = 16; fwrite(&u16, 2, 1, f);         // block align, bits
+  fwrite("data", 1, 4, f); fwrite(&dsz, 4, 1, f);
+  for (int i = 0; i < a->n; i++) {
+    float s = a->samples[i];
+    if (s > 1.0f) s = 1.0f;
+    if (s < -1.0f) s = -1.0f;
+    int16_t v = (int16_t)(s * 32767.0f);
+    fwrite(&v, 2, 1, f);
+  }
+  fclose(f);
+  return 0;
+}
+
 void audio_free(Audio *a) {
   free(a->samples);
   a->samples = NULL;

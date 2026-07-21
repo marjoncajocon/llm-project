@@ -73,7 +73,11 @@ LMs). Diffusion is the SOTA alternative but a much bigger, different build — n
       8×8 image, loss 4.53 → 0.0003). (Text→image conditioning = next; prefix the caption.)
 - [x] Step GI3 — Generate: greedy autoregressive sampling of image tokens (KV cache +
       `sample_argmax`) → **64/64 tokens reproduced** → `tokens_to_image` → pixels. Minimal image
-      generation works end-to-end. (CLI subcommand + real dataset + upscaling = polish.)
+      generation works end-to-end.
+- [x] Step G-CLI — `transformer imggen <in.ppm> <out.ppm> [levels] [steps]` and
+      `audgen <in.wav> <out.wav> [steps]`: generate real media FILES (image_save_ppm /
+      audio_save_wav; `autoregress_reconstruct` helper). Verified: 12×12 PPM → out.ppm (144/144),
+      160-sample WAV → out.wav (160/160). Small inputs only (O(n²)); single-example overfit.
 - [x] Step GA — Audio generation: `audiogen.c` **µ-law 256-level** codec
       (`audio_to_tokens`/`tokens_to_audio`, WaveNet-style). Generated via text→audio (below).
 - [x] Step GV — Video generation: reuse `imagegen` per frame (a clip = concatenated frame

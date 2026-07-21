@@ -59,6 +59,20 @@ Image image_load_ppm(const char *path) {
   return im;
 }
 
+int image_save_ppm(const char *path, const Image *im) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return 1;
+  fprintf(f, "P6\n%d %d\n255\n", im->w, im->h);
+  for (int i = 0; i < im->w * im->h * 3; i++) {
+    int v = (int)(im->data[i] * 255.0f + 0.5f);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    fputc(v, f);
+  }
+  fclose(f);
+  return 0;
+}
+
 void image_free(Image *im) {
   free(im->data);
   im->data = NULL;

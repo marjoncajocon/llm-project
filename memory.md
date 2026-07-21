@@ -83,8 +83,10 @@ GPT + KV cache + sampler + cross-entropy; NOT diffusion). Codecs: `imagegen.c` (
 media+text, text ids offset above media; predict media after the text prefix; smoke `[11]`
 16/16, 32/32, 32/32). Video-gen = concatenated per-frame image tokens. Also ✅ **media→text captioning**
 (`media_to_text` in main.c: image/audio/video → generate caption text; smoke `[12]` 3/3 each)
-— so media↔text works BOTH ways. Remaining polish: a `generate-*` CLI subcommand + PPM/WAV
-output files, real datasets, VQ-VAE/diffusion for quality (palette/µ-law are crude).
+— so media↔text works BOTH ways. ✅ **CLI subcommands** `transformer imggen <in.ppm> <out.ppm>
+[levels] [steps]` + `audgen <in.wav> <out.wav> [steps]` generate real media FILES
+(image_save_ppm/audio_save_wav; `autoregress_reconstruct` helper; overfits one input, small
+only — O(n^2)). Remaining polish: real datasets, VQ-VAE/diffusion for quality, a captioning CLI.
 
 **Model naming/identity:** `--name X` = the model FOLDER (`model/X/`). The PERSONA ("I am X,
 created by Y") comes from TRAINING DATA — `data/identity.txt` (identity Q&A) trained in; demo:

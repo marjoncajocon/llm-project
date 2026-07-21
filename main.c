@@ -961,9 +961,108 @@ static int run_train(int argc, char **argv) {
   return train_run(data, &cfg);
 }
 
+// ============================================================================
+// Media generation to a file: quantize the input to tokens, train a small GPT to
+// model that token sequence, then autoregressively regenerate it and decode. The
+// codec (imagegen/audiogen) is the only difference between imggen and audgen.
+// (A single-example generative model — overfits the input; a real generative
+// model needs a dataset. Kept small: O(n^2) attention, so short inputs only.)
+// ============================================================================
+static int autoregress_reconstruct(const int *tok, int P, int V, int steps, int *gen) {
+  int *tgt = (int*)malloc(P * sizeof(int));
+  for (int i = 0; i < P; i++) tgt[i] = (i < P - 1) ? tok[i + 1] : -1;
+  srand(1234);
+  GPT g = gpt_create(V, 64, 4, 2, 256, P);
+  GPTActs a = gpt_acts_create(&g, P);
+  int lz[2] = {P, V};
+  Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
+  Tensor *par[256];
+  int np = gpt_collect_params(&g, par);
+  Adam opt = adam_create(par, np, 0.005f);
+  int report = (steps >= 10) ? steps / 10 : 1;
+  for (int s = 0; s < steps; s++) {
+    gpt_forward_train(&g, tok, P, &a, &lo);
+    float loss = cross_entropy_forward(&lo, tgt, &pr);
+    tensor_zero_grad(&lo);
+    cross_entropy_backward(&pr, tgt, &lo);
+    gpt_backward(&g, tok, P, &a, &lo);
+    adam_step(&opt, par, np);
+    if (s % report == 0) fprintf(stderr, "  step %d/%d  loss %.4f\n", s, steps, loss);
+  }
+  KVCache kv = gpt_kvcache_create(&g);
+  int gz[2] = {1, V};
+  Tensor gl = tensor_create(gz, 2);
+  gen[0] = tok[0];
+  gpt_decode_step(&g, &kv, tok[0], &gl);
+  for (int i = 1; i < P; i++) {
+    gen[i] = sample_argmax(&gl, 0);
+    gpt_decode_step(&g, &kv, gen[i], &gl);
+  }
+  int match = 0;
+  for (int i = 0; i < P; i++) if (gen[i] == tok[i]) match++;
+  tensor_free(&gl); gpt_kvcache_free(&kv); adam_free(&opt);
+  tensor_free(&lo); tensor_free(&pr); gpt_acts_free(&a); gpt_free(&g); free(tgt);
+  return match;
+}
+
+static int run_imggen(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: transformer imggen <in.ppm> <out.ppm> [levels=4] [steps=500]\n");
+    return 2;
+  }
+  int levels = (argc > 4) ? atoi(argv[4]) : 4;
+  int steps = (argc > 5) ? atoi(argv[5]) : 500;
+  Image im = image_load_ppm(argv[2]);
+  if (!im.data) return 1;
+  int P = im.h * im.w, V = imagegen_vocab(levels);
+  if (P > 1024) {
+    fprintf(stderr, "image too large (%d px); use <= ~32x32 (img_to_ppm.py --size 32)\n", P);
+    image_free(&im); return 1;
+  }
+  fprintf(stderr, "imggen: %dx%d, %d tokens, vocab %d, %d steps\n", im.w, im.h, P, V, steps);
+  int *tok = (int*)malloc(P * sizeof(int));
+  int *gen = (int*)malloc(P * sizeof(int));
+  image_to_tokens(&im, levels, tok);
+  int match = autoregress_reconstruct(tok, P, V, steps, gen);
+  Image out = tokens_to_image(gen, im.w, im.h, levels);
+  int rc = image_save_ppm(argv[3], &out);
+  fprintf(stderr, "generated %d/%d tokens; wrote %s (%s)\n",
+          match, P, argv[3], rc ? "FAILED" : "ok");
+  image_free(&out); image_free(&im); free(tok); free(gen);
+  return rc;
+}
+
+static int run_audgen(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: transformer audgen <in.wav> <out.wav> [steps=500]\n");
+    return 2;
+  }
+  int steps = (argc > 4) ? atoi(argv[4]) : 500;
+  Audio a = audio_load_wav(argv[2]);
+  if (!a.samples) return 1;
+  int P = a.n, V = audiogen_vocab();
+  if (P > 1024) {
+    fprintf(stderr, "audio too long (%d samples); use a short clip (<= ~1024 samples)\n", P);
+    audio_free(&a); return 1;
+  }
+  fprintf(stderr, "audgen: %d samples @ %d Hz, %d tokens, %d steps\n", a.n, a.sample_rate, P, steps);
+  int *tok = (int*)malloc(P * sizeof(int));
+  int *gen = (int*)malloc(P * sizeof(int));
+  audio_to_tokens(&a, tok);
+  int match = autoregress_reconstruct(tok, P, V, steps, gen);
+  Audio out = tokens_to_audio(gen, P, a.sample_rate);
+  int rc = audio_save_wav(argv[3], &out);
+  fprintf(stderr, "generated %d/%d tokens; wrote %s (%s)\n",
+          match, P, argv[3], rc ? "FAILED" : "ok");
+  audio_free(&out); audio_free(&a); free(tok); free(gen);
+  return rc;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);
   if (argc > 1 && strcmp(argv[1], "train") == 0) return run_train(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "imggen") == 0) return run_imggen(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "audgen") == 0) return run_audgen(argc, argv);
   return run_demo();
 }
