@@ -8,6 +8,16 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > **Sync rule (user request):** this file mirrors Claude's memory — whenever the assistant
 > updates its memory, it must also update `memory.md` here.
 
+> **▶▶ PLANNED NEXT STEP (agreed 2026-07-21):** build a **real LLM agent backend** —
+> `tools/agent_llm.py` that reads the transcript (argv), calls a real LLM (Claude via Anthropic
+> API; OpenAI ok), with a system prompt to emit exactly one `<tool …>` / `<done>` block, and
+> prints it to stdout. Then `transformer agent --cmd "python tools/agent_llm.py" --goal "..."`
+> genuinely acts (approval gate stays). Needs an API key. No C changes (backend already
+> pluggable; see `agent.c` + `tools/agent_mock.py` for the contract; load the `claude-api`
+> skill for model ids). This is the biggest usefulness jump and the original coding-agent
+> vision. Backups: split the smoke test out of `main.c` into `selftest.c`; dataset-trained
+> `imggen`/`audgen`. See notes.md "▶▶ PLANNED NEXT STEP" for detail.
+
 _Last updated: 2026-07-21._
 
 ## Who / project

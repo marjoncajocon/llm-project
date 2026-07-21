@@ -146,6 +146,30 @@ LMs). Diffusion is the SOTA alternative but a much bigger, different build — n
 Order rationale: text (1–4) is very achievable locally; images (5) and video (6) are big
 multimodal builds where the plumbing is feasible but real quality needs far more scale.
 
+## ▶▶ PLANNED NEXT STEP (agreed 2026-07-21) — real LLM agent backend
+
+**Do this next.** Turn the agent from a scripted demo into one that genuinely acts, using the
+already-pluggable `agent --cmd` backend. This is the biggest usefulness jump (the original
+"local coding-agent CLI" vision) and NOT gated on model scale — only on an API key.
+
+**Build:** `tools/agent_llm.py` — reads the transcript file (argv), calls a real LLM (Claude
+via the Anthropic API; also fine to support OpenAI), with a system prompt that makes the model
+reply with EXACTLY one of our blocks: `<tool name="write_file|read_file|run_command" .../>...`
+or `<done>summary</done>`. Print the response to stdout (the C agent uses stdout as the model
+response — see `agent.c` command backend + `tools/agent_mock.py` for the exact contract).
+
+**Run:** `transformer agent --cmd "python tools/agent_llm.py" --goal "..."` — the existing
+approval gate (`--ask`) stays as the safety layer. Needs `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`).
+
+**Notes for whoever builds it:** consult the Claude API reference for current model ids/params
+(load the `claude-api` skill). Keep `agent_mock.py` as the offline/no-key fallback. Test the
+plumbing with the mock first, then the live call once a key is set. Small, clean change — no C
+changes needed (backend is already pluggable).
+
+**Backups if not doing the agent backend:** (a) code health — split the 12-part smoke test out
+of `main.c` (~1000 lines) into `selftest.c` so main.c is just CLI dispatch; (b) dataset-trained
+generator — make `imggen`/`audgen` learn from a folder instead of one input.
+
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
 **If a session ran out of usage / you're picking this up fresh, start here.**
