@@ -16,6 +16,8 @@
 #include "tokenizer.h"
 #include "train.h"
 #include "agent.h"
+#include "image.h"
+#include "patch.h"
 
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
@@ -215,6 +217,40 @@ static int run_demo(void) {
   all_ok &= kv_ok;
   tensor_free(&slog);
   gpt_kvcache_free(&kv);
+
+  // --------------------------------------------------------------------------
+  // Part 7: image patch embedding (Phase E: image -> sequence of vectors)
+  // --------------------------------------------------------------------------
+  FILE *pf = fopen("img.ppm.tmp", "wb");
+  if (pf) {
+    fprintf(pf, "P6\n4 4\n255\n");
+    for (int i = 0; i < 4 * 4 * 3; i++) fputc((unsigned char)((i * 7) & 0xFF), pf);
+    fclose(pf);
+  }
+  Image im = image_load_ppm("img.ppm.tmp");
+  int img_ok = (im.data != NULL && im.h == 4 && im.w == 4);
+  if (img_ok) {
+    const int patch = 2;
+    int np = patch_count(&im, patch);              // 4 patches
+    int pd = patch_dim(&im, patch);                // 2*2*3 = 12
+    int ws[2] = {pd, d_model};
+    Tensor Wp = tensor_create(ws, 2); tensor_init_random(&Wp);
+    int bs[1] = {d_model};  Tensor bp = tensor_create(bs, 1);
+    int os[2] = {np, d_model}; Tensor pemb = tensor_create(os, 2);
+    patch_embed(&im, patch, &Wp, &bp, &pemb);
+    int finite = 1;
+    for (int i = 0; i < pemb.size; i++)
+      if (isnan(pemb.data[i]) || isinf(pemb.data[i])) { finite = 0; break; }
+    img_ok = (pemb.size == np * d_model) && finite;
+    printf("[5] Image: 4x4 PPM -> %d patches x d_model %d -> %s\n\n",
+           np, d_model, img_ok ? "OK" : "FAIL");
+    tensor_free(&Wp); tensor_free(&bp); tensor_free(&pemb);
+  } else {
+    printf("[5] Image: load FAIL\n\n");
+  }
+  image_free(&im);
+  remove("img.ppm.tmp");
+  all_ok &= img_ok;
 
   adam_free(&opt);
   tensor_free(&logits);

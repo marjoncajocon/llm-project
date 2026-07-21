@@ -8,7 +8,8 @@ LDLIBS  = -lm -pthread
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o \
-          toolcall.o toolexec.o approval.o agent.o corpus.o train.o main.o
+          toolcall.o toolexec.o approval.o agent.o corpus.o train.o \
+          image.o patch.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
 ZIG            ?= zig
@@ -47,7 +48,9 @@ approval.o:   approval.h
 agent.o:      agent.h approval.h toolcall.h toolexec.h
 corpus.o:     corpus.h
 train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h
-main.o:       tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h
+image.o:      image.h
+patch.o:      patch.h tensor.h image.h matrix.h
+main.o:       tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h image.h patch.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.
 # Requires `zig` and a POSIX shell (Linux/macOS/WSL). No per-OS toolchain needed.

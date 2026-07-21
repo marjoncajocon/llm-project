@@ -35,6 +35,8 @@ defined in the matching `.c`.
 | `toolexec.h` / `toolexec.c`       | Execute a tool call: write_file / read_file / run_command     |
 | `approval.h` / `approval.c`       | Approval gate for tool actions (ask y/N, or auto)             |
 | `agent.h` / `agent.c`             | Agent loop: parse → approve → execute → observe               |
+| `image.h` / `image.c`             | Minimal image loading (binary PPM) — Phase E (multimodal)     |
+| `patch.h` / `patch.c`             | ViT-style patch embedding: image → sequence of vectors        |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`)     |

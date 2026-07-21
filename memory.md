@@ -66,7 +66,10 @@ via `make cross`).
 4. ✅ Real agent backend — `agent.c` pluggable `AgentBackend`: scripted + **command** backend
    (`agent --cmd "<prog>"`, program stdout = model response; `tools/agent_mock.py` example).
    Plug in a real LLM via an API script. DONE.
-5. **Phase E — images (multimodal)** (RECOMMENDED NEXT). 6. Phase F — video. (Text-only today.)
+5. Phase E images — **E1+E2 DONE** (`image.c` PPM load, `patch.c` ViT patch embedding,
+   `tools/img_to_ppm.py`; verified in smoke test). **E3 (feed patches into GPT) + E4
+   (image-text training) remain** — RECOMMENDED NEXT. 6. Phase F — video. (Still text-only for
+   real output; image is plumbing only.)
 
 Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/**/*.bin`
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).

@@ -30,14 +30,16 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 - [ ] B4 remainder — threaded/SIMD matmul + int8 quant (needed for big models to train fast).
 
 **Phase E — Multimodal (images), the big future build (user goal: understand/describe images):**
-- [ ] Step E1 — Image decode (PNG/JPG → pixel tensor). Use `stb_image.h` (single-header,
-      vendored in root or `tools/`) or a PPM/BMP reader first. Store images in `data/images/`.
-- [ ] Step E2 — Patch embedding front-end (ViT-style): split image into patches, linear-embed
-      each patch → a sequence of vectors (new module `patch.c`).
+- [x] Step E1 — Image decode: `image.c` reads binary **PPM (P6)** → HWC floats in [0,1]
+      (pure C, no deps). `tools/img_to_ppm.py` converts PNG/JPG → PPM. Store in `data/images/`.
+- [x] Step E2 — Patch embedding (ViT-style): `patch.c` splits the image into patches, flattens
+      each, and projects with W+b (reuses `matmul`/`bias_add`) → `(n_patches, d_model)`.
+      Verified in the smoke test (`[5] Image`).
 - [ ] Step E3 — Multimodal input: prepend image-patch embeddings to the token embeddings so
-      one `GPT` consumes `[image patches] + [text tokens]` (extend `embedding.c`/`model.c`).
-- [ ] Step E4 — Image-text paired data (`data/pairs/` with image+caption) + a training loop
-      that predicts the caption from the image.
+      one `GPT` consumes `[image patches] + [text tokens]` (extend `embedding.c`/`model.c` +
+      the training forward to accept precomputed embeddings + a projection to d_model).
+- [ ] Step E4 — Image-text paired data (`data/pairs/` image+caption) + a training loop that
+      predicts the caption from the image.
       (Honest: a genuinely useful vision-language model needs far more model+data+compute than
       is feasible locally from scratch; this builds the plumbing, quality needs real scale.)
 
@@ -144,10 +146,12 @@ authorized; local only, don't push).
    `agent --cmd "<prog>"` uses an external program as the model (`tools/agent_mock.py`).
    For a genuinely acting agent, point `--cmd` at an instruction-tuned model or an LLM API
    (base `model/gpt2` won't follow tool-call formats well).
-5. **Phase E (images)** then **Phase F (video)** — see the roadmap above; big future builds.
+5. **Phase E (images)** — E1 (PPM load) + E2 (patch embedding) DONE; **E3 (patches into GPT) +
+   E4 (image-text training) remain (RECOMMENDED NEXT)**. Then **Phase F (video)**.
 
-Not supported yet (asked about): **image training** and **video training** — text-only today;
-they are Phase E / Phase F (multimodal), documented with concrete steps in the roadmap.
+Not supported yet (asked about): image/video *understanding* — image **plumbing** exists
+(load + patch-embed), but feeding it into the model (E3) and training on image-text (E4) are
+not done; video is Phase F. Real multimodal quality needs far more scale than local-from-scratch.
 
 ## Session summary (2026-07-21, autonomous run)
 
@@ -752,10 +756,23 @@ Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 q
   to know the step), with a commented Anthropic/OpenAI call to swap in a real LLM.
 - Verified: scripted + command backends both run; all 8 targets build; smoke test PASSED.
 
+## Phase #5 / E1+E2 (image plumbing) — DONE; E3+E4 remain
+
+- **`image.c/.h`** — loads binary **PPM (P6)** into an `Image` (h,w,c=3; HWC floats [0,1]),
+  pure C (skip whitespace/#comments in the header). `tools/img_to_ppm.py` (Pillow) converts
+  PNG/JPG → PPM so the C stays dependency-free.
+- **`patch.c/.h`** — `patch_embed`: grid of (patch×patch) patches → flatten (HWC) → `matmul`
+  by W (patch·patch·C, d_model) + `bias_add` → `(n_patches, d_model)`. `patch_count`/`patch_dim`.
+- **`main.c`** smoke test `[5]`: writes a 4×4 PPM, loads it, patch-embeds (patch 2 → 4 patches),
+  checks shape + finiteness. All 8 targets build; PASSED.
+- **Next (E3):** feed patch embeddings into the `GPT` — prepend `[image patches]` to the token
+  embeddings in the training forward (project patches to d_model, add a modality/position
+  signal), so the model attends over image+text. Then **E4**: image-caption pairs + a loop that
+  predicts the caption. Honest: useful VLM quality needs far more scale than local-from-scratch.
+
 ## Next steps (not started)
-- #5 **images** (Phase E) then #6 **video** (Phase F) — see roadmap. Big multimodal builds.
-- Optional real agent: write a `tools/agent_llm.py` that calls a real LLM API and use
-  `agent --cmd "python tools/agent_llm.py"` (needs an API key).
+- #5 E3+E4 (multimodal into GPT + image-text training) then #6 **video** (Phase F).
+- Optional real agent: a `tools/agent_llm.py` calling a real LLM API (`agent --cmd ...`).
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.
 - Phase D — perf/quant + a genuinely capable model (real weights).
