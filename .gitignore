@@ -28,11 +28,12 @@ build/*
 # model/ subfolders: ignore weights, keep text/markdown (READMEs)
 model/**/*.bin
 
-# Training data — keep the README + sample, ignore your own datasets
+# Training data — keep the README + samples, ignore your own datasets
 data/*
 !data/README.md
 !data/README.MD
 !data/sample.txt
+!data/identity.txt
 
 # Agent demo artifact
 agent_demo.txt

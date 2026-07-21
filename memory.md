@@ -81,9 +81,15 @@ GPT + KV cache + sampler + cross-entropy; NOT diffusion). Codecs: `imagegen.c` (
 64 tokens) + `audiogen.c` (µ-law, 256). ✅ GI unconditional (`[10]` regenerate 8×8 image
 64/64). ✅ **text→image / text→audio / text→video** (`cond_gen` in main.c: combined vocab =
 media+text, text ids offset above media; predict media after the text prefix; smoke `[11]`
-16/16, 32/32, 32/32). Video-gen = concatenated per-frame image tokens. Remaining polish: a
-`generate-*` CLI subcommand + PPM/WAV output files, real datasets, VQ-VAE/diffusion for
-quality (palette/µ-law are crude).
+16/16, 32/32, 32/32). Video-gen = concatenated per-frame image tokens. Also ✅ **media→text captioning**
+(`media_to_text` in main.c: image/audio/video → generate caption text; smoke `[12]` 3/3 each)
+— so media↔text works BOTH ways. Remaining polish: a `generate-*` CLI subcommand + PPM/WAV
+output files, real datasets, VQ-VAE/diffusion for quality (palette/µ-law are crude).
+
+**Model naming/identity:** `--name X` = the model FOLDER (`model/X/`). The PERSONA ("I am X,
+created by Y") comes from TRAINING DATA — `data/identity.txt` (identity Q&A) trained in; demo:
+`train data/identity.txt --name marvin` → "Who are you?" → "I am Marvin, an AI model created by
+Marjon." Add identity.txt alongside other data to bake identity into any model.
 
 Pure C11, 8 platforms, every step green. Ceiling: pipelines correct/runnable; real quality
 needs real datasets + far bigger models (palette/µ-law codecs are crude). Optional future:

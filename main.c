@@ -102,6 +102,61 @@ static int cond_gen(const char *label, const int *text, int T,
   return match == M;
 }
 
+// Media -> text (captioning / transcription): train a GPT to predict `caption`
+// (C text tokens) from the precomputed media embeddings (media_emb: n_media x
+// d_model), then autoregressively GENERATE the caption from the media alone.
+// Returns 1 if all C caption tokens were reproduced. (media_emb's projection is
+// fixed here; jointly training it is E4's job — this demonstrates text decoding.)
+static int media_to_text(const char *label, const Tensor *media_emb, int n_media,
+                         const int *caption, int C, int v_text, int steps) {
+  const int dm = media_emb->shape[1];
+  const int total = n_media + C;
+
+  GPT g = gpt_create(v_text, dm, 2, 2, dm * 4, total);
+  GPTActs a = gpt_acts_create(&g, total);
+  int lz[2] = {total, v_text};
+  Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
+  int *tgt = (int*)malloc(total * sizeof(int));
+  for (int i = 0; i < total; i++) tgt[i] = -1;
+  for (int k = 0; k < C; k++) tgt[n_media - 1 + k] = caption[k];   // predict caption after media
+  Tensor *par[128];
+  int np = gpt_collect_params(&g, par);
+  Adam opt = adam_create(par, np, 0.01f);
+
+  float l0 = 0.0f, lN = 0.0f;
+  for (int s = 0; s < steps; s++) {
+    gpt_forward_multimodal(&g, media_emb, caption, n_media, C, &a, &lo);
+    float loss = cross_entropy_forward(&lo, tgt, &pr);
+    if (s == 0) l0 = loss;
+    lN = loss;
+    tensor_zero_grad(&lo);
+    cross_entropy_backward(&pr, tgt, &lo);
+    gpt_backward_multimodal(&g, caption, n_media, C, &a, &lo, (Tensor*)media_emb);
+    adam_step(&opt, par, np);
+  }
+  gpt_acts_free(&a); tensor_free(&lo); tensor_free(&pr); adam_free(&opt); free(tgt);
+
+  // Autoregressively generate the caption from the media prefix (grow one token
+  // at a time; acts are resized per step since the sequence length changes).
+  int *gen = (int*)malloc(C * sizeof(int));
+  for (int t = 0; t < C; t++) {
+    int tot = n_media + t;
+    GPTActs ag = gpt_acts_create(&g, tot);
+    int gz[2] = {tot, v_text};
+    Tensor glo = tensor_create(gz, 2);
+    gpt_forward_multimodal(&g, media_emb, gen, n_media, t, &ag, &glo);
+    gen[t] = sample_argmax(&glo, tot - 1);
+    tensor_free(&glo); gpt_acts_free(&ag);
+  }
+  int match = 0;
+  for (int t = 0; t < C; t++) if (gen[t] == caption[t]) match++;
+  printf("    %-12s loss %.4f -> %.4f | generated %d/%d caption tokens -> %s\n",
+         label, l0, lN, match, C, match == C ? "OK" : "FAIL");
+
+  free(gen); gpt_free(&g);
+  return match == C;
+}
+
 // Full-model loss: training forward + cross-entropy. Fills logits and probs.
 static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
                       const int *targets, Tensor *logits, Tensor *probs) {
@@ -617,6 +672,68 @@ static int run_demo(void) {
   }
   printf("\n");
   all_ok &= cg_ok;
+
+  // --------------------------------------------------------------------------
+  // Part 12: media -> text (captioning): image/audio/video -> caption tokens,
+  // generated autoregressively from the media.
+  // --------------------------------------------------------------------------
+  printf("[12] Media -> text (captioning)\n");
+  int mt_ok = 1;
+  const int MD = 32;                              // media/model dimension
+
+  // image -> text: 8x8 image -> 16 patch embeddings -> 3 caption tokens
+  {
+    Image im8; im8.h = 8; im8.w = 8; im8.c = 3;
+    im8.data = (float*)malloc(64 * 3 * sizeof(float));
+    for (int y = 0; y < 8; y++)
+      for (int x = 0; x < 8; x++) {
+        int i = y * 8 + x;
+        im8.data[i * 3 + 0] = (float)x / 7.0f;
+        im8.data[i * 3 + 1] = (float)y / 7.0f;
+        im8.data[i * 3 + 2] = 0.4f;
+      }
+    int patch = 2, npi = patch_count(&im8, patch), pdi = patch_dim(&im8, patch);
+    int wi[2] = {pdi, MD}; Tensor Wi = tensor_create(wi, 2); tensor_init_random(&Wi);
+    int bi[1] = {MD};      Tensor bmi = tensor_create(bi, 1);
+    int ei[2] = {npi, MD}; Tensor emi = tensor_create(ei, 2);
+    patch_embed(&im8, patch, &Wi, &bmi, &emi);
+    int cap[3] = {7, 8, 9};
+    mt_ok &= media_to_text("image->text", &emi, npi, cap, 3, 32, 250);
+    tensor_free(&Wi); tensor_free(&bmi); tensor_free(&emi); image_free(&im8);
+  }
+  // audio -> text: 128 samples -> 4 frame embeddings -> 3 caption tokens
+  {
+    Audio au; au.n = 128; au.sample_rate = 8000;
+    au.samples = (float*)malloc(128 * sizeof(float));
+    for (int i = 0; i < 128; i++) au.samples[i] = sinf(i * 0.25f) * 0.7f;
+    int fs = 32, hop = 32, nfa = audio_frame_count(&au, fs, hop);
+    int wa[2] = {fs, MD}; Tensor Wa = tensor_create(wa, 2); tensor_init_random(&Wa);
+    int ba[1] = {MD};     Tensor bma = tensor_create(ba, 1);
+    int ea[2] = {nfa, MD}; Tensor ema = tensor_create(ea, 2);
+    audio_embed(&au, fs, hop, &Wa, &bma, &ema);
+    int cap[3] = {10, 11, 12};
+    mt_ok &= media_to_text("audio->text", &ema, nfa, cap, 3, 32, 250);
+    tensor_free(&Wa); tensor_free(&bma); tensor_free(&ema); audio_free(&au);
+  }
+  // video -> text: 2 frames (4x4) -> 8 patch embeddings -> 3 caption tokens
+  {
+    Video vd; vd.n = 2; vd.frames = (Image*)malloc(2 * sizeof(Image));
+    for (int f = 0; f < 2; f++) {
+      vd.frames[f].h = 4; vd.frames[f].w = 4; vd.frames[f].c = 3;
+      vd.frames[f].data = (float*)malloc(16 * 3 * sizeof(float));
+      for (int i = 0; i < 16 * 3; i++) vd.frames[f].data[i] = (float)((i + f * 20) % 100) / 100.0f;
+    }
+    int patch = 2, nvp = video_patch_count(&vd, patch), pdv = patch_dim(&vd.frames[0], patch);
+    int wv[2] = {pdv, MD}; Tensor Wv = tensor_create(wv, 2); tensor_init_random(&Wv);
+    int bv[1] = {MD};      Tensor bmv = tensor_create(bv, 1);
+    int ev[2] = {nvp, MD}; Tensor emv = tensor_create(ev, 2);
+    video_embed(&vd, patch, &Wv, &bmv, &emv);
+    int cap[3] = {13, 14, 15};
+    mt_ok &= media_to_text("video->text", &emv, nvp, cap, 3, 32, 250);
+    tensor_free(&Wv); tensor_free(&bmv); tensor_free(&emv); video_free(&vd);
+  }
+  printf("\n");
+  all_ok &= mt_ok;
 
   adam_free(&opt);
   tensor_free(&logits);

@@ -85,6 +85,13 @@ LMs). Diffusion is the SOTA alternative but a much bigger, different build — n
       (Honest: pipeline reuses ~80% of the stack; the codec is the quality bottleneck —
       palette/µ-law give tiny/blocky output; real quality needs a trained VQ-VAE or diffusion
       + big data + compute. Unconditional gen = empty text prefix.)
+- [x] Step G-caption — **image→text / audio→text / video→text** (`media_to_text` in `main.c`):
+      the reverse — media embeddings as the prefix (`patch_embed`/`audio_embed`/`video_embed`),
+      autoregressively generate the caption text (`gpt_forward_multimodal` + `gpt_backward_multimodal`).
+      Smoke `[12]`: image/audio/video → 3/3 caption tokens. So media↔text works both ways.
+- [x] Model identity/persona — comes from **training data** (not a flag). `data/identity.txt`
+      (identity Q&A) + `transformer train --name marvin` → "Who are you?" → "I am Marvin, an AI
+      model created by Marjon." (`--name` = folder; persona = data.)
 
 **Phase B — A local generation CLI:**
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
