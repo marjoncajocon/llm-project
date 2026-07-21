@@ -1,34 +1,198 @@
-// matrix.c - Basic matrix operations
+// matrix.c - Basic matrix operations (with a persistent thread pool for GEMMs)
 #include "matrix.h"
 
-// Matrix Multiplication: C = A @ B
-// A: (M x K), B: (K x N), C: (M x N)
-// Uses ikj loop order: the inner loop streams over a row of B and a row of C
-// sequentially (cache-friendly, and auto-vectorizable), instead of walking a
-// column of B with stride N. Same result as the naive i-j-k form.
-// NOTE: multi-threading was tried (Win32/pthreads, per-call) and measured SLOWER
-// at these matmul sizes (thread-spawn overhead > benefit; backward is unthreaded).
-// The correct fix is a persistent thread pool + threaded backward — see notes.md #2.
-void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
-  const int M = A->shape[0];
-  const int K = A->shape[1];
-  const int N = B->shape[1];
-  const float *Ad = A->data;
-  const float *Bd = B->data;
-  float *Cd = C->data;
+#include <stdlib.h>
 
-  for (int i = 0; i < M; i++) {
-    float *Ci = &Cd[i * N];
+// ===========================================================================
+// Persistent thread pool (internal to matrix.c).
+//
+// A fork-join pool: N-1 worker threads are created once (lazily) and reused for
+// every parallel region — no per-call thread spawning (that was measured slower).
+// `parallel_for(total, fn, ctx)` splits [0,total) into N contiguous chunks; the
+// workers run chunks 0..N-2 and the calling thread runs chunk N-1, then joins.
+//
+// matmul / matmul_backward parallelize over OUTPUT ROWS (or dB rows), so every
+// output element is produced by exactly one thread in the same summation order
+// as the single-threaded kernel -> results are bit-identical. Small matmuls stay
+// single-threaded (below MM_THREAD_THRESHOLD), so the demo/tests are unchanged.
+// WebAssembly has no threads -> parallel_for runs inline.
+// Thread count: $TF_THREADS, else the CPU count (capped).
+// ===========================================================================
+
+#if defined(__wasi__) || defined(__wasm__)
+#  define POOL_DISABLED 1
+#elif defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#  include <unistd.h>
+#endif
+
+#define POOL_MAX_THREADS 64
+#define MM_THREAD_THRESHOLD (1L << 19)   // ~500k MACs; below this, run single-threaded
+
+typedef void (*range_fn)(int lo, int hi, void *ctx);
+
+#if defined(POOL_DISABLED)
+
+static void parallel_for(int total, range_fn fn, void *ctx) { fn(0, total, ctx); }
+
+#else
+
+// --- thin per-platform mutex / condition-variable wrappers ---
+#if defined(_WIN32)
+typedef CRITICAL_SECTION pmtx; typedef CONDITION_VARIABLE pcnd; typedef HANDLE pthr;
+static void pmtx_init(pmtx *m) { InitializeCriticalSection(m); }
+static void pmtx_lock(pmtx *m) { EnterCriticalSection(m); }
+static void pmtx_unlock(pmtx *m) { LeaveCriticalSection(m); }
+static void pcnd_init(pcnd *c) { InitializeConditionVariable(c); }
+static void pcnd_wait(pcnd *c, pmtx *m) { SleepConditionVariableCS(c, m, INFINITE); }
+static void pcnd_signal(pcnd *c) { WakeConditionVariable(c); }
+static void pcnd_broadcast(pcnd *c) { WakeAllConditionVariable(c); }
+#else
+typedef pthread_mutex_t pmtx; typedef pthread_cond_t pcnd; typedef pthread_t pthr;
+static void pmtx_init(pmtx *m) { pthread_mutex_init(m, NULL); }
+static void pmtx_lock(pmtx *m) { pthread_mutex_lock(m); }
+static void pmtx_unlock(pmtx *m) { pthread_mutex_unlock(m); }
+static void pcnd_init(pcnd *c) { pthread_cond_init(c, NULL); }
+static void pcnd_wait(pcnd *c, pmtx *m) { pthread_cond_wait(c, m); }
+static void pcnd_signal(pcnd *c) { pthread_cond_signal(c); }
+static void pcnd_broadcast(pcnd *c) { pthread_cond_broadcast(c); }
+#endif
+
+static int      P_nthreads = 0;
+static int      P_started = 0;
+static pmtx     P_mtx;
+static pcnd     P_work, P_done;
+static int      P_gen = 0;         // job generation counter
+static int      P_remaining = 0;   // workers still finishing the current job
+static int      P_shutdown = 0;
+static range_fn P_fn = NULL;
+static void    *P_ctx = NULL;
+static int      P_total = 0;
+static pthr     P_threads[POOL_MAX_THREADS];
+static int      P_ids[POOL_MAX_THREADS];
+
+static void chunk_of(int total, int idx, int n, int *lo, int *hi) {
+  int per = (total + n - 1) / n;
+  int l = idx * per, h = l + per;
+  if (l > total) l = total;
+  if (h > total) h = total;
+  *lo = l; *hi = h;
+}
+
+static void pool_body(int id) {
+  int last = 0;
+  pmtx_lock(&P_mtx);
+  for (;;) {
+    while (!P_shutdown && P_gen == last) pcnd_wait(&P_work, &P_mtx);
+    if (P_shutdown) { pmtx_unlock(&P_mtx); return; }
+    last = P_gen;
+    range_fn fn = P_fn; void *ctx = P_ctx; int total = P_total, n = P_nthreads;
+    pmtx_unlock(&P_mtx);
+
+    int lo, hi; chunk_of(total, id, n, &lo, &hi);
+    fn(lo, hi, ctx);
+
+    pmtx_lock(&P_mtx);
+    if (--P_remaining == 0) pcnd_signal(&P_done);
+  }
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI pool_entry(LPVOID a) { pool_body(*(int*)a); return 0; }
+#else
+static void *pool_entry(void *a) { pool_body(*(int*)a); return NULL; }
+#endif
+
+static int detect_threads(void) {
+  const char *env = getenv("TF_THREADS");
+  if (env && atoi(env) > 0) return atoi(env);
+#if defined(_WIN32)
+  SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors;
+#else
+  long c = sysconf(_SC_NPROCESSORS_ONLN); return (c > 0) ? (int)c : 4;
+#endif
+}
+
+static void pool_shutdown(void) {
+  if (!P_started || P_nthreads <= 1) return;
+  pmtx_lock(&P_mtx); P_shutdown = 1; pcnd_broadcast(&P_work); pmtx_unlock(&P_mtx);
+  for (int i = 0; i < P_nthreads - 1; i++) {
+#if defined(_WIN32)
+    WaitForSingleObject(P_threads[i], INFINITE); CloseHandle(P_threads[i]);
+#else
+    pthread_join(P_threads[i], NULL);
+#endif
+  }
+}
+
+static void pool_init(void) {
+  if (P_started) return;
+  int n = detect_threads();
+  if (n < 1) n = 1;
+  if (n > POOL_MAX_THREADS) n = POOL_MAX_THREADS;
+  P_nthreads = n;
+  if (n <= 1) { P_started = 1; return; }   // no workers; parallel_for runs inline
+  pmtx_init(&P_mtx); pcnd_init(&P_work); pcnd_init(&P_done);
+  for (int i = 0; i < n - 1; i++) {
+    P_ids[i] = i;
+#if defined(_WIN32)
+    P_threads[i] = CreateThread(NULL, 0, pool_entry, &P_ids[i], 0, NULL);
+#else
+    pthread_create(&P_threads[i], NULL, pool_entry, &P_ids[i]);
+#endif
+  }
+  atexit(pool_shutdown);
+  P_started = 1;
+}
+
+static void parallel_for(int total, range_fn fn, void *ctx) {
+  if (!P_started) pool_init();
+  if (P_nthreads <= 1 || total < 2) { fn(0, total, ctx); return; }
+  pmtx_lock(&P_mtx);
+  P_fn = fn; P_ctx = ctx; P_total = total;
+  P_remaining = P_nthreads - 1;
+  P_gen++;
+  pcnd_broadcast(&P_work);
+  pmtx_unlock(&P_mtx);
+
+  int lo, hi; chunk_of(total, P_nthreads - 1, P_nthreads, &lo, &hi);  // caller's chunk
+  fn(lo, hi, ctx);
+
+  pmtx_lock(&P_mtx);
+  while (P_remaining > 0) pcnd_wait(&P_done, &P_mtx);
+  pmtx_unlock(&P_mtx);
+}
+
+#endif  // POOL_DISABLED
+
+// ===========================================================================
+// Matrix multiply (forward) - C = A @ B, A:(M,K) B:(K,N) C:(M,N)
+// ===========================================================================
+typedef struct { const float *A, *B; float *C; int K, N; } MMFwd;
+
+// ikj kernel for output rows [i0, i1): cache-friendly, auto-vectorizable.
+static void mm_fwd_rows(int i0, int i1, void *ctx) {
+  const MMFwd *t = (const MMFwd*)ctx;
+  const int K = t->K, N = t->N;
+  for (int i = i0; i < i1; i++) {
+    float *Ci = &t->C[(size_t)i * N];
     for (int j = 0; j < N; j++) Ci[j] = 0.0f;
-    const float *Ai = &Ad[i * K];
+    const float *Ai = &t->A[(size_t)i * K];
     for (int k = 0; k < K; k++) {
       const float a = Ai[k];
-      const float *Bk = &Bd[k * N];
-      for (int j = 0; j < N; j++) {
-        Ci[j] += a * Bk[j];
-      }
+      const float *Bk = &t->B[(size_t)k * N];
+      for (int j = 0; j < N; j++) Ci[j] += a * Bk[j];
     }
   }
+}
+
+void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
+  const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
+  MMFwd t = { A->data, B->data, C->data, K, N };
+  if ((long)M * N * K < MM_THREAD_THRESHOLD) { mm_fwd_rows(0, M, &t); return; }
+  parallel_for(M, mm_fwd_rows, &t);
 }
 
 // Matrix Addition: C = A + B (element-wise)
@@ -59,34 +223,45 @@ void bias_add(const Tensor *x, const Tensor *bias, Tensor *out) {
 // ---------------------------------------------------------------------------
 // Backward passes
 // ---------------------------------------------------------------------------
+typedef struct { const Tensor *A, *B, *C; int M, K, N; } MMBwd;
+
+// dA[i,k] += sum_j dC[i,j] * B[k,j]   (parallel over rows i)
+static void mm_bwd_dA(int i0, int i1, void *ctx) {
+  const MMBwd *t = (const MMBwd*)ctx;
+  const int K = t->K, N = t->N;
+  for (int i = i0; i < i1; i++) {
+    for (int k = 0; k < K; k++) {
+      float sum = 0.0f;
+      for (int j = 0; j < N; j++) sum += t->C->grad[i * N + j] * t->B->data[k * N + j];
+      t->A->grad[i * K + k] += sum;
+    }
+  }
+}
+
+// dB[k,j] += sum_i A[i,k] * dC[i,j]   (parallel over rows k)
+static void mm_bwd_dB(int k0, int k1, void *ctx) {
+  const MMBwd *t = (const MMBwd*)ctx;
+  const int M = t->M, K = t->K, N = t->N;
+  for (int k = k0; k < k1; k++) {
+    for (int j = 0; j < N; j++) {
+      float sum = 0.0f;
+      for (int i = 0; i < M; i++) sum += t->A->data[i * K + k] * t->C->grad[i * N + j];
+      t->B->grad[k * N + j] += sum;
+    }
+  }
+}
 
 // Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
-  const int M = A->shape[0];
-  const int K = A->shape[1];
-  const int N = B->shape[1];
-
-  // dA[i,k] += sum_j dC[i,j] * B[k,j]
-  for (int i = 0; i < M; i++) {
-    for (int k = 0; k < K; k++) {
-      float sum = 0.0f;
-      for (int j = 0; j < N; j++) {
-        sum += C->grad[i * N + j] * B->data[k * N + j];
-      }
-      A->grad[i * K + k] += sum;
-    }
+  const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
+  MMBwd t = { A, B, C, M, K, N };
+  if ((long)M * N * K < MM_THREAD_THRESHOLD) {
+    mm_bwd_dA(0, M, &t);
+    mm_bwd_dB(0, K, &t);
+    return;
   }
-
-  // dB[k,j] += sum_i A[i,k] * dC[i,j]
-  for (int k = 0; k < K; k++) {
-    for (int j = 0; j < N; j++) {
-      float sum = 0.0f;
-      for (int i = 0; i < M; i++) {
-        sum += A->data[i * K + k] * C->grad[i * N + j];
-      }
-      B->grad[k * N + j] += sum;
-    }
-  }
+  parallel_for(M, mm_bwd_dA, &t);
+  parallel_for(K, mm_bwd_dB, &t);
 }
 
 // Backward of C = A + B: dA += dC, dB += dC

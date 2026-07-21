@@ -2,8 +2,8 @@
 # All source files live flat in the project root (Lua-style layout).
 
 CC      = gcc
-CFLAGS  = -std=c11 -O3 -march=native -Wall
-LDLIBS  = -lm
+CFLAGS  = -std=c11 -O3 -march=native -Wall -pthread
+LDLIBS  = -lm -pthread
 
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \

@@ -76,6 +76,15 @@ cross-compiling every source with `zig cc -target <triple>` (all `-Wall`-clean):
 | macOS Apple Silicon | `aarch64-macos` | builds |
 | **WebAssembly (WASI)** | `wasm32-wasi` | builds + **runs** (via Node WASI, PASSED) |
 
+### Threads
+
+`matmul` and `matmul_backward` run on a **persistent thread pool** (auto-enabled for large
+matrices; small ones stay single-threaded and bit-exact). It uses all CPU cores by default;
+override with the `TF_THREADS` env var (e.g. `TF_THREADS=4`). Measured ~2.7× on 8 threads for
+a d_model-256 / 4-layer model. WebAssembly runs single-threaded (no thread model).
+
+### Cross-compiling
+
 Build **all** targets at once into `build/` (needs `zig` + a POSIX shell):
 
 ```sh

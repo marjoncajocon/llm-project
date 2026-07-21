@@ -72,11 +72,12 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
 
 1. **Training UX** — train/val split + **held-out loss**; `--checkpoint-every N`;
    `--resume model.bin` (keep training across sessions).  ✅ DONE
-2. **Performance (B4 remainder)** *(medium)* — ⚠️ per-call `matmul` threading was tried and
-   measured **slower** (0.94×: OS thread-spawn per call > benefit; backward is unthreaded).
-   Proper approach: a **persistent thread pool** (reused workers, no per-call spawn) that also
-   threads `matmul_backward` + attention; then SIMD + int8 quant. Deferred until models are
-   big enough to warrant it (current CPU models are small). See findings below.
+2. **Performance — matmul thread pool** ✅ DONE — a **persistent fork-join thread pool** in
+   `matrix.c` threads `matmul` + both loops of `matmul_backward` (row-parallel → **bit-exact**;
+   verified byte-identical models at 1 vs 8 threads). Thresholded (tiny matmuls stay
+   single-threaded), portable (Win32 / pthreads / WASM-single-thread). **Measured 2.68× on 8
+   threads** (d_model 256, 4 layers). Threads = `$TF_THREADS` or CPU count. Remaining perf
+   (later): SIMD + int8 quantization.
 3. **Real GPT-2 weights** *(medium)* — step-4b recipe (download → `convert_gpt2.py` →
    `gpt_load`) + real GPT-2 BPE → coherent text without training from scratch.
 4. **Real agent backend** *(medium)* — wire a live LLM (or a locally-trained model) into
@@ -127,9 +128,9 @@ authorized; local only, don't push).
 1. ✅ DONE — **Training UX**: train/val split + held-out `val` loss, `--checkpoint-every N`,
    `--resume model.bin` (continue a saved model; loads its config + tokenizer). In `train.c`
    (`eval_split`, resume/checkpoint logic) + `main.c` flags.
-2. **Speed for big models** — ⚠️ per-call matmul threading was tried and measured *slower*
-   (see "Phase #2 (performance) — investigated, deferred" below). Do it right later with a
-   **persistent thread pool** that also threads `matmul_backward`; then SIMD + int8 quant.
+2. ✅ DONE — **matmul thread pool** (`matrix.c`): persistent fork-join pool threads `matmul` +
+   `matmul_backward`, bit-exact (verified), 2.68× on 8 threads, all 8 targets build. Threads =
+   `$TF_THREADS` or CPU count. (SIMD + int8 quant remain, later.)
 3. **Real GPT-2** (RECOMMENDED NEXT) — run the step-4b recipe (download gpt2, `tools/convert_gpt2.py` →
    `convert_to_gptc.py` → `gpt_load`) for genuinely good text; add the real GPT-2 BPE
    (`encoder.json`/`vocab.bpe`) so text↔tokens match its weights.
@@ -692,27 +693,31 @@ its tokenizer (`--tok`) and continues training (config comes from the checkpoint
 `main.c` flags: `--val-frac --checkpoint-every --resume`. Verified: checkpoint saved mid-run;
 resume continued from the saved loss (not from scratch); val loss tracks train loss.
 
-## Phase #2 (performance) — investigated, deferred
+## Phase #2 (performance) — matmul thread pool DONE
 
-**Finding (measured):** per-call multi-threaded `matmul` (Win32 threads / pthreads, guarded,
-row-parallel so bit-exact, size-thresholded, single-thread on WASM) **built clean on all 8
-targets and kept the smoke test bit-exact**, but on a d_model 256 / 4-layer / ctx 64 config it
-ran at **0.94× (slower)** than single-threaded. Reasons: (a) spawning OS threads *per matmul
-call* thousands of times costs more than the parallelism saves at these sizes; (b)
-`matmul_backward` (the bulk of training compute) and attention loops weren't threaded.
-**Reverted** (don't ship a regression) — `matmul` is the clean single-threaded ikj kernel.
+**First attempt (reverted):** per-call threading (spawn threads inside each `matmul`) measured
+**0.94× — slower** (per-call OS thread spawn > benefit; backward unthreaded).
 
-**Correct approach when we do #2 for real:** a **persistent thread pool** (workers created
-once, wake on a condition var/event, no per-call spawn) used by `matmul` AND `matmul_backward`
-(+ the attention score/weight loops), with the size threshold + WASM single-thread fallback
-kept. Then SIMD (portable via compiler auto-vec or guarded intrinsics) and int8 weight
-quantization for memory + speed. Only worth it once models are large (current CPU models are
-small enough that this isn't the bottleneck).
+**Final (kept):** a **persistent fork-join thread pool** in `matrix.c`:
+- N-1 worker threads created once (lazily), reused for every parallel region — no per-call
+  spawn. `parallel_for(total, fn, ctx)` splits `[0,total)` into N chunks (workers do 0..N-2,
+  the caller does N-1) using a mutex + two condition variables. `atexit` joins the workers.
+- Portable sync wrappers: **Win32** `CRITICAL_SECTION`+`CONDITION_VARIABLE`, **POSIX**
+  `pthread_mutex`+`pthread_cond`, **WASM** disabled (runs inline). Makefile adds `-pthread`.
+- Threads `matmul` (over output rows) and **both loops of `matmul_backward`** (over rows of
+  dA and dB) — the bulk of training compute. Attention's inner loops are not threaded (minor
+  at small seq).
+- **Bit-exact:** row-parallel, so each output element is produced by one thread in the same
+  order → verified byte-identical checkpoints at `TF_THREADS=1` vs `8`. Tiny matmuls stay
+  single-threaded (below `MM_THREAD_THRESHOLD` ~500k MACs), so the demo/tests are unchanged.
+- **Speedup:** **2.68×** on 8 threads (d_model 256 / 4 layers / ctx 64). Thread count =
+  `$TF_THREADS` or the CPU count (capped 64). All 8 cross-targets build; WASM still runs.
+
+Remaining perf (later, if needed): SIMD (auto-vec / guarded intrinsics) + int8 quantization.
 
 ## Next steps (not started)
 - **Recommended next: #3 real GPT-2** (biggest quality win: download → `tools/convert_gpt2.py`
   → `gpt_load` + real GPT-2 BPE). Then #4 agent backend, #5 images, #6 video.
-- #2 performance thread-pool — do this deliberately when training big models gets slow.
 - Wire a real model backend into `agent.c` (replace scripted `responses[]`) — live LLM API
   or a large locally-run model.
 - Phase D — perf/quant + a genuinely capable model (real weights).
