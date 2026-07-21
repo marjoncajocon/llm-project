@@ -19,7 +19,7 @@ int main() {
   // Parameters
   const int seq_len = 4;         // Sequence length (number of tokens)
   const int d_model = 8;         // Model dimension
-  const int d_k = 4;             // Key/Query dimension
+  const int n_heads = 2;         // Number of attention heads (head_dim = d_model / n_heads)
   const int d_ff = 4 * d_model;  // Feed-forward hidden dimension
 
   // Seed random number generator for reproducibility
@@ -32,11 +32,11 @@ int main() {
   printf("Input sequence:\n");
   tensor_print(&input, "Input");
 
-  // Create weight matrices for self-attention
-  int wq_shape[2] = {d_model, d_k};
-  int wk_shape[2] = {d_model, d_k};
-  int wv_shape[2] = {d_model, d_k};
-  int wo_shape[2] = {d_k, d_model};
+  // Create weight matrices for multi-head attention (all square: d_model x d_model)
+  int wq_shape[2] = {d_model, d_model};
+  int wk_shape[2] = {d_model, d_model};
+  int wv_shape[2] = {d_model, d_model};
+  int wo_shape[2] = {d_model, d_model};
 
   Tensor W_q = tensor_create(wq_shape, 2);
   Tensor W_k = tensor_create(wk_shape, 2);
@@ -93,7 +93,7 @@ int main() {
       &ff_W1, &ff_b1,
       &ff_W2, &ff_b2,
       &output,
-      d_k, d_ff
+      n_heads, d_ff
   );
 
   // Print results

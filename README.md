@@ -18,7 +18,7 @@ and defined in the matching `.c`.
 | `activation.h` / `activation.c` | `softmax_rowwise`                               |
 | `layernorm.h` / `layernorm.c`   | `layernorm`                                     |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear |
-| `attention.h` / `attention.c`   | `self_attention_forward`, `transformer_block_forward` |
+| `attention.h` / `attention.c`   | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `main.c`                     | Demo entry point                                   |
 | `Makefile`                   | Build rules                                        |
 

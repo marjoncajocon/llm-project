@@ -8,71 +8,84 @@
 #include "layernorm.h"
 #include "feedforward.h"
 
-// Single-head Self-Attention forward pass
-// Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
-void self_attention_forward(
+// Multi-head causal Self-Attention forward pass.
+// Attention(Q, K, V) = softmax(mask(Q @ K^T / sqrt(head_dim))) @ V, per head.
+void multihead_attention_forward(
     const Tensor *input,          // (seq_len, d_model)
-    const Tensor *W_q,            // (d_model, d_k)
-    const Tensor *W_k,            // (d_model, d_k)
-    const Tensor *W_v,            // (d_model, d_v)
-    const Tensor *W_o,            // (d_v, d_model)
+    const Tensor *W_q,            // (d_model, d_model)
+    const Tensor *W_k,            // (d_model, d_model)
+    const Tensor *W_v,            // (d_model, d_model)
+    const Tensor *W_o,            // (d_model, d_model)
     Tensor *output,               // (seq_len, d_model)
-    int d_k                       // Dimension of key/query
+    int n_heads                   // Number of attention heads (must divide d_model)
 ) {
   const int seq_len = input->shape[0];
-  const int d_v = W_v->shape[1];
+  const int d_model = input->shape[1];
+  const int head_dim = d_model / n_heads;
+  const float scale = 1.0f / sqrtf((float)head_dim);
 
-  // Temporary tensors for intermediate computations
-  int shape_q[2] = {seq_len, d_k};
-  int shape_k[2] = {seq_len, d_k};
-  int shape_v[2] = {seq_len, d_v};
-  int shape_scores[2] = {seq_len, seq_len};
-  int shape_attn[2] = {seq_len, d_v};
+  // Full projections (all heads at once): Q,K,V = X @ W_{q,k,v}  -> (seq_len, d_model)
+  int shape_proj[2] = {seq_len, d_model};
+  Tensor Q = tensor_create(shape_proj, 2);
+  Tensor K = tensor_create(shape_proj, 2);
+  Tensor V = tensor_create(shape_proj, 2);
+  Tensor concat = tensor_create(shape_proj, 2);  // concatenated per-head outputs
 
-  Tensor Q = tensor_create(shape_q, 2);
-  Tensor K = tensor_create(shape_k, 2);
-  Tensor V = tensor_create(shape_v, 2);
-  Tensor scores = tensor_create(shape_scores, 2);
-  Tensor attn_weights = tensor_create(shape_scores, 2);
-  Tensor attn_output = tensor_create(shape_attn, 2);
-
-  // Step 1: Linear projections Q = X @ W_q, K = X @ W_k, V = X @ W_v
   matmul(input, W_q, &Q);
   matmul(input, W_k, &K);
   matmul(input, W_v, &V);
 
-  // Step 2: Compute attention scores: scores = Q @ K^T / sqrt(d_k)
-  // K^T is (d_k, seq_len), so we multiply Q (seq_len, d_k) by K^T
-  for (int i = 0; i < seq_len; i++) {
-    for (int j = 0; j < seq_len; j++) {
-      float dot = 0.0f;
-      for (int k = 0; k < d_k; k++) {
-        dot += Q.data[i * d_k + k] * K.data[j * d_k + k];  // K transposed
+  // Per-head scratch buffers for scores and softmax weights
+  int shape_scores[2] = {seq_len, seq_len};
+  Tensor scores = tensor_create(shape_scores, 2);
+  Tensor weights = tensor_create(shape_scores, 2);
+
+  for (int h = 0; h < n_heads; h++) {
+    const int off = h * head_dim;  // this head occupies columns [off, off + head_dim)
+
+    // Scores = Q_h @ K_h^T * scale, with a causal mask (no attending to the future)
+    for (int i = 0; i < seq_len; i++) {
+      for (int j = 0; j < seq_len; j++) {
+        if (j > i) {
+          scores.data[i * seq_len + j] = -INFINITY;  // mask future positions
+        } else {
+          float dot = 0.0f;
+          for (int d = 0; d < head_dim; d++) {
+            dot += Q.data[i * d_model + off + d] * K.data[j * d_model + off + d];
+          }
+          scores.data[i * seq_len + j] = dot * scale;
+        }
       }
-      scores.data[i * seq_len + j] = dot / sqrtf((float)d_k);
+    }
+
+    // Softmax over each row (masked entries -> exp(-inf) = 0)
+    softmax_rowwise(&scores, &weights);
+
+    // head_out = weights @ V_h, written into this head's columns of concat
+    for (int i = 0; i < seq_len; i++) {
+      for (int d = 0; d < head_dim; d++) {
+        float sum = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+          sum += weights.data[i * seq_len + j] * V.data[j * d_model + off + d];
+        }
+        concat.data[i * d_model + off + d] = sum;
+      }
     }
   }
 
-  // Step 3: Apply softmax to get attention weights
-  softmax_rowwise(&scores, &attn_weights);
+  // Output projection: output = concat @ W_o
+  matmul(&concat, W_o, output);
 
-  // Step 4: Weighted sum: output = attn_weights @ V
-  matmul(&attn_weights, &V, &attn_output);
-
-  // Step 5: Final linear projection: output = attn_output @ W_o
-  matmul(&attn_output, W_o, output);
-
-  // Clean up temporary tensors
   tensor_free(&Q);
   tensor_free(&K);
   tensor_free(&V);
+  tensor_free(&concat);
   tensor_free(&scores);
-  tensor_free(&attn_weights);
-  tensor_free(&attn_output);
+  tensor_free(&weights);
 }
 
-// Complete Transformer block (pre-norm): Self-Attention + FFN with residuals
-//   a = input + Attention(LN1(input))
+// Complete Transformer block (pre-norm): Multi-head Attention + FFN with residuals
+//   a = input + MultiHeadAttention(LN1(input))
 //   output = a + FFN(LN2(a))
 void transformer_block_forward(
     const Tensor *input,
@@ -82,7 +95,7 @@ void transformer_block_forward(
     const Tensor *ff_W1, const Tensor *ff_b1,
     const Tensor *ff_W2, const Tensor *ff_b2,
     Tensor *output,
-    int d_k, int d_ff
+    int n_heads, int d_ff
 ) {
   int shape[2] = {input->shape[0], input->shape[1]};
   Tensor norm1_out = tensor_create(shape, 2);
@@ -91,9 +104,9 @@ void transformer_block_forward(
   Tensor norm2_out = tensor_create(shape, 2);
   Tensor ff_out = tensor_create(shape, 2);
 
-  // Sub-layer 1: attn_residual = input + Attention(LN1(input))
+  // Sub-layer 1: attn_residual = input + MultiHeadAttention(LN1(input))
   layernorm(input, gamma1, beta1, &norm1_out, 1e-5f);
-  self_attention_forward(&norm1_out, W_q, W_k, W_v, W_o, &attn_out, d_k);
+  multihead_attention_forward(&norm1_out, W_q, W_k, W_v, W_o, &attn_out, n_heads);
   matadd(input, &attn_out, &attn_residual);
 
   // Sub-layer 2: output = attn_residual + FFN(LN2(attn_residual))

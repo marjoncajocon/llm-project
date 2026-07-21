@@ -52,8 +52,36 @@ zig cc -std=c11 -O2 -Wall -o transformer.exe *.c -lm
 ```
 The `Makefile` (`make`) produces the same result on a machine with gcc/clang installed.
 
+## Step 2 — Multi-head attention + causal masking
+
+**Status: DONE — smoke test passed.**
+
+### What changed
+Single-head `self_attention_forward` was replaced by
+**`multihead_attention_forward`**, which:
+- Projects the input into `n_heads` heads (`head_dim = d_model / n_heads`) using square
+  `(d_model, d_model)` weight matrices `W_q/W_k/W_v/W_o`.
+- Runs scaled dot-product attention per head with a **causal mask**: position `i` may
+  attend only to positions `j <= i`; future positions get score `-INFINITY`, so after
+  softmax their weight is exactly 0 (autoregressive behavior, like GPT-2).
+- Concatenates the per-head outputs and projects through `W_o`.
+
+`transformer_block_forward` now calls the multi-head function; its `d_k` parameter became
+`n_heads`. `main.c` uses `n_heads = 2` and square attention weights.
+
+### Progress checklist
+- [x] Multi-head projection + per-head attention (`attention.h` / `attention.c`)
+- [x] Causal masking (future positions -> -INFINITY before softmax)
+- [x] `transformer_block_forward` updated (`d_k` -> `n_heads`)
+- [x] `main.c` updated (square weights, `n_heads = 2`)
+- [x] `README.md` updated (attention module description)
+- [x] Smoke test (build + run -> `Output validation: PASSED`, `-Wall` clean)
+
+### Smoke test result (2026-07-21)
+Built with `zig cc -std=c11 -O2 -Wall`; `-Wall` clean, ran to completion with
+`Output validation: PASSED (no NaN/Inf)`.
+
 ## Next steps (not started)
-- Step 2: multi-head attention + causal masking.
 - Step 3: token + positional embeddings, stacked blocks, output projection, sampler.
 - Step 4: BPE tokenizer + load real GPT-2 weights.
 - Step 5: backprop + training (uses the unused `Tensor.grad` field).
