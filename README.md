@@ -33,6 +33,17 @@ Every module (tensors, matrix math, softmax, GELU, LayerNorm, causal multi-head 
 feed-forward, embeddings, sampling, checkpointing, BPE tokenizer) is still small enough to read in
 one sitting — the codebase stays approachable even as the project grows.
 
+## Why I'm building this
+
+I'm building this because I don't want to be left behind as AI advances. I want to understand it
+from the ground up — not just use it, but know how it actually works — so I can help make AI
+better and better in the future. My goal is to become one of the people who *raise* AI: who help
+it grow, improve, and carry it forward. This project is where I learn that craft, one honest,
+from-scratch step at a time. — Marjon
+
+Every stage here is built to be *understood*, not just run — because you can't help raise
+something you don't understand.
+
 ## Project layout
 
 Inspired by the Lua source tree: **every C source file lives flat in the project root —

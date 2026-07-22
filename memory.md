@@ -134,3 +134,35 @@ Model folders: each model in `model/<name>/` (`model.bin` + `tok.bin`); `model/*
 git-ignored, READMEs kept. `model/gpt2/` holds real GPT-2 (token-ID mode via tiktoken).
 One-command GPT-2: `python tools/gpt2_chat.py "prompt"` (tokenize → C generate → detokenize;
 resolves the exe to an abspath so it runs from cwd on Windows).
+
+## How a model becomes a capable coding assistant — the 5 stages (reference)
+
+Discussed with the user 2026-07-22. What separates a frontier model (e.g. Claude Opus 4.8)
+from this project is **scale + data + compute + engineering — NOT a secret algorithm.** The
+*techniques* are public (research papers); the weights/data/exact recipe are proprietary and
+closed (you cannot download or copy them). `capability ≈ model_size × data × compute ×
+training_method`. The pipeline that turns raw next-token prediction into a coding assistant:
+
+1. **Architecture** — a transformer. This project is GPT-2-style (LayerNorm, learned positions,
+   GELU MLP, attention biases). Modern (LLaMA-family) = **RMSNorm, RoPE, SwiGLU, GQA**, no biases,
+   SentencePiece tokenizer. Adding these is the roadmap's big leap (→ mini-`llama.cpp`).
+2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
+   at toy scale (`transformer train`).
+3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;
+   this is the step that makes a base model FOLLOW instructions instead of just continuing text.
+   Same machinery as our supervised next-token training — just the right data (could include our
+   `<tool …>` agent format). This is the most feasible "real recipe" experiment to demo here.
+4. **RLHF / DPO** — align to helpful/correct/human-preferred outputs. Anthropic's **Constitutional
+   AI** is a *published* paper.
+5. **Tool-use / agentic training** — train on tool-call formats (fits our `agent.c` `<tool>`/`<done>`
+   protocol).
+
+**Honest ceiling (told the user):** the techniques transfer to this project at small scale, but
+the *capability* does not — a from-scratch CPU model can't reach Opus-level coding (needs
+frontier-scale data + compute + teams). "Human-like" coding is an EMERGENT property of scale +
+alignment, not a reasoning module to copy. Realistic capable-coding paths: (a) plug a capable
+model behind our agent loop — Claude API via `tools/agent_llm.py`, or a **local** model via
+Ollama/`llama.cpp` (OpenAI-compatible endpoint; `agent_llm.py` already speaks that API);
+(b) local hardware for a real local model ≈ **12–24 GB GPU or 32 GB+ Apple Silicon + Qwen2.5-Coder
+7B–32B (Q4)**. Offline-vs-capable tradeoff: our own small model = offline but weak; capable =
+online API or a separate local-LLM runtime (not this from-scratch engine).

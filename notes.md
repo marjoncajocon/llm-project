@@ -174,6 +174,20 @@ the `claude-api` skill; `agent_mock.py` remains the offline/no-key fallback.
 **Backups:** (a) ✅ DONE (2026-07-22) — code health: smoke test split into `selftest.c`;
 (b) ✅ DONE (2026-07-22) — dataset-trained `imggen`/`audgen` (learn from a folder). Both below.
 
+## Instruction tuning (SFT) smoke test — DONE (2026-07-22)
+
+First "real LLM recipe" step demonstrated end-to-end (see the 5-stage recipe in `memory.md`).
+New selftest **part `[9]`** (filled the gap between `[8]` and `[10]`): trains the GPT on two
+`prompt → response` pairs with the **prompt positions masked** (loss only on the response tokens,
+via the existing cross-entropy ignore-index `target < 0`) — exactly how SFT supervises the
+completion. Then feeds each prompt through the KV cache and greedily generates: prompt A `[1,2]`
+→ `7 8 9`, prompt B `[3,4,5]` → `11 12`. Two distinct prompts → two distinct correct responses =
+instruction-following in miniature. Verified: `[9] ... loss 3.19 → 0.0001 | A OK | B OK`, smoke
+test still `PASSED`, `-Wall` clean. (Toy scale — it memorizes; the *technique* is the real thing.)
+This is the "start step by step" first step toward the recipe; next candidates: a real SFT
+dataset via `transformer train` on `instruction → <tool …>` data, then the modern-architecture /
+quantization roadmap.
+
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
 `imggen`/`audgen` now have a **dataset mode** in addition to the original single-example

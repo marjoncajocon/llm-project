@@ -539,6 +539,72 @@ int run_selftest(void) {
   all_ok &= aud_ok;
 
   // --------------------------------------------------------------------------
+  // Part 9: instruction tuning (SFT) — the recipe step (stage 3, see memory.md)
+  // that makes a base model FOLLOW instructions instead of just continuing text.
+  // Train on (prompt -> response) pairs with the PROMPT positions MASKED (loss
+  // only on the response tokens; target < 0 = ignore, same trick real SFT uses
+  // on the completion), then feed each prompt and check the model generates the
+  // right response. Two distinct prompts -> two distinct responses = instruction
+  // following in miniature. (Toy scale: it memorizes; the *technique* is real.)
+  // --------------------------------------------------------------------------
+  {
+    const int Vs = 16, dm = 32, L = 5;
+    // Both examples padded to the same length L=5 so one acts/logits buffer serves both.
+    //   A: prompt [1,2]   -> response [7,8,9]     B: prompt [3,4,5] -> response [11,12]
+    int seqA[5] = {1, 2, 7, 8, 9},    tgtA[5] = {-1, 7, 8, 9, -1};   // supervise response only
+    int seqB[5] = {3, 4, 5, 11, 12},  tgtB[5] = {-1, -1, 11, 12, -1};
+    int promptA[2] = {1, 2},    respA[3] = {7, 8, 9};
+    int promptB[3] = {3, 4, 5}, respB[2] = {11, 12};
+
+    GPT gs = gpt_create(Vs, dm, 2, 2, dm * 4, L);
+    GPTActs as = gpt_acts_create(&gs, L);
+    int lz[2] = {L, Vs};
+    Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
+    Tensor *par[256];
+    int np = gpt_collect_params(&gs, par);
+    Adam opt = adam_create(par, np, 0.01f);
+
+    float first = 0.0f, last = 0.0f;
+    for (int s = 0; s < 800; s++) {
+      int *seq = (s & 1) ? seqB : seqA;
+      int *tgt = (s & 1) ? tgtB : tgtA;
+      gpt_forward_train(&gs, seq, L, &as, &lo);
+      float loss = cross_entropy_forward(&lo, tgt, &pr);
+      if (s == 0) first = loss;
+      last = loss;
+      tensor_zero_grad(&lo);
+      cross_entropy_backward(&pr, tgt, &lo);
+      gpt_backward(&gs, seq, L, &as, &lo);
+      adam_step(&opt, par, np);
+    }
+
+    // Feed each prompt through the KV cache, then greedily generate the response.
+    int genA[3], genB[2];
+    int gz[2] = {1, Vs};
+    Tensor gl = tensor_create(gz, 2);
+    KVCache kvA = gpt_kvcache_create(&gs);
+    for (int i = 0; i < 2; i++) gpt_decode_step(&gs, &kvA, promptA[i], &gl);
+    for (int r = 0; r < 3; r++) { genA[r] = sample_argmax(&gl, 0); if (r < 2) gpt_decode_step(&gs, &kvA, genA[r], &gl); }
+    gpt_kvcache_free(&kvA);
+    KVCache kvB = gpt_kvcache_create(&gs);
+    for (int i = 0; i < 3; i++) gpt_decode_step(&gs, &kvB, promptB[i], &gl);
+    for (int r = 0; r < 2; r++) { genB[r] = sample_argmax(&gl, 0); if (r < 1) gpt_decode_step(&gs, &kvB, genB[r], &gl); }
+    gpt_kvcache_free(&kvB);
+
+    int okA = (genA[0] == respA[0] && genA[1] == respA[1] && genA[2] == respA[2]);
+    int okB = (genB[0] == respB[0] && genB[1] == respB[1]);
+    int sft_ok = okA && okB;
+    printf("[9] Instruction tuning (SFT): loss %.4f -> %.4f | prompt A -> %d %d %d %s | "
+           "prompt B -> %d %d %s -> %s\n\n",
+           first, last, genA[0], genA[1], genA[2], okA ? "OK" : "BAD",
+           genB[0], genB[1], okB ? "OK" : "BAD", sft_ok ? "OK" : "FAIL");
+    all_ok &= sft_ok;
+
+    tensor_free(&gl); adam_free(&opt);
+    tensor_free(&lo); tensor_free(&pr); gpt_acts_free(&as); gpt_free(&gs);
+  }
+
+  // --------------------------------------------------------------------------
   // Part 10: image GENERATION (Phase G, GI minimal) — pixels -> tokens, train a
   // GPT to autoregress them, then generate and decode back to pixels.
   // --------------------------------------------------------------------------
