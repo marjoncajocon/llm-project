@@ -616,7 +616,139 @@ static int run_llama(int argc, char **argv) {
   return 0;
 }
 
+// ============================================================================
+// `hfgen` subcommand: pure-C text chat for HF models (GPT-2 / LLaMA-family) using
+// the engine's own byte-level BPE tokenizer (hftok) — NO Python at runtime.
+// Reads the prompt text from stdin, tokenizes it, generates, and streams each
+// token's decoded text as a JSON delta {"d":"piece"} then {"done":true}.
+//   transformer hfgen <model.bin> <tok.hf> [n_new]
+// ============================================================================
+static void hf_emit_delta(const char *full, int *prevlen) {
+  int fl = (int)strlen(full);
+  fputs("{\"d\":\"", stdout);
+  for (int i = *prevlen; i < fl; i++) {
+    unsigned char c = (unsigned char)full[i];
+    if (c == '"') fputs("\\\"", stdout);
+    else if (c == '\\') fputs("\\\\", stdout);
+    else if (c == '\n') fputs("\\n", stdout);
+    else if (c == '\r') fputs("\\r", stdout);
+    else if (c == '\t') fputs("\\t", stdout);
+    else if (c < 0x20) printf("\\u%04x", c);
+    else putchar(c);
+  }
+  fputs("\"}\n", stdout);
+  fflush(stdout);
+  *prevlen = fl;
+}
+
+// Truncate the decoded text at a hallucinated next turn ("\nUser"); returns 1 if hit.
+static int hf_stop(char *dec) {
+  char *s = strstr(dec, "\nUser");
+  if (s) { *s = '\0'; return 1; }
+  return 0;
+}
+
+static int run_hfgen(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new]\n");
+    return 2;
+  }
+  const char *mpath = argv[2];
+  int n_new = (argc > 4) ? atoi(argv[4]) : 128;
+
+  HFTok tok;
+  if (hftok_load(&tok, argv[3]) != 0) return 1;
+
+  // read the whole prompt from stdin and tokenize it.
+  static char prompt[1 << 16];
+  int plen = (int)fread(prompt, 1, sizeof(prompt) - 1, stdin);
+  prompt[plen] = '\0';
+  int cap = plen + 16;
+  int *pids = (int*)malloc((size_t)cap * sizeof(int));
+  int np = hftok_encode(&tok, prompt, pids, cap);
+
+  // peek the checkpoint magic to pick the model family.
+  unsigned int magic = 0;
+  FILE *pf = fopen(mpath, "rb");
+  if (!pf) { fprintf(stderr, "cannot open '%s'\n", mpath); free(pids); hftok_free(&tok); return 1; }
+  if (fread(&magic, 4, 1, pf) != 1) magic = 0;
+  fclose(pf);
+
+  const float temp = 0.8f, top_p = 0.95f;
+  const int top_k = 40;
+  Rng rng = rng_create(1234);
+  char *dec = (char*)malloc(1 << 20);
+  int prevlen = 0;
+  int *gen = (int*)malloc((size_t)(np + n_new) * sizeof(int));
+  int gn = 0;
+
+  if (magic == 0x43545047u) {                 // 'GPTC' — GPT-2 family
+    GPT m;
+    if (gpt_load(mpath, &m) != 0) { goto done; }
+    int lz[2] = {1, m.vocab_size};
+    Tensor logits = tensor_create(lz, 2);
+    KVCache kv = gpt_kvcache_create(&m);
+    for (int i = 0; i < np; i++) { gen[gn++] = pids[i]; gpt_decode_step(&m, &kv, pids[i], &logits); }
+    for (int s = 0; s < n_new && kv.len < m.max_seq_len; s++) {
+      int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
+      if (nx == tok.eos) break;
+      gen[gn++] = nx;
+      gpt_decode_step(&m, &kv, nx, &logits);
+      hftok_decode(&tok, gen + np, gn - np, dec, 1 << 20);
+      int stop = hf_stop(dec);
+      hf_emit_delta(dec, &prevlen);
+      if (stop) break;
+    }
+    tensor_free(&logits); gpt_kvcache_free(&kv); gpt_free(&m);
+  } else if (magic == 0x514D4C4Cu) {          // 'LLMQ' — int8 llama
+    QLlamaModel m;
+    if (q_llama_model_load(mpath, &m) != 0) { goto done; }
+    int lz[2] = {1, m.vocab};
+    Tensor logits = tensor_create(lz, 2);
+    LlamaKV kv = q_llama_kv_create(&m);
+    for (int i = 0; i < np && i < m.max_seq; i++) { gen[gn++] = pids[i]; q_llama_decode_step(&m, &kv, pids[i], &logits); }
+    for (int s = 0; s < n_new && kv.len < m.max_seq; s++) {
+      int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
+      if (nx == tok.eos) break;
+      gen[gn++] = nx;
+      q_llama_decode_step(&m, &kv, nx, &logits);
+      hftok_decode(&tok, gen + np, gn - np, dec, 1 << 20);
+      int stop = hf_stop(dec);
+      hf_emit_delta(dec, &prevlen);
+      if (stop) break;
+    }
+    tensor_free(&logits); llama_kv_free(&kv); q_llama_model_free(&m);
+  } else if (magic == 0x414D4C4Cu) {          // 'LLMA' — f32 llama
+    LlamaModel m;
+    if (llama_model_load(mpath, &m) != 0) { goto done; }
+    int lz[2] = {1, m.vocab};
+    Tensor logits = tensor_create(lz, 2);
+    LlamaKV kv = llama_kv_create(&m);
+    for (int i = 0; i < np && i < m.max_seq; i++) { gen[gn++] = pids[i]; llama_decode_step(&m, &kv, pids[i], &logits); }
+    for (int s = 0; s < n_new && kv.len < m.max_seq; s++) {
+      int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
+      if (nx == tok.eos) break;
+      gen[gn++] = nx;
+      llama_decode_step(&m, &kv, nx, &logits);
+      hftok_decode(&tok, gen + np, gn - np, dec, 1 << 20);
+      int stop = hf_stop(dec);
+      hf_emit_delta(dec, &prevlen);
+      if (stop) break;
+    }
+    tensor_free(&logits); llama_kv_free(&kv); llama_model_free(&m);
+  } else {
+    fprintf(stderr, "error: '%s' is not a GPTC/LLMA/LLMQ checkpoint\n", mpath);
+  }
+
+done:
+  printf("{\"done\":true}\n");
+  fflush(stdout);
+  free(dec); free(gen); free(pids); hftok_free(&tok);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "hfgen") == 0) return run_hfgen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);

@@ -221,11 +221,11 @@ func chatMedia(c *wsConn, kind, prompt, attachB64 string) {
 		"wav_b64": base64.StdEncoding.EncodeToString(outWav)})
 }
 
-// streamText routes the text path by model type (pure-C: one delta; gpt2/llama:
-// live token streaming via the Python wrappers).
+// streamText routes the text path. Pure-C models: one delta. For gpt2/llama it
+// prefers the engine's OWN tokenizer (hfgen — no Python) when the model's vocab
+// is exported to model/<name>/tok.hf, and falls back to the Python bridges.
 func streamText(c *wsConn, m *Model, prompt string, n int) {
-	switch m.Mode {
-	case "purec-text":
+	if m.Mode == "purec-text" {
 		reply, _, err := runChat(*m, prompt, n)
 		if err != nil {
 			sendJSON(c, errMsg(err))
@@ -234,6 +234,21 @@ func streamText(c *wsConn, m *Model, prompt string, n int) {
 		if reply = trimAtStop(reply); reply != "" {
 			sendJSON(c, map[string]any{"op": "chat_delta", "text": reply})
 		}
+		return
+	}
+
+	// Pure-C tokenizer path (no Python) when the vocab was exported.
+	if _, err := os.Stat(filepath.Join(cfg.root, "model", m.Name, "tok.hf")); err == nil {
+		rel := "model/" + m.Name + "/tok.hf"
+		if err := runCmdStream(cfg.exe, []string{"hfgen", m.Ckpt, rel, strconv.Itoa(n)}, prompt,
+			func(line string) { forwardDelta(c, line) }); err != nil {
+			sendJSON(c, errMsg(err))
+		}
+		return
+	}
+
+	// Fallback: the Python tokenizer bridges.
+	switch m.Mode {
 	case "gpt2":
 		if err := runCmdStream(cfg.python,
 			[]string{"tools/gpt2_stream.py", "--name", m.Name}, prompt,
