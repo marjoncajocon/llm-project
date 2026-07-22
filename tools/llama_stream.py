@@ -13,11 +13,16 @@ sequence (default "\nUser:") ends a turn cleanly and stops the model rambling.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
 from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
+
+# End marker, or a role label on its own line as a whole word (User: / User\n / etc.).
+STOP_RE = re.compile(r"<\|endoftext\|>|<\|im_end\|>|<\|eot_id\|>|"
+                     r"\n(?:User|You|Human|Assistant|AI|System|Q)(?=[\s:]|$)")
 
 
 def load_tok(model):
@@ -80,11 +85,8 @@ def main():
             break
         gen.append(tid)
         full = tok.decode(gen)
-        cut = -1
-        for st in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser:", "\nHuman:", "\nYou:", "\nAssistant:", "\nAI:"):
-            i = full.find(st)
-            if i != -1 and (cut == -1 or i < cut):
-                cut = i
+        m = STOP_RE.search(full)
+        cut = m.start() if m else -1
         if cut != -1:                       # end marker / new turn -> stop
             piece = full[len(prev):cut]
             if piece:

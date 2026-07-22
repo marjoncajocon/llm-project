@@ -641,18 +641,33 @@ static void hf_emit_delta(const char *full, int *prevlen) {
   *prevlen = fl;
 }
 
-// Truncate the decoded text at an end-of-turn marker or a hallucinated next turn
-// (including <|endoftext|>/<|im_end|> emitted as literal text, which some models
-// do instead of the special token). Cuts at the EARLIEST match; returns 1 if hit.
+// Truncate the decoded text at an end-of-turn marker or a hallucinated next turn.
+// Catches: literal end tokens (some models emit <|endoftext|>/<|im_end|> as text);
+// and a role label on its own line (User/You/Human/Assistant/AI/System) as a WHOLE
+// WORD — followed by ':', whitespace, or end — so "User"/"You" stop it but
+// "Users"/"Youtube" in real text don't. Cuts at the EARLIEST match.
 static int hf_stop(char *dec) {
-  static const char *stops[] = {"<|endoftext|>", "<|im_end|>", "<|eot_id|>",
-                                "\nUser:", "\nHuman:", "\nYou:", "\nAssistant:", "\nAI:", NULL};
-  char *earliest = NULL;
-  for (int i = 0; stops[i]; i++) {
-    char *s = strstr(dec, stops[i]);
-    if (s && (!earliest || s < earliest)) earliest = s;
+  char *cut = NULL;
+  static const char *ends[] = {"<|endoftext|>", "<|im_end|>", "<|eot_id|>", NULL};
+  for (int i = 0; ends[i]; i++) {
+    char *s = strstr(dec, ends[i]);
+    if (s && (!cut || s < cut)) cut = s;
   }
-  if (earliest) { *earliest = '\0'; return 1; }
+  static const char *labels[] = {"User", "You", "Human", "Assistant", "AI", "System", "Q", NULL};
+  for (char *p = dec; (p = strchr(p, '\n')) != NULL; p++) {
+    char *w = p + 1;
+    for (int i = 0; labels[i]; i++) {
+      int ll = (int)strlen(labels[i]);
+      if (strncmp(w, labels[i], (size_t)ll) == 0) {
+        char a = w[ll];
+        if (a == '\0' || a == ':' || a == ' ' || a == '\t' || a == '\r' || a == '\n') {
+          if (!cut || p < cut) cut = p;
+          break;
+        }
+      }
+    }
+  }
+  if (cut) { *cut = '\0'; return 1; }
   return 0;
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -284,13 +285,16 @@ func forwardDelta(c *wsConn, line string) {
 	}
 }
 
+// stopRe matches an end marker, or a role label on its own line as a WHOLE WORD
+// (User: / User\n / etc.) so "User"/"You" stop a reply but "Users"/"Youtube" don't.
+var stopRe = regexp.MustCompile(`<\|endoftext\|>|<\|im_end\|>|<\|eot_id\|>|` +
+	`\n(?:User|You|Human|Assistant|AI|System|Q)(?:[\s:]|$)`)
+
 // trimAtStop cuts a reply at the first hallucinated next turn (the pure-C path
 // generates a fixed token count with no stop sequence).
 func trimAtStop(s string) string {
-	for _, st := range []string{"<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser:", "\nHuman:", "\nYou:", "\nAssistant:", "\nAI:"} {
-		if i := strings.Index(s, st); i >= 0 {
-			s = s[:i]
-		}
+	if loc := stopRe.FindStringIndex(s); loc != nil {
+		s = s[:loc[0]]
 	}
 	return strings.TrimRight(s, "\n ")
 }
