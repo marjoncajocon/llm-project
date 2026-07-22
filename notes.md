@@ -146,29 +146,34 @@ LMs). Diffusion is the SOTA alternative but a much bigger, different build — n
 Order rationale: text (1–4) is very achievable locally; images (5) and video (6) are big
 multimodal builds where the plumbing is feasible but real quality needs far more scale.
 
-## ▶▶ PLANNED NEXT STEP (agreed 2026-07-21) — real LLM agent backend
+## ▶▶ PLANNED NEXT STEP (agreed 2026-07-21) — real LLM agent backend — ✅ DONE (2026-07-22)
 
-**Do this next.** Turn the agent from a scripted demo into one that genuinely acts, using the
-already-pluggable `agent --cmd` backend. This is the biggest usefulness jump (the original
-"local coding-agent CLI" vision) and NOT gated on model scale — only on an API key.
+**DONE.** `tools/agent_llm.py` turns the agent from a scripted demo into one that genuinely
+acts, via the already-pluggable `agent --cmd` backend. Biggest usefulness jump (the original
+"local coding-agent CLI" vision); NOT gated on model scale — only on an API key. No C changes.
 
-**Build:** `tools/agent_llm.py` — reads the transcript file (argv), calls a real LLM (Claude
-via the Anthropic API; also fine to support OpenAI), with a system prompt that makes the model
-reply with EXACTLY one of our blocks: `<tool name="write_file|read_file|run_command" .../>...`
-or `<done>summary</done>`. Print the response to stdout (the C agent uses stdout as the model
-response — see `agent.c` command backend + `tools/agent_mock.py` for the exact contract).
+**Built:** `tools/agent_llm.py` — reads the transcript file (argv[1], stdin fallback), calls a
+real LLM with a system prompt constraining it to emit EXACTLY one block:
+`<tool name="write_file|read_file|run_command" ...>...</tool>` or `<done>summary</done>` (exact
+attribute syntax matched to `toolcall.c`'s parser). Prints only text blocks to stdout (skips
+thinking blocks); strips stray ``` fences. Provider: **Claude via Anthropic API**
+(`claude-opus-4-8`, adaptive thinking) by default, **OpenAI** if only `OPENAI_API_KEY` is set
+(`$OPENAI_MODEL` or `gpt-4o`). On no key / no SDK / any API error it prints a `<done>` block so
+the C loop ends cleanly instead of hanging.
 
-**Run:** `transformer agent --cmd "python tools/agent_llm.py" --goal "..."` — the existing
-approval gate (`--ask`) stays as the safety layer. Needs `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`).
+**Run:** `transformer agent --cmd "python tools/agent_llm.py" --goal "..." --ask` — the approval
+gate (`--ask`) stays as the safety layer. Needs `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`).
 
-**Notes for whoever builds it:** consult the Claude API reference for current model ids/params
-(load the `claude-api` skill). Keep `agent_mock.py` as the offline/no-key fallback. Test the
-plumbing with the mock first, then the live call once a key is set. Small, clean change — no C
-changes needed (backend is already pluggable).
+**Verified (this machine, no key available):** script compiles; the no-key path emits the
+graceful `<done>`; full path through the C command backend works end-to-end
+(`transformer agent --cmd "<py> tools/agent_llm.py" --goal ...` → writes transcript → runs the
+script → parses its `<done>` → stops). Smoke test still `PASSED`, `-Wall` clean. The live LLM
+call is untested here (no `anthropic` pkg / no key) — it's the standard Messages API shape from
+the `claude-api` skill; `agent_mock.py` remains the offline/no-key fallback.
 
-**Backups if not doing the agent backend:** (a) code health — split the 12-part smoke test out
-of `main.c` (~1000 lines) into `selftest.c` so main.c is just CLI dispatch; (b) dataset-trained
-generator — make `imggen`/`audgen` learn from a folder instead of one input.
+**Backups (not needed now, still open):** (a) code health — split the 12-part smoke test out of
+`main.c` (~1000 lines) into `selftest.c`; (b) dataset-trained `imggen`/`audgen` (learn from a
+folder, not one input).
 
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 

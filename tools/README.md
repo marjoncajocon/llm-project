@@ -56,6 +56,34 @@ transformer train data/wiki --out ml.bin --tok ml.tok --steps 10000
 Standard library only (urllib); needs internet. Sets a descriptive User-Agent and rate-limits
 per Wikipedia's guidelines.
 
+### `agent_mock.py` / `agent_llm.py` — model backends for the agent loop
+
+The C agent (`agent --cmd "<prog>"`) writes the running transcript to a temp file, passes its
+path as `argv[1]`, and uses the program's **stdout** as the model's next response. A valid
+response is exactly one block that `toolcall.c` can parse:
+
+```
+<tool name="write_file" path="a.txt">contents</tool>
+<tool name="read_file" path="a.txt"></tool>
+<tool name="run_command" command="echo hi"></tool>
+<done>one-line summary</done>
+```
+
+- **`agent_mock.py`** — offline, no-key demo: drives write→read→done deterministically
+  (counts `OBSERVATION:` lines). Use it to test the plumbing.
+- **`agent_llm.py`** — real LLM backend (makes the agent genuinely act). Constrains the model
+  to emit exactly one of the blocks above. Provider: **Claude via the Anthropic API**
+  (`claude-opus-4-8`, adaptive thinking) by default, or **OpenAI** if only `OPENAI_API_KEY` is
+  set (`$OPENAI_MODEL` or `gpt-4o`). With no key / no SDK / any API error it prints a `<done>`
+  block so the loop ends cleanly. `pip install anthropic` (or `openai`) and set the key.
+
+```sh
+# offline demo
+transformer agent --cmd "python tools/agent_mock.py" --goal "..."
+# real LLM (needs ANTHROPIC_API_KEY or OPENAI_API_KEY); keep --ask as the safety gate
+transformer agent --cmd "python tools/agent_llm.py" --goal "refactor X" --ask
+```
+
 ## Adding a tool
 
 Drop your script in this folder, keep it self-contained, and document its usage here.
