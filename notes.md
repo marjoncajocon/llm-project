@@ -406,12 +406,20 @@ quantized matmul — 4× less RAM and 4× less weight memory traffic in the matm
 - `main.c` `llama` peeks the magic: **LLMQ → in-memory int8 path**, LLMA → f32 path (auto).
 Verified: selftest **part `[21]`** — quantize a small fp32 model, run `q_llama_decode_step` per token,
 compare to `llama_model_forward`: L2 rel error **6.38e-03** (<1%, tiny-dim; real models lower). Smoke
-test PASSED, `-Wall` clean. `transformer llama model_int8.bin` now runs the true int8 model (4× less
-RAM than the 621 MB f32 in memory too). [timing of SmolLM2 int8 in-memory measured separately.]
+test PASSED, `-Wall` clean. `transformer llama model_int8.bin` now runs the true int8 model.
 
-Perf follow-ups: **thread qmatmul** (decode is M=1 so single-threaded, but memory-bound → int8 helps
-regardless; batch/prefill would want threading), SIMD. Block/model forward-only (add backward to
-fine-tune). Qwen2.5-0.5B needs attention-bias support in LlamaBlock.
+**Measured (SmolLM2-135M, honest):** RAM ~135 MB int8 vs ~540 MB f32 (4× less, by construction) and
+file 156 MB vs 621 MB (4×). But **NO compute speedup: 83.3 s vs f32 85.2 s (~2%, noise).** Why: our
+`qmatmul` converts each int8 weight to float and does f32 arithmetic (`av * (float)q`), so it does the
+SAME number of FLOPs as f32 (plus an int8→float convert) — it only cuts memory *bytes*. At this size
+decode is compute-bound, not memory-bound, so less traffic + same FLOPs nets ~zero. The real int8
+compute speedup needs **SIMD int8×int8→int32 dot-products (AVX2/AVX-512 VNNI)** which do 4× MACs per
+instruction, and that requires **activation quantization** (int8 activations) + SIMD intrinsics — a
+bigger, separate step. So this step's honest win is RAM/size, not latency.
+
+Perf follow-ups (for actual speed): **SIMD + activation quant (int8×int8) matmul**; also thread
+qmatmul. Block/model forward-only (add backward to fine-tune). Qwen2.5-0.5B needs attention-bias
+support in LlamaBlock.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
