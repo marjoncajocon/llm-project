@@ -1406,3 +1406,67 @@ quant (#2 remainder); a `tools/agent_llm.py` real-LLM agent backend; instruction
 - Run the actual 124M weights: download GPT-2, `convert_gpt2.py` → `convert_to_gptc.py` →
   `gpt_load`, then generate (needs Phase B sampling/KV-cache/REPL).
 - Phase B/C: generation CLI, then the agent loop (tools + approval). See roadmap at top.
+
+
+## 2026-07-22 -- Session: chat templates + C-native text-to-image (RESUME HERE)
+
+Branch `agent-1` (local only; NOT pushed -- master merged by user). Everything below is
+smoke-tested (Output validation PASSED); grad-check + KV bit-exact untouched (all additive).
+
+**DONE this session:**
+
+1. **Chat stop fixes** (commits 745c057, ce6ed61, e04b692): generation stops at end tokens
+   (`<|endoftext|>`/`<|im_end|>`/`<|eot_id|>`) and at role labels
+   (User/You/Human/Assistant/AI/System) matched as WHOLE WORDS at line start -- fixes Qwen's
+   trailing "\nUser" garbage and fake self-conversations. In main.c `hf_stop`,
+   tools/llama_stream.py, gpt2_stream.py, webchat handlers.go `trimAtStop`.
+
+2. **Special tokens + chat templates in pure C** (commits 45b0a08, dd60835) -- the big one:
+   - `.tok` format -> v2 (v1 still loads): adds bos, template_kind (plain/chatml/llama3),
+     default_system, and the special-token table (id, end-of-generation flag, literal string).
+   - hftok.c: `hftok_encode` splits input on special-token strings (greedy, probed at '<') and
+     emits each as ONE id; `hftok_is_eog` (stop set); `hftok_chat_render` (turns -> prompt for
+     ChatML / Llama-3 / plain).
+   - main.c: `hf_generate()` shared core stops on the REAL eog token; new
+     `hfchat <model.bin> <tok.hf> [n]` reads RS(0x1e)/US(0x1f)-delimited turns from stdin and
+     applies the template in C.
+   - tools/export_tokenizer.py writes v2 (reads added_tokens + chat_template from HF files).
+   - webchat sends structured turns -> hfchat. VERIFIED: a ChatML prompt tokenizes
+     BIT-IDENTICAL to HF `tokenizers` (`<|im_start|>`=151644, `<|im_end|>`=151645 single ids).
+   - NOTE: `model/*/tok.hf` are git-ignored; qwen/smollm/gpt2 already re-exported to v2. Base
+     Qwen/SmolLM still ramble (not instruct-tuned) -- the infra is correct; an INSTRUCT model
+     would emit `<|im_end|>` and stop cleanly (offered to convert SmolLM2-135M-Instruct, not done).
+
+3. **Text-to-image kept C-NATIVE** (user: "no python for diffusers, make it C, from scratch"):
+   uninstalled torch/diffusers; webchat `-imagegen` is now OPT-IN only (commit f0bd205). Default
+   image path = the from-scratch `t2i` (VQ-VAE + autoregressive GPT, all pure C, no Python).
+
+4. **t2i improved** (commits 482afc5, 09bab75):
+   - `t2i-data`: procedural dataset generator (5 shapes x 8 colors; caption "a <color> <shape>").
+   - Generation SAMPLES image codes (temp + top_k, masked to the code vocab) not greedy argmax.
+   - **Minibatch gradient accumulation** (BATCH=8) in `t2i_build`: `gpt_backward` zeros+fills
+     grads per example, so accumulate into a shadow buffer + average before `adam_step`. Drove
+     GPT loss 1.0 -> **0.0002** on the DETERMINISTIC 40-shape set.
+   - `t2i-recon`: debug subcommand -- round-trips an image through the trained VQ only (no GPT).
+   - RESULT (VERIFIED via montage): every "a <color> <shape>" caption -> correct color AND a
+     recognizable shape. Clean from-scratch pure-C text-to-image.
+
+**IN PROGRESS -- generalization (commit 4294e91, WIP, NOT validated):**
+   - Reintroduced per-variant position/size jitter (seeded per index) + linear LR decay to 0.1x.
+     Defaults now: `t2i-data` n=480, `t2i-train` 1800 steps, gen temp 0.6.
+   - Prior no-decay run (1400 steps) UNDERTRAINED: loss plateaued ~0.25, confused blue->green,
+     blobby shapes. LR decay + gentler jitter were added to fix that, but the confirming train
+     was STOPPED (user paused). `model/t2i/t2i` on disk = that undertrained 0.25 model (ignored).
+   - **RESUME:** rebuild (zig cc), `transformer t2i-data <dir> 480 16`,
+     `transformer t2i-train <dir> model/t2i/t2i 1800 1800`, then verify (same caption x several
+     seeds -> varied but CORRECT color+shape). If colors still confused: train longer / bigger
+     model (d=128) / gentler jitter. The crisp memorized demo used the pre-4294e91 deterministic
+     generator (no jitter).
+
+**THEN (user-requested next): richer concepts** -- multi-object scenes + spatial relations
+("on the left"), more shapes -> real compositionality.
+
+Build: `$c=(Get-ChildItem *.c|%{$_.Name}); D:\env\zig\zig.exe cc -std=c11 -O2 -Wall -o
+transformer.exe @c -lm`. Both exes (transformer.exe, tools/webchat/webchat.exe) left built.
+Montage helper (view PPMs): scratchpad ppm_montage.py (stdlib zlib PNG).
+
