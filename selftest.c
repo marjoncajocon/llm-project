@@ -1072,6 +1072,44 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 18: full modern MODEL (embedding -> N blocks -> RMSNorm -> head).
+  // Forward on token ids + model-level causality: changing the LAST token id
+  // must leave the logits at every earlier position unchanged.
+  // --------------------------------------------------------------------------
+  {
+    const int vocab = 32, dm = 8, nl = 3, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    printf("[18] Modern model: %d layers, vocab %d -> forward + causality\n", nl, vocab);
+    srand(11);
+    LlamaModel lm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    llama_model_randomize(&lm);
+    int ids[6]  = {3, 7, 1, 9, 2, 5};
+    int ids2[6] = {3, 7, 1, 9, 2, 8};   // differs only in the LAST token
+    int ls[2] = {seq, vocab};
+    Tensor L1 = tensor_create(ls, 2), L2 = tensor_create(ls, 2);
+    llama_model_forward(&lm, ids, seq, &L1);
+    llama_model_forward(&lm, ids2, seq, &L2);
+
+    int finite = 1;
+    for (int i = 0; i < seq * vocab; i++) if (!isfinite(L1.data[i])) finite = 0;
+    float past_diff = 0.0f, last_diff = 0.0f;
+    for (int i = 0; i < seq - 1; i++)
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(L1.data[i * vocab + j] - L2.data[i * vocab + j]);
+        if (d > past_diff) past_diff = d;
+      }
+    for (int j = 0; j < vocab; j++) {
+      float d = fabsf(L1.data[(seq - 1) * vocab + j] - L2.data[(seq - 1) * vocab + j]);
+      if (d > last_diff) last_diff = d;
+    }
+    int lm_ok = finite && (past_diff < 1e-6f) && (last_diff > 1e-4f);
+    printf("    finite=%d | causality: earlier-token logits max|diff|=%.2e (==0) last-token |diff|=%.2e (>0) -> %s\n\n",
+           finite, past_diff, last_diff, lm_ok ? "OK" : "FAIL");
+    all_ok &= lm_ok;
+    llama_model_free(&lm);
+    tensor_free(&L1); tensor_free(&L2);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

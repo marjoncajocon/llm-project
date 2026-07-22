@@ -84,3 +84,58 @@ void llama_block_forward(const LlamaBlock *b, const Tensor *x, Tensor *out) {
   tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
   tensor_free(&o); tensor_free(&ao); tensor_free(&h); tensor_free(&hn); tensor_free(&f);
 }
+
+// ---------------------------------------------------------------------------
+// Full model
+// ---------------------------------------------------------------------------
+
+LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
+                              int n_kv, int head_dim, int d_ff, int max_seq,
+                              float rope_base, float eps) {
+  LlamaModel m;
+  m.vocab = vocab; m.d_model = d_model; m.n_layers = n_layers;
+  m.n_heads = n_heads; m.n_kv = n_kv; m.head_dim = head_dim; m.d_ff = d_ff;
+  m.max_seq = max_seq; m.rope_base = rope_base; m.eps = eps;
+  m.wte = mat(vocab, d_model);
+  m.blocks = (LlamaBlock*)malloc((size_t)n_layers * sizeof(LlamaBlock));
+  for (int l = 0; l < n_layers; l++)
+    m.blocks[l] = llama_block_create(d_model, n_heads, n_kv, head_dim, d_ff, rope_base, eps);
+  m.final_norm = vec(d_model);
+  m.lm_head = mat(d_model, vocab);
+  return m;
+}
+
+void llama_model_free(LlamaModel *m) {
+  tensor_free(&m->wte);
+  for (int l = 0; l < m->n_layers; l++) llama_block_free(&m->blocks[l]);
+  free(m->blocks);
+  tensor_free(&m->final_norm); tensor_free(&m->lm_head);
+}
+
+void llama_model_randomize(LlamaModel *m) {
+  fill_rand(&m->wte, 0.05f);
+  for (int l = 0; l < m->n_layers; l++) llama_block_randomize(&m->blocks[l]);
+  for (int j = 0; j < m->d_model; j++) m->final_norm.data[j] = 1.0f;
+  fill_rand(&m->lm_head, 0.05f);
+}
+
+void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tensor *logits) {
+  const int dm = m->d_model;
+  Tensor a = mat(seq_len, dm), b = mat(seq_len, dm), hn = mat(seq_len, dm);
+
+  // Token embedding (no positional term — RoPE carries position).
+  for (int i = 0; i < seq_len; i++)
+    for (int j = 0; j < dm; j++)
+      a.data[i * dm + j] = m->wte.data[ids[i] * dm + j];
+
+  Tensor *cur = &a, *nxt = &b;
+  for (int l = 0; l < m->n_layers; l++) {
+    llama_block_forward(&m->blocks[l], cur, nxt);
+    Tensor *t = cur; cur = nxt; nxt = t;      // ping-pong buffers
+  }
+
+  rmsnorm(cur, &m->final_norm, &hn, m->eps);
+  matmul(&hn, &m->lm_head, logits);            // (seq_len, vocab)
+
+  tensor_free(&a); tensor_free(&b); tensor_free(&hn);
+}

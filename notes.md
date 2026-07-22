@@ -283,10 +283,25 @@ LAST input position changed its own output (|diff| 5.2e-1) but left every earlie
 **exactly** unchanged (max |diff| 0.00e+00), proving the causal mask survives the full assembly.
 Smoke test PASSED, `-Wall` clean.
 
-Next: **`convert_llama.py`** (HF safetensors → our weight layout, handling the HF RoPE weight
-permutation) + a multi-block model path + a SentencePiece/BPE tokenizer bridge, so we can load and
-generate from a real small modern model (SmolLM2-135M / Qwen2.5-0.5B). Also pending: SIMD/int8 quant
-for speed on bigger models.
+## Modern architecture — step 6: multi-block MODEL + forward — DONE (2026-07-22)
+
+`LlamaModel` in `llama.h`/`llama.c`: token embedding (`wte`, vocab×d_model; NO positional term —
+RoPE carries position) → `n_layers` `LlamaBlock`s (ping-pong buffers) → final RMSNorm → `lm_head`
+(d_model×vocab; tie = wte^T) → logits (seq, vocab). `llama_model_create/free/randomize/forward`.
+Forward-only (inference). Verified: new selftest **part `[18]`** — 3-layer model forward is finite
+AND model-level **causal**: changing the LAST token id changes only its own logits (|diff| 6.6e-2),
+every earlier position's logits **exactly** unchanged (0.00e+00) through all 3 blocks + embedding +
+final norm + head. Smoke test PASSED.
+
+**Cross-compile verified (user asked):** all **8 `make cross` targets build clean** with the new
+modules (rmsnorm/rope/swiglu/gqa/llama) — x86_64/aarch64 linux-gnu, linux-musl, x86_64/aarch64
+windows-gnu, x86_64/aarch64 macos, and **wasm32-wasi** (the new modules are pure standard C + math +
+malloc, no platform code). `-Wall` clean everywhere.
+
+Next: **`convert_llama.py`** (HF safetensors → our weight layout, handling the HF RoPE Q/K weight
+permutation + tokenizer) + a load path, so we can load and generate from a real small modern model
+(SmolLM2-135M / Qwen2.5-0.5B). Also pending: SIMD/int8 quant for speed; a `GPTC`-style checkpoint
+format for LlamaModel. (Block/model are forward-only; add backward if we want to fine-tune.)
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

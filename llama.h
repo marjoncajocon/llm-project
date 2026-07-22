@@ -41,4 +41,26 @@ void llama_block_randomize(LlamaBlock *b);
 // Forward: x (seq_len, d_model) -> out (seq_len, d_model). Causal.
 void llama_block_forward(const LlamaBlock *b, const Tensor *x, Tensor *out);
 
+// ---------------------------------------------------------------------------
+// Full modern model: token embedding -> n_layers blocks -> final RMSNorm ->
+// output head. No positional embedding (RoPE handles position inside attention).
+// ---------------------------------------------------------------------------
+typedef struct {
+  int vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq;
+  float rope_base, eps;
+  Tensor wte;          // (vocab, d_model)   token embedding
+  LlamaBlock *blocks;  // n_layers
+  Tensor final_norm;   // (d_model)          RMSNorm before the head
+  Tensor lm_head;      // (d_model, vocab)    output projection (tie = wte^T)
+} LlamaModel;
+
+LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
+                              int n_kv, int head_dim, int d_ff, int max_seq,
+                              float rope_base, float eps);
+void llama_model_free(LlamaModel *m);
+void llama_model_randomize(LlamaModel *m);
+
+// Forward: token ids (length seq_len) -> logits (seq_len, vocab). Causal.
+void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tensor *logits);
+
 #endif // LLAMA_H
