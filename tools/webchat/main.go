@@ -29,34 +29,77 @@ var cfg config
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	root := flag.String("root", filepath.Join("..", ".."), "repo root (holds transformer + model/)")
-	exe := flag.String("exe", "", "transformer binary (default <root>/transformer[.exe])")
+	root := flag.String("root", "", "repo root (holds transformer + model/); default: auto-detect")
+	exe := flag.String("exe", "", "transformer binary (default: next to webchat, then <root>)")
 	python := flag.String("python", "python", "python interpreter for the tokenizer bridges")
 	flag.Parse()
 
-	absRoot, err := filepath.Abs(*root)
-	if err != nil {
-		log.Fatalf("resolving root: %v", err)
-	}
-	cfg.root = absRoot
+	cfg.root = resolveRoot(*root)
 	cfg.python = *python
 	if *exe != "" {
 		cfg.exe = *exe
 	} else {
-		name := "transformer"
-		if runtime.GOOS == "windows" {
-			name = "transformer.exe"
-		}
-		cfg.exe = filepath.Join(absRoot, name)
+		cfg.exe = findTransformer(cfg.root)
 	}
 	if _, err := os.Stat(cfg.exe); err != nil {
-		log.Printf("WARNING: transformer binary not found at %s — build it first", cfg.exe)
+		log.Printf("WARNING: transformer binary not found (looked next to webchat and in %s) — build it first", cfg.root)
 	}
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/ws", handleWS)
-	log.Printf("webchat on http://localhost%s   (root=%s)", *addr, cfg.root)
+	log.Printf("webchat on http://localhost%s   (root=%s, exe=%s)", *addr, cfg.root, cfg.exe)
 	log.Fatal(http.ListenAndServe(*addr, nil))
+}
+
+// resolveRoot finds the repo root (the folder holding model/ and the tools/). If
+// -root is given it wins; otherwise auto-detect so a built webchat.exe just works
+// whether run from the repo root or double-clicked in tools/webchat/.
+func resolveRoot(flagVal string) string {
+	if flagVal != "" {
+		if a, err := filepath.Abs(flagVal); err == nil {
+			return a
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil && hasModelDir(cwd) {
+		return cwd
+	}
+	// webchat.exe lives in <root>/tools/webchat/, so climb two levels.
+	if self, err := os.Executable(); err == nil {
+		up := filepath.Dir(filepath.Dir(filepath.Dir(self)))
+		if hasModelDir(up) {
+			return up
+		}
+	}
+	cwd, _ := os.Getwd()
+	return cwd
+}
+
+func hasModelDir(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, "model"))
+	return err == nil && fi.IsDir()
+}
+
+// findTransformer locates the engine: next to the webchat binary first (so both
+// exes can sit in one folder), then in root, then cwd.
+func findTransformer(root string) string {
+	name := "transformer"
+	if runtime.GOOS == "windows" {
+		name = "transformer.exe"
+	}
+	var candidates []string
+	if self, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(self), name))
+	}
+	candidates = append(candidates, filepath.Join(root, name))
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, name))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return filepath.Join(root, name) // default (may not exist -> warning above)
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {

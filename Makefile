@@ -81,8 +81,16 @@ cross:
 	done
 	@echo "cross builds written to $(BUILDDIR)/"
 
+# Build the Go web testing frontend (tools/webchat). Depends on the engine so
+# `make webchat` produces BOTH exes: ./transformer and tools/webchat/webchat.
+# On Windows without make, use: powershell -File tools\webchat\build.ps1
+webchat: $(TARGET)
+	cd tools/webchat && go build -o webchat .
+	@echo "built ./$(TARGET) and tools/webchat/webchat — run: ./tools/webchat/webchat"
+
 clean:
 	rm -f $(OBJS) $(TARGET)
 	rm -f $(BUILDDIR)/transformer-*
+	rm -f tools/webchat/webchat tools/webchat/webchat.exe
 
-.PHONY: all clean cross
+.PHONY: all clean cross webchat

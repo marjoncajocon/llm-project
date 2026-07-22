@@ -11,25 +11,36 @@ Go standard library only — no external modules. The server bridges each reques
 to the CLI as a subprocess (run with cwd = repo root), so it works exactly like
 running `transformer` by hand.
 
-## Build & run
+## Build standalone exes
 
-Build the engine first (from the repo root), then start the server:
+Build **both** executables at once — the C engine and the self-contained server
+(its UI is embedded, so `webchat.exe` needs no extra files):
 
 ```sh
-# 1. build the engine (repo root)
-make                                  # -> ./transformer   (or transformer.exe on Windows)
-
-# 2. run the server (from this folder)
-cd tools/webchat
-go run . -addr :8080 -root ../..      # open http://localhost:8080
+make webchat                          # POSIX: -> ./transformer + tools/webchat/webchat
+powershell -File tools\webchat\build.ps1   # Windows (uses zig): -> transformer.exe + webchat.exe
 ```
 
-Flags: `-addr` (listen address, default `:8080`), `-root` (repo root that holds
-`transformer` + `model/`, default `../..`), `-exe` (override the binary path),
-`-python` (interpreter for the tokenizer bridges, default `python`).
+Then just run the server — it **auto-detects** the repo root and the engine
+(whether started from the repo root or from `tools/webchat/`):
 
-On Windows without `make`, build the engine with `zig` and run the server the
-same way (`go run .` picks up `transformer.exe` automatically).
+```sh
+./tools/webchat/webchat               # open http://localhost:8080
+```
+
+Both binaries are git-ignored (`*.exe` / `tools/webchat/webchat`).
+
+## Run without building
+
+```sh
+make                                  # build the engine (repo root)
+cd tools/webchat && go run .          # start the server (auto-detects root)
+```
+
+Flags (all optional): `-addr` (listen address, default `:8080`), `-root` (repo
+root holding `transformer` + `model/`; auto-detected if omitted), `-exe`
+(override the engine path — searched next to the server, then in root),
+`-python` (interpreter for the tokenizer bridges, default `python`).
 
 ## Panels
 
