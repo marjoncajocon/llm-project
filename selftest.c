@@ -24,11 +24,21 @@
 #include "imagegen.h"
 #include "audiogen.h"
 #include "rmsnorm.h"
+#include "rope.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
                              const float *w, float eps) {
   rmsnorm(x, gm, y, eps);
+  int n = y->shape[0] * y->shape[1];
+  float l = 0.0f;
+  for (int i = 0; i < n; i++) l += w[i] * y->data[i];
+  return l;
+}
+
+// Scalar loss L = sum(w * rope(x)) — used by the [14] gradient check.
+static float rope_scalar_loss(const Tensor *x, Tensor *y, const float *w, float base) {
+  rope(x, y, base);
   int n = y->shape[0] * y->shape[1];
   float l = 0.0f;
   for (int i = 0; i < n; i++) l += w[i] * y->data[i];
@@ -856,6 +866,60 @@ int run_selftest(void) {
            max_all, max_cond, rms_ok ? "OK" : "FAIL");
     all_ok &= rms_ok;
     tensor_free(&x); tensor_free(&y); tensor_free(&gm); tensor_free(&gg);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 14: RoPE (rotary positions, LLaMA-family) — numerical gradient check +
+  // the DEFINING RoPE property: <RoPE(q,m), RoPE(k,n)> depends only on (m-n), so
+  // the same relative offset at different absolute positions gives equal Q·K.
+  // --------------------------------------------------------------------------
+  {
+    printf("[14] RoPE (rotary positions): gradient check + relative-position property\n");
+    const int R = 6, D = 8;
+    const float base = 10000.0f;
+    int sh[2] = {R, D};
+    Tensor x = tensor_create(sh, 2), y = tensor_create(sh, 2);
+    float w[48];
+    for (int i = 0; i < R * D; i++) {
+      x.data[i] = ((i * 29 % 100) / 50.0f) - 1.0f;
+      w[i] = ((i * 61 % 100) / 50.0f) - 1.0f;
+    }
+    // Analytic grads (L = sum(w * y), dL/dy = w). RoPE is parameter-free -> dx only.
+    rope(&x, &y, base);
+    for (int i = 0; i < R * D; i++) { x.grad[i] = 0.0f; y.grad[i] = w[i]; }
+    rope_backward(&x, &y, base);
+    const float h = 1e-3f;
+    float max_cond = 0.0f;
+    for (int k = 0; k < R * D; k++) {
+      float s = x.data[k];
+      x.data[k] = s + h; float lp = rope_scalar_loss(&x, &y, w, base);
+      x.data[k] = s - h; float lm = rope_scalar_loss(&x, &y, w, base);
+      x.data[k] = s;
+      float num = (lp - lm) / (2.0f * h), rel = fabsf(num - x.grad[k]) / (fabsf(x.grad[k]) + 1e-3f);
+      if (fabsf(x.grad[k]) > 1e-2f && rel > max_cond) max_cond = rel;
+    }
+
+    // Relative-position property: q at positions 1 and 4, k at positions 2 and 5
+    // (both have offset n-m = 1), so <R_1 q, R_2 k> should equal <R_4 q, R_5 k>.
+    Tensor p = tensor_create(sh, 2), pr = tensor_create(sh, 2);
+    for (int i = 0; i < R * D; i++) p.data[i] = 0.0f;
+    for (int j = 0; j < D; j++) {
+      float q = ((j * 17 % 100) / 50.0f) - 1.0f, kk = ((j * 41 % 100) / 50.0f) - 1.0f;
+      p.data[1 * D + j] = q;  p.data[4 * D + j] = q;    // query at pos 1 and 4
+      p.data[2 * D + j] = kk; p.data[5 * D + j] = kk;   // key   at pos 2 and 5
+    }
+    rope(&p, &pr, base);
+    float dot1 = 0.0f, dot2 = 0.0f;
+    for (int j = 0; j < D; j++) {
+      dot1 += pr.data[1 * D + j] * pr.data[2 * D + j];
+      dot2 += pr.data[4 * D + j] * pr.data[5 * D + j];
+    }
+    float rel_dp = fabsf(dot1 - dot2) / (fabsf(dot1) + 1e-3f);
+    int rope_ok = (max_cond < 1e-2f) && (rel_dp < 1e-3f);
+    printf("    gradient %.2e (|grad|>1e-2) | rel-pos <q,k>: pos(1,2)=%.4f == pos(4,5)=%.4f (rel %.2e) -> %s\n\n",
+           max_cond, dot1, dot2, rel_dp, rope_ok ? "OK" : "FAIL");
+    all_ok &= rope_ok;
+    tensor_free(&x); tensor_free(&y); tensor_free(&p); tensor_free(&pr);
   }
 
   // --------------------------------------------------------------------------

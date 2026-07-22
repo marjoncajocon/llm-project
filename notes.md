@@ -229,9 +229,20 @@ subtraction, no bias — `y_j = x_j / sqrt(mean(x^2)+eps) * gamma_j`) + `rmsnorm
 Verified: new selftest **part `[13]`** does a numerical gradient check (analytic backward vs central
 difference) — max rel error **7.74e-04** (< 1e-2 gate); smoke test still PASSED, `-Wall` clean.
 Makefile + build lists + README module table updated. NOT yet wired into the model — that's the
-bigger arch swap (a modern block uses RMSNorm + RoPE + SwiGLU + GQA together). Next primitives:
-**RoPE** (rotary positions), then SwiGLU, GQA; then `convert_llama.py` + a modern-arch model path
-to load small modern models (SmolLM/Qwen).
+bigger arch swap (a modern block uses RMSNorm + RoPE + SwiGLU + GQA together).
+
+## Modern architecture — step 2: RoPE — DONE (2026-07-22)
+
+Rotary position embeddings (`rope.h`/`rope.c`): rotates each row (a Q/K head vector, head_dim even)
+by a position-dependent angle so RELATIVE position enters the Q·K dot product; parameter-free,
+replaces learned positions. **Half-split ("rotate_half") convention matching HuggingFace LLaMA**
+(so it lines up with real weights later): pair `(k, k+h)` rotated by `pos * base^(-2k/cols)`,
+`base=10000`, `h=cols/2`. Backward = inverse (transpose) rotation of `dy` (orthogonal map).
+Verified: new selftest **part `[14]`** — (1) numerical gradient check 1.38e-03 (< 1e-2); (2) the
+DEFINING RoPE property `<RoPE(q,m),RoPE(k,n)>` depends only on `(m-n)`: q@{1,4}, k@{2,5} (offset 1
+both) -> dot -0.6568 == -0.6568, rel 1.8e-07. Smoke test PASSED, `-Wall` clean. (Perf note: `powf`
+in the inner loop; precompute cos/sin tables when wiring into the model.) Next: SwiGLU, then GQA,
+then `convert_llama.py` + a modern-arch model path to load small modern models (SmolLM/Qwen).
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
@@ -290,7 +301,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c rmsnorm.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  optim.c rmsnorm.c rope.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
   video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
 .\transformer.exe            # must print: Output validation: PASSED
 ```
