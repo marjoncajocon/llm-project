@@ -42,6 +42,8 @@ func handleChat(c *wsConn, msg map[string]any) {
 	case "image", "audio":
 		if attach != "" {
 			chatMedia(c, modality, text, attach) // teach-then-reproduce, inline
+		} else if modality == "image" && t2iTrained() {
+			chatT2I(c, text) // generate from a pre-trained text->image model
 		} else {
 			chatSay(c, mediaHint(modality))
 		}
@@ -87,10 +89,44 @@ func detectMediaIntent(text string) string {
 func chatSay(c *wsConn, s string) { sendJSON(c, map[string]any{"op": "chat_delta", "text": s}) }
 
 func mediaHint(kind string) string {
+	if kind == "image" {
+		return "🎨 I detected an image request, but no trained text→image model is loaded. " +
+			"Train one from scratch with `transformer t2i-train <captioned-image-dir> model/t2i/t2i` " +
+			"(the built-in VQ-VAE + GPT text→image), then I'll generate here. Or attach a target " +
+			"image with 📎 to run the teach-then-reproduce demo now."
+	}
 	return fmt.Sprintf("🎨 I detected an %s request. This engine has no trained text→%s model, "+
-		"so I can't generate one from words alone (that needs a diffusion/VQ-VAE model + scale). "+
-		"Attach a target %s with 📎 and I'll run the teach-then-reproduce demo, or plug in a real "+
-		"model later.", kind, kind, kind)
+		"so I can't generate one from words alone. Attach a target %s with 📎 and I'll run the "+
+		"teach-then-reproduce demo.", kind, kind, kind)
+}
+
+// t2iTrained reports whether a saved text->image model exists at model/t2i/.
+func t2iTrained() bool {
+	_, err := os.Stat(filepath.Join(cfg.root, "model", "t2i", "t2i.vqt"))
+	return err == nil
+}
+
+// chatT2I generates an image from a caption using the pre-trained t2i model
+// (fast: it loads the saved VQ-VAE + GPT, no retraining) and renders it inline.
+func chatT2I(c *wsConn, prompt string) {
+	dir, err := os.MkdirTemp("", "webchat")
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	defer os.RemoveAll(dir)
+	out := filepath.Join(dir, "gen.ppm")
+	if _, _, err := runCmd(cfg.exe, []string{"t2i-gen", "model/t2i/t2i", out, prompt}, ""); err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	png, err := ppmFileToPNG(out)
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	sendJSON(c, map[string]any{"op": "chat_media", "kind": "image",
+		"png_b64": base64.StdEncoding.EncodeToString(png)})
 }
 
 // chatMedia runs the toy text->media path on an attached target and renders the

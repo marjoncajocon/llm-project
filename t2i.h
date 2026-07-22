@@ -13,8 +13,14 @@
 //
 // This is a real (if toy) text->image MODEL living entirely in the engine — it
 // generalizes within its training distribution instead of overfitting one pair.
-// Quality is capped by scale + the crude color-cube codec (a learned VQ-VAE is
-// the next step). Returns 0 on success.
+// Returns 0 on success.
 int run_t2i(int argc, char **argv);
+
+// Train once and SAVE (<prefix>.gpt + <prefix>.vqt), then generate fast without
+// retraining. The webchat uses this split.
+//   transformer t2i-train <dataset-dir> <model-prefix> [gpt-steps] [vq-steps]
+//   transformer t2i-gen   <model-prefix> <out.ppm> <caption>
+int run_t2i_train(int argc, char **argv);
+int run_t2i_gen(int argc, char **argv);
 
 #endif // T2I_H

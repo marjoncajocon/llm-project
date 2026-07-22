@@ -25,8 +25,12 @@ build/*
 
 # Model checkpoints (generated weights, not source)
 *.bin
+*.gpt
+*.vqt
 # model/ subfolders: ignore weights, keep text/markdown (READMEs)
 model/**/*.bin
+model/**/*.gpt
+model/**/*.vqt
 
 # Training data — keep the README + samples, ignore your own datasets
 data/*

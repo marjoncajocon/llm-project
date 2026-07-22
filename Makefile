@@ -62,7 +62,7 @@ imagegen.o:   imagegen.h image.h
 audiogen.o:   audiogen.h audio.h
 caption.o:    caption.h tensor.h image.h patch.h audio.h video.h model.h loss.h optim.h sampler.h
 text2media.o: text2media.h tensor.h image.h imagegen.h audio.h audiogen.h model.h loss.h optim.h sampler.h
-t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h
+t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h checkpoint.h
 vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h matrix.h
 main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h
