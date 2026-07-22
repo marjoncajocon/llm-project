@@ -208,9 +208,18 @@ identical loss to smoke-test `[9]`, now on real data. Random example per step; n
 Verified: `train data/sft.txt --sft --name sft --d-model 96 --layers 3 --heads 4 --merges 48
 --steps 3000 --lr 1e-3` → sft-loss 5.92 → 0.0003; all 12 instructions route to their exact
 tool-call/`<done>` response (read_file, run_command pwd/make test/rm, write_file, `<done>`).
-`model/sft/*.bin` git-ignored. KNOWN LIMITATION: no EOS token + `generate` emits a fixed 40 tokens,
-so the correct response is the LEADING part of the output, then filler — a stop token is a small
-future add. Build `-Wall` clean, smoke test still PASSED. Next: EOS/stop token, or the
+`model/sft/*.bin` git-ignored. Build `-Wall` clean, smoke test still PASSED.
+
+**EOS / stop token — DONE (2026-07-22):** `--sft` now reserves one extra vocab slot as EOS
+(`EOS = tok.vocab_size`; model vocab = `tok.vocab_size + 1`), appends it to every response
+(`seq = [prompt ++ response ++ EOS]`, padded), and supervises predicting it (the last response
+token predicts EOS). `run_generate` (text mode) stops as soon as it samples an id ≥ `tok.vocab_size`
+and drops it — non-SFT models have no extra id so they're unaffected (backward compatible, no
+checkpoint-format change). BUG caught + fixed during the build: after bumping the model vocab I
+left `logits`/`probs` sized to `tok.vocab_size` → forward wrote one column OOB → crash (exit 116);
+fix = size the tensors to `model.vocab_size`. Retrained: sft-loss → 0.0005; **generation now stops
+cleanly** — every instruction produces its exact tool-call/`<done>` response with NO trailing
+filler (read_file, run_command make test/rm/pwd, write_file, `<done>Task complete.>`). Next: the
 modern-architecture (RMSNorm/RoPE/SwiGLU/GQA) + quantization roadmap.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)

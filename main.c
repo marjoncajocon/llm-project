@@ -135,6 +135,9 @@ static int run_generate(int argc, char **argv) {
     int ng = 0;
     for (int s = 0; s < n_new && kv.len < max_seq; s++) {
       int next = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
+      // EOS = any id >= the tokenizer's vocab (SFT models reserve one extra slot).
+      // Stop cleanly and drop it (nothing to decode). Non-EOS models never hit this.
+      if (text_mode && next >= tok.vocab_size) break;
       gen[ng++] = next;
       gpt_decode_step(&model, &kv, next, &logits);
     }

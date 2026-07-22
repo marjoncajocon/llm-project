@@ -156,8 +156,10 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    keep `--merges` LOW for routing); (c) **true masked SFT** `transformer train data/sft.txt --sft`
    (`prompt<TAB>response` lines; `train_sft()` in `train.c` supervises the RESPONSE tokens only,
    prompt+padding masked with target −1). Verified: each instruction routes to its exact tool-call/
-   `<done>`. Limitation: no EOS token yet, so the correct response is the *leading* part of the
-   fixed-length `generate` output.
+   `<done>`, and generation **stops cleanly** — `--sft` reserves an **EOS** token
+   (`EOS = tok.vocab_size`, model vocab = tok+1), appends+supervises it, and `generate` halts on
+   any id ≥ tok vocab (non-SFT models unaffected; no checkpoint change). (Bug fixed en route:
+   `logits`/`probs` must be sized to `model.vocab_size`, not `tok.vocab_size`, after the +1.)
 4. **RLHF / DPO** — align to helpful/correct/human-preferred outputs. Anthropic's **Constitutional
    AI** is a *published* paper.
 5. **Tool-use / agentic training** — train on tool-call formats (fits our `agent.c` `<tool>`/`<done>`

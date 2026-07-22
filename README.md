@@ -268,13 +268,16 @@ model is trained to *produce* the answer, not reconstruct the prompt:
 transformer train data/sft.txt --sft --name sft --d-model 96 --layers 3 \
   --heads 4 --merges 48 --steps 3000 --lr 1e-3
 echo "read notes.txt" | transformer generate --name sft
-#   -> <tool name="read_file" path="notes.txt"></tool>   (then filler — no stop token yet)
+#   -> <tool name="read_file" path="notes.txt"></tool>     (stops cleanly at EOS)
 ```
 
-Verified: every instruction routes to its exact tool-call/`<done>` response. This is the same
-loss the smoke-test part `[9]` uses, now available on your own data. (`generate` always emits a
-fixed number of tokens and there is no EOS token, so the correct response is the *leading* part of
-the output; a stop token is a small future add.)
+Verified: every instruction routes to its exact tool-call/`<done>` response, and generation
+**stops cleanly** at the end. This is the same loss the smoke-test part `[9]` uses, now available
+on your own data. **EOS/stop token:** `--sft` reserves one extra vocab slot as an end-of-sequence
+token (`EOS = tokenizer.vocab_size`), appends it to every response and supervises predicting it, so
+the model learns to *end* its answer; `generate` halts as soon as it samples an id ≥ the
+tokenizer's vocab (non-SFT models have no extra id, so they're unaffected — fully backward
+compatible).
 
 **Honest scale:** at this size the model *memorizes* the pairs — the value is seeing the SFT
 technique work end-to-end on real data via the CLI; generalizing to unseen instructions needs far

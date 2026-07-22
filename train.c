@@ -74,7 +74,7 @@ static int train_sft(char *text, const TrainConfig *cfg) {
         if (T >= 1 && Rn >= 1 && T + Rn <= 4096) {
           P[nex] = (int*)malloc(T * sizeof(int));  memcpy(P[nex], t, T * sizeof(int)); PL[nex] = T;
           R[nex] = (int*)malloc(Rn * sizeof(int)); memcpy(R[nex], r, Rn * sizeof(int)); RL[nex] = Rn;
-          if (T + Rn > maxL) maxL = T + Rn;
+          if (T + Rn + 1 > maxL) maxL = T + Rn + 1;   // +1 for the EOS token
           nex++;
         }
       }
@@ -87,7 +87,12 @@ static int train_sft(char *text, const TrainConfig *cfg) {
     free(P); free(PL); free(R); free(RL); tokenizer_free(&tok); return 1;
   }
 
-  // Build padded, masked training sequences (all length maxL).
+  // EOS lives at id = tokenizer vocab (the model gets one extra slot). Appending it
+  // to every response and supervising its prediction teaches the model to STOP;
+  // `generate` then halts when it samples any id >= the tokenizer's vocab.
+  const int EOS = tok.vocab_size;
+
+  // Build padded, masked training sequences (all length maxL): [prompt ++ response ++ EOS ++ pad].
   int **seq = (int**)malloc(nex * sizeof(int*));
   int **tgt = (int**)malloc(nex * sizeof(int*));
   for (int e = 0; e < nex; e++) {
@@ -96,18 +101,19 @@ static int train_sft(char *text, const TrainConfig *cfg) {
     int T = PL[e], Rn = RL[e];
     for (int j = 0; j < T; j++) seq[e][j] = P[e][j];
     for (int j = 0; j < Rn; j++) seq[e][T + j] = R[e][j];
-    for (int j = T + Rn; j < maxL; j++) seq[e][j] = 0;      // pad
+    seq[e][T + Rn] = EOS;
+    for (int j = T + Rn + 1; j < maxL; j++) seq[e][j] = 0;  // pad
     for (int j = 0; j < maxL; j++) tgt[e][j] = -1;          // mask everything...
-    for (int j = T - 1; j <= T + Rn - 2; j++) tgt[e][j] = seq[e][j + 1];  // ...supervise response only
+    for (int j = T - 1; j <= T + Rn - 1; j++) tgt[e][j] = seq[e][j + 1];  // ...supervise response + EOS
   }
 
   const int d_ff = (cfg->d_ff > 0) ? cfg->d_ff : 4 * cfg->d_model;
-  GPT model = gpt_create(tok.vocab_size, cfg->d_model, cfg->n_heads, cfg->n_layers, d_ff, maxL);
-  printf("SFT: %d examples | vocab %d | seq len (padded) %d | d_model=%d layers=%d lr=%g\n",
+  GPT model = gpt_create(tok.vocab_size + 1, cfg->d_model, cfg->n_heads, cfg->n_layers, d_ff, maxL);
+  printf("SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d lr=%g\n",
          nex, tok.vocab_size, maxL, cfg->d_model, cfg->n_layers, cfg->lr);
 
   GPTActs acts = gpt_acts_create(&model, maxL);
-  int lshape[2] = {maxL, tok.vocab_size};
+  int lshape[2] = {maxL, model.vocab_size};   // model vocab (= tok vocab + EOS)
   Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
   Tensor *params[1024];
   int n_params = gpt_collect_params(&model, params);
