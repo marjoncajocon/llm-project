@@ -37,7 +37,7 @@ rmsnorm.o:    rmsnorm.h tensor.h
 rope.o:       rope.h tensor.h
 swiglu.o:     swiglu.h tensor.h matrix.h
 gqa.o:        gqa.h tensor.h
-quant.o:      quant.h
+quant.o:      quant.h matrix.h tensor.h
 llama.o:      llama.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h quant.h
 feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h

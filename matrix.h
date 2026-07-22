@@ -2,6 +2,8 @@
 #ifndef MATRIX_H
 #define MATRIX_H
 
+#include <stdint.h>
+
 #include "tensor.h"
 
 // Matrix Multiplication: C = A @ B
@@ -31,5 +33,13 @@ void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B);
 // Backward of bias_add: bias_grad[j] += sum_i out->grad[i,j] (reads out->grad,
 // accumulates into bias_grad->grad).
 void bias_add_backward(const Tensor *out, const Tensor *bias_grad);
+
+// Threaded int8 column-accumulate for the quantized (decode) path:
+//   acc[j] = sum_k qa[k] * qw[k*N + j]      for j in [0, N)
+// Parallelizes over the OUTPUT COLUMNS N (using the same thread pool as matmul),
+// so it speeds up single-token decode (M=1) — the case row-parallel matmul can't
+// help. Result is bit-identical to the serial loop (each column's sum is
+// independent of threading). qw is row-major (K x N).
+void qacc_columns(const signed char *qa, const signed char *qw, int K, int N, int32_t *acc);
 
 #endif // MATRIX_H

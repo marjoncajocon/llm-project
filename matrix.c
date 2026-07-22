@@ -294,3 +294,28 @@ void bias_add_backward(const Tensor *out, const Tensor *bias_grad) {
     bias_grad->grad[j] += sum;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Threaded int8 column-accumulate (for the quantized decode path)
+// ---------------------------------------------------------------------------
+typedef struct { const signed char *qa, *qw; int K, N; int32_t *acc; } QAcc;
+
+// Compute acc[j] = sum_k qa[k]*qw[k,j] for j in [j0, j1). Each column's full
+// k-sum lives entirely in one thread, so no races and bit-identical to serial.
+static void qacc_rows(int j0, int j1, void *ctx) {
+  const QAcc *t = (const QAcc*)ctx;
+  const int K = t->K, N = t->N;
+  int32_t *acc = t->acc;
+  for (int j = j0; j < j1; j++) acc[j] = 0;
+  for (int k = 0; k < K; k++) {
+    const int av = t->qa[k];
+    const signed char *qr = &t->qw[(size_t)k * N];
+    for (int j = j0; j < j1; j++) acc[j] += av * (int)qr[j];
+  }
+}
+
+void qacc_columns(const signed char *qa, const signed char *qw, int K, int N, int32_t *acc) {
+  QAcc t = { qa, qw, K, N, acc };
+  if ((size_t)K * N < MM_THREAD_THRESHOLD) { qacc_rows(0, N, &t); return; }
+  parallel_for(N, qacc_rows, &t);
+}

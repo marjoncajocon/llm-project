@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 
+#include "matrix.h"
+
 void quantize_int8_percol(const float *w, int rows, int cols, signed char *q, float *scale) {
   for (int j = 0; j < cols; j++) {
     float mx = 0.0f;
@@ -74,13 +76,8 @@ void qmatmul(const Tensor *A, const QTensor *W, Tensor *C) {
       if (v < -127) v = -127;
       qa[k] = (signed char)v;
     }
-    // integer i-k-j accumulate
-    for (int j = 0; j < N; j++) acc[j] = 0;
-    for (int k = 0; k < K; k++) {
-      int av = qa[k];
-      const signed char *qr = &W->q[(size_t)k * N];
-      for (int j = 0; j < N; j++) acc[j] += av * (int)qr[j];
-    }
+    // integer i-k-j accumulate (threaded over the output columns N)
+    qacc_columns(qa, W->q, K, N, acc);
     float *c = &C->data[(size_t)m * N];
     for (int j = 0; j < N; j++) c[j] = as * ws[j] * (float)acc[j];
   }
