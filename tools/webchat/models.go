@@ -138,23 +138,29 @@ func statOK(path string) (os.FileInfo, bool) {
 func runChat(m Model, text string, n int) (string, string, error) {
 	switch m.Mode {
 	case "purec-text":
-		// generate --name X reads one stdin line and prints "<prompt><continuation>".
-		out, se, err := runCmd(cfg.exe, []string{"generate", "--name", m.Name}, text+"\n")
+		// generate --name X reads ONE stdin line and prints "<prompt><continuation>".
+		// The continuation can contain newlines (the model emits them), so the
+		// output spans multiple lines — keep ALL of it, not just the first line
+		// (that truncation made replies look cut off after the first token).
+		// Flatten the prompt to a single line so it stays one stdin line and the
+		// echoed prefix matches for stripping.
+		prompt := strings.NewReplacer("\r", " ", "\n", " ").Replace(text)
+		out, se, err := runCmd(cfg.exe, []string{"generate", "--name", m.Name}, prompt+"\n")
 		if err != nil {
 			return "", se, err
 		}
-		line := firstNonEmptyLine(out)
-		return strings.TrimPrefix(line, text), se, nil
+		reply := strings.TrimPrefix(strings.TrimRight(out, "\r\n"), prompt)
+		return cleanText(reply), se, nil
 	case "gpt2":
 		out, se, err := runCmd(cfg.python, []string{"tools/gpt2_chat.py", text, "--name", m.Name}, "")
-		return strings.TrimRight(out, "\r\n"), se, err
+		return cleanText(out), se, err
 	case "llama":
 		args := []string{"tools/llama_chat.py", text, "--ckpt", m.Ckpt, "--n", strconv.Itoa(n)}
 		if m.HFRepo != "" {
 			args = append(args, "--model", m.HFRepo)
 		}
 		out, se, err := runCmd(cfg.python, args, "")
-		return strings.TrimRight(out, "\r\n"), se, err
+		return cleanText(out), se, err
 	}
 	return "", "", fmt.Errorf("unsupported model mode %q", m.Mode)
 }
@@ -179,6 +185,11 @@ func runCmd(bin string, args []string, stdin string) (string, string, error) {
 		err = fmt.Errorf("subprocess timed out after %s (try fewer steps / smaller input)", runTimeout)
 	}
 	return so.String(), se.String(), err
+}
+
+// cleanText normalizes Windows CRLF to LF and trims trailing blank lines.
+func cleanText(s string) string {
+	return strings.TrimRight(strings.ReplaceAll(s, "\r\n", "\n"), "\n ")
 }
 
 func firstNonEmptyLine(s string) string {
