@@ -671,29 +671,14 @@ static int hf_stop(char *dec) {
   return 0;
 }
 
-static int run_hfgen(int argc, char **argv) {
-  if (argc < 4) {
-    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new]\n");
-    return 2;
-  }
-  const char *mpath = argv[2];
-  int n_new = (argc > 4) ? atoi(argv[4]) : 128;
-
-  HFTok tok;
-  if (hftok_load(&tok, argv[3]) != 0) return 1;
-
-  // read the whole prompt from stdin and tokenize it.
-  static char prompt[1 << 16];
-  int plen = (int)fread(prompt, 1, sizeof(prompt) - 1, stdin);
-  prompt[plen] = '\0';
-  int cap = plen + 16;
-  int *pids = (int*)malloc((size_t)cap * sizeof(int));
-  int np = hftok_encode(&tok, prompt, pids, cap);
-
-  // peek the checkpoint magic to pick the model family.
+// Generate from an already-tokenized prompt (pids/np), streaming JSON deltas.
+// Stops on the model's real end-of-generation token (hftok_is_eog) — no string
+// heuristic needed once a chat template is used; hf_stop stays as a safety net
+// for base models that emit role labels as plain text.
+static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_new) {
   unsigned int magic = 0;
   FILE *pf = fopen(mpath, "rb");
-  if (!pf) { fprintf(stderr, "cannot open '%s'\n", mpath); free(pids); hftok_free(&tok); return 1; }
+  if (!pf) { fprintf(stderr, "cannot open '%s'\n", mpath); return 1; }
   if (fread(&magic, 4, 1, pf) != 1) magic = 0;
   fclose(pf);
 
@@ -714,10 +699,10 @@ static int run_hfgen(int argc, char **argv) {
     for (int i = 0; i < np; i++) { gen[gn++] = pids[i]; gpt_decode_step(&m, &kv, pids[i], &logits); }
     for (int s = 0; s < n_new && kv.len < m.max_seq_len; s++) {
       int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
-      if (nx == tok.eos) break;
+      if (hftok_is_eog(tok, nx)) break;
       gen[gn++] = nx;
       gpt_decode_step(&m, &kv, nx, &logits);
-      hftok_decode(&tok, gen + np, gn - np, dec, 1 << 20);
+      hftok_decode(tok, gen + np, gn - np, dec, 1 << 20);
       int stop = hf_stop(dec);
       hf_emit_delta(dec, &prevlen);
       if (stop) break;
@@ -732,10 +717,10 @@ static int run_hfgen(int argc, char **argv) {
     for (int i = 0; i < np && i < m.max_seq; i++) { gen[gn++] = pids[i]; q_llama_decode_step(&m, &kv, pids[i], &logits); }
     for (int s = 0; s < n_new && kv.len < m.max_seq; s++) {
       int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
-      if (nx == tok.eos) break;
+      if (hftok_is_eog(tok, nx)) break;
       gen[gn++] = nx;
       q_llama_decode_step(&m, &kv, nx, &logits);
-      hftok_decode(&tok, gen + np, gn - np, dec, 1 << 20);
+      hftok_decode(tok, gen + np, gn - np, dec, 1 << 20);
       int stop = hf_stop(dec);
       hf_emit_delta(dec, &prevlen);
       if (stop) break;
@@ -750,10 +735,10 @@ static int run_hfgen(int argc, char **argv) {
     for (int i = 0; i < np && i < m.max_seq; i++) { gen[gn++] = pids[i]; llama_decode_step(&m, &kv, pids[i], &logits); }
     for (int s = 0; s < n_new && kv.len < m.max_seq; s++) {
       int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
-      if (nx == tok.eos) break;
+      if (hftok_is_eog(tok, nx)) break;
       gen[gn++] = nx;
       llama_decode_step(&m, &kv, nx, &logits);
-      hftok_decode(&tok, gen + np, gn - np, dec, 1 << 20);
+      hftok_decode(tok, gen + np, gn - np, dec, 1 << 20);
       int stop = hf_stop(dec);
       hf_emit_delta(dec, &prevlen);
       if (stop) break;
@@ -766,12 +751,76 @@ static int run_hfgen(int argc, char **argv) {
 done:
   printf("{\"done\":true}\n");
   fflush(stdout);
-  free(dec); free(gen); free(pids); hftok_free(&tok);
+  free(dec); free(gen);
   return 0;
+}
+
+static int run_hfgen(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new]\n");
+    return 2;
+  }
+  int n_new = (argc > 4) ? atoi(argv[4]) : 128;
+  HFTok tok;
+  if (hftok_load(&tok, argv[3]) != 0) return 1;
+
+  // read the whole prompt from stdin and tokenize it (special-token aware).
+  static char prompt[1 << 16];
+  int plen = (int)fread(prompt, 1, sizeof(prompt) - 1, stdin);
+  prompt[plen] = '\0';
+  int cap = plen + 16;
+  int *pids = (int*)malloc((size_t)cap * sizeof(int));
+  int np = hftok_encode(&tok, prompt, pids, cap);
+  int rc = hf_generate(&tok, argv[2], pids, np, n_new);
+  free(pids); hftok_free(&tok);
+  return rc;
+}
+
+// `hfchat`: pure-C chat that applies the model's OWN chat template. Reads the
+// conversation from stdin as turns — each turn "role\x1fcontent" separated by
+// "\x1e" — renders it via hftok_chat_render, tokenizes, and generates. This is
+// the model-agnostic fix for the "rambling / fake conversation" behavior: the
+// prompt is in the exact format the model was trained on and it stops on its own
+// end token.
+//   transformer hfchat <model.bin> <tok.hf> [n_new]
+static int run_hfchat(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: transformer hfchat <model.bin> <tok.hf> [n_new]\n");
+    return 2;
+  }
+  int n_new = (argc > 4) ? atoi(argv[4]) : 256;
+  HFTok tok;
+  if (hftok_load(&tok, argv[3]) != 0) return 1;
+
+  static char in[1 << 16];
+  int ilen = (int)fread(in, 1, sizeof(in) - 1, stdin);
+  in[ilen] = '\0';
+
+  const char *roles[256], *contents[256];
+  int nt = 0;
+  char *p = in;
+  while (*p && nt < 256) {
+    char *rec_end = strchr(p, '\x1e');
+    if (rec_end) *rec_end = '\0';
+    char *us = strchr(p, '\x1f');
+    if (us) { *us = '\0'; roles[nt] = p; contents[nt] = us + 1; nt++; }
+    if (!rec_end) break;
+    p = rec_end + 1;
+  }
+
+  static char rendered[1 << 16];
+  hftok_chat_render(&tok, roles, contents, nt, rendered, sizeof(rendered));
+  int cap = (int)strlen(rendered) + 16;
+  int *pids = (int*)malloc((size_t)cap * sizeof(int));
+  int np = hftok_encode(&tok, rendered, pids, cap);
+  int rc = hf_generate(&tok, argv[2], pids, np, n_new);
+  free(pids); hftok_free(&tok);
+  return rc;
 }
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "hfgen") == 0) return run_hfgen(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "hfchat") == 0) return run_hfchat(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);

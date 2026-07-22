@@ -29,6 +29,11 @@ int hftok_load(HFTok *t, const char *path) {
 
   t->n_vocab = (int)n;
   t->eos = eos;
+  t->bos = -1;
+  t->n_special = 0;
+  t->special_id = NULL; t->special_len = NULL; t->special_str = NULL; t->special_eog = NULL;
+  t->template_kind = HFTOK_TMPL_PLAIN;
+  t->default_system = NULL;
   t->tok_len = (int*)malloc((size_t)n * sizeof(int));
   t->tok_bytes = (unsigned char**)malloc((size_t)n * sizeof(unsigned char*));
   for (int i = 0; i < 256; i++) t->byte2id[i] = -1;
@@ -40,6 +45,33 @@ int hftok_load(HFTok *t, const char *path) {
     t->tok_bytes[i] = (unsigned char*)malloc(len ? len : 1);
     if (len && fread(t->tok_bytes[i], 1, len, f) != len) { fprintf(stderr, "error: truncated bytes\n"); fclose(f); return 1; }
     if (len == 1) t->byte2id[t->tok_bytes[i][0]] = (int)i;
+  }
+
+  // v2 tail: bos, template kind, default system prompt, special tokens.
+  if (ver >= 2) {
+    int32_t bos; uint8_t kind; uint16_t syslen; uint32_t nsp;
+    if (fread(&bos, 4, 1, f) != 1 || fread(&kind, 1, 1, f) != 1 || fread(&syslen, 2, 1, f) != 1) {
+      fprintf(stderr, "error: truncated v2 header\n"); fclose(f); return 1;
+    }
+    t->bos = bos; t->template_kind = kind;
+    t->default_system = (char*)malloc((size_t)syslen + 1);
+    if (syslen && fread(t->default_system, 1, syslen, f) != syslen) { fprintf(stderr, "error: truncated system\n"); fclose(f); return 1; }
+    t->default_system[syslen] = '\0';
+    if (fread(&nsp, 4, 1, f) != 1 || nsp > 100000) { fprintf(stderr, "error: bad n_special\n"); fclose(f); return 1; }
+    t->n_special = (int)nsp;
+    t->special_id = (int*)malloc((size_t)(nsp ? nsp : 1) * sizeof(int));
+    t->special_len = (int*)malloc((size_t)(nsp ? nsp : 1) * sizeof(int));
+    t->special_str = (unsigned char**)malloc((size_t)(nsp ? nsp : 1) * sizeof(unsigned char*));
+    t->special_eog = (int*)malloc((size_t)(nsp ? nsp : 1) * sizeof(int));
+    for (uint32_t i = 0; i < nsp; i++) {
+      int32_t sid; uint8_t eog; uint16_t slen;
+      if (fread(&sid, 4, 1, f) != 1 || fread(&eog, 1, 1, f) != 1 || fread(&slen, 2, 1, f) != 1) {
+        fprintf(stderr, "error: truncated special\n"); fclose(f); return 1;
+      }
+      t->special_id[i] = sid; t->special_eog[i] = eog; t->special_len[i] = slen;
+      t->special_str[i] = (unsigned char*)malloc(slen ? slen : 1);
+      if (slen && fread(t->special_str[i], 1, slen, f) != slen) { fprintf(stderr, "error: truncated special str\n"); fclose(f); return 1; }
+    }
   }
   fclose(f);
 
@@ -61,7 +93,11 @@ int hftok_load(HFTok *t, const char *path) {
 void hftok_free(HFTok *t) {
   for (int i = 0; i < t->n_vocab; i++) free(t->tok_bytes[i]);
   free(t->tok_bytes); free(t->tok_len); free(t->hmap);
+  for (int i = 0; i < t->n_special; i++) free(t->special_str[i]);
+  free(t->special_id); free(t->special_len); free(t->special_str); free(t->special_eog);
+  free(t->default_system);
   t->tok_bytes = NULL; t->tok_len = NULL; t->hmap = NULL; t->n_vocab = 0;
+  t->special_str = NULL; t->n_special = 0; t->default_system = NULL;
 }
 
 static int hftok_lookup(const HFTok *t, const unsigned char *b, int len) {
@@ -123,16 +159,16 @@ static int next_chunk(const char *s, int len, int *pos, int *cs, int *cl) {
 
 // --- encode / decode -------------------------------------------------------
 
-int hftok_encode(const HFTok *t, const char *text, int *ids, int max_ids) {
-  int len = (int)strlen(text);
-  int n = 0;
-  unsigned char *buf = (unsigned char*)malloc((size_t)len + 2);   // concat scratch
-  int *pieces = (int*)malloc(((size_t)len + 1) * sizeof(int));
+// Byte-level BPE encode a plain run text[start,end) (no special tokens inside).
+static int encode_run(const HFTok *t, const char *text, int start, int end,
+                      int *ids, int n, int max_ids, unsigned char *buf, int *pieces) {
+  const char *s = text + start;
+  int len = end - start;
   int pos = 0, cs, cl;
-  while (n < max_ids && next_chunk(text, len, &pos, &cs, &cl)) {
+  while (n < max_ids && next_chunk(s, len, &pos, &cs, &cl)) {
     int npc = 0;
     for (int i = 0; i < cl; i++) {
-      int id = t->byte2id[(unsigned char)text[cs + i]];
+      int id = t->byte2id[(unsigned char)s[cs + i]];
       pieces[npc++] = (id >= 0) ? id : 0;
     }
     // BPE: repeatedly merge the adjacent pair with the lowest combined-token id.
@@ -153,8 +189,109 @@ int hftok_encode(const HFTok *t, const char *text, int *ids, int max_ids) {
     }
     for (int i = 0; i < npc && n < max_ids; i++) ids[n++] = pieces[i];
   }
+  return n;
+}
+
+// Longest special token whose literal string matches text at pos (or -1).
+static int match_special(const HFTok *t, const char *text, int pos, int len, int *out_len) {
+  int best = -1, best_len = 0;
+  for (int i = 0; i < t->n_special; i++) {
+    int sl = t->special_len[i];
+    if (sl > best_len && pos + sl <= len &&
+        memcmp(text + pos, t->special_str[i], (size_t)sl) == 0) {
+      best = t->special_id[i]; best_len = sl;
+    }
+  }
+  *out_len = best_len;
+  return best;
+}
+
+int hftok_encode(const HFTok *t, const char *text, int *ids, int max_ids) {
+  int len = (int)strlen(text);
+  int n = 0;
+  unsigned char *buf = (unsigned char*)malloc((size_t)len + 2);   // concat scratch
+  int *pieces = (int*)malloc(((size_t)len + 1) * sizeof(int));
+  int run_start = 0, pos = 0;
+  while (pos < len && n < max_ids) {
+    // Special tokens all begin with '<'; try to match one greedily here.
+    if (text[pos] == '<') {
+      int slen = 0, sid = match_special(t, text, pos, len, &slen);
+      if (sid >= 0) {
+        n = encode_run(t, text, run_start, pos, ids, n, max_ids, buf, pieces);
+        if (n < max_ids) ids[n++] = sid;
+        pos += slen; run_start = pos;
+        continue;
+      }
+    }
+    pos++;
+  }
+  n = encode_run(t, text, run_start, len, ids, n, max_ids, buf, pieces);
   free(buf); free(pieces);
   return n;
+}
+
+int hftok_is_eog(const HFTok *t, int id) {
+  if (id == t->eos) return 1;
+  for (int i = 0; i < t->n_special; i++)
+    if (t->special_id[i] == id && t->special_eog[i]) return 1;
+  return 0;
+}
+
+// --- chat template ---------------------------------------------------------
+
+static void sb_put(char *out, int *pos, int max, const char *s) {
+  while (*s && *pos < max - 1) out[(*pos)++] = *s++;
+}
+
+int hftok_chat_render(const HFTok *t, const char **roles, const char **contents,
+                      int nturns, char *out, int max_out) {
+  int p = 0;
+  int has_system = 0;
+  for (int i = 0; i < nturns; i++)
+    if (strcmp(roles[i], "system") == 0) has_system = 1;
+
+  if (t->template_kind == HFTOK_TMPL_LLAMA3) {
+    sb_put(out, &p, max_out, "<|begin_of_text|>");
+    if (!has_system && t->default_system && t->default_system[0]) {
+      sb_put(out, &p, max_out, "<|start_header_id|>system<|end_header_id|>\n\n");
+      sb_put(out, &p, max_out, t->default_system);
+      sb_put(out, &p, max_out, "<|eot_id|>");
+    }
+    for (int i = 0; i < nturns; i++) {
+      sb_put(out, &p, max_out, "<|start_header_id|>");
+      sb_put(out, &p, max_out, roles[i]);
+      sb_put(out, &p, max_out, "<|end_header_id|>\n\n");
+      sb_put(out, &p, max_out, contents[i]);
+      sb_put(out, &p, max_out, "<|eot_id|>");
+    }
+    sb_put(out, &p, max_out, "<|start_header_id|>assistant<|end_header_id|>\n\n");
+  } else if (t->template_kind == HFTOK_TMPL_CHATML) {
+    if (!has_system && t->default_system && t->default_system[0]) {
+      sb_put(out, &p, max_out, "<|im_start|>system\n");
+      sb_put(out, &p, max_out, t->default_system);
+      sb_put(out, &p, max_out, "<|im_end|>\n");
+    }
+    for (int i = 0; i < nturns; i++) {
+      sb_put(out, &p, max_out, "<|im_start|>");
+      sb_put(out, &p, max_out, roles[i]);
+      sb_put(out, &p, max_out, "\n");
+      sb_put(out, &p, max_out, contents[i]);
+      sb_put(out, &p, max_out, "<|im_end|>\n");
+    }
+    sb_put(out, &p, max_out, "<|im_start|>assistant\n");
+  } else {   // plain "User:/Assistant:" fallback
+    for (int i = 0; i < nturns; i++) {
+      const char *r = roles[i];
+      const char *label = (strcmp(r, "user") == 0) ? "User: " :
+                          (strcmp(r, "assistant") == 0) ? "Assistant: " : "System: ";
+      sb_put(out, &p, max_out, label);
+      sb_put(out, &p, max_out, contents[i]);
+      sb_put(out, &p, max_out, "\n");
+    }
+    sb_put(out, &p, max_out, "Assistant:");
+  }
+  out[p] = '\0';
+  return p;
 }
 
 int hftok_decode(const HFTok *t, const int *ids, int n, char *out, int max_out) {
