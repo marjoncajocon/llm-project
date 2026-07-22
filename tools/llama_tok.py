@@ -14,10 +14,19 @@ import argparse
 import sys
 
 
-def load_tokenizer(model):
+# Resolve a repo file from the local HF cache without a network round-trip
+# (local_files_only skips the slow Hub HEAD check); download once if not cached.
+def cached_file(repo, filename):
     from huggingface_hub import hf_hub_download
+    try:
+        return hf_hub_download(repo, filename, local_files_only=True)
+    except Exception:
+        return hf_hub_download(repo, filename)
+
+
+def load_tokenizer(model):
     from tokenizers import Tokenizer
-    return Tokenizer.from_file(hf_hub_download(model, "tokenizer.json"))
+    return Tokenizer.from_file(cached_file(model, "tokenizer.json"))
 
 
 def main():

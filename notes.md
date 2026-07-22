@@ -432,11 +432,16 @@ coherent (int8 SmolLM2: "…There is a square in Paris called the Place de la Co
 **⚠️ TIMING CORRECTION (important):** the earlier "~85 s" llama_chat numbers were **NOT the C engine** —
 they were Python-side **huggingface_hub doing a slow (rate-limited, unauthenticated) HEAD check on
 tokenizer.json** every run. Feeding token IDs straight to `transformer llama` shows the engine is
-seconds, not minutes (fp32 2.3 s, int8 0.9 s / 30 tokens). So: (a) the int8 SIMD speedup is real and
-2.5×; (b) fix llama_chat/gpt2 tooling to cache/offline the tokenizer (`HF_HUB_OFFLINE=1` /
-`local_files_only`) so the wrapper isn't dominated by an HF metadata call. The earlier "no speedup"
-finding (step 12) was for the *f32-activation* qmatmul and was correct for that version; int8×int8 is
-the one that's actually faster.
+seconds, not minutes (fp32 2.3 s, int8 0.9 s / 30 tokens). So the int8 SIMD speedup is real and 2.5×.
+The earlier "no speedup" finding (step 12) was for the *f32-activation* qmatmul and was correct for
+that version; int8×int8 is the one that's actually faster.
+
+**FIXED (the HF-hub overhead): `llama_tok.py` + `llama_chat.py` now resolve `tokenizer.json` via
+`hf_hub_download(..., local_files_only=True)` (fall back to a one-time download if not cached) — no
+per-run Hub HEAD check. Result: `llama_chat` end-to-end dropped from ~83 s to 1.3 s (64×) for a
+20-token SmolLM2 int8 generation, same coherent output ("…a square in Paris called the Place de la
+Concorde…"). So the whole pipeline (tokenize → C int8 generate → detokenize) is now ~1 s, matching the
+engine.**
 
 Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
 Block/model forward-only (add backward to fine-tune). Qwen2.5-0.5B needs attention-bias support.

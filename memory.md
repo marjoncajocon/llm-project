@@ -189,8 +189,9 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    (quant.c qmatmul now quantizes activations to int8 + int32 accumulate, auto-vectorizes under
    `-O3 -march=native`; selftest `[21]` 0.75%). **Measured (token-IDs direct, AVX2 build, 30 tok):
    int8 0.9 s vs fp32 2.3 s = 2.5× faster.** ⚠️ CORRECTION: earlier "~85 s" was Python huggingface_hub
-   doing a slow HEAD check on tokenizer.json, NOT the C engine (engine is seconds; fix tooling with
-   `HF_HUB_OFFLINE=1`). Perf remaining: explicit AVX2/NEON intrinsics, block/prefill qmatmul, threading.
+   doing a slow HEAD check on tokenizer.json, NOT the C engine. **FIXED:** `llama_tok.py`/`llama_chat.py`
+   now use `hf_hub_download(local_files_only=True)` (one-time download fallback) → `llama_chat` dropped
+   ~83 s → **1.3 s** (64×) for a 20-tok SmolLM2 int8 gen. Whole pipeline now ~1 s. Perf remaining: explicit AVX2/NEON intrinsics, block/prefill qmatmul, threading.
    Qwen2.5 needs attn-bias support. Block/model forward-only (add backward to fine-tune).
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).

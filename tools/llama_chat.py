@@ -30,7 +30,13 @@ def main():
 
     from huggingface_hub import hf_hub_download
     from tokenizers import Tokenizer
-    tok = Tokenizer.from_file(hf_hub_download(a.model, "tokenizer.json"))
+    # Use the local HF cache without a network HEAD check (local_files_only);
+    # download once if not cached. Avoids a slow Hub round-trip on every run.
+    try:
+        tok_path = hf_hub_download(a.model, "tokenizer.json", local_files_only=True)
+    except Exception:
+        tok_path = hf_hub_download(a.model, "tokenizer.json")
+    tok = Tokenizer.from_file(tok_path)
     prompt_ids = tok.encode(a.prompt).ids
 
     exe = a.exe or ("transformer.exe" if os.name == "nt" else "./transformer")
