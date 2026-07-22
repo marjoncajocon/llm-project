@@ -171,9 +171,36 @@ script → parses its `<done>` → stops). Smoke test still `PASSED`, `-Wall` cl
 call is untested here (no `anthropic` pkg / no key) — it's the standard Messages API shape from
 the `claude-api` skill; `agent_mock.py` remains the offline/no-key fallback.
 
-**Backups:** (a) ✅ DONE (2026-07-22) — code health: smoke test split out of `main.c` into
-`selftest.c` (see below); (b) still open — dataset-trained `imggen`/`audgen` (learn from a
-folder, not one input).
+**Backups:** (a) ✅ DONE (2026-07-22) — code health: smoke test split into `selftest.c`;
+(b) ✅ DONE (2026-07-22) — dataset-trained `imggen`/`audgen` (learn from a folder). Both below.
+
+## Dataset-trained imggen / audgen — DONE (2026-07-22)
+
+`imggen`/`audgen` now have a **dataset mode** in addition to the original single-example
+reconstruct. Auto-selected from the input path (no new flag), so single-file use is byte-identical:
+
+- **Single file** (`imggen cat.ppm out.ppm ...`): unchanged — `autoregress_reconstruct` overfits
+  the one input (greedy decode).
+- **Folder** (`imggen imgset/ out.ppm ...`): triggered when the path isn't a loadable PPM/WAV.
+  Loads `dir/img_%04d.ppm` (or `dir/aud_%04d.wav`) sequentially until missing (same numbered-file
+  convention as `video_load`; no new dir-walk code, portable). All examples must share
+  size/length (mismatches skipped with a warning). Trains ONE GPT on the set (random example per
+  step, SGD) via new `dataset_autoregress`, then **generates a novel sample**.
+- **How generation works:** a **BOS** token is prepended to every training sequence (model vocab
+  = V+1, BOS = index V), so the model learns P(first token) and can sample unconditionally from
+  BOS. Sampling uses `sample_token` (temp 0.9 / top-k 40 / top-p 0.95, seeded); BOS is never
+  emitted into the media stream (clamped). Reuses the exact GPT/KV-cache/sampler stack — no codec
+  changes.
+- **Verified:** built `-Wall` clean, smoke test still `PASSED`. Dataset mode on 4 PPMs (3 red /
+  1 blue) → loss ~0.03, generated a 4×4 image = all red (the majority example). Audio dataset on
+  3 WAVs → loss ~0.0006, wrote a 64-sample clip. Single-file reconstruct still 16/16 (loss
+  0.0002). Bogus input → clear error. (`main.c` grew from 367 → ~490 lines with the two loaders +
+  `dataset_autoregress`.)
+- **Honest note:** still a toy — the model tends to reproduce a training example (memorization at
+  this scale); the color-cube/µ-law codecs cap quality. The *pipeline* (folder → learned
+  distribution → sampled generation) is the deliverable.
+
+## Code health — smoke test split into selftest.c — DONE (2026-07-22)
 
 ## Code health — smoke test split into selftest.c — DONE (2026-07-22)
 

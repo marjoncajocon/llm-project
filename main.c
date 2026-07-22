@@ -304,15 +304,113 @@ static int autoregress_reconstruct(const int *tok, int P, int V, int steps, int 
   return match;
 }
 
+// Dataset mode: train ONE GPT on N equal-length token sequences (one per media
+// file in a folder) and GENERATE a novel sample. A BOS token (index V, so the
+// model vocab is V+1) is prepended to every sequence, so the model learns the
+// distribution of first tokens too and can generate unconditionally. Generation
+// samples P tokens from BOS with temperature + top-k/top-p (sampler.c); BOS is
+// never emitted into the media stream. Unlike autoregress_reconstruct (one
+// example, greedy), this learns from a set -- quality still needs real scale.
+static void dataset_autoregress(int **toks, int n, int P, int V, int steps, int *gen) {
+  const int MV = V + 1;      // media vocab + BOS
+  const int BOS = V;
+  const int L = P + 1;       // BOS + P media tokens
+  int *seq = (int*)malloc(L * sizeof(int));
+  int *tgt = (int*)malloc(L * sizeof(int));
+  srand(1234);
+  GPT g = gpt_create(MV, 64, 4, 2, 256, L);
+  GPTActs a = gpt_acts_create(&g, L);
+  int lz[2] = {L, MV};
+  Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
+  Tensor *par[256];
+  int np = gpt_collect_params(&g, par);
+  Adam opt = adam_create(par, np, 0.005f);
+  int report = (steps >= 10) ? steps / 10 : 1;
+  for (int s = 0; s < steps; s++) {
+    const int *e = toks[rand() % n];              // random example per step (SGD)
+    seq[0] = BOS;
+    for (int i = 0; i < P; i++) { seq[i + 1] = e[i]; tgt[i] = e[i]; }
+    tgt[P] = -1;                                    // last position predicts nothing
+    gpt_forward_train(&g, seq, L, &a, &lo);
+    float loss = cross_entropy_forward(&lo, tgt, &pr);
+    tensor_zero_grad(&lo);
+    cross_entropy_backward(&pr, tgt, &lo);
+    gpt_backward(&g, seq, L, &a, &lo);
+    adam_step(&opt, par, np);
+    if (s % report == 0) fprintf(stderr, "  step %d/%d  loss %.4f\n", s, steps, loss);
+  }
+  // Generate: feed BOS, then sample P media tokens.
+  KVCache kv = gpt_kvcache_create(&g);
+  int gz[2] = {1, MV};
+  Tensor gl = tensor_create(gz, 2);
+  Rng rng = rng_create(1234);
+  gpt_decode_step(&g, &kv, BOS, &gl);
+  for (int i = 0; i < P; i++) {
+    int t = sample_token(&gl, 0, 0.9f, 40, 0.95f, &rng);
+    if (t >= V) t = V - 1;                          // never emit BOS into the media stream
+    gen[i] = t;
+    gpt_decode_step(&g, &kv, t, &gl);
+  }
+  tensor_free(&gl); gpt_kvcache_free(&kv); adam_free(&opt);
+  tensor_free(&lo); tensor_free(&pr); gpt_acts_free(&a); gpt_free(&g);
+  free(seq); free(tgt);
+}
+
+// imggen dataset mode: load dir/img_0000.ppm, img_0001.ppm, ... (all same size),
+// train one GPT on the set, and generate a novel image. Triggered when the input
+// path is a folder rather than a single PPM.
+static int imggen_dataset(const char *dir, const char *out, int levels, int steps) {
+  int cap = 16, n = 0, P = 0, W = 0, H = 0;
+  int **toks = (int**)malloc(cap * sizeof(int*));
+  for (int i = 0; ; i++) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/img_%04d.ppm", dir, i);
+    Image im = image_load_ppm(path);
+    if (!im.data) break;
+    if (n == 0) { W = im.w; H = im.h; P = W * H; }
+    else if (im.w != W || im.h != H) {
+      fprintf(stderr, "  skip %s: %dx%d != %dx%d\n", path, im.w, im.h, W, H);
+      image_free(&im); continue;
+    }
+    if (n == cap) { cap *= 2; toks = (int**)realloc(toks, cap * sizeof(int*)); }
+    int *t = (int*)malloc(P * sizeof(int));
+    image_to_tokens(&im, levels, t);
+    toks[n++] = t; image_free(&im);
+  }
+  if (n == 0) {
+    fprintf(stderr, "imggen: '%s' is neither a PPM nor a folder of img_0000.ppm, img_0001.ppm, ...\n", dir);
+    free(toks); return 1;
+  }
+  int V = imagegen_vocab(levels);
+  if (P > 1024) {
+    fprintf(stderr, "images too large (%d px); use <= ~32x32\n", P);
+    for (int i = 0; i < n; i++) free(toks[i]);
+    free(toks); return 1;
+  }
+  fprintf(stderr, "imggen dataset: %d images %dx%d, %d tokens, vocab %d(+BOS), %d steps\n",
+          n, W, H, P, V, steps);
+  int *gen = (int*)malloc(P * sizeof(int));
+  dataset_autoregress(toks, n, P, V, steps, gen);
+  Image outim = tokens_to_image(gen, W, H, levels);
+  int rc = image_save_ppm(out, &outim);
+  fprintf(stderr, "generated a %dx%d image from %d examples; wrote %s (%s)\n",
+          W, H, n, out, rc ? "FAILED" : "ok");
+  image_free(&outim); free(gen);
+  for (int i = 0; i < n; i++) free(toks[i]);
+  free(toks);
+  return rc;
+}
+
 static int run_imggen(int argc, char **argv) {
   if (argc < 4) {
-    fprintf(stderr, "usage: transformer imggen <in.ppm> <out.ppm> [levels=4] [steps=500]\n");
+    fprintf(stderr, "usage: transformer imggen <in.ppm | dir/> <out.ppm> [levels=4] [steps=500]\n"
+                    "  single PPM: reconstruct it; a folder of img_0000.ppm,... : learn + generate\n");
     return 2;
   }
   int levels = (argc > 4) ? atoi(argv[4]) : 4;
   int steps = (argc > 5) ? atoi(argv[5]) : 500;
   Image im = image_load_ppm(argv[2]);
-  if (!im.data) return 1;
+  if (!im.data) return imggen_dataset(argv[2], argv[3], levels, steps);
   int P = im.h * im.w, V = imagegen_vocab(levels);
   if (P > 1024) {
     fprintf(stderr, "image too large (%d px); use <= ~32x32 (img_to_ppm.py --size 32)\n", P);
@@ -331,14 +429,60 @@ static int run_imggen(int argc, char **argv) {
   return rc;
 }
 
+// audgen dataset mode: load dir/aud_0000.wav, aud_0001.wav, ... (all same length),
+// train one GPT on the set, and generate a novel clip. Triggered when the input
+// path is a folder rather than a single WAV.
+static int audgen_dataset(const char *dir, const char *out, int steps) {
+  int cap = 16, n = 0, P = 0, rate = 0;
+  int **toks = (int**)malloc(cap * sizeof(int*));
+  for (int i = 0; ; i++) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/aud_%04d.wav", dir, i);
+    Audio a = audio_load_wav(path);
+    if (!a.samples) break;
+    if (n == 0) { P = a.n; rate = a.sample_rate; }
+    else if (a.n != P) {
+      fprintf(stderr, "  skip %s: %d samples != %d\n", path, a.n, P);
+      audio_free(&a); continue;
+    }
+    if (n == cap) { cap *= 2; toks = (int**)realloc(toks, cap * sizeof(int*)); }
+    int *t = (int*)malloc(P * sizeof(int));
+    audio_to_tokens(&a, t);
+    toks[n++] = t; audio_free(&a);
+  }
+  if (n == 0) {
+    fprintf(stderr, "audgen: '%s' is neither a WAV nor a folder of aud_0000.wav, aud_0001.wav, ...\n", dir);
+    free(toks); return 1;
+  }
+  int V = audiogen_vocab();
+  if (P > 1024) {
+    fprintf(stderr, "audio too long (%d samples); use <= ~1024 samples\n", P);
+    for (int i = 0; i < n; i++) free(toks[i]);
+    free(toks); return 1;
+  }
+  fprintf(stderr, "audgen dataset: %d clips of %d samples @ %d Hz, vocab %d(+BOS), %d steps\n",
+          n, P, rate, V, steps);
+  int *gen = (int*)malloc(P * sizeof(int));
+  dataset_autoregress(toks, n, P, V, steps, gen);
+  Audio outa = tokens_to_audio(gen, P, rate);
+  int rc = audio_save_wav(out, &outa);
+  fprintf(stderr, "generated a %d-sample clip from %d examples; wrote %s (%s)\n",
+          P, n, out, rc ? "FAILED" : "ok");
+  audio_free(&outa); free(gen);
+  for (int i = 0; i < n; i++) free(toks[i]);
+  free(toks);
+  return rc;
+}
+
 static int run_audgen(int argc, char **argv) {
   if (argc < 4) {
-    fprintf(stderr, "usage: transformer audgen <in.wav> <out.wav> [steps=500]\n");
+    fprintf(stderr, "usage: transformer audgen <in.wav | dir/> <out.wav> [steps=500]\n"
+                    "  single WAV: reconstruct it; a folder of aud_0000.wav,... : learn + generate\n");
     return 2;
   }
   int steps = (argc > 4) ? atoi(argv[4]) : 500;
   Audio a = audio_load_wav(argv[2]);
-  if (!a.samples) return 1;
+  if (!a.samples) return audgen_dataset(argv[2], argv[3], steps);
   int P = a.n, V = audiogen_vocab();
   if (P > 1024) {
     fprintf(stderr, "audio too long (%d samples); use a short clip (<= ~1024 samples)\n", P);

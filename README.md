@@ -259,21 +259,31 @@ to drop in). The pieces: `toolcall.c` (parse) · `toolexec.c` (write/read/run) �
 ### `transformer imggen` / `audgen` (generate media to a file)
 
 Discrete-token media generation (Phase G): quantize the input to tokens, train a small GPT to
-model that sequence, then autoregressively regenerate it and decode to a real file.
+model it, then autoregressively decode to a real file. Two modes, auto-selected from the input:
 
 ```sh
+# Single-file mode -- reconstruct one input (overfits it):
 python tools/img_to_ppm.py cat.png cat.ppm 32     # any image -> small PPM (<= ~32x32)
 transformer imggen cat.ppm out.ppm 4 500          # -> out.ppm   (levels=4, steps=500)
-
 python tools/audio_to_wav.py clip.mp3 clip.wav    # any audio -> 16-bit mono WAV (short)
 transformer audgen clip.wav out.wav 500           # -> out.wav
+
+# Dataset mode -- learn from a FOLDER and GENERATE a novel sample:
+#   name the files img_0000.ppm, img_0001.ppm, ...  (all the same size)
+transformer imggen imgset/ out.ppm 4 800          # -> a generated image
+#   name the files aud_0000.wav, aud_0001.wav, ...  (all the same length)
+transformer audgen audset/ out.wav 800            # -> a generated clip
 ```
 
-Image uses a **color-cube** codec (`levels³` tokens); audio uses **µ-law** (256). These are
-single-example generative models (they overfit the input) with O(n²) attention, so keep inputs
-small (≤ ~32×32 image, ≤ ~1024 audio samples). Text-conditioned generation (text→image/audio/
-video) and captioning (media→text) are demonstrated in the default smoke test — see `notes.md`
-(Phase G). Real quality needs a trained VQ-VAE/diffusion + a dataset.
+If the input path is a single PPM/WAV it is reconstructed (overfit); if it is a folder of
+`img_0000.ppm,…` / `aud_0000.wav,…` the model trains on the whole set and **generates** a new
+sample. Dataset mode prepends a **BOS** token so the model learns the distribution of first
+tokens and can sample unconditionally (temperature 0.9 / top-k 40 / top-p 0.95).
+
+Image uses a **color-cube** codec (`levels³` tokens); audio uses **µ-law** (256). O(n²)
+attention, so keep inputs small (≤ ~32×32 image, ≤ ~1024 audio samples). Text-conditioned
+generation (text→image/audio/video) and captioning (media→text) are in the default smoke test —
+see `notes.md` (Phase G). Real quality needs a trained VQ-VAE/diffusion + far more data.
 
 ### `tools/convert_to_gptc.py` (weight importer)
 

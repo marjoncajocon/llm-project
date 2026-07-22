@@ -27,8 +27,19 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > KV 0.00e+00). Build now lists `selftest.c` (the notes build cmd also gained the media `.c`
 > files it had been missing).
 >
-> **Next candidate (still open):** dataset-trained `imggen`/`audgen` (learn from a folder, not
-> one input).
+> **Dataset-trained imggen/audgen — DONE (2026-07-22):** `imggen`/`audgen` gained a **dataset
+> mode** alongside single-example reconstruct, auto-selected from the input path (single file =
+> unchanged reconstruct; a **folder** of `img_%04d.ppm` / `aud_%04d.wav` = learn from the set +
+> **generate** a novel sample). New `dataset_autoregress` in main.c: prepends a **BOS** token
+> (model vocab V+1) so it learns P(first token) and samples unconditionally from BOS
+> (`sample_token`, temp 0.9/top-k 40/top-p 0.95; BOS clamped out of output). Numbered-file
+> loaders (same convention as `video_load`, no new dir-walk). Verified: `-Wall` clean, smoke
+> PASSED; 4-PPM set (3 red/1 blue) → generates red; 3-WAV set → wrote a clip; single-file recon
+> still 16/16. Honest: memorizes at this scale; codecs cap quality — the folder→generate pipeline
+> is the deliverable.
+>
+> **Roadmap + both backups are now done.** Optional future: real image-caption/video datasets,
+> VQ-VAE/diffusion for quality, mel-spectrogram audio, SIMD/int8 quant, larger GPT-2 variants.
 
 _Last updated: 2026-07-22._
 
