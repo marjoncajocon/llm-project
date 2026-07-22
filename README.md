@@ -60,6 +60,7 @@ defined in the matching `.c`.
 | `rope.h` / `rope.c`               | `rope` (LLaMA-family rotary position embeddings) + backward     |
 | `swiglu.h` / `swiglu.c`           | `swiglu` (LLaMA-family gated FFN: SiLU gate) + backward         |
 | `gqa.h` / `gqa.c`                 | `gqa` (LLaMA-family grouped-query causal attention) + backward |
+| `llama.h` / `llama.c`             | Modern (LLaMA-family) transformer block: RMSNorm+RoPE+GQA+SwiGLU |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |

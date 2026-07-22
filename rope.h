@@ -20,4 +20,10 @@ void rope(const Tensor *input, Tensor *output, float base);
 // orthogonal, so dx is the inverse rotation of dy (no parameters to learn).
 void rope_backward(const Tensor *input, const Tensor *output, float base);
 
+// In-place multi-head RoPE for an assembled attention layer: x is
+// (seq_len, n_heads * head_dim); each head's head_dim slice is rotated by the
+// row's position (head_dim = cols / n_heads, must be even). Forward only —
+// used when running a modern block for inference.
+void rope_heads(Tensor *x, int n_heads, float base);
+
 #endif // ROPE_H

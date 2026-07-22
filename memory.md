@@ -149,9 +149,13 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    **Progress — ALL FOUR modern primitives DONE + gradient-checked (standalone, NOT yet wired into
    a block):** ✅ **RMSNorm** (`rmsnorm.c`, `[13]`, 7.7e-4) · ✅ **RoPE** (`rope.c`, HF half-split,
    `[14]`: grad 1.4e-3 + rel-pos 1.8e-7) · ✅ **SwiGLU** (`swiglu.c`, `[15]`: grad 1.2e-3) ·
-   ✅ **GQA** (`gqa.c`, grouped-query causal attn, `[16]`: grad 7.3e-3). Next: assemble a modern
-   block (RMSNorm→GQA(+RoPE)→resid→RMSNorm→SwiGLU→resid) + `convert_llama.py` + a model path to load
-   small modern models (SmolLM/Qwen); also SIMD/int8 quant for speed.
+   ✅ **GQA** (`gqa.c`, grouped-query causal attn, `[16]`: grad 7.3e-3). ✅ **Assembled BLOCK**
+   (`llama.c`, `LlamaBlock`: RMSNorm→RoPE→GQA→resid→RMSNorm→SwiGLU→resid, no biases; forward-only /
+   inference; new in-place `rope_heads` in `rope.c`; selftest `[17]`: forward finite + end-to-end
+   CAUSALITY verified — perturb last pos changes only its own row, earlier rows 0.00e+00). Next:
+   `convert_llama.py` (HF safetensors→our layout, incl. HF RoPE weight permutation) + a multi-block
+   model path + SentencePiece/BPE tokenizer bridge → load & generate from SmolLM2-135M / Qwen2.5-0.5B.
+   Also SIMD/int8 quant for speed.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

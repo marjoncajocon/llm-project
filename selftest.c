@@ -27,6 +27,7 @@
 #include "rope.h"
 #include "swiglu.h"
 #include "gqa.h"
+#include "llama.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -1027,6 +1028,47 @@ int run_selftest(void) {
     all_ok &= gqa_ok;
     gqa_cache_free(&c);
     tensor_free(&Q); tensor_free(&K); tensor_free(&V); tensor_free(&O);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 17: modern (LLaMA-family) transformer block assembled from the four
+  // primitives (RMSNorm + RoPE + GQA + SwiGLU + residuals). Forward + an
+  // end-to-end CAUSALITY check: perturbing the LAST position must leave every
+  // earlier output row unchanged (proves the causal mask survives assembly).
+  // --------------------------------------------------------------------------
+  {
+    printf("[17] Modern block (RMSNorm+RoPE+GQA+SwiGLU): forward + causality\n");
+    const int n = 5, dm = 8, nh = 4, nkv = 2, hd = 2, dff = 16;
+    srand(7);
+    LlamaBlock blk = llama_block_create(dm, nh, nkv, hd, dff, 10000.0f, 1e-5f);
+    llama_block_randomize(&blk);
+    int xs[2] = {n, dm};
+    Tensor X = tensor_create(xs, 2), X2 = tensor_create(xs, 2);
+    Tensor O1 = tensor_create(xs, 2), O2 = tensor_create(xs, 2);
+    for (int i = 0; i < n * dm; i++) { X.data[i] = ((i * 13 % 100) / 50.0f) - 1.0f; X2.data[i] = X.data[i]; }
+    for (int j = 0; j < dm; j++) X2.data[(n - 1) * dm + j] += 0.5f;   // perturb the last position only
+
+    llama_block_forward(&blk, &X, &O1);
+    llama_block_forward(&blk, &X2, &O2);
+
+    int finite = 1;
+    for (int i = 0; i < n * dm; i++) if (!isfinite(O1.data[i])) finite = 0;
+    float past_diff = 0.0f, last_diff = 0.0f;
+    for (int i = 0; i < n - 1; i++)
+      for (int j = 0; j < dm; j++) {
+        float d = fabsf(O1.data[i * dm + j] - O2.data[i * dm + j]);
+        if (d > past_diff) past_diff = d;
+      }
+    for (int j = 0; j < dm; j++) {
+      float d = fabsf(O1.data[(n - 1) * dm + j] - O2.data[(n - 1) * dm + j]);
+      if (d > last_diff) last_diff = d;
+    }
+    int blk_ok = finite && (past_diff < 1e-6f) && (last_diff > 1e-4f);
+    printf("    finite=%d | causality: past rows max|diff|=%.2e (==0) last row |diff|=%.2e (>0) -> %s\n\n",
+           finite, past_diff, last_diff, blk_ok ? "OK" : "FAIL");
+    all_ok &= blk_ok;
+    llama_block_free(&blk);
+    tensor_free(&X); tensor_free(&X2); tensor_free(&O1); tensor_free(&O2);
   }
 
   // --------------------------------------------------------------------------

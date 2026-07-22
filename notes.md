@@ -267,10 +267,26 @@ accumulating into the shared K/V. Verified: new selftest **part `[16]`** numeric
 Q, K, V (4 query / 2 KV heads) — max rel error **7.30e-03** (< 1e-2). Smoke test PASSED, `-Wall` clean.
 
 🏁 **All four modern (LLaMA-family) primitives DONE + gradient-checked:** RMSNorm `[13]`, RoPE
-`[14]`, SwiGLU `[15]`, GQA `[16]` — all standalone, NOT yet wired into a block. Next: assemble a
-**modern transformer block** (RMSNorm → GQA(+RoPE) → residual → RMSNorm → SwiGLU → residual) +
-`convert_llama.py` + a model path to load small modern models (SmolLM/Qwen). Also pending: the perf
-work (SIMD/int8 quant) needed to run bigger models at usable speed.
+`[14]`, SwiGLU `[15]`, GQA `[16]`.
+
+## Modern architecture — step 5: assembled transformer BLOCK — DONE (2026-07-22)
+
+`llama.h`/`llama.c` — the four primitives wired into one LLaMA-family block (no biases):
+`xn=RMSNorm(x,attn_norm)` → `q,k,v = xn@{Wq,Wk,Wv}` (RoPE per-head on q,k via new in-place
+`rope_heads` in `rope.c`) → `h = x + GQA(q,k,v)@Wo` (residual) → `hn=RMSNorm(h,ffn_norm)` →
+`out = h + SwiGLU(hn,Wgate,Wup,Wdown)` (residual). Weights: `attn_norm/ffn_norm` (d_model),
+`Wq`(d_model,H·hd), `Wk/Wv`(d_model,KV·hd), `Wo`(H·hd,d_model), `Wgate/Wup`(d_model,d_ff),
+`Wdown`(d_ff,d_model). **Forward only (inference)** — the target is loading real small models;
+block backward is a later add if we want to fine-tune. `llama_block_create/free/randomize/forward`.
+Verified: new selftest **part `[17]`** — forward is finite AND end-to-end **causal**: perturbing the
+LAST input position changed its own output (|diff| 5.2e-1) but left every earlier output row
+**exactly** unchanged (max |diff| 0.00e+00), proving the causal mask survives the full assembly.
+Smoke test PASSED, `-Wall` clean.
+
+Next: **`convert_llama.py`** (HF safetensors → our weight layout, handling the HF RoPE weight
+permutation) + a multi-block model path + a SentencePiece/BPE tokenizer bridge, so we can load and
+generate from a real small modern model (SmolLM2-135M / Qwen2.5-0.5B). Also pending: SIMD/int8 quant
+for speed on bigger models.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
@@ -329,7 +345,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c rmsnorm.c rope.c swiglu.c gqa.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  optim.c rmsnorm.c rope.c swiglu.c gqa.c llama.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
   video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
 .\transformer.exe            # must print: Output validation: PASSED
 ```
