@@ -33,6 +33,7 @@ def main():
     prompt = sys.stdin.read()
     enc = tiktoken.get_encoding("gpt2")
     ids = enc.encode(prompt)
+    eos = enc.eot_token  # <|endoftext|> (50256): natural end of text
 
     exe = args.exe or ("transformer.exe" if os.name == "nt" else "./transformer")
     if os.path.exists(exe):
@@ -53,9 +54,13 @@ def main():
         if not line.startswith("t "):
             continue
         try:
-            gen.append(int(line[2:]))
+            tid = int(line[2:])
         except ValueError:
             continue
+        if tid == eos:
+            proc.kill()
+            break
+        gen.append(tid)
         full = enc.decode(gen)
         cut = full.find(args.stop)
         if cut != -1:

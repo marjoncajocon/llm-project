@@ -46,6 +46,13 @@ def main():
     tok = load_tok(args.model)
     ids = tok.encode(prompt).ids
 
+    # End-of-turn tokens: stop as soon as the model emits one (natural finish).
+    eos_ids = set()
+    for t in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>", "<end_of_utterance>"):
+        i = tok.token_to_id(t)
+        if i is not None:
+            eos_ids.add(i)
+
     exe = args.exe or ("transformer.exe" if os.name == "nt" else "./transformer")
     if os.path.exists(exe):
         exe = os.path.abspath(exe)
@@ -65,9 +72,13 @@ def main():
         if not line.startswith("t "):
             continue
         try:
-            gen.append(int(line[2:]))
+            tid = int(line[2:])
         except ValueError:
             continue
+        if tid in eos_ids:                  # model finished the turn
+            proc.kill()
+            break
+        gen.append(tid)
         full = tok.decode(gen)
         cut = full.find(args.stop)
         if cut != -1:                       # model started a new turn -> stop

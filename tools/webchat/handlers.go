@@ -18,7 +18,9 @@ import (
 func handleChat(c *wsConn, msg map[string]any) {
 	name, _ := msg["model"].(string)
 	text, _ := msg["text"].(string)
-	n := intField(msg, "n", 128)
+	// Generous safety cap: generation stops naturally on EOS / the stop sequence
+	// (handled in the stream wrappers); this only bounds a runaway base model.
+	n := intField(msg, "n", 512)
 	if strings.TrimSpace(text) == "" {
 		sendJSON(c, errMsg(fmt.Errorf("empty prompt")))
 		return
