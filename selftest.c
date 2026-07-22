@@ -26,6 +26,7 @@
 #include "rmsnorm.h"
 #include "rope.h"
 #include "swiglu.h"
+#include "gqa.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -973,6 +974,59 @@ int run_selftest(void) {
     all_ok &= sw_ok;
     swiglu_cache_free(&c);
     tensor_free(&x); tensor_free(&y); tensor_free(&Wg); tensor_free(&Wu); tensor_free(&Wd);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 16: GQA (grouped-query attention, LLaMA-family) — causal attention with
+  // FEWER KV heads than query heads. Forward + numerical gradient check (through
+  // softmax + causal mask) over Q, K, V.
+  // --------------------------------------------------------------------------
+  {
+    const int n = 4, H = 4, KV = 2, hd = 3;   // 4 query heads, 2 KV heads (group size 2)
+    printf("[16] GQA (grouped-query attn): %d query heads, %d KV heads (group %d) + gradient check\n",
+           H, KV, H / KV);
+    int qs[2] = {n, H * hd}, ks[2] = {n, KV * hd};
+    Tensor Q = tensor_create(qs, 2), O = tensor_create(qs, 2);
+    Tensor K = tensor_create(ks, 2), V = tensor_create(ks, 2);
+    GqaCache c = gqa_cache_create(n, H, KV, hd);
+    for (int i = 0; i < n * H * hd; i++) Q.data[i] = ((i * 13 % 100) / 50.0f) - 1.0f;
+    for (int i = 0; i < n * KV * hd; i++) {
+      K.data[i] = ((i * 17 % 100) / 50.0f) - 1.0f;
+      V.data[i] = ((i * 23 % 100) / 50.0f) - 1.0f;
+    }
+    float w[48];
+    for (int i = 0; i < n * H * hd; i++) w[i] = ((i * 31 % 100) / 50.0f) - 1.0f;
+
+    // Analytic grads (L = sum(w * O), dL/dO = w).
+    gqa_forward(&Q, &K, &V, &c, &O);
+    tensor_zero_grad(&Q); tensor_zero_grad(&K); tensor_zero_grad(&V);
+    for (int i = 0; i < n * H * hd; i++) O.grad[i] = w[i];
+    gqa_backward(&Q, &K, &V, &c, &O);
+
+    // Numerical grads over Q, K, V.
+    const float h = 1e-3f;
+    float max_cond = 0.0f;
+    Tensor *ps[3] = {&Q, &K, &V};
+    for (int pi = 0; pi < 3; pi++) {
+      Tensor *T = ps[pi];
+      int sz = T->shape[0] * T->shape[1];
+      for (int k = 0; k < sz; k++) {
+        float s = T->data[k];
+        T->data[k] = s + h; gqa_forward(&Q, &K, &V, &c, &O);
+        float lp = 0.0f; for (int i = 0; i < n * H * hd; i++) lp += w[i] * O.data[i];
+        T->data[k] = s - h; gqa_forward(&Q, &K, &V, &c, &O);
+        float lm = 0.0f; for (int i = 0; i < n * H * hd; i++) lm += w[i] * O.data[i];
+        T->data[k] = s;
+        float num = (lp - lm) / (2.0f * h), rel = fabsf(num - T->grad[k]) / (fabsf(T->grad[k]) + 1e-3f);
+        if (fabsf(T->grad[k]) > 1e-2f && rel > max_cond) max_cond = rel;
+      }
+    }
+    int gqa_ok = (max_cond < 1e-2f);
+    printf("    gradient check (Q, K, V): max rel error %.2e (|grad|>1e-2) -> %s\n\n",
+           max_cond, gqa_ok ? "OK" : "FAIL");
+    all_ok &= gqa_ok;
+    gqa_cache_free(&c);
+    tensor_free(&Q); tensor_free(&K); tensor_free(&V); tensor_free(&O);
   }
 
   // --------------------------------------------------------------------------

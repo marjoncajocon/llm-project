@@ -146,11 +146,12 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
 1. **Architecture** — a transformer. This project is GPT-2-style (LayerNorm, learned positions,
    GELU MLP, attention biases). Modern (LLaMA-family) = **RMSNorm, RoPE, SwiGLU, GQA**, no biases,
    SentencePiece tokenizer. Adding these is the roadmap's big leap (→ mini-`llama.cpp`).
-   **Progress:** ✅ **RMSNorm** (`rmsnorm.c`, selftest `[13]`, 7.7e-4) · ✅ **RoPE** (`rope.c`, HF
-   half-split, selftest `[14]`: grad 1.4e-3 + rel-pos property 1.8e-7) · ✅ **SwiGLU** (`swiglu.c`,
-   gated FFN SiLU(x@Wg)*(x@Wu)@Wd, selftest `[15]`: grad 1.2e-3 over all 4 tensors) — all standalone,
-   gradient-checked, NOT yet wired into the GPT block. Next: GQA → `convert_llama.py` + a modern-arch
-   model path (SmolLM/Qwen).
+   **Progress — ALL FOUR modern primitives DONE + gradient-checked (standalone, NOT yet wired into
+   a block):** ✅ **RMSNorm** (`rmsnorm.c`, `[13]`, 7.7e-4) · ✅ **RoPE** (`rope.c`, HF half-split,
+   `[14]`: grad 1.4e-3 + rel-pos 1.8e-7) · ✅ **SwiGLU** (`swiglu.c`, `[15]`: grad 1.2e-3) ·
+   ✅ **GQA** (`gqa.c`, grouped-query causal attn, `[16]`: grad 7.3e-3). Next: assemble a modern
+   block (RMSNorm→GQA(+RoPE)→resid→RMSNorm→SwiGLU→resid) + `convert_llama.py` + a model path to load
+   small modern models (SmolLM/Qwen); also SIMD/int8 quant for speed.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

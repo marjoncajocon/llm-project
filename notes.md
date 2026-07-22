@@ -252,9 +252,25 @@ GELU MLP. No biases: `g = x@W_gate`, `u = x@W_up`, `h = SiLU(g) (*) u`, `y = h@W
 Backward: `dh` via `matmul_backward`, then `da=dh*u`, `du=dh*a`, `dg=da*SiLU'(g)`
 (`SiLU'(z)=s(1+z(1-s))`), then `matmul_backward` for x/W_gate/W_up. Verified: new selftest
 **part `[15]`** numerically gradient-checks all four tensors (x, W_gate, W_up, W_down) — max rel
-error **1.17e-03** (< 1e-2). Smoke test PASSED, `-Wall` clean. Next: **GQA** (grouped-query
-attention), then `convert_llama.py` + a modern-arch model path to load small modern models
-(SmolLM/Qwen).
+error **1.17e-03** (< 1e-2). Smoke test PASSED, `-Wall` clean.
+
+## Modern architecture — step 4: GQA — DONE (2026-07-22)
+
+Grouped-query causal attention (`gqa.h`/`gqa.c`): n_heads QUERY heads but only n_kv KEY/VALUE
+heads (n_kv | n_heads); query head h shares KV head `h/(n_heads/n_kv)` — a group of query heads
+reuse one K/V head (what shrinks the KV cache in modern models; n_kv=n_heads is plain MHA, n_kv=1
+is MQA). Takes pre-projected per-head-concatenated Q (n, n_heads·hd), K/V (n, n_kv·hd) → O
+(n, n_heads·hd). Causal (j≤i), scale 1/√hd; forward caches the row-softmax weights (`GqaCache`).
+Backward = standard attention backward (dV += att·dO; datt=<dO,V>; softmax backward
+ds=att·(datt−Σatt·datt); dQ+=ds·scale·K, dK+=ds·scale·Q) with grads of grouped query heads
+accumulating into the shared K/V. Verified: new selftest **part `[16]`** numerically gradient-checks
+Q, K, V (4 query / 2 KV heads) — max rel error **7.30e-03** (< 1e-2). Smoke test PASSED, `-Wall` clean.
+
+🏁 **All four modern (LLaMA-family) primitives DONE + gradient-checked:** RMSNorm `[13]`, RoPE
+`[14]`, SwiGLU `[15]`, GQA `[16]` — all standalone, NOT yet wired into a block. Next: assemble a
+**modern transformer block** (RMSNorm → GQA(+RoPE) → residual → RMSNorm → SwiGLU → residual) +
+`convert_llama.py` + a model path to load small modern models (SmolLM/Qwen). Also pending: the perf
+work (SIMD/int8 quant) needed to run bigger models at usable speed.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
@@ -313,7 +329,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c rmsnorm.c rope.c swiglu.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  optim.c rmsnorm.c rope.c swiglu.c gqa.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
   video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
 .\transformer.exe            # must print: Output validation: PASSED
 ```
