@@ -8,6 +8,29 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > **Sync rule (user request):** this file mirrors Claude's memory — whenever the assistant
 > updates its memory, it must also update `memory.md` here.
 
+> **▶▶ Live streaming chat + mixed multimodal + FROM-SCRATCH text→image — ✅ DONE (2026-07-22):**
+> Big arc on the `tools/webchat/` frontend (all on `agent-1`, each smoke-green). Full detail:
+> `notes.md` → "Webchat → live streaming chat → mixed multimodal + FROM-SCRATCH text→image".
+> **Chat:** `017ce13` live token streaming + conversation memory (C prints `t <id>` per token;
+> `tools/llama_stream.py`/`gpt2_stream.py` incrementally detokenize → JSON deltas; Go `runCmdStream`
+> forwards; client keeps `User:/Assistant:` history + Clear); `b4773bd` runs until EOS (no max-new);
+> `f63e5c7` fixed truncated replies; `f61cf75` standalone exes via `build.ps1`/`make webchat` +
+> auto-detect root/engine; `48552e1` threaded int8 decode (`qacc_columns`, ~1.3× — bandwidth-bound);
+> `749f628` prefer int8 ckpt. Chat quality capped by base Qwen2.5-0.5B (convert the **-Instruct**
+> variant to improve). **Mixed chat:** `8074c3b` C `text2media` (text→image/audio teach-then-
+> reproduce); `581e21f` unified chat AUTO-DETECTS modality (keyword + Auto/Text/Image/Audio/Video
+> override), renders inline (chat_media); 📎 attach for the media demo.
+> **TEXT→IMAGE FROM SCRATCH (DALL-E/Parti recipe, NO diffusion/libs):** `e02815c` step1 `t2i`
+> (GPT learns P(image|caption) on a folder of cap_%04d.txt/img_%04d.ppm pairs); `8c28860` step2
+> **`vqvae.c/.h`** = a learned VQ-VAE image codec (patch encoder + learned codebook + decoder,
+> straight-through estimator, matmul only — 16×16→64 codes vs 256 px, MSE 0.0083); `0048fbc` step3
+> t2i uses the VQ-VAE codes (4× fewer tokens); `d33a3d9` `t2i-train <dataset> <prefix>` saves
+> `.gpt`+`.vqt`, `t2i-gen <prefix> <out> <caption>` generates in ~0.03s, webchat image intent
+> generates from `model/t2i/` inline. Usage: `t2i-train model/mydata model/t2i/t2i 3000 2000` then
+> ask "a picture of X". Ceiling: shown on red/green/blue (no real dataset here); novel images need
+> thousands of pairs + scale — architecture done, needs data+compute. `.gitignore` covers
+> `*.gpt`/`*.vqt`. HF text-to-image (SD/FLUX) is diffusion → can't load here; this is the AR path.
+>
 > **▶▶ Web testing frontend (Go+WebSocket) + `caption` subcommand — ✅ DONE (2026-07-22):**
 > `tools/webchat/` = a self-contained **Go** web server (stdlib only, hand-rolled RFC 6455;
 > embedded single-page UI) to test ALL modalities from a browser. 4 committed phases (`5eb41eb`

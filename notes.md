@@ -612,6 +612,54 @@ the pipelines RUN on real media, it is not a real captioner. Deps: Go 1.23; Pyth
 tokenizers only for the real models; ffmpeg only for video. Run: `cd tools/webchat && go run .
 -root ../..` → http://localhost:8080. See `tools/webchat/README.md`.
 
+## Webchat → live streaming chat → mixed multimodal + FROM-SCRATCH text→image — DONE (2026-07-22)
+
+Big arc on top of the `tools/webchat/` frontend (all committed on `agent-1`, each smoke-green):
+
+**ChatGPT-style chat** — `017ce13` live token streaming + conversation memory; `b4773bd` responses
+run until the model finishes (no max-new). C `llama`/`generate` now print each token as `t <id>`
+flushed; new Python **stream wrappers** (`tools/llama_stream.py`, `gpt2_stream.py`) incrementally
+detokenize (tokenizers/tiktoken) and emit JSON `{"d":piece}` deltas, stopping on EOS tokens or a
+`\nUser` stop; Go `runCmdStream` forwards each delta over the WS; the client keeps history (rebuilds
+a `User:/Assistant:` context) + a Clear button. `f63e5c7` fixed truncated replies (keep the whole
+stdout, not first line). `48552e1` threaded the int8 decode matmul over output columns (new typed
+`qacc_columns` in matrix.c) — decode is MEMORY-BANDWIDTH-bound so ~1.3× on this box; `749f628`
+webchat prefers the int8 checkpoint. **Standalone exes:** `f61cf75` `tools/webchat/build.ps1` +
+`make webchat` build BOTH `transformer.exe` + self-contained `webchat.exe`; the server auto-detects
+repo root + engine (runs with no flags). Honest ceiling for the CHAT: Qwen2.5-0.5B is a *base*
+model (rambles); the biggest quality lever would be converting Qwen2.5-0.5B-**Instruct**.
+
+**Mixed multimodal chat** — `8074c3b` new C `text2media` subcommand (text→image/audio, teach-then-
+reproduce via the cond_gen path); `581e21f` one unified chat that AUTO-DETECTS the requested
+modality (keyword classifier + manual Auto/Text/Image/Audio/Video override) and renders results
+inline: text streams; image/audio + an attached target run text2media inline (chat_media); no
+attachment → an honest note (no trained media model). The media branch is the documented seam for a
+real generator.
+
+**FROM-SCRATCH TEXT→IMAGE (the real thing, no diffusion, no libs)** — the DALL-E/Parti recipe built
+from matmul up, in 3 steps + save/load + chat integration:
+- `e02815c` **step 1**: `t2i` subcommand — trains ONE GPT on a folder of (caption, image) pairs
+  (`cap_%04d.txt`/`img_%04d.ppm`) so it learns P(image tokens | caption), generates an image from a
+  caption. Verified: red/green/blue captioned imgs → correct colors.
+- `8c28860` **step 2**: `vqvae.c/.h` — a learned **VQ-VAE image codec** (patch encoder → learned
+  codebook nearest-neighbor quantize → patch decoder), trained with reconstruction + commitment
+  losses + the **straight-through estimator**, using only matmul/matmul_backward + Adam. `vqvae` CLI
+  test: 16×16 → 64 codes (vs 256 color-cube px, 4× fewer) at MSE 0.0083.
+- `0048fbc` **step 3**: `t2i` now uses the VQ-VAE (generate learned codes, VQ-decode) instead of the
+  per-pixel color-cube → 4× fewer tokens, learned codec. Verified red/green/blue via codes.
+- `d33a3d9` **train/save + fast generate + chat**: `t2i-train <dataset> <prefix>` saves
+  `<prefix>.gpt` (gpt_save) + `<prefix>.vqt` (config + VQ weights); `t2i-gen <prefix> <out.ppm>
+  <caption>` loads + generates in **~0.03 s** (no retrain). The webchat image intent generates from
+  `model/t2i/` inline when present, else the honest note. `.gitignore` now covers `*.gpt`/`*.vqt`.
+  Usage: `t2i-train model/mydata model/t2i/t2i 3000 2000` then ask "a picture of X" in the chat.
+
+**Honest ceiling for text→image:** demonstrated on red/green/blue (no real captioned dataset here);
+recognizable NOVEL images need thousands of caption/image pairs + a bigger model + more training —
+scale, not code. The architecture (learned tokenizer + text→codes transformer + save/load + chat) is
+now complete and fast; scaling up is just data + compute. Note: HF text-to-image models (Stable
+Diffusion/FLUX) are DIFFUSION (different architecture) and can't load into this engine — this is the
+autoregressive path instead.
+
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
 **If a session ran out of usage / you're picking this up fresh, start here.**
@@ -634,7 +682,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
   optim.c rmsnorm.c rope.c swiglu.c gqa.c quant.c llama.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
-  video.c audio.c imagegen.c audiogen.c caption.c selftest.c main.c -lm
+  video.c audio.c imagegen.c audiogen.c caption.c text2media.c t2i.c vqvae.c selftest.c main.c -lm
 # On this Windows box, listing files explicitly is fragile — easiest is to glob:
 #   $c = (Get-ChildItem *.c | ForEach-Object { $_.Name }); zig cc -std=c11 -O2 -Wall -o transformer.exe @c -lm
 # (check.h is header-only — no .c to list. Add -DNDEBUG to disable the debug assertions.)
