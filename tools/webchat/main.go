@@ -33,25 +33,14 @@ func main() {
 	root := flag.String("root", "", "repo root (holds transformer + model/); default: auto-detect")
 	exe := flag.String("exe", "", "transformer binary (default: next to webchat, then <root>)")
 	python := flag.String("python", "python", "python interpreter for the tokenizer bridges")
-	imagegen := flag.String("imagegen", "", "text->image command (prompt on stdin, PNG path appended). Empty = auto-use tools/imagegen_diffusers.py if present; \"off\" disables")
+	imagegen := flag.String("imagegen", "", "OPT-IN external text->image command (e.g. a Python diffusers hook). Off by default: the C-native from-scratch t2i model is used instead")
 	flag.Parse()
 
 	cfg.root = resolveRoot(*root)
 	cfg.python = *python
-	// Text->image (real HF diffusion) auto-enables when the hook script is present;
-	// the script itself reports cleanly if torch/diffusers aren't installed. Pass
-	// -imagegen off to disable, or a custom command to override.
-	switch *imagegen {
-	case "off", "none":
-		cfg.imagegen = ""
-	case "":
-		if _, err := os.Stat(filepath.Join(cfg.root, "tools", "imagegen_diffusers.py")); err == nil {
-			cfg.imagegen = cfg.python + " tools/imagegen_diffusers.py"
-			log.Printf("text->image: auto-enabled via tools/imagegen_diffusers.py (needs torch+diffusers; -imagegen off to disable)")
-		}
-	default:
-		cfg.imagegen = *imagegen
-	}
+	// Text->image stays C-native by default (the from-scratch t2i model). A Python
+	// diffusion hook is only used if the operator explicitly opts in with -imagegen.
+	cfg.imagegen = *imagegen
 	if *exe != "" {
 		cfg.exe = *exe
 	} else {

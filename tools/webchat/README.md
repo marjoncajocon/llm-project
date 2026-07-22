@@ -68,23 +68,21 @@ The engine's own text→image (`t2i`) is toy-scale. For **real** quality, run a
 diffusion model *alongside* the engine (diffusion is a different architecture —
 it can't load into the transformer). The server has a hook:
 
+Text→image is **C-native by default**: image requests use the from-scratch `t2i`
+model (VQ-VAE + autoregressive transformer, all in the engine — no Python). This
+matches the project's pure-C aim; quality is toy-scale by design.
+
+A real HF diffusion model (Stable Diffusion / SD-Turbo) can only run *beside* the
+engine in Python (diffusion is a different architecture that can't load into the
+transformer), so it is strictly **opt-in** and off by default:
+
 ```sh
 pip install diffusers transformers accelerate torch      # ~2-3 GB (torch is large)
-.\tools\webchat\webchat.exe                               # hook auto-enables
+.\tools\webchat\webchat.exe -imagegen "python tools/imagegen_diffusers.py"
 ```
 
-The hook **auto-enables** whenever `tools/imagegen_diffusers.py` is present — no
-flag needed. If `torch`/`diffusers` aren't installed, an image request shows the
-exact `pip install …` line inline (nothing crashes). Pass `-imagegen off` to
-disable it, or `-imagegen "<cmd>"` to point at a different text→image command.
-
-In the chat, "a picture of the sun" (auto-detected as an image request) runs
-`tools/imagegen_diffusers.py` and shows the generated image inline. Model:
-`$SD_MODEL` (default `stabilityai/sd-turbo` — 1-step, CPU-tolerant); steps
-`$SD_STEPS`. First run downloads the model (~2.5 GB); CPU inference is tens of
-seconds. Without the deps, image requests fall back to the trained `t2i` model if
-present, else an honest note. Routing priority for image requests:
-**diffusers hook → trained `t2i` model → note**.
+Routing priority for image requests: **`-imagegen` hook (if opted in) → trained
+`t2i` model → honest note**. With no `-imagegen`, everything stays pure C.
 
 ## Honest limitations
 
