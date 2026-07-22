@@ -259,6 +259,9 @@ async function sendPrompt() {
   $("#prompt").value = "";
   busy(true);
   const prompt = buildPrompt(text);
+  // structured turns so the engine can apply the model's OWN chat template
+  const messages = history.map(t => ({role: t.role, content: t.text}));
+  messages.push({role: "user", content: text});
   history.push({role:"user", text});
   liveText = ""; liveMedia = null;
   liveBot = document.createElement("div");
@@ -267,7 +270,7 @@ async function sendPrompt() {
   liveBot._body = document.createTextNode("");
   liveBot.appendChild(liveBot._body);
   const log = $("#log-text"); log.appendChild(liveBot); log.scrollTop = log.scrollHeight;
-  const payload = {op:"chat", model:m.name, text, context:prompt, modality:$("#modality").value};
+  const payload = {op:"chat", model:m.name, text, context:prompt, messages, modality:$("#modality").value};
   if (attachB64) payload.media_b64 = attachB64;
   send(payload);
   clearAttach();

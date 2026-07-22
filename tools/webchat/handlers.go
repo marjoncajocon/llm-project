@@ -60,7 +60,8 @@ func handleChat(c *wsConn, msg map[string]any) {
 			sendJSON(c, errMsg(fmt.Errorf("unknown model: %s", name)))
 			return
 		}
-		streamText(c, m, context, n)
+		messages, _ := msg["messages"].([]any)
+		streamText(c, m, context, messages, n)
 	}
 	sendJSON(c, map[string]any{"op": "chat_done", "model": name})
 }
@@ -225,7 +226,7 @@ func chatMedia(c *wsConn, kind, prompt, attachB64 string) {
 // streamText routes the text path. Pure-C models: one delta. For gpt2/llama it
 // prefers the engine's OWN tokenizer (hfgen — no Python) when the model's vocab
 // is exported to model/<name>/tok.hf, and falls back to the Python bridges.
-func streamText(c *wsConn, m *Model, prompt string, n int) {
+func streamText(c *wsConn, m *Model, prompt string, messages []any, n int) {
 	if m.Mode == "purec-text" {
 		reply, _, err := runChat(*m, prompt, n)
 		if err != nil {
@@ -241,6 +242,15 @@ func streamText(c *wsConn, m *Model, prompt string, n int) {
 	// Pure-C tokenizer path (no Python) when the vocab was exported.
 	if _, err := os.Stat(filepath.Join(cfg.root, "model", m.Name, "tok.hf")); err == nil {
 		rel := "model/" + m.Name + "/tok.hf"
+		// Preferred: hfchat applies the model's OWN chat template in C and stops
+		// on its real end token. Falls back to hfgen (raw prompt) if no turns.
+		if turns := turnsToRS(messages); turns != "" {
+			if err := runCmdStream(cfg.exe, []string{"hfchat", m.Ckpt, rel, strconv.Itoa(n)}, turns,
+				func(line string) { forwardDelta(c, line) }); err != nil {
+				sendJSON(c, errMsg(err))
+			}
+			return
+		}
 		if err := runCmdStream(cfg.exe, []string{"hfgen", m.Ckpt, rel, strconv.Itoa(n)}, prompt,
 			func(line string) { forwardDelta(c, line) }); err != nil {
 			sendJSON(c, errMsg(err))
@@ -283,6 +293,29 @@ func forwardDelta(c *wsConn, line string) {
 	if d, ok := m["d"].(string); ok && d != "" {
 		sendJSON(c, map[string]any{"op": "chat_delta", "text": d})
 	}
+}
+
+// turnsToRS serializes chat turns for `hfchat`: each turn is "role\x1fcontent",
+// turns separated by "\x1e" (control chars that never occur in chat text). The
+// engine parses these and applies the model's chat template itself.
+func turnsToRS(messages []any) string {
+	var b strings.Builder
+	for _, mi := range messages {
+		t, ok := mi.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := t["role"].(string)
+		content, _ := t["content"].(string)
+		if role == "" {
+			continue
+		}
+		b.WriteString(role)
+		b.WriteByte(0x1f)
+		b.WriteString(content)
+		b.WriteByte(0x1e)
+	}
+	return b.String()
 }
 
 // stopRe matches an end marker, or a role label on its own line as a WHOLE WORD
