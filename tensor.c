@@ -29,11 +29,15 @@ static inline float* aligned_malloc(size_t size) {
   return ptr;
 }
 
-// Create a tensor with given shape
-Tensor tensor_create(int *shape, int ndim) {
+// Shared allocator: with_grad=0 leaves grad == NULL (inference-only tensors).
+static Tensor tensor_alloc(int *shape, int ndim, int with_grad) {
   Tensor t;
   t.ndim = ndim;
   t.shape = (int*)malloc(ndim * sizeof(int));
+  if (!t.shape) {
+    fprintf(stderr, "Error: shape allocation failed\n");
+    exit(EXIT_FAILURE);
+  }
   memcpy(t.shape, shape, ndim * sizeof(int));
 
   // Calculate total size (accumulate in size_t so the product never wraps).
@@ -42,22 +46,37 @@ Tensor tensor_create(int *shape, int ndim) {
     t.size *= (size_t)shape[i];
   }
 
-  // Allocate aligned memory for data and gradients
+  // Allocate aligned memory for data (and gradients if requested), zero-filled.
   t.data = (float*)aligned_malloc(t.size * sizeof(float));
-  t.grad = (float*)aligned_malloc(t.size * sizeof(float));
-
-  // Initialize to zeros
   memset(t.data, 0, t.size * sizeof(float));
-  memset(t.grad, 0, t.size * sizeof(float));
+  if (with_grad) {
+    t.grad = (float*)aligned_malloc(t.size * sizeof(float));
+    memset(t.grad, 0, t.size * sizeof(float));
+  } else {
+    t.grad = NULL;
+  }
 
   return t;
 }
 
+// Create a tensor with given shape (with a gradient array, for training).
+Tensor tensor_create(int *shape, int ndim) {
+  return tensor_alloc(shape, ndim, 1);
+}
+
+// Create a tensor WITHOUT a gradient array (grad == NULL). For inference-only
+// tensors — weights loaded only for generation, KV caches, decode scratch —
+// this halves the memory of a forward-only model. Never pass one to a *_backward
+// that writes into grad.
+Tensor tensor_create_nograd(int *shape, int ndim) {
+  return tensor_alloc(shape, ndim, 0);
+}
+
 // Free tensor memory
 void tensor_free(Tensor *t) {
-  ALIGNED_FREE(t->data);  // data/grad came from the aligned allocator
-  ALIGNED_FREE(t->grad);
-  free(t->shape);         // shape came from plain malloc
+  ALIGNED_FREE(t->data);      // data/grad came from the aligned allocator
+  if (t->grad) ALIGNED_FREE(t->grad);   // grad is NULL for inference-only tensors
+  free(t->shape);             // shape came from plain malloc
   t->data = NULL;
   t->grad = NULL;
   t->shape = NULL;
@@ -74,9 +93,10 @@ void tensor_init_random(Tensor *t) {
   }
 }
 
-// Zero the gradient array (call before accumulating grads for a new step)
+// Zero the gradient array (call before accumulating grads for a new step).
+// No-op for inference-only tensors (grad == NULL).
 void tensor_zero_grad(Tensor *t) {
-  memset(t->grad, 0, t->size * sizeof(float));
+  if (t->grad) memset(t->grad, 0, t->size * sizeof(float));
 }
 
 // Print tensor (for debugging)

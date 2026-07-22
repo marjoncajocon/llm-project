@@ -19,8 +19,14 @@ typedef struct {
 // Memory Management Functions
 // ============================================================================
 
-// Create a tensor with given shape
+// Create a tensor with given shape (includes a gradient array, for training).
 Tensor tensor_create(int *shape, int ndim);
+
+// Create a tensor WITHOUT a gradient array (grad == NULL) — for inference-only
+// tensors (loaded-for-generation weights, KV caches, decode scratch). Halves the
+// memory of a forward-only model. Must not be passed to a gradient-writing
+// *_backward. tensor_free and tensor_zero_grad both handle a NULL grad.
+Tensor tensor_create_nograd(int *shape, int ndim);
 
 // Free tensor memory
 void tensor_free(Tensor *t);

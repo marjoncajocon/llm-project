@@ -177,10 +177,13 @@ void gpt_generate(const GPT *m, int *token_ids, int prompt_len, int n_new) {
 // Training: activation cache
 // ---------------------------------------------------------------------------
 
-static Tensor *make_layer_tensors(int n_layers, int rows, int cols) {
+// with_grad=1 for training activations (backprop writes their grad); 0 for the
+// inference-only KV cache (halves its memory — matters for large GPT-2 weights).
+static Tensor *make_layer_tensors(int n_layers, int rows, int cols, int with_grad) {
   Tensor *arr = (Tensor*)malloc(n_layers * sizeof(Tensor));
   int shape[2] = {rows, cols};
-  for (int l = 0; l < n_layers; l++) arr[l] = tensor_create(shape, 2);
+  for (int l = 0; l < n_layers; l++)
+    arr[l] = with_grad ? tensor_create(shape, 2) : tensor_create_nograd(shape, 2);
   return arr;
 }
 
@@ -194,19 +197,19 @@ GPTActs gpt_acts_create(const GPT *m, int seq_len) {
   a.emb = tensor_create(s2, 2);
   a.ln_f_out = tensor_create(s2, 2);
 
-  a.ln1 = make_layer_tensors(L, seq_len, dm);
-  a.Q = make_layer_tensors(L, seq_len, dm);
-  a.K = make_layer_tensors(L, seq_len, dm);
-  a.V = make_layer_tensors(L, seq_len, dm);
-  a.weights = make_layer_tensors(L, nh * seq_len, seq_len);
-  a.concat = make_layer_tensors(L, seq_len, dm);
-  a.attn_out = make_layer_tensors(L, seq_len, dm);
-  a.a_resid = make_layer_tensors(L, seq_len, dm);
-  a.ln2 = make_layer_tensors(L, seq_len, dm);
-  a.ff_h1b = make_layer_tensors(L, seq_len, df);
-  a.ff_act = make_layer_tensors(L, seq_len, df);
-  a.ff_out = make_layer_tensors(L, seq_len, dm);
-  a.block_out = make_layer_tensors(L, seq_len, dm);
+  a.ln1 = make_layer_tensors(L, seq_len, dm, 1);
+  a.Q = make_layer_tensors(L, seq_len, dm, 1);
+  a.K = make_layer_tensors(L, seq_len, dm, 1);
+  a.V = make_layer_tensors(L, seq_len, dm, 1);
+  a.weights = make_layer_tensors(L, nh * seq_len, seq_len, 1);
+  a.concat = make_layer_tensors(L, seq_len, dm, 1);
+  a.attn_out = make_layer_tensors(L, seq_len, dm, 1);
+  a.a_resid = make_layer_tensors(L, seq_len, dm, 1);
+  a.ln2 = make_layer_tensors(L, seq_len, dm, 1);
+  a.ff_h1b = make_layer_tensors(L, seq_len, df, 1);
+  a.ff_act = make_layer_tensors(L, seq_len, df, 1);
+  a.ff_out = make_layer_tensors(L, seq_len, dm, 1);
+  a.block_out = make_layer_tensors(L, seq_len, dm, 1);
   return a;
 }
 
@@ -425,8 +428,8 @@ KVCache gpt_kvcache_create(const GPT *m) {
   kv.n_heads = m->n_heads;
   kv.max_seq_len = m->max_seq_len;
   kv.len = 0;
-  kv.K = make_layer_tensors(m->n_layers, m->max_seq_len, m->d_model);
-  kv.V = make_layer_tensors(m->n_layers, m->max_seq_len, m->d_model);
+  kv.K = make_layer_tensors(m->n_layers, m->max_seq_len, m->d_model, 0);  // inference-only
+  kv.V = make_layer_tensors(m->n_layers, m->max_seq_len, m->d_model, 0);
   return kv;
 }
 
@@ -443,11 +446,11 @@ void gpt_decode_step(const GPT *m, KVCache *kv, int token, Tensor *logits) {
   const int pos = kv->len;
   const float scale = 1.0f / sqrtf((float)hd);
 
-  int s1[2] = {1, dm};
-  Tensor x = tensor_create(s1, 2), ln1 = tensor_create(s1, 2);
-  Tensor q = tensor_create(s1, 2), k = tensor_create(s1, 2), v = tensor_create(s1, 2);
-  Tensor concat = tensor_create(s1, 2), attn = tensor_create(s1, 2);
-  Tensor ln2 = tensor_create(s1, 2), ff = tensor_create(s1, 2), lnf = tensor_create(s1, 2);
+  int s1[2] = {1, dm};   // per-step decode scratch is inference-only (no grad)
+  Tensor x = tensor_create_nograd(s1, 2), ln1 = tensor_create_nograd(s1, 2);
+  Tensor q = tensor_create_nograd(s1, 2), k = tensor_create_nograd(s1, 2), v = tensor_create_nograd(s1, 2);
+  Tensor concat = tensor_create_nograd(s1, 2), attn = tensor_create_nograd(s1, 2);
+  Tensor ln2 = tensor_create_nograd(s1, 2), ff = tensor_create_nograd(s1, 2), lnf = tensor_create_nograd(s1, 2);
 
   // Embed the new token at its position
   for (int j = 0; j < dm; j++) {

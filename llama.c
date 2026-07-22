@@ -15,8 +15,11 @@
 #include "swiglu.h"
 #include "quant.h"
 
-static Tensor vec(int n) { int s[1] = {n}; return tensor_create(s, 1); }
-static Tensor mat(int r, int c) { int s[2] = {r, c}; return tensor_create(s, 2); }
+// The LLaMA-family path is forward-only (inference), so none of its tensors —
+// weights, KV cache, or decode scratch — ever need a gradient array. Allocating
+// without one halves the memory of a loaded fp32 model.
+static Tensor vec(int n) { int s[1] = {n}; return tensor_create_nograd(s, 1); }
+static Tensor mat(int r, int c) { int s[2] = {r, c}; return tensor_create_nograd(s, 2); }
 
 LlamaBlock llama_block_create(int d_model, int n_heads, int n_kv, int head_dim,
                               int d_ff, float rope_base, float eps) {
