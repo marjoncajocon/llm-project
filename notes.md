@@ -507,14 +507,93 @@ up via `SRCS = $(OBJS:.o=.c)`). **Behavior byte-identical**: same `PASSED`, grad
 `9.28e-04` (|grad|>1e-2), KV cache `0.00e+00`, same losses; `-Wall` clean. (Also fixed the
 CONTINUATION-GUIDE build command, which had been missing the media `.c` files.)
 
+## Security & robustness hardening pass — DONE (2026-07-22)
+
+A multi-agent code review (5 parallel reviewers over the whole tree) found the math correct
+(softmax stability, GELU/SiLU/LayerNorm/RMSNorm backward, RoPE, GQA, attention scaling,
+cross-entropy, int8 all verified) but flagged bugs at the **trust boundaries and robustness
+edges**. Worked through the top of the list — 4 criticals + every high + the biggest
+mediums/lows — in **6 commits on `agent-1`**. Every commit is smoke-tested (`PASSED`,
+byte-identical numerics: grad `9.28e-04`, KV cache `0.00e+00`) and `-Wall` clean.
+
+1. **`b08d7b6` — loader validation** (checkpoint.c, llama.c, tokenizer.c). The binary loaders
+   are the untrusted-input boundary (a "download a model" workflow feeds them). Added
+   `gpt_config_valid` / `llama_config_valid` gates that reject a corrupt/hostile header BEFORE
+   building a model: non-positive/oversized dims (cap 1e6), `d_model % n_heads != 0`, `n_kv == 0`
+   (was a decode divide-by-zero), GQA groups that don't divide evenly (was OOB K/V reads), and
+   2D weight element counts > INT_MAX (the forward path still indexes weights in int).
+   `tokenizer_load` also bounds-checks `n_merges`, null-checks its mallocs, and validates every
+   merge id references an already-existing token (`< 256 + rank`).
+
+2. **`9f34d12` — sandbox the tool executor** (toolexec.c, agent.c). Closes the two CRITICAL
+   agent bugs. `write_file`/`read_file` paths are confined to the working directory via
+   `path_is_safe()` (relative only — no leading `/`/`\`, no drive letter, no UNC, no `..`
+   component); the executor enforces this regardless of the approval outcome (hard boundary).
+   `run_command` is NEVER auto-approved — it always forces an interactive y/N even in
+   `APPROVAL_AUTO` (non-interactive stdin denies), and `write_file` now prints the full content
+   before approval so the gate is meaningful. Verified: traversal + absolute paths refused,
+   run_command not auto-approved, no files escaped.
+
+3. **`5fd66ff` — size_t migration** (tensor.h/.c, matrix.c, optim.h/.c). `Tensor.size` and
+   `Adam.total` were `int` → a tensor/param-set over 2^31 elements wrapped negative and
+   `aligned_malloc`/`memset` corrupted memory. Now `size_t` end-to-end (loops over `.size`, the
+   flat Adam m/v index too). `matmul`/`matmul_backward`: the `(long)M*N*K` thread threshold
+   overflowed on Windows (LLP64: `long` is 32-bit) → huge GEMMs silently ran single-threaded;
+   now `(size_t)`, and the backward kernels' `i*N+j` index math is now `size_t` (matching the
+   forward, which already was). NOTE: the loader caps (item 1) stay at INT_MAX because the
+   embedding/forward path still indexes in int — full >INT_MAX-element single-tensor support
+   would need migrating every forward index expression too (future).
+
+4. **`6151129` — fail-closed persistence** (checkpoint.c, tokenizer.c, llama.c, train.c,
+   model.c/.h, selftest.c, main.c). Saves are ATOMIC: write to `<path>.tmp` + `fflush`/`fclose`
+   check + atomic rename (POSIX) / remove+rename (Windows), so a failed/interrupted/disk-full
+   save never truncates a good checkpoint; `llama_model_save` no longer ignores `fclose`.
+   Periodic checkpoints in `train.c` now report failures loudly. New `gpt_param_count()` heap-
+   sizes the param list in `train_run`/`train_sft`, killing the fixed `Tensor *params[1024]`
+   that smashed the stack above 63 layers (`--layers`/`--resume` reachable). Self-test no longer
+   writes/`remove()`s the exact train defaults `model.bin`/`tok.bin` (it used `selftest_*.tmp`
+   now) — that was DATA LOSS on any bare/typo'd run. And an unknown subcommand prints usage +
+   exits 1 instead of falling through to the self-test. Verified: a decoy model.bin survives a
+   self-test run; `trian` errors without touching it.
+
+5. **`5064878` — debug validation layer** (new header-only `check.h`, wired into matrix.c,
+   embedding.c, loss.c). Typed helpers (`tf_check_matmul`, `tf_check_same_size`,
+   `tf_check_bias_add`, `tf_check_token_id`, `tf_check_target_id`, `TF_ASSERT`) abort with a
+   clear message AT THE POINT OF FAILURE instead of silently corrupting the heap. Guards the
+   `wte->grad[bad_token*d_model]` scatter-add in `embedding_backward` and OOB target ids in
+   cross-entropy. O(1)/matmul, O(seq_len)/embedding; **compiled out under `-DNDEBUG`** — the
+   DEFAULT build leaves them ON (cheap, catches mistakes). SwiGLU's internal matmuls are
+   validated transitively. Verified: default build PASSED with no assertion fired (codebase is
+   shape-consistent), `-DNDEBUG` build clean + PASSES, a bad-shape probe aborts as intended.
+
+6. **`73902ac` — no-grad inference tensors** (tensor.h/.c, llama.c, model.c). Every Tensor
+   allocated a same-size unused `grad` array even for forward-only models (~+540 MB for
+   SmolLM2-135M fp32). New `tensor_create_nograd()` (grad == NULL; `tensor_free`/
+   `tensor_zero_grad` handle NULL). The LLaMA path's `vec()`/`mat()` helpers — which build ALL
+   its tensors (fp32 weights, int8-model f32 norms/biases, KV cache, decode scratch) — now skip
+   grad, HALVING a loaded fp32 model's RAM (headline win for SmolLM2/Qwen2.5). GPT KV cache +
+   `gpt_decode_step` scratch also nograd (`make_layer_tensors` gained a `with_grad` flag).
+   GPT model weights stay grad-capable (dual-use: `--resume` trains them). Verified byte-
+   identical numerics incl. LLaMA save→load→forward→decode (parts 18–19).
+
+**Remaining (lower priority, none load-bearing):** endianness portability of checkpoints/`tok.bin`
+(only matters for big-endian, which none of the 8 targets are); a real `generate` CLI
+(`--seed/--temp/--top-k/--top-p/--n`, seed-from-time); 64-bit file sizes for >2 GB corpora
+(`corpus.c` `ftell`/`int` narrowing); crawler retry/backoff + filename-collision dedup;
+`convert_llama.py` sharded-checkpoint support. See the review tables (in-session) for the full list.
+
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
 **If a session ran out of usage / you're picking this up fresh, start here.**
 
 **Repo state:** pure-C GPT that trains on text, generates text, has a token/text CLI, a
-scripted agent loop, cross-platform builds (incl. WASM). Work is on branch **`agent-1`**
-(several commits ahead of `master`). Tree should be clean — run `git status` and `git log
---oneline -12` to confirm where you are.
+scripted agent loop, loads & runs real modern LLMs (SmolLM2-135M, Qwen2.5-0.5B via LLMA/LLMQ),
+and cross-platform builds (incl. WASM). A 6-commit **security/robustness hardening pass** landed
+2026-07-22 (see that section above): sandboxed tool executor, validated loaders, size_t overflow
+fixes, atomic saves, a `check.h` debug layer, and no-grad inference tensors. **`check.h` runs
+shape/bounds assertions in the DEFAULT build; add `-DNDEBUG` to compile them out.** Work is on
+branch **`agent-1`** (several commits ahead of `master`). Tree should be clean — run `git status`
+and `git log --oneline -12` to confirm where you are.
 
 **Environment (this Windows machine):** no gcc/clang/make. Use **`zig`** (`D:\env\zig\zig.exe`)
 and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
@@ -524,8 +603,11 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c rmsnorm.c rope.c swiglu.c gqa.c llama.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  optim.c rmsnorm.c rope.c swiglu.c gqa.c quant.c llama.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
   video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
+# On this Windows box, listing files explicitly is fragile — easiest is to glob:
+#   $c = (Get-ChildItem *.c | ForEach-Object { $_.Name }); zig cc -std=c11 -O2 -Wall -o transformer.exe @c -lm
+# (check.h is header-only — no .c to list. Add -DNDEBUG to disable the debug assertions.)
 .\transformer.exe            # must print: Output validation: PASSED
 ```
 Then clean: `Remove-Item transformer.exe,*.o,*.bin,*.wasm,xbuild_* -ErrorAction SilentlyContinue`.

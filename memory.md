@@ -8,6 +8,26 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > **Sync rule (user request):** this file mirrors Claude's memory — whenever the assistant
 > updates its memory, it must also update `memory.md` here.
 
+> **▶▶ Security/robustness hardening pass — ✅ DONE (2026-07-22):** a 5-agent code review of the
+> whole tree found the MATH correct (softmax/GELU/RMSNorm/RoPE/GQA/cross-entropy/int8 all
+> verified) but bugs at the **trust boundaries**. Fixed the top of the list — 4 criticals + every
+> high + top mediums — in **6 commits on `agent-1`**, each smoke-tested (`PASSED`, grad 9.28e-04,
+> KV 0.00e+00) and `-Wall` clean. Full detail: `notes.md` → "Security & robustness hardening
+> pass". In order: `b08d7b6` loader validation (reject corrupt/hostile checkpoint + tokenizer
+> headers before building — bad dims, `n_kv==0`, uneven GQA, merge ids); `9f34d12` sandbox the
+> tool executor (`toolexec` confines file paths to cwd — no abs/`..`/drive/UNC; `run_command`
+> NEVER auto-approves, always interactive); `5fd66ff` size_t migration (`Tensor.size`,
+> `Adam.total`, matmul `M*N*K` threshold — kills the 2^31 overflow/corruption class); `6151129`
+> fail-closed persistence (ATOMIC saves = temp+rename; `gpt_param_count` heap list replaces the
+> `params[1024]` stack-smash; self-test now uses `selftest_*.tmp` so it can't overwrite/delete a
+> user's `model.bin`/`tok.bin`; unknown subcommand → usage+exit 1, not the self-test); `5064878`
+> debug validation layer (**new `check.h`** — typed shape/bounds asserts that abort at the fault;
+> **ON in the default build, `-DNDEBUG` compiles them out**); `73902ac` no-grad inference tensors
+> (`tensor_create_nograd`; LLaMA path + GPT KV cache/decode skip the unused grad array →
+> **halves a loaded fp32 model's RAM**, ~540 MB for SmolLM2-135M). Remaining (minor, none
+> load-bearing): checkpoint endianness, a real `generate` CLI (seed/temp flags), >2 GB corpora
+> (`corpus.c` int narrowing), crawler retry/backoff, `convert_llama.py` sharded checkpoints.
+>
 > **▶▶ real LLM agent backend — ✅ DONE (2026-07-22):** `tools/agent_llm.py` reads the
 > transcript (argv[1], stdin fallback), calls a real LLM with a system prompt constraining it to
 > emit exactly one `<tool name="write_file|read_file|run_command" ...>...</tool>` or
@@ -72,12 +92,14 @@ _Last updated: 2026-07-22._
 - **No gcc/clang/make.** Use **`zig`** = `D:\env\zig\zig.exe` (also cross-compiles + `zig cc`),
   **Python** = `D:\env\python\python-3.9.10.amd64\python.exe` (+ numpy), **Node** at `D:\env\node`
   (has WASI). `git` works.
-- Build + smoke test:
+- Build + smoke test (PowerShell doesn't glob for native exes — expand `*.c` first):
   ```
-  zig cc -std=c11 -O2 -Wall -o transformer.exe *.c -lm    # (list the .c files explicitly)
+  $c = (Get-ChildItem *.c | ForEach-Object { $_.Name }); zig cc -std=c11 -O2 -Wall -o transformer.exe @c -lm
   .\transformer.exe        # must print: Output validation: PASSED
   ```
-  Then clean artifacts (`transformer.exe *.o *.bin *.wasm xbuild_*`). Cross-compile all: `make cross`.
+  `check.h` is header-only (no `.c`). Its shape/bounds assertions run in this default build; add
+  `-DNDEBUG` for a checks-off release build. Then clean artifacts (`transformer.exe *.o *.bin
+  *.wasm *.tmp xbuild_*`). Cross-compile all: `make cross`.
 
 ## What's built (working, committed)
 Full **text** pipeline: transformer (GPT-2-style, attention biases, pre-norm, GELU FFN) that
