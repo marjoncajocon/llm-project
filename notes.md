@@ -660,6 +660,30 @@ now complete and fast; scaling up is just data + compute. Note: HF text-to-image
 Diffusion/FLUX) are DIFFUSION (different architecture) and can't load into this engine — this is the
 autoregressive path instead.
 
+## Pure-C tokenizer — the engine parses HF models itself, NO Python at runtime — DONE (2026-07-22)
+
+User goal: "our own llm can parse it, not python." Built a from-scratch byte-level BPE tokenizer
+so the engine tokenizes GPT-2 / SmolLM2 / Qwen2.5 ITSELF — Python is now only a one-time export
+(like the weight converters), never at runtime.
+- `baf5f20` **`hftok.c/.h`** — loads a `.tok` vocab (id→raw bytes) into a bytes→id hash, hand-codes
+  the GPT-2 pretokenization regex (contractions / ` ?\p{L}+` / ` ?\p{N}+` / punctuation / whitespace;
+  \p{L} ≈ ASCII letters + UTF-8 bytes), and runs the tiktoken byte-level-BPE rule "merge the adjacent
+  pair with the lowest combined-token id". Key insight: HF BPE assigns vocab ids in MERGE ORDER
+  (256 bytes + merges), so min-combined-id == min merge rank → the SAME algorithm works for tiktoken
+  AND HF tokenizers. `tools/export_tokenizer.py`: `gpt2` via tiktoken; `<hf-repo>` via the tokenizers
+  lib + the HF byte-decoder → `.tok`. CLI `hftok <file.tok> encode|decode`.
+- `5a0517a` **`hfgen <model.bin> <tok.hf> [n]`** — pure-C HF chat: prompt on stdin → hftok encode →
+  generate (auto-detect GPTC/LLMA/LLMQ) → stream JSON `{"d":piece}` deltas (incremental hftok decode)
+  → `{"done":true}`, stopping on EOS or `\nUser`. webchat `streamText` prefers this when
+  `model/<name>/tok.hf` exists (export once), else the Python bridges.
+- **VERIFIED EXACT** vs the reference tokenizers: GPT-2 (tiktoken), SmolLM2 + Qwen2.5 (tokenizers) all
+  match byte-for-byte on punctuation / code / numbers / contractions. End-to-end: gpt2 chats in the
+  webchat with zero Python (coherent "…capital of the Republic of Belgium…"); SmolLM2 int8 generates
+  pure-C. `.gitignore` covers the generated `*.hf`.
+- **To make an HF model pure-C:** `python tools/export_tokenizer.py <gpt2|hf-repo> model/<name>/tok.hf`
+  once; the webchat then chats it with no Python. (Qwen's digit-group pretokenizer edge cases may
+  differ; SmolLM2/GPT-2 are exact.)
+
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
 **If a session ran out of usage / you're picking this up fresh, start here.**

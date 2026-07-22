@@ -8,6 +8,21 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > **Sync rule (user request):** this file mirrors Claude's memory — whenever the assistant
 > updates its memory, it must also update `memory.md` here.
 
+> **▶▶ Pure-C tokenizer — engine parses HF models, NO Python at runtime — ✅ DONE (2026-07-22):**
+> User goal "our own llm can parse it, not python." `baf5f20` **`hftok.c/.h`** = from-scratch
+> byte-level BPE: loads a `.tok` vocab (id→bytes) into a bytes→id hash, hand-codes the GPT-2
+> pretokenization regex, runs the tiktoken min-combined-id merge rule. Key insight: HF BPE ids are in
+> MERGE ORDER, so the same algorithm works for tiktoken AND HF tokenizers. `tools/export_tokenizer.py`
+> (`gpt2`→tiktoken, `<hf-repo>`→tokenizers lib) writes the `.tok` ONCE (like a weight converter);
+> runtime is pure C. `5a0517a` **`hfgen <model.bin> <tok.hf> [n]`** = pure-C HF chat (stdin text →
+> encode → generate, auto-detects GPTC/LLMA/LLMQ → JSON `{"d":piece}` deltas → `{"done":true}`, stops
+> on EOS/`\nUser`); webchat `streamText` uses it when `model/<name>/tok.hf` exists, else Python
+> bridges. **VERIFIED EXACT** vs reference for GPT-2, SmolLM2, Qwen2.5 (punctuation/code/numbers/
+> contractions); gpt2 + SmolLM2 chat end-to-end in pure C. To activate:
+> `python tools/export_tokenizer.py <gpt2|hf-repo> model/<name>/tok.hf` once. `.gitignore` covers
+> `*.hf`. (The diffusers text→image hook `da472d5` still exists but is OFF/optional — user wants the
+> engine to do it, so the pure-C `t2i` is the default; diffusers install was stopped.)
+>
 > **▶▶ Live streaming chat + mixed multimodal + FROM-SCRATCH text→image — ✅ DONE (2026-07-22):**
 > Big arc on the `tools/webchat/` frontend (all on `agent-1`, each smoke-green). Full detail:
 > `notes.md` → "Webchat → live streaming chat → mixed multimodal + FROM-SCRATCH text→image".
