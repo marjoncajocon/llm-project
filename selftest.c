@@ -23,6 +23,17 @@
 #include "audio.h"
 #include "imagegen.h"
 #include "audiogen.h"
+#include "rmsnorm.h"
+
+// Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
+static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
+                             const float *w, float eps) {
+  rmsnorm(x, gm, y, eps);
+  int n = y->shape[0] * y->shape[1];
+  float l = 0.0f;
+  for (int i = 0; i < n; i++) l += w[i] * y->data[i];
+  return l;
+}
 
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
@@ -794,6 +805,58 @@ int run_selftest(void) {
   tensor_free(&probs);
   gpt_acts_free(&acts);
   gpt_free(&model);
+
+  // --------------------------------------------------------------------------
+  // Part 13: RMSNorm (LLaMA-family primitive, modern-architecture roadmap) —
+  // forward + numerical gradient check (analytic backward vs central difference).
+  // --------------------------------------------------------------------------
+  {
+    printf("[13] RMSNorm (LLaMA-family): forward + gradient check\n");
+    const int R = 3, D = 8;
+    int sh[2] = {R, D}, gsh[1] = {D};
+    Tensor x = tensor_create(sh, 2), y = tensor_create(sh, 2);
+    Tensor gm = tensor_create(gsh, 1), gg = tensor_create(gsh, 1);
+    float w[24];
+    for (int i = 0; i < R * D; i++) {
+      x.data[i] = ((i * 37 % 100) / 50.0f) - 1.0f;    // deterministic pseudo-random in [-1,1)
+      w[i] = ((i * 53 % 100) / 50.0f) - 1.0f;
+    }
+    for (int j = 0; j < D; j++) gm.data[j] = 0.5f + (j % 3) * 0.25f;
+    const float eps = 1e-5f;
+
+    // Analytic grads: L = sum(w * y) so dL/dy = w.
+    rmsnorm(&x, &gm, &y, eps);
+    for (int i = 0; i < R * D; i++) { x.grad[i] = 0.0f; y.grad[i] = w[i]; }
+    for (int j = 0; j < D; j++) gg.grad[j] = 0.0f;
+    rmsnorm_backward(&x, &gm, &y, &gg, eps);
+
+    // Numerical grads (central difference) vs analytic.
+    const float h = 1e-3f;
+    float max_all = 0.0f, max_cond = 0.0f;
+    for (int k = 0; k < R * D; k++) {
+      float s = x.data[k];
+      x.data[k] = s + h; float lp = rms_scalar_loss(&x, &gm, &y, w, eps);
+      x.data[k] = s - h; float lm = rms_scalar_loss(&x, &gm, &y, w, eps);
+      x.data[k] = s;
+      float num = (lp - lm) / (2.0f * h), rel = fabsf(num - x.grad[k]) / (fabsf(x.grad[k]) + 1e-3f);
+      if (rel > max_all) max_all = rel;
+      if (fabsf(x.grad[k]) > 1e-2f && rel > max_cond) max_cond = rel;
+    }
+    for (int j = 0; j < D; j++) {
+      float s = gm.data[j];
+      gm.data[j] = s + h; float lp = rms_scalar_loss(&x, &gm, &y, w, eps);
+      gm.data[j] = s - h; float lm = rms_scalar_loss(&x, &gm, &y, w, eps);
+      gm.data[j] = s;
+      float num = (lp - lm) / (2.0f * h), rel = fabsf(num - gg.grad[j]) / (fabsf(gg.grad[j]) + 1e-3f);
+      if (rel > max_all) max_all = rel;
+      if (fabsf(gg.grad[j]) > 1e-2f && rel > max_cond) max_cond = rel;
+    }
+    int rms_ok = (max_cond < 1e-2f);
+    printf("    gradient check: max rel error %.2e (all) | %.2e (|grad|>1e-2) -> %s\n\n",
+           max_all, max_cond, rms_ok ? "OK" : "FAIL");
+    all_ok &= rms_ok;
+    tensor_free(&x); tensor_free(&y); tensor_free(&gm); tensor_free(&gg);
+  }
 
   // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");

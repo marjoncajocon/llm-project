@@ -56,6 +56,7 @@ defined in the matching `.c`.
 | `matrix.h` / `matrix.c`           | `matmul`, `matadd`, `matscale`                                |
 | `activation.h` / `activation.c`   | `softmax_rowwise`, `gelu`                                      |
 | `layernorm.h` / `layernorm.c`     | `layernorm`                                                    |
+| `rmsnorm.h` / `rmsnorm.c`         | `rmsnorm` (LLaMA-family; RMS-only norm, no mean/bias) + backward |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |

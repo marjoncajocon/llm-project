@@ -146,6 +146,9 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
 1. **Architecture** — a transformer. This project is GPT-2-style (LayerNorm, learned positions,
    GELU MLP, attention biases). Modern (LLaMA-family) = **RMSNorm, RoPE, SwiGLU, GQA**, no biases,
    SentencePiece tokenizer. Adding these is the roadmap's big leap (→ mini-`llama.cpp`).
+   **Progress:** ✅ **RMSNorm** done (`rmsnorm.c`, gradient-checked in selftest `[13]`, rel err
+   7.7e-4) — standalone module, not yet wired into the GPT block. Next: RoPE → SwiGLU → GQA →
+   `convert_llama.py` + a modern-arch model path.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

@@ -219,8 +219,19 @@ checkpoint-format change). BUG caught + fixed during the build: after bumping th
 left `logits`/`probs` sized to `tok.vocab_size` → forward wrote one column OOB → crash (exit 116);
 fix = size the tensors to `model.vocab_size`. Retrained: sft-loss → 0.0005; **generation now stops
 cleanly** — every instruction produces its exact tool-call/`<done>` response with NO trailing
-filler (read_file, run_command make test/rm/pwd, write_file, `<done>Task complete.>`). Next: the
-modern-architecture (RMSNorm/RoPE/SwiGLU/GQA) + quantization roadmap.
+filler (read_file, run_command make test/rm/pwd, write_file, `<done>Task complete.>`).
+
+## Modern architecture — step 1: RMSNorm — DONE (2026-07-22)
+
+First LLaMA-family primitive. New `rmsnorm.h`/`rmsnorm.c`: `rmsnorm` (RMS-only norm, no mean
+subtraction, no bias — `y_j = x_j / sqrt(mean(x^2)+eps) * gamma_j`) + `rmsnorm_backward`
+(`dx_j = r*(g_j - x_j*r^2*S/d)`, `g_j = dy_j*gamma_j`, `S = sum g_k x_k`; `dgamma_j += dy_j*x_j*r`).
+Verified: new selftest **part `[13]`** does a numerical gradient check (analytic backward vs central
+difference) — max rel error **7.74e-04** (< 1e-2 gate); smoke test still PASSED, `-Wall` clean.
+Makefile + build lists + README module table updated. NOT yet wired into the model — that's the
+bigger arch swap (a modern block uses RMSNorm + RoPE + SwiGLU + GQA together). Next primitives:
+**RoPE** (rotary positions), then SwiGLU, GQA; then `convert_llama.py` + a modern-arch model path
+to load small modern models (SmolLM/Qwen).
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
@@ -279,7 +290,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  optim.c rmsnorm.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
   video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
 .\transformer.exe            # must print: Output validation: PASSED
 ```
