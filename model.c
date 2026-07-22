@@ -374,6 +374,10 @@ void gpt_backward_multimodal(GPT *m, const int *token_ids, int n_img, int seq_le
   }
 }
 
+int gpt_param_count(const GPT *m) {
+  return 2 + 16 * m->n_layers + 3;   // wte,wpe + 16/layer + ln_f_gamma,ln_f_beta,lm_head
+}
+
 int gpt_collect_params(GPT *m, Tensor **list) {
   int n = 0;
   list[n++] = &m->wte;
@@ -404,8 +408,7 @@ int gpt_collect_params(GPT *m, Tensor **list) {
 }
 
 void gpt_zero_grad(GPT *m) {
-  int cap = 2 + 16 * m->n_layers + 3;
-  Tensor **list = (Tensor**)malloc(cap * sizeof(Tensor*));
+  Tensor **list = (Tensor**)malloc(gpt_param_count(m) * sizeof(Tensor*));
   int n = gpt_collect_params(m, list);
   for (int i = 0; i < n; i++) tensor_zero_grad(list[i]);
   free(list);

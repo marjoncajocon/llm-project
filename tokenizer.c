@@ -179,16 +179,35 @@ void tokenizer_train(Tokenizer *t, const char *text, int num_merges) {
   free(count);
 }
 
+// Atomically replace dst with tmp: rename is atomic on POSIX; on Windows rename
+// fails if dst exists, so fall back to remove+rename. Returns 0 on success.
+static int replace_file(const char *tmp, const char *dst) {
+  if (rename(tmp, dst) == 0) return 0;
+  remove(dst);
+  return rename(tmp, dst);
+}
+
 int tokenizer_save(const Tokenizer *t, const char *path) {
-  FILE *f = fopen(path, "wb");
-  if (!f) return 1;
+  // Write to a temp file, then atomically rename over `path`, so a failed or
+  // interrupted save never truncates an existing good tokenizer file.
+  char *tmp = (char*)malloc(strlen(path) + 5);
+  if (!tmp) return 1;
+  sprintf(tmp, "%s.tmp", path);
+
+  FILE *f = fopen(tmp, "wb");
+  if (!f) { free(tmp); return 1; }
   const char magic[4] = {'B', 'P', 'E', '1'};
   int ok = 1;
   ok &= (fwrite(magic, 1, 4, f) == 4);
   ok &= (fwrite(&t->n_merges, sizeof(int), 1, f) == 1);
   ok &= (fwrite(t->merge_a, sizeof(int), t->n_merges, f) == (size_t)t->n_merges);
   ok &= (fwrite(t->merge_b, sizeof(int), t->n_merges, f) == (size_t)t->n_merges);
-  fclose(f);
+  ok &= (fflush(f) == 0);
+  ok &= (fclose(f) == 0);
+
+  if (ok) ok = (replace_file(tmp, path) == 0);
+  if (!ok) remove(tmp);
+  free(tmp);
   return ok ? 0 : 1;
 }
 

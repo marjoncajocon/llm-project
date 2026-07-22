@@ -99,8 +99,12 @@ void gpt_backward(GPT *m, const int *token_ids, int seq_len,
 void gpt_backward_multimodal(GPT *m, const int *token_ids, int n_img, int seq_len,
                              GPTActs *a, Tensor *logits, Tensor *img_emb);
 
+// Number of learnable parameter tensors (== 2 + 16*n_layers + 3). Use this to
+// size the buffer passed to gpt_collect_params instead of a fixed array.
+int gpt_param_count(const GPT *m);
+
 // Fill list[] with pointers to all learnable parameter tensors, in canonical
-// order. Returns the count (== 2 + 16*n_layers + 3). list must have room for that.
+// order. Returns the count (== gpt_param_count(m)). list must have room for that.
 int gpt_collect_params(GPT *m, Tensor **list);
 
 // Zero the gradient of every parameter.

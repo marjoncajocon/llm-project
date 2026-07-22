@@ -198,15 +198,17 @@ int run_selftest(void) {
   int rt_ok = (strcmp(sample, decoded) == 0);
   int comp_ok = (n_tids < (int)strlen(sample));
 
-  int save_load_ok = (tokenizer_save(&tok, "tok.bin") == 0);
+  // Use throwaway names (NOT the train defaults tok.bin/model.bin) so running
+  // the self-test can never overwrite or delete a user's trained model.
+  int save_load_ok = (tokenizer_save(&tok, "selftest_tok.tmp") == 0);
   Tokenizer tok2;
-  save_load_ok = save_load_ok && (tokenizer_load(&tok2, "tok.bin") == 0);
+  save_load_ok = save_load_ok && (tokenizer_load(&tok2, "selftest_tok.tmp") == 0);
   if (save_load_ok) {
     int n2 = tokenizer_encode(&tok2, sample, tids2, 256);
     save_load_ok = (n2 == n_tids) && (memcmp(tids, tids2, n_tids * sizeof(int)) == 0);
     tokenizer_free(&tok2);
   }
-  remove("tok.bin");
+  remove("selftest_tok.tmp");
   int tok_ok = rt_ok && comp_ok && save_load_ok;
   printf("    tokenizer: train %d bytes -> %d tokens | round-trip %s | save/load %s\n",
          (int)strlen(sample), n_tids, rt_ok ? "OK" : "FAIL",
@@ -219,15 +221,15 @@ int run_selftest(void) {
   int plshape[2] = {3, 16};
   Tensor pla = tensor_create(plshape, 2), plb = tensor_create(plshape, 2);
   gpt_forward(&probe, pseq, 3, &pla);
-  int ckpt_ok = (gpt_save("model.bin", &probe) == 0);
+  int ckpt_ok = (gpt_save("selftest_model.tmp", &probe) == 0);
   GPT probe2;
-  ckpt_ok = ckpt_ok && (gpt_load("model.bin", &probe2) == 0);
+  ckpt_ok = ckpt_ok && (gpt_load("selftest_model.tmp", &probe2) == 0);
   if (ckpt_ok) {
     gpt_forward(&probe2, pseq, 3, &plb);
     ckpt_ok = (memcmp(pla.data, plb.data, pla.size * sizeof(float)) == 0);
     gpt_free(&probe2);
   }
-  tensor_free(&pla); tensor_free(&plb); gpt_free(&probe); remove("model.bin");
+  tensor_free(&pla); tensor_free(&plb); gpt_free(&probe); remove("selftest_model.tmp");
   printf("    checkpoint: save/load logits identical -> %s\n\n",
          ckpt_ok ? "OK" : "FAIL");
   all_ok &= ckpt_ok;

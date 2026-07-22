@@ -183,9 +183,23 @@ static int llama_collect(const LlamaModel *m, const Tensor **list) {
   return n;
 }
 
+// Atomically replace dst with tmp: rename is atomic on POSIX; on Windows rename
+// fails if dst exists, so fall back to remove+rename. Returns 0 on success.
+static int replace_file(const char *tmp, const char *dst) {
+  if (rename(tmp, dst) == 0) return 0;
+  remove(dst);
+  return rename(tmp, dst);
+}
+
 int llama_model_save(const char *path, const LlamaModel *m) {
-  FILE *f = fopen(path, "wb");
-  if (!f) { fprintf(stderr, "Error: cannot open '%s' for writing\n", path); return 1; }
+  // Write to a temp file, then atomically rename over `path`, so a failed or
+  // interrupted save never truncates an existing good checkpoint.
+  char *tmp = (char*)malloc(strlen(path) + 5);
+  if (!tmp) { fprintf(stderr, "Error: out of memory saving '%s'\n", path); return 1; }
+  sprintf(tmp, "%s.tmp", path);
+
+  FILE *f = fopen(tmp, "wb");
+  if (!f) { fprintf(stderr, "Error: cannot open '%s' for writing\n", tmp); free(tmp); return 1; }
 
   uint32_t header[2] = {LLMA_MAGIC, LLMA_VERSION};
   int32_t cfg[8] = {m->vocab, m->d_model, m->n_layers, m->n_heads,
@@ -204,8 +218,17 @@ int llama_model_save(const char *path, const LlamaModel *m) {
     ok &= (fwrite(list[i]->data, sizeof(float), sz, f) == sz);
   }
   free(list);
-  fclose(f);
-  if (!ok) { fprintf(stderr, "Error: failed while writing '%s'\n", path); return 1; }
+  ok &= (fflush(f) == 0);
+  ok &= (fclose(f) == 0);          // catch deferred write errors (e.g. disk full)
+
+  if (ok) ok = (replace_file(tmp, path) == 0);
+  if (!ok) {
+    remove(tmp);
+    fprintf(stderr, "Error: failed while writing '%s'\n", path);
+    free(tmp);
+    return 1;
+  }
+  free(tmp);
   return 0;
 }
 

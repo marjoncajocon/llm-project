@@ -115,7 +115,7 @@ static int train_sft(char *text, const TrainConfig *cfg) {
   GPTActs acts = gpt_acts_create(&model, maxL);
   int lshape[2] = {maxL, model.vocab_size};   // model vocab (= tok vocab + EOS)
   Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
-  Tensor *params[1024];
+  Tensor **params = (Tensor**)malloc(gpt_param_count(&model) * sizeof(Tensor*));
   int n_params = gpt_collect_params(&model, params);
   Adam opt = adam_create(params, n_params, cfg->lr);
 
@@ -140,6 +140,7 @@ static int train_sft(char *text, const TrainConfig *cfg) {
 
   for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); free(seq[e]); free(tgt[e]); }
   free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
+  free(params);
   adam_free(&opt); tensor_free(&logits); tensor_free(&probs);
   gpt_acts_free(&acts); gpt_free(&model); tokenizer_free(&tok);
   return rc;
@@ -234,7 +235,7 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
   int lshape[2] = {ctx, tok.vocab_size};
   Tensor logits = tensor_create(lshape, 2);
   Tensor probs = tensor_create(lshape, 2);
-  Tensor *params[1024];
+  Tensor **params = (Tensor**)malloc(gpt_param_count(&model) * sizeof(Tensor*));
   int n_params = gpt_collect_params(&model, params);
   Adam opt = adam_create(params, n_params, cfg->lr);
 
@@ -264,11 +265,13 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
       }
     }
 
-    // Periodic checkpoint so long runs are safe / resumable.
+    // Periodic checkpoint so long runs are safe / resumable. Saves are atomic
+    // (temp + rename), so a failed/interrupted save keeps the previous good one.
     if (cfg->checkpoint_every > 0 && s > 0 && s % cfg->checkpoint_every == 0) {
-      gpt_save(cfg->out_model, &model);
-      tokenizer_save(&tok, cfg->out_tok);
-      printf("  [checkpoint] saved at step %d -> %s\n", s, cfg->out_model);
+      int cok = (gpt_save(cfg->out_model, &model) == 0);
+      cok = (tokenizer_save(&tok, cfg->out_tok) == 0) && cok;
+      if (cok) printf("  [checkpoint] saved at step %d -> %s\n", s, cfg->out_model);
+      else fprintf(stderr, "  [checkpoint] FAILED at step %d (previous checkpoint kept)\n", s);
     }
   }
 
@@ -279,6 +282,7 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
   if (rc == 0) printf("saved model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
 
   free(inp); free(tgt); free(toks);
+  free(params);
   adam_free(&opt);
   tensor_free(&logits); tensor_free(&probs);
   gpt_acts_free(&acts);

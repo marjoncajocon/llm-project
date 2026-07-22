@@ -615,5 +615,14 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "train") == 0) return run_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "imggen") == 0) return run_imggen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "audgen") == 0) return run_audgen(argc, argv);
+  // Bare `transformer` (no args) runs the built-in self-test. An UNRECOGNIZED
+  // subcommand must NOT fall through to it (a typo like `trian` would otherwise
+  // silently run the demo) — print usage and fail instead.
+  if (argc > 1) {
+    fprintf(stderr, "unknown command '%s'\n", argv[1]);
+    fprintf(stderr, "usage: transformer [train|generate|agent|imggen|audgen|llama] ...\n");
+    fprintf(stderr, "       transformer            (no args: run the built-in self-test)\n");
+    return 1;
+  }
   return run_selftest();
 }

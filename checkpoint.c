@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <limits.h>
 
 #define CKPT_MAGIC   0x43545047u  // 'GPTC' (little-endian bytes G,P,T,C)
@@ -50,10 +51,25 @@ static const Tensor **alloc_tensor_list(const GPT *m) {
   return (const Tensor**)malloc(max * sizeof(const Tensor*));
 }
 
+// Atomically replace dst with tmp: rename is atomic on POSIX; on Windows rename
+// fails if dst exists, so fall back to remove+rename. Returns 0 on success.
+static int replace_file(const char *tmp, const char *dst) {
+  if (rename(tmp, dst) == 0) return 0;
+  remove(dst);
+  return rename(tmp, dst);
+}
+
 int gpt_save(const char *path, const GPT *m) {
-  FILE *f = fopen(path, "wb");
+  // Write to a temp file, then atomically rename over `path`, so a failed or
+  // interrupted save never truncates an existing good checkpoint.
+  char *tmp = (char*)malloc(strlen(path) + 5);
+  if (!tmp) { fprintf(stderr, "Error: out of memory saving '%s'\n", path); return 1; }
+  sprintf(tmp, "%s.tmp", path);
+
+  FILE *f = fopen(tmp, "wb");
   if (!f) {
-    fprintf(stderr, "Error: cannot open '%s' for writing\n", path);
+    fprintf(stderr, "Error: cannot open '%s' for writing\n", tmp);
+    free(tmp);
     return 1;
   }
 
@@ -73,12 +89,17 @@ int gpt_save(const char *path, const GPT *m) {
     ok &= (fwrite(list[i]->data, sizeof(float), size, f) == size);
   }
   free(list);
-  fclose(f);
+  ok &= (fflush(f) == 0);
+  ok &= (fclose(f) == 0);          // catch deferred write errors (e.g. disk full)
 
+  if (ok) ok = (replace_file(tmp, path) == 0);
   if (!ok) {
+    remove(tmp);
     fprintf(stderr, "Error: failed while writing '%s'\n", path);
+    free(tmp);
     return 1;
   }
+  free(tmp);
   return 0;
 }
 
