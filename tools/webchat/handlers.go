@@ -3,12 +3,89 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// handleChat streams a reply for the client-built conversation prompt (text).
+// Routes by model type: pure-C text models have their own tokenizer and are fast
+// (one delta, no streaming); gpt2 / llama stream token deltas live via the Python
+// wrappers (tiktoken / tokenizers do the incremental detokenization).
+func handleChat(c *wsConn, msg map[string]any) {
+	name, _ := msg["model"].(string)
+	text, _ := msg["text"].(string)
+	n := intField(msg, "n", 128)
+	if strings.TrimSpace(text) == "" {
+		sendJSON(c, errMsg(fmt.Errorf("empty prompt")))
+		return
+	}
+	m := findModel(cfg.root, name)
+	if m == nil {
+		sendJSON(c, errMsg(fmt.Errorf("unknown model: %s", name)))
+		return
+	}
+
+	switch m.Mode {
+	case "purec-text":
+		reply, _, err := runChat(*m, text, n)
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		if reply = trimAtStop(reply); reply != "" {
+			sendJSON(c, map[string]any{"op": "chat_delta", "text": reply})
+		}
+	case "gpt2":
+		if err := runCmdStream(cfg.python,
+			[]string{"tools/gpt2_stream.py", "--name", m.Name}, text,
+			func(line string) { forwardDelta(c, line) }); err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+	case "llama":
+		args := []string{"tools/llama_stream.py", "--ckpt", m.Ckpt, "--n", strconv.Itoa(n)}
+		if m.HFRepo != "" {
+			args = append(args, "--model", m.HFRepo)
+		}
+		if err := runCmdStream(cfg.python, args, text,
+			func(line string) { forwardDelta(c, line) }); err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+	default:
+		sendJSON(c, errMsg(fmt.Errorf("unsupported model mode %q", m.Mode)))
+		return
+	}
+	sendJSON(c, map[string]any{"op": "chat_done", "model": name})
+}
+
+// forwardDelta parses a wrapper JSON line ({"d":"piece"}) and forwards the text.
+func forwardDelta(c *wsConn, line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(line), &m) != nil {
+		return
+	}
+	if d, ok := m["d"].(string); ok && d != "" {
+		sendJSON(c, map[string]any{"op": "chat_delta", "text": d})
+	}
+}
+
+// trimAtStop cuts a reply at the first hallucinated next turn (the pure-C path
+// generates a fixed token count with no stop sequence).
+func trimAtStop(s string) string {
+	if i := strings.Index(s, "\nUser"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimRight(s, "\n ")
+}
 
 // imggen: browser image -> P6 PPM (resized) -> engine reconstruct -> PNG back.
 func handleImggen(c *wsConn, msg map[string]any) {

@@ -78,6 +78,7 @@
       <label for="ntok">max new</label>
       <input id="ntok" type="number" value="128" min="1" max="512" style="width:72px">
       <span id="modelnote" class="pill"></span>
+      <button id="clear" class="ghost" style="margin-left:auto">Clear</button>
     </div>
     <div class="log" id="log-text"></div>
     <div class="composer">
@@ -156,9 +157,10 @@ function send(obj) { ws && ws.readyState === 1 && ws.send(JSON.stringify(obj)); 
 function handle(m) {
   switch (m.op) {
     case "models": models = m.items || []; fillModels(); break;
-    case "chat_result": addMsg("text", "bot", m.text || "(empty)", m.model); busy(false); break;
+    case "chat_delta": appendBot(m.text); break;
+    case "chat_done": finishBot(); busy(false); break;
     case "status": addMsg(activeView(), "status", m.text); break;
-    case "error": addMsg(activeView(), "err", "⚠ " + m.text); mediaBusy(false); busy(false); break;
+    case "error": addMsg(activeView(), "err", "⚠ " + m.text); finishBot(); mediaBusy(false); busy(false); break;
     case "image_result": showImage(m); mediaBusy(false); break;
     case "audio_result": showAudio(m); mediaBusy(false); break;
     case "caption_result": showCaption(m); mediaBusy(false); break;
@@ -196,6 +198,30 @@ function addMsg(view, kind, text, who) {
 
 let sending = false;
 function busy(b) { sending = b; $("#send").disabled = b; $("#send").textContent = b ? "…" : "Send"; }
+
+// ---- conversation memory + live streaming ----
+const history = [];          // [{role:"user"|"assistant", text}]
+let liveBot = null, liveText = "";
+
+function buildPrompt(newText) {
+  let p = "";
+  for (const t of history) p += (t.role === "user" ? "User: " : "Assistant: ") + t.text + "\n";
+  return p + "User: " + newText + "\nAssistant:";
+}
+function appendBot(piece) {
+  if (!liveBot) return;
+  liveText += piece;
+  liveBot._body.textContent = liveText;
+  const log = $("#log-text"); log.scrollTop = log.scrollHeight;
+}
+function finishBot() {
+  if (!liveBot) return;
+  const t = liveText.trim();
+  if (t === "") liveBot._body.textContent = "(no output)";
+  else liveBot._body.textContent = t;
+  history.push({role:"assistant", text: t});
+  liveBot = null; liveText = "";
+}
 function sendPrompt() {
   if (sending) return;
   const text = $("#prompt").value.trim();
@@ -205,11 +231,25 @@ function sendPrompt() {
   addMsg("text", "user", text, "you");
   $("#prompt").value = "";
   busy(true);
-  send({op:"chat", model:m.name, text, n: parseInt($("#ntok").value) || 40});
+  const prompt = buildPrompt(text);
+  history.push({role:"user", text});
+  // open a live assistant bubble that fills in token-by-token
+  liveText = "";
+  liveBot = document.createElement("div");
+  liveBot.className = "msg bot";
+  liveBot.innerHTML = `<div class="who">${m.name}</div>`;
+  liveBot._body = document.createTextNode("");
+  liveBot.appendChild(liveBot._body);
+  const log = $("#log-text"); log.appendChild(liveBot); log.scrollTop = log.scrollHeight;
+  send({op:"chat", model:m.name, text:prompt, n: parseInt($("#ntok").value) || 128});
 }
 $("#send").addEventListener("click", sendPrompt);
 $("#prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+});
+$("#clear").addEventListener("click", () => {
+  history.length = 0; liveBot = null; liveText = "";
+  $("#log-text").innerHTML = "";
 });
 
 // ---- media (image / audio) ----

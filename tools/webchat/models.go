@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -192,6 +193,50 @@ func runCmd(bin string, args []string, stdin string) (string, string, error) {
 // cleanText normalizes Windows CRLF to LF and trims trailing blank lines.
 func cleanText(s string) string {
 	return strings.TrimRight(strings.ReplaceAll(s, "\r\n", "\n"), "\n ")
+}
+
+// runCmdStream runs a subprocess, feeds it stdin, and calls onLine for each
+// stdout line as it arrives — used for live token streaming (the child flushes
+// per token). Returns when the process exits.
+func runCmdStream(bin string, args []string, stdin string, onLine func(string)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = cfg.root
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	inPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	outPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() {
+		io.WriteString(inPipe, stdin)
+		inPipe.Close()
+	}()
+	sc := bufio.NewScanner(outPipe)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // allow long delta lines
+	for sc.Scan() {
+		onLine(sc.Text())
+	}
+	if err := cmd.Wait(); err != nil {
+		if s := strings.TrimSpace(errBuf.String()); s != "" {
+			return fmt.Errorf("%v: %s", err, lastLine(s))
+		}
+		return err
+	}
+	return nil
+}
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	return lines[len(lines)-1]
 }
 
 func firstNonEmptyLine(s string) string {

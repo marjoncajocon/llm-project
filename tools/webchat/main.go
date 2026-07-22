@@ -152,33 +152,6 @@ func handleMessage(c *wsConn, msg map[string]any) {
 	}
 }
 
-func handleChat(c *wsConn, msg map[string]any) {
-	name, _ := msg["model"].(string)
-	text, _ := msg["text"].(string)
-	n := 40
-	if f, ok := msg["n"].(float64); ok && f > 0 {
-		n = int(f)
-	}
-	if text == "" {
-		sendJSON(c, map[string]any{"op": "error", "text": "empty prompt"})
-		return
-	}
-	m := findModel(cfg.root, name)
-	if m == nil {
-		sendJSON(c, map[string]any{"op": "error", "text": "unknown model: " + name})
-		return
-	}
-	reply, status, err := runChat(*m, text, n)
-	if status != "" {
-		sendJSON(c, map[string]any{"op": "status", "text": status})
-	}
-	if err != nil {
-		sendJSON(c, map[string]any{"op": "error", "text": err.Error()})
-		return
-	}
-	sendJSON(c, map[string]any{"op": "chat_result", "text": reply, "model": name})
-}
-
 func sendJSON(c *wsConn, v any) {
 	b, err := json.Marshal(v)
 	if err != nil {

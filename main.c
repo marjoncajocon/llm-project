@@ -141,6 +141,7 @@ static int run_generate(int argc, char **argv) {
       // Stop cleanly and drop it (nothing to decode). Non-EOS models never hit this.
       if (text_mode && next >= tok.vocab_size) break;
       gen[ng++] = next;
+      if (!text_mode) { printf("t %d\n", next); fflush(stdout); }  // stream ids (gpt2)
       gpt_decode_step(&model, &kv, next, &logits);
     }
 
@@ -578,6 +579,7 @@ static int run_llama(int argc, char **argv) {
       for (int s = 0; s < n_new && n < m.max_seq; s++) {
         int nxt = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
         seq[n++] = nxt;
+        printf("t %d\n", nxt); fflush(stdout);   // stream each token as generated
         q_llama_decode_step(&m, &kv, nxt, &logits);
       }
       llama_print_gen(seq, n);
@@ -600,6 +602,7 @@ static int run_llama(int argc, char **argv) {
       for (int s = 0; s < n_new && n < m.max_seq; s++) {
         int nxt = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
         seq[n++] = nxt;
+        printf("t %d\n", nxt); fflush(stdout);   // stream each token as generated
         llama_decode_step(&m, &kv, nxt, &logits);
       }
       llama_print_gen(seq, n);
