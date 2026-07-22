@@ -331,11 +331,25 @@ finite logits + argmax -- proving the Python<->C byte format (magic, config orde
 order/layout, LE float32) matches end-to-end. Smoke test PASSED; wasm32-wasi + linux-musl still
 cross-compile with the new `llama` subcommand.
 
-Next: a **tokenizer bridge** (SmolLM/Qwen BPE, like `gpt2_tok.py`) + a **text generate path** for
-LlamaModel (a KV cache would help speed), then download SmolLM2-135M, convert, and generate real
-modern text. Also pending: SIMD/int8 quant. The *real-model* correctness (name-map/transpose ->
-coherent text) is only fully proven once we generate. Block/model still forward-only (add backward for
-fine-tuning).
+## Modern architecture — step 9: tokenizer bridge + generate path — DONE (2026-07-22)
+
+`main.c` `llama` subcommand now **generates**: reads a prompt (token IDs), autoregressively samples
+`n_new` tokens (`sample_token`, temp 0.8/top-k 40/top-p 0.95, seeded), prints `gen: <all ids>`.
+Re-runs the full forward per step (NO KV cache yet → slow on big models; KV cache is the perf
+follow-up). `tools/llama_tok.py` (encode/decode via the model's `tokenizer.json` using the `tokenizers`
+lib) + `tools/llama_chat.py` (one command: tokenize → `transformer llama` → detokenize, like
+`gpt2_chat.py`).
+
+Verified (tiny, no download): `convert_llama.py --tiny t.bin` → `echo "5 9 2" | transformer llama
+t.bin 12` → `gen: 5 9 2 20 15 5 20 31 16 25 1 27 30 7 14` (all ids in range) — the generate loop +
+sampling integrate correctly. Smoke test PASSED. Tools `py_compile` clean. Deps present:
+huggingface_hub 1.8.0, safetensors 0.7.0; `tokenizers` NOT yet installed (needed for the real run).
+
+**Everything for running a real modern model is now built** (arch + block + model + LLMA checkpoint +
+converter + tokenizer bridge + generate CLI). The remaining gate is *operational*: `pip install
+tokenizers`, download SmolLM2-135M (~270MB), convert (→ ~540MB fp32 LLMA), and generate — slow in
+unoptimized CPU C (full re-forward per token). Perf follow-ups: **KV cache** for LlamaModel + SIMD/int8
+quant. Correctness of the real name-map/transpose is only fully proven once we generate coherent text.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

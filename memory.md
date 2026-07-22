@@ -166,9 +166,13 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    is HF half-split, so HF q/k load directly; transposes linear weights (HF (out,in)→our (in,out)),
    tied lm_head=wte^T, warns on Qwen2 attn biases (unsupported); `--tiny` no-download test file.
    `main.c` `llama <ckpt>` subcommand: token-ids→next-token argmax. Verified Python-write→C-load→forward
-   with --tiny, cross-compiles). Remaining to run a REAL model: a **tokenizer bridge** (SmolLM/Qwen BPE)
-   + a **text generate path** for LlamaModel, then download+convert+generate SmolLM2-135M. Also SIMD/int8
-   quant. Real-model correctness only fully proven once we generate.
+   with --tiny, cross-compiles). ✅ **tokenizer bridge + generate path**
+   (`main.c` `llama <ckpt> [n_new]` now autoregressively samples & prints `gen: <ids>`, no KV cache yet;
+   `tools/llama_tok.py` encode/decode via `tokenizer.json`; `tools/llama_chat.py` one-command
+   tokenize→generate→detokenize. Verified tiny: `echo "5 9 2" | transformer llama t.bin 12` → in-range
+   ids). **The entire modern-model pipeline is now built.** Remaining is OPERATIONAL: `pip install
+   tokenizers`, download SmolLM2-135M, convert, generate (slow — full re-forward per token). Perf:
+   **KV cache for LlamaModel** + SIMD/int8 quant. Real-model coherence only proven once we generate.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

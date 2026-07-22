@@ -79,6 +79,21 @@ python tools/convert_llama.py --tiny t.bin                        # small format
 
 Requires Python 3 + NumPy + safetensors + huggingface_hub, and internet for the download.
 
+### `llama_tok.py` / `llama_chat.py` — tokenizer bridge + one-command text generation
+
+`llama_tok.py` encodes/decodes with the model's own `tokenizer.json` (the fast `tokenizers` BPE).
+`llama_chat.py` ties it together like `gpt2_chat.py`: tokenize → `transformer llama <ckpt>`
+(token-in/token-out) → detokenize.
+
+```sh
+pip install tokenizers huggingface_hub
+python tools/llama_chat.py --model HuggingFaceTB/SmolLM2-135M --ckpt model/smollm/model.bin \
+    "The capital of France is" --n 40
+```
+
+Heads-up: the C model re-runs the full forward per token (no KV cache yet), so a 135M model is
+slow on CPU — fine for a short demo, not long generations.
+
 ### `agent_mock.py` / `agent_llm.py` — model backends for the agent loop
 
 The C agent (`agent --cmd "<prog>"`) writes the running transcript to a temp file, passes its

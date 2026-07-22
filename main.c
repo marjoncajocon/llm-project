@@ -510,23 +510,32 @@ static int run_audgen(int argc, char **argv) {
 
 // ============================================================================
 // `llama` subcommand: load an LLMA checkpoint (modern LlamaModel — see
-// tools/convert_llama.py) and run a forward pass over space-separated token IDs
-// from stdin, printing the next-token argmax per line. Token-in/token-out (a
-// tokenizer bridge + text generation come next). Verifies the converter output.
+// tools/convert_llama.py) and autoregressively GENERATE tokens. Reads a prompt
+// as space-separated token IDs per stdin line, samples `n_new` continuation
+// tokens (temp/top-k/top-p), and prints `gen: <all ids>`. Token-in/token-out;
+// tools/llama_tok.py + llama_chat.py bridge text<->tokens.
+//   transformer llama <checkpoint.bin> [n_new=40]
+// Note: re-runs the full forward per step (no KV cache yet) — slow on big models.
 // ============================================================================
 static int run_llama(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: transformer llama <checkpoint.bin>\n"
-                    "  reads space-separated token IDs per stdin line; prints next-token argmax\n");
+    fprintf(stderr, "usage: transformer llama <checkpoint.bin> [n_new=40]\n"
+                    "  reads space-separated token IDs per stdin line; prints 'gen: <ids>'\n");
     return 2;
   }
+  const int n_new = (argc > 3) ? atoi(argv[3]) : 40;
   LlamaModel m;
   if (llama_model_load(argv[2], &m) != 0) return 1;
   fprintf(stderr, "loaded LLMA: vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
           m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
 
+  const float temperature = 0.8f;
+  const int top_k = 40;
+  const float top_p = 0.95f;
+  Rng rng = rng_create(1234);
+
   char line[8192];
-  int *ids = (int*)malloc(m.max_seq * sizeof(int));
+  int *seq = (int*)malloc(m.max_seq * sizeof(int));
   while (fgets(line, sizeof(line), stdin)) {
     char *p = line;
     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
@@ -534,27 +543,25 @@ static int run_llama(int argc, char **argv) {
     for (char *t = strtok(p, " \t\r\n"); t && n < m.max_seq; t = strtok(NULL, " \t\r\n")) {
       int id = atoi(t);
       if (id < 0 || id >= m.vocab) { fprintf(stderr, "skip out-of-range id %d (vocab %d)\n", id, m.vocab); continue; }
-      ids[n++] = id;
+      seq[n++] = id;
     }
     if (n == 0) continue;
 
-    int ls[2] = {n, m.vocab};
-    Tensor logits = tensor_create(ls, 2);
-    llama_model_forward(&m, ids, n, &logits);
-
-    const float *last = &logits.data[(n - 1) * m.vocab];
-    int best = 0, finite = 1;
-    float bv = last[0];
-    for (int j = 0; j < m.vocab; j++) {
-      float v = last[j];
-      if (!isfinite(v)) finite = 0;
-      if (v > bv) { bv = v; best = j; }
+    for (int s = 0; s < n_new && n < m.max_seq; s++) {
+      int ls[2] = {n, m.vocab};
+      Tensor logits = tensor_create(ls, 2);
+      llama_model_forward(&m, seq, n, &logits);
+      int nxt = sample_token(&logits, n - 1, temperature, top_k, top_p, &rng);
+      tensor_free(&logits);
+      seq[n++] = nxt;
     }
-    printf("llama: %d tokens -> next argmax = %d (logit %.4f) finite=%d\n", n, best, bv, finite);
+
+    printf("gen:");
+    for (int i = 0; i < n; i++) printf(" %d", seq[i]);
+    printf("\n");
     fflush(stdout);
-    tensor_free(&logits);
   }
-  free(ids);
+  free(seq);
   llama_model_free(&m);
   return 0;
 }
