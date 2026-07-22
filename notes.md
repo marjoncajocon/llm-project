@@ -345,11 +345,31 @@ t.bin 12` → `gen: 5 9 2 20 15 5 20 31 16 25 1 27 30 7 14` (all ids in range) �
 sampling integrate correctly. Smoke test PASSED. Tools `py_compile` clean. Deps present:
 huggingface_hub 1.8.0, safetensors 0.7.0; `tokenizers` NOT yet installed (needed for the real run).
 
-**Everything for running a real modern model is now built** (arch + block + model + LLMA checkpoint +
-converter + tokenizer bridge + generate CLI). The remaining gate is *operational*: `pip install
-tokenizers`, download SmolLM2-135M (~270MB), convert (→ ~540MB fp32 LLMA), and generate — slow in
-unoptimized CPU C (full re-forward per token). Perf follow-ups: **KV cache** for LlamaModel + SIMD/int8
-quant. Correctness of the real name-map/transpose is only fully proven once we generate coherent text.
+## 🎉 REAL MODERN MODEL RUNS — SmolLM2-135M generates coherent text (2026-07-22)
+
+**End-to-end SUCCESS.** Downloaded + converted **HuggingFaceTB/SmolLM2-135M** and generated fluent
+English through the pure-C `LlamaModel`:
+- `python tools/convert_llama.py --model HuggingFaceTB/SmolLM2-135M --out model/smollm/model.bin`
+  → 621 MB LLMA (vocab 49152, d_model 576, 30 layers, 9 q / 3 kv heads, head_dim 64, d_ff 1536,
+  **rope_base 100000** — SmolLM2's non-default rope_theta, correctly read from config.json — tied).
+- `python tools/llama_chat.py --model HuggingFaceTB/SmolLM2-135M --ckpt model/smollm/model.bin
+  "The capital of France is" --n 16` →
+  **"The capital of France is the capital of the department of Loir-et-Cher. It is"** — coherent,
+  grammatical (Loir-et-Cher is a real French département; the model is tiny so it's not factually
+  perfect, but the ENGLISH is fluent → the weight mapping/RoPE/GQA/SwiGLU/RMSNorm/tokenizer are all
+  CORRECT; wrong mapping would give gibberish tokens, not prose).
+
+**bf16 fix (required):** SmolLM2 weights ship in bfloat16, which `safetensors.numpy` can't load
+(numpy has no bf16). Added a manual safetensors reader in `convert_llama.py` (`load_safetensors_f32`):
+parse the u64-length JSON header + raw blob, convert BF16→F32 by widening u16→u32 and shifting up 16
+bits (bf16 = high half of f32); also handles F16/F32. No torch needed. Deps used: huggingface_hub,
+safetensors (header only), numpy, tokenizers. `model/smollm/*.bin` git-ignored.
+
+The from-scratch pure-C engine now loads and runs a real modern (LLaMA-family) LLM. 🏁
+
+Perf follow-ups (to make it usable, not just correct): **KV cache** for LlamaModel (currently a full
+re-forward per token — slow: ~seconds/token on 135M CPU) + SIMD/int8 quant. Block/model still
+forward-only (add backward for fine-tuning). Bigger models (Qwen2.5-0.5B) need attention-bias support.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

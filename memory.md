@@ -170,9 +170,15 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    (`main.c` `llama <ckpt> [n_new]` now autoregressively samples & prints `gen: <ids>`, no KV cache yet;
    `tools/llama_tok.py` encode/decode via `tokenizer.json`; `tools/llama_chat.py` one-command
    tokenize→generate→detokenize. Verified tiny: `echo "5 9 2" | transformer llama t.bin 12` → in-range
-   ids). **The entire modern-model pipeline is now built.** Remaining is OPERATIONAL: `pip install
-   tokenizers`, download SmolLM2-135M, convert, generate (slow — full re-forward per token). Perf:
-   **KV cache for LlamaModel** + SIMD/int8 quant. Real-model coherence only proven once we generate.
+   ids). 🎉 **REAL MODERN MODEL RUNS (2026-07-22):** converted **SmolLM2-135M** (`convert_llama.py`, 621 MB
+   LLMA; needed a manual bf16→f32 safetensors reader `load_safetensors_f32` since safetensors.numpy
+   can't load bf16; rope_base 100000 read from config) and generated fluent English through the pure-C
+   engine: "The capital of France is" → "…the capital of the department of Loir-et-Cher. It is"
+   (coherent grammar = weight map/RoPE/GQA/SwiGLU/RMSNorm/tokenizer all CORRECT). `model/smollm/*.bin`
+   git-ignored; deps: tokenizers 0.22.2, huggingface_hub 1.8.0, safetensors 0.7.0. **The from-scratch
+   pure-C engine loads & runs a real LLaMA-family LLM.** Perf follow-ups to make it usable: **KV cache
+   for LlamaModel** (full re-forward per token now — slow) + SIMD/int8 quant. Qwen2.5 needs attn-bias
+   support. Block/model forward-only (add backward to fine-tune).
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

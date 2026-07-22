@@ -34,6 +34,36 @@ def f32(a):
     return np.ascontiguousarray(a, dtype="<f4")
 
 
+# Read a safetensors file to a {name: float32 ndarray} dict WITHOUT torch, and
+# handling bfloat16 (which safetensors.numpy can't load — numpy has no bf16).
+# Format: u64 header length, then that many bytes of JSON {name: {dtype, shape,
+# data_offsets:[a,b]}}, then the raw tensor bytes.
+def load_safetensors_f32(path):
+    with open(path, "rb") as fh:
+        n = int.from_bytes(fh.read(8), "little")
+        header = json.loads(fh.read(n).decode("utf-8"))
+        blob = fh.read()
+    out = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        dt = meta["dtype"]
+        a, b = meta["data_offsets"]
+        raw = blob[a:b]
+        if dt == "F32":
+            arr = np.frombuffer(raw, dtype="<f4")
+        elif dt == "F16":
+            arr = np.frombuffer(raw, dtype="<f2").astype(np.float32)
+        elif dt == "BF16":
+            # bf16 = high 16 bits of f32: widen to u32, shift up, reinterpret.
+            u = np.frombuffer(raw, dtype="<u2").astype(np.uint32)
+            arr = (u << 16).view(np.float32)
+        else:
+            raise ValueError(f"unsupported dtype {dt} for tensor {name}")
+        out[name] = arr.reshape(meta["shape"])
+    return out
+
+
 # Write the LLMA file. `ints` = 8 config ints in C order (vocab, d_model,
 # n_layers, n_heads, n_kv, head_dim, d_ff, max_seq); `floats` = (rope_base, eps);
 # `tensors` = arrays in the canonical order llama_collect() expects.
@@ -57,7 +87,6 @@ def build_order(wte, layers, final_norm, lm_head):
 
 def convert_hf(model, out):
     from huggingface_hub import hf_hub_download
-    from safetensors.numpy import load_file
 
     cfg = json.load(open(hf_hub_download(model, "config.json")))
     vocab = cfg["vocab_size"]
@@ -75,7 +104,7 @@ def convert_hf(model, out):
         sys.exit(f"n_heads {n_heads} not divisible by n_kv {n_kv}")
 
     print(f"downloading {model}/model.safetensors ...")
-    st = load_file(hf_hub_download(model, "model.safetensors"))
+    st = load_safetensors_f32(hf_hub_download(model, "model.safetensors"))
 
     def g(name):
         return f32(st[name])
