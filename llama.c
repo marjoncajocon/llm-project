@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 #include "matrix.h"
 #include "rmsnorm.h"
@@ -301,6 +302,29 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
   tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
 }
 
+// Validate the 8 config ints of an LLMA/LLMQ header before building a model.
+// cfg = {vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq}.
+// Guards against corrupt/hostile checkpoints (the primary input path of this
+// tool): non-positive/huge dims, n_kv=0 (division by zero in decode), GQA groups
+// that don't divide evenly (out-of-bounds K/V reads), and 2D weight element
+// counts that overflow the int Tensor.size. Returns 1 if sane, 0 otherwise.
+static int llama_config_valid(const int32_t *cfg) {
+  const int32_t MAXD = 1000000;
+  for (int i = 0; i < 8; i++)
+    if (cfg[i] <= 0 || cfg[i] > MAXD) return 0;
+  int vocab = cfg[0], d_model = cfg[1], n_heads = cfg[3];
+  int n_kv = cfg[4], head_dim = cfg[5], d_ff = cfg[6];
+  if (n_heads % n_kv != 0) return 0;                    // GQA groups divide evenly
+  long long qd = (long long)n_heads * head_dim;
+  long long kvd = (long long)n_kv * head_dim;
+  if (qd > MAXD || kvd > MAXD) return 0;
+  // Every 2D weight's element count must fit in int (Tensor.size is int).
+  if ((long long)vocab * d_model > (long long)INT_MAX) return 0;   // wte / lm_head
+  if ((long long)d_model * d_ff > (long long)INT_MAX) return 0;    // SwiGLU weights
+  if (qd * d_model > (long long)INT_MAX) return 0;                 // Wq / Wo
+  return 1;
+}
+
 int llama_model_load(const char *path, LlamaModel *out) {
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "Error: cannot open '%s' for reading\n", path); return 1; }
@@ -317,6 +341,10 @@ int llama_model_load(const char *path, LlamaModel *out) {
   const int quant = (header[0] == LLMQ_MAGIC);
   if ((header[0] != LLMA_MAGIC && !quant) || header[1] != LLMA_VERSION) {
     fprintf(stderr, "Error: '%s' is not a v%u LLMA/LLMQ checkpoint\n", path, LLMA_VERSION);
+    fclose(f); return 1;
+  }
+  if (!llama_config_valid(cfg)) {
+    fprintf(stderr, "Error: '%s' has an invalid/unsupported config\n", path);
     fclose(f); return 1;
   }
 
@@ -534,6 +562,10 @@ int q_llama_model_load(const char *path, QLlamaModel *out) {
   }
   if (header[0] != LLMQ_MAGIC || header[1] != LLMA_VERSION) {
     fprintf(stderr, "Error: '%s' is not a v%u int8 LLMQ checkpoint\n", path, LLMA_VERSION);
+    fclose(f); return 1;
+  }
+  if (!llama_config_valid(cfg)) {
+    fprintf(stderr, "Error: '%s' has an invalid/unsupported config\n", path);
     fclose(f); return 1;
   }
 

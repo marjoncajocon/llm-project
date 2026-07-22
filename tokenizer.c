@@ -202,18 +202,36 @@ int tokenizer_load(Tokenizer *t, const char *path) {
     fclose(f);
     return 1;
   }
-  int *a = (int*)malloc(n_merges * sizeof(int));
-  int *b = (int*)malloc(n_merges * sizeof(int));
+  // Reject a corrupt/hostile count before allocating or reading (10M is far above
+  // any real BPE vocab; negatives would make malloc/fread wildly misbehave).
+  if (n_merges < 0 || n_merges > 10000000) {
+    fprintf(stderr, "Error: '%s' has an invalid merge count\n", path);
+    fclose(f);
+    return 1;
+  }
+  int *a = (int*)malloc((size_t)n_merges * sizeof(int) + 1);
+  int *b = (int*)malloc((size_t)n_merges * sizeof(int) + 1);
+  if (!a || !b) { free(a); free(b); fclose(f); return 1; }
   int ok = (fread(a, sizeof(int), n_merges, f) == (size_t)n_merges) &&
            (fread(b, sizeof(int), n_merges, f) == (size_t)n_merges);
   fclose(f);
 
   *t = tokenizer_create_bytelevel();
   if (ok) {
-    for (int i = 0; i < n_merges; i++) tokenizer_add_merge(t, a[i], b[i]);
+    for (int i = 0; i < n_merges; i++) {
+      // Merge rank i may only reference token ids that already exist (0..256+i-1);
+      // an out-of-range id would make tokenizer_add_merge read past its tables.
+      if (a[i] < 0 || a[i] >= 256 + i || b[i] < 0 || b[i] >= 256 + i) {
+        fprintf(stderr, "Error: '%s' has an out-of-range merge at rank %d\n", path, i);
+        ok = 0;
+        break;
+      }
+      tokenizer_add_merge(t, a[i], b[i]);
+    }
   }
   free(a);
   free(b);
+  if (!ok) { tokenizer_free(t); }
   return ok ? 0 : 1;
 }
 

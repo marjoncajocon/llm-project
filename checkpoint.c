@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 
 #define CKPT_MAGIC   0x43545047u  // 'GPTC' (little-endian bytes G,P,T,C)
 #define CKPT_VERSION 2u           // v2 adds attention biases (b_q/b_k/b_v/b_o)
@@ -81,6 +82,28 @@ int gpt_save(const char *path, const GPT *m) {
   return 0;
 }
 
+// A tensor's element count is stored in an int (Tensor.size), so a config whose
+// weights would exceed INT_MAX elements must be rejected before allocation — an
+// overflow there wraps to a small/negative size and corrupts memory downstream.
+static int prod_fits_int(long long a, long long b) {
+  return a > 0 && b > 0 && a <= (long long)INT_MAX / b;
+}
+
+// Validate the 6 config ints of a GPTC header before building a model from them.
+// config = {vocab, d_model, n_heads, n_layers, d_ff, max_seq}. Guards against
+// corrupt/hostile checkpoints (negative/zero/huge dims, non-divisible heads,
+// element counts that overflow int). Returns 1 if sane, 0 otherwise.
+static int gpt_config_valid(const int32_t *c) {
+  const int32_t MAXD = 1000000;
+  for (int i = 0; i < 6; i++)
+    if (c[i] <= 0 || c[i] > MAXD) return 0;
+  int vocab = c[0], d_model = c[1], n_heads = c[2], d_ff = c[4];
+  if (d_model % n_heads != 0) return 0;                 // heads split d_model evenly
+  if (!prod_fits_int(vocab, d_model)) return 0;         // wte / lm_head
+  if (!prod_fits_int(d_model, d_ff)) return 0;          // FFN weights
+  return 1;
+}
+
 int gpt_load(const char *path, GPT *out) {
   FILE *f = fopen(path, "rb");
   if (!f) {
@@ -98,6 +121,11 @@ int gpt_load(const char *path, GPT *out) {
   }
   if (header[0] != CKPT_MAGIC || header[1] != CKPT_VERSION) {
     fprintf(stderr, "Error: '%s' is not a v%u GPTC checkpoint\n", path, CKPT_VERSION);
+    fclose(f);
+    return 1;
+  }
+  if (!gpt_config_valid(config)) {
+    fprintf(stderr, "Error: '%s' has an invalid/unsupported config\n", path);
     fclose(f);
     return 1;
   }
