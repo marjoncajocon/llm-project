@@ -66,8 +66,14 @@ RMSNorm+RoPE+GQA+SwiGLU architecture in `llama.c`).
 pip install numpy safetensors huggingface_hub
 python tools/convert_llama.py --model HuggingFaceTB/SmolLM2-135M --out model/smollm/model.bin
 echo "1 2 3 4 5" | transformer llama model/smollm/model.bin      # token-in -> next-token argmax
+python tools/convert_llama.py --model HuggingFaceTB/SmolLM2-135M --out model/smollm/m8.bin --int8
 python tools/convert_llama.py --tiny t.bin                        # small format-test file (no download)
 ```
+
+- **`--int8`** writes the **LLMQ** format: 2D weights are per-output-channel int8-quantized (scales +
+  int8 bytes), norms stay f32 → **~4× smaller** checkpoint (SmolLM2-135M: 621 MB → 156 MB). The C
+  loader dequantizes on load, so the runtime forward is unchanged (storage/download win). Output stays
+  coherent (int8 linear-layer error ~<1%).
 
 - **No RoPE weight permutation** is needed: `rope.c` uses HF's half-split ("rotate_half")
   convention, so HF `q_proj`/`k_proj` load directly.

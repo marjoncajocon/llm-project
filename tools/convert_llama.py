@@ -26,7 +26,8 @@ import sys
 
 import numpy as np
 
-MAGIC = 0x414D4C4C   # 'LLMA' little-endian bytes L,L,M,A
+MAGIC = 0x414D4C4C    # 'LLMA' little-endian bytes L,L,M,A (f32 weights)
+MAGIC_Q = 0x514D4C4C  # 'LLMQ' little-endian bytes L,L,M,Q (int8 weights)
 VERSION = 1
 
 
@@ -64,16 +65,26 @@ def load_safetensors_f32(path):
     return out
 
 
-# Write the LLMA file. `ints` = 8 config ints in C order (vocab, d_model,
+# Write the checkpoint. `ints` = 8 config ints in C order (vocab, d_model,
 # n_layers, n_heads, n_kv, head_dim, d_ff, max_seq); `floats` = (rope_base, eps);
-# `tensors` = arrays in the canonical order llama_collect() expects.
-def write_llma(path, ints, floats, tensors):
+# `tensors` = arrays in the canonical order llama_collect() expects. With
+# int8=True, 2D weights are stored per-column int8 (scales f32 then int8 bytes)
+# -> the 'LLMQ' format, ~4x smaller; 1D norms stay f32.
+def write_llma(path, ints, floats, tensors, int8=False):
     with open(path, "wb") as f:
-        f.write(struct.pack("<II", MAGIC, VERSION))
+        f.write(struct.pack("<II", MAGIC_Q if int8 else MAGIC, VERSION))
         f.write(struct.pack("<8i", *ints))
         f.write(struct.pack("<2f", *floats))
         for a in tensors:
-            f.write(f32(a).tobytes())
+            a = np.asarray(a)
+            if int8 and a.ndim == 2:
+                mx = np.abs(a).max(axis=0)                 # per output-channel (column)
+                scale = np.where(mx > 0, mx / 127.0, 1.0).astype("<f4")
+                q = np.clip(np.rint(a / scale), -127, 127).astype(np.int8)
+                f.write(scale.tobytes())
+                f.write(q.tobytes())                        # row-major int8
+            else:
+                f.write(f32(a).tobytes())
 
 
 def build_order(wte, layers, final_norm, lm_head):
@@ -85,7 +96,7 @@ def build_order(wte, layers, final_norm, lm_head):
     return order
 
 
-def convert_hf(model, out):
+def convert_hf(model, out, int8=False):
     from huggingface_hub import hf_hub_download
 
     cfg = json.load(open(hf_hub_download(model, "config.json")))
@@ -132,10 +143,10 @@ def convert_hf(model, out):
     lm_head = f32(wte.T) if (tied or "lm_head.weight" not in st) else g("lm_head.weight").T
 
     ints = (vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq)
-    write_llma(out, ints, (rope_base, eps), build_order(wte, layers, final_norm, lm_head))
-    print(f"wrote {out}: vocab={vocab} d_model={d_model} layers={n_layers} heads={n_heads} "
-          f"kv={n_kv} head_dim={head_dim} d_ff={d_ff} ctx={max_seq} rope_base={rope_base} "
-          f"eps={eps} tied={tied}")
+    write_llma(out, ints, (rope_base, eps), build_order(wte, layers, final_norm, lm_head), int8=int8)
+    print(f"wrote {out} ({'int8/LLMQ' if int8 else 'f32/LLMA'}): vocab={vocab} d_model={d_model} "
+          f"layers={n_layers} heads={n_heads} kv={n_kv} head_dim={head_dim} d_ff={d_ff} ctx={max_seq} "
+          f"rope_base={rope_base} eps={eps} tied={tied}")
 
 
 def write_tiny(out):
@@ -165,12 +176,13 @@ def main():
     ap = argparse.ArgumentParser(description="HF LLaMA-family -> LLMA checkpoint")
     ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M", help="HF repo id")
     ap.add_argument("--out", default="model.bin", help="output LLMA checkpoint")
+    ap.add_argument("--int8", action="store_true", help="int8-quantize 2D weights (LLMQ, ~4x smaller)")
     ap.add_argument("--tiny", metavar="PATH", help="write a small deterministic checkpoint (no download) and exit")
     args = ap.parse_args()
     if args.tiny:
         write_tiny(args.tiny)
     else:
-        convert_hf(args.model, args.out)
+        convert_hf(args.model, args.out, int8=args.int8)
 
 
 if __name__ == "__main__":

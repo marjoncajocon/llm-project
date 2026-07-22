@@ -28,6 +28,8 @@
 #include "swiglu.h"
 #include "gqa.h"
 #include "llama.h"
+#include "quant.h"
+#include "matrix.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -1162,6 +1164,41 @@ int run_selftest(void) {
     all_ok &= kv_ok;
     tensor_free(&Lf); tensor_free(&Ld);
     llama_kv_free(&kv); llama_model_free(&lm);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 20: int8 weight quantization (the LLMQ checkpoint format). Quantize a
+  // weight per-column to int8, dequantize, and check the LINEAR-LAYER output is
+  // preserved: A @ dequant(quant(W)) vs A @ W. int8 weights are 4x smaller.
+  // --------------------------------------------------------------------------
+  {
+    printf("[20] int8 weight quantization: A @ dequant(quant(W)) vs A @ W\n");
+    const int n = 4, rows = 64, cols = 32;    // realistic reduction dim (noise averages out)
+    int as[2] = {n, rows}, ws[2] = {rows, cols}, ys[2] = {n, cols};
+    Tensor A = tensor_create(as, 2), W = tensor_create(ws, 2), Wdq = tensor_create(ws, 2);
+    Tensor Y = tensor_create(ys, 2), Yq = tensor_create(ys, 2);
+    for (int i = 0; i < n * rows; i++) A.data[i] = ((i * 13 % 100) / 50.0f) - 1.0f;
+    for (int i = 0; i < rows * cols; i++) W.data[i] = ((i * 29 % 100) / 50.0f - 1.0f) * 0.3f;
+
+    signed char *q = (signed char*)malloc((size_t)rows * cols);
+    float *scale = (float*)malloc((size_t)cols * sizeof(float));
+    quantize_int8_percol(W.data, rows, cols, q, scale);
+    dequantize_int8_percol(q, scale, rows, cols, Wdq.data);
+    matmul(&A, &W, &Y);
+    matmul(&A, &Wdq, &Yq);
+    float num = 0.0f, den = 0.0f;                 // L2 relative error ||Yq-Y|| / ||Y||
+    for (int i = 0; i < n * cols; i++) {
+      float d = Yq.data[i] - Y.data[i];
+      num += d * d;
+      den += Y.data[i] * Y.data[i];
+    }
+    float rel = sqrtf(num / den);
+    int q_ok = (rel < 0.03f);
+    printf("    matmul output L2 rel error = %.2e (int8 weights = 4x smaller) -> %s\n\n",
+           rel, q_ok ? "OK" : "FAIL");
+    all_ok &= q_ok;
+    free(q); free(scale);
+    tensor_free(&A); tensor_free(&W); tensor_free(&Wdq); tensor_free(&Y); tensor_free(&Yq);
   }
 
   // --------------------------------------------------------------------------

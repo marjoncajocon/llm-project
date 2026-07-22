@@ -381,9 +381,22 @@ via decode steps. **Bit-exact:** new selftest **part `[19]`** runs a sequence th
 max |diff| **0.00e+00** (like the GPT KV cache). Smoke test PASSED, `-Wall` clean. Re-ran SmolLM2-135M
 with the cache — same coherent output, faster.
 
-Perf follow-ups remaining: SIMD/int8 quant (smaller files + faster matmuls). Block/model still
-forward-only (add backward to fine-tune). Bigger models (Qwen2.5-0.5B) need attention-bias support in
-LlamaBlock.
+## Modern architecture — step 11: int8 quantization (LLMQ) — DONE (2026-07-22)
+
+`quant.h`/`quant.c`: per-output-channel (per-column) symmetric int8 quantize/dequantize
+(`scale[j]=max_i|w[i,j]|/127`, `q=round(w/scale)`, `w~=q*scale`). New **`LLMQ`** checkpoint magic:
+same config header, then per canonical tensor — 2D weights as `scales (cols f32) + int8 bytes`, 1D
+norms as f32. `convert_llama.py --int8` writes it (numpy per-column quantize); `llama_model_load`
+detects LLMQ and DEQUANTIZES to the fp32 model on load, so the runtime forward is unchanged — this is
+a **storage/download win** (in-memory int8 + a quantized matmul for RAM/compute is the next step).
+Verified: selftest **part `[20]`** — `A@dequant(quant(W))` vs `A@W` L2 rel error **6.81e-03** (<1%,
+int8 weights 4× smaller). **Real model: SmolLM2-135M f32 621 MB → int8 156 MB (4×)**, and the int8
+checkpoint still generates coherent text. Smoke test PASSED, `-Wall` clean.
+
+Perf follow-ups remaining: **in-memory int8 + a quantized matmul** (RAM 4× + compute speedup — the
+next real speed win; today int8 is dequantized to f32 at load so RAM/compute are unchanged), SIMD.
+Block/model still forward-only (add backward to fine-tune). Bigger models (Qwen2.5-0.5B) need
+attention-bias support in LlamaBlock.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

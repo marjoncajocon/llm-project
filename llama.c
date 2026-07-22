@@ -12,6 +12,7 @@
 #include "rope.h"
 #include "gqa.h"
 #include "swiglu.h"
+#include "quant.h"
 
 static Tensor vec(int n) { int s[1] = {n}; return tensor_create(s, 1); }
 static Tensor mat(int r, int c) { int s[2] = {r, c}; return tensor_create(s, 2); }
@@ -148,7 +149,8 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
 // Checkpoint I/O ('LLMA' flat binary)
 // ---------------------------------------------------------------------------
 
-#define LLMA_MAGIC   0x414D4C4Cu  // 'LLMA' little-endian bytes L,L,M,A
+#define LLMA_MAGIC   0x414D4C4Cu  // 'LLMA' little-endian bytes L,L,M,A (f32 weights)
+#define LLMQ_MAGIC   0x514D4C4Cu  // 'LLMQ' little-endian bytes L,L,M,Q (int8 weights)
 #define LLMA_VERSION 1u
 
 // Every weight tensor in a fixed canonical order shared by save and load, so the
@@ -305,8 +307,9 @@ int llama_model_load(const char *path, LlamaModel *out) {
     fprintf(stderr, "Error: '%s' is truncated (bad header)\n", path);
     fclose(f); return 1;
   }
-  if (header[0] != LLMA_MAGIC || header[1] != LLMA_VERSION) {
-    fprintf(stderr, "Error: '%s' is not a v%u LLMA checkpoint\n", path, LLMA_VERSION);
+  const int quant = (header[0] == LLMQ_MAGIC);
+  if ((header[0] != LLMA_MAGIC && !quant) || header[1] != LLMA_VERSION) {
+    fprintf(stderr, "Error: '%s' is not a v%u LLMA/LLMQ checkpoint\n", path, LLMA_VERSION);
     fclose(f); return 1;
   }
 
@@ -317,8 +320,20 @@ int llama_model_load(const char *path, LlamaModel *out) {
   const Tensor **list = (const Tensor**)malloc((size_t)(1 + 9 * out->n_layers + 2) * sizeof(const Tensor*));
   int count = llama_collect(out, list);
   for (int i = 0; i < count && ok; i++) {
-    size_t sz = (size_t)list[i]->size;
-    ok &= (fread(list[i]->data, sizeof(float), sz, f) == sz);
+    const Tensor *t = list[i];
+    if (quant && t->ndim == 2) {
+      // int8: per-column scales (cols float32) then rows*cols int8; dequantize in.
+      int rows = t->shape[0], cols = t->shape[1];
+      float *scale = (float*)malloc((size_t)cols * sizeof(float));
+      signed char *q = (signed char*)malloc((size_t)rows * cols);
+      ok &= (fread(scale, sizeof(float), (size_t)cols, f) == (size_t)cols);
+      ok &= (fread(q, 1, (size_t)rows * cols, f) == (size_t)rows * cols);
+      if (ok) dequantize_int8_percol(q, scale, rows, cols, t->data);
+      free(scale); free(q);
+    } else {
+      size_t sz = (size_t)t->size;                 // f32 (LLMA, or 1D norms in LLMQ)
+      ok &= (fread(t->data, sizeof(float), sz, f) == sz);
+    }
   }
   free(list);
   fclose(f);
