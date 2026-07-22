@@ -830,6 +830,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "caption") == 0) return run_caption(argc, argv);
   if (argc > 1 && strcmp(argv[1], "text2media") == 0) return run_text2media(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i") == 0) return run_t2i(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "t2i-data") == 0) return run_t2i_data(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-train") == 0) return run_t2i_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-gen") == 0) return run_t2i_gen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "vqvae") == 0) return run_vqvae(argc, argv);

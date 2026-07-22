@@ -67,6 +67,94 @@ static void ensure_dirs(const char *prefix) {
 }
 
 // ---------------------------------------------------------------------------
+// Procedural dataset: diverse (caption, image) pairs of colored shapes so the
+// model learns real color+shape composition. VQGAN / DALL-E need a real dataset
+// to generalize; this is a from-scratch, pure-C stand-in (no downloads).
+//   transformer t2i-data <out-dir> [n] [size]
+// ---------------------------------------------------------------------------
+typedef struct { const char *name; float r, g, b; } NamedColor;
+
+static const NamedColor T2I_COLORS[] = {
+  {"red", 0.85f, 0.12f, 0.12f}, {"green", 0.13f, 0.70f, 0.20f},
+  {"blue", 0.15f, 0.30f, 0.90f}, {"yellow", 0.95f, 0.85f, 0.15f},
+  {"cyan", 0.15f, 0.80f, 0.85f}, {"magenta", 0.85f, 0.20f, 0.80f},
+  {"orange", 0.95f, 0.55f, 0.10f}, {"purple", 0.55f, 0.20f, 0.75f},
+};
+static const char *T2I_SHAPES[] = {"circle", "square", "triangle", "diamond", "cross"};
+#define T2I_NCOLORS ((int)(sizeof(T2I_COLORS) / sizeof(T2I_COLORS[0])))
+#define T2I_NSHAPES ((int)(sizeof(T2I_SHAPES) / sizeof(T2I_SHAPES[0])))
+
+// tiny LCG so the jitter is reproducible without touching global rand().
+static float urand(unsigned int *s) {
+  *s = *s * 1103515245u + 12345u;
+  return (float)(*s >> 8) / 16777216.0f;   // [0,1)
+}
+
+// Is point (dx,dy) relative to the shape center inside the shape of radius rad?
+static int shape_hit(int shape, float dx, float dy, float rad) {
+  float ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+  switch (shape) {
+    case 0: return dx * dx + dy * dy <= rad * rad;                 // circle
+    case 1: return ax <= rad && ay <= rad;                         // square
+    case 2:                                                        // triangle (apex up)
+      if (dy < -rad || dy > rad) return 0;
+      return ax <= rad * (dy + rad) / (2.0f * rad);
+    case 3: return ax + ay <= rad;                                 // diamond
+    case 4: return (ax <= rad * 0.34f && ay <= rad) ||             // cross / plus
+                   (ay <= rad * 0.34f && ax <= rad);
+  }
+  return 0;
+}
+
+static void draw_pair(const char *dir, int idx, int size, int shape, int color, unsigned int *rng) {
+  Image im; im.h = size; im.w = size; im.c = 3;
+  im.data = (float*)malloc((size_t)size * size * 3 * sizeof(float));
+  float bg = 0.06f + 0.06f * urand(rng);                 // dark background
+  for (int i = 0; i < size * size * 3; i++) im.data[i] = bg;
+
+  float jit = size * 0.10f;
+  float cx = size * 0.5f + jit * (urand(rng) - 0.5f);
+  float cy = size * 0.5f + jit * (urand(rng) - 0.5f);
+  float rad = size * (0.28f + 0.08f * urand(rng));
+  const NamedColor *col = &T2I_COLORS[color];
+
+  for (int y = 0; y < size; y++)
+    for (int x = 0; x < size; x++)
+      if (shape_hit(shape, (x + 0.5f) - cx, (y + 0.5f) - cy, rad)) {
+        size_t p = ((size_t)y * size + x) * 3;
+        im.data[p] = col->r; im.data[p + 1] = col->g; im.data[p + 2] = col->b;
+      }
+
+  char ip[600], cp[600];
+  snprintf(ip, sizeof(ip), "%s/img_%04d.ppm", dir, idx);
+  snprintf(cp, sizeof(cp), "%s/cap_%04d.txt", dir, idx);
+  image_save_ppm(ip, &im);
+  FILE *cf = fopen(cp, "wb");
+  if (cf) { fprintf(cf, "a %s %s", col->name, T2I_SHAPES[shape]); fclose(cf); }
+  image_free(&im);
+}
+
+int run_t2i_data(int argc, char **argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: transformer t2i-data <out-dir> [n] [size]\n"
+                    "  writes n colored-shape (caption,image) pairs (default 240, 16px)\n");
+    return 2;
+  }
+  const char *dir = argv[2];
+  int n = (argc > 3) ? atoi(argv[3]) : 240;
+  int size = (argc > 4) ? atoi(argv[4]) : 16;
+  if (size % T2I_PATCH) { fprintf(stderr, "error: size must be divisible by %d\n", T2I_PATCH); return 1; }
+  ensure_dirs(dir);
+  T2I_MKDIR(dir);
+  unsigned int rng = 20240607u;
+  for (int i = 0; i < n; i++)
+    draw_pair(dir, i, size, i % T2I_NSHAPES, (i / T2I_NSHAPES) % T2I_NCOLORS, &rng);
+  printf("t2i-data: wrote %d pairs (%dx%d, %d shapes x %d colors) -> %s\n",
+         n, size, size, T2I_NSHAPES, T2I_NCOLORS, dir);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Build (train the VQ-VAE + GPT on a captioned-image folder)
 // ---------------------------------------------------------------------------
 static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
@@ -115,8 +203,9 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
   fprintf(stderr, "t2i: %d pairs, %dx%d -> %d codes/img, vocab %d, GPT %d steps\n",
           N, w, h, M, V, gpt_steps);
 
-  // stage 2: GPT over [caption | codes]
-  GPT g = gpt_create(V, 64, 4, 3, 256, total);
+  // stage 2: GPT over [caption | codes] (larger than a single-pair overfit needs,
+  // so it can hold the whole color x shape distribution).
+  GPT g = gpt_create(V, 128, 4, 6, 512, total);
   GPTActs a = gpt_acts_create(&g, total);
   int lz[2] = {total, V};
   Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
@@ -155,24 +244,31 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
 // ---------------------------------------------------------------------------
 // Generate an image from a caption using a trained (vq, gpt)
 // ---------------------------------------------------------------------------
-static Image t2i_generate(const VQVAE *vq, GPT *g, int w, int h, int T, const char *caption) {
+// Autoregressively sample the image-code grid from the caption, then VQ-decode.
+// Sampling (temperature + top-k) over image codes ONLY — the media-token logits
+// are copied into a masked row so a text token can never be chosen (DALL-E/VQGAN
+// sample image tokens; greedy argmax collapses to one washed-out output).
+static Image t2i_generate(const VQVAE *vq, GPT *g, int w, int h, int T,
+                          const char *caption, float temp, int top_k, unsigned long long seed) {
   const int v_media = vq->K;
   const int M = vqvae_ncodes(vq, w, h);
   const int V = g->vocab_size;
   int *qtext = (int*)malloc((size_t)T * sizeof(int));
   encode_caption(caption, v_media, qtext);
   KVCache kv = gpt_kvcache_create(g);
-  int gz[2] = {1, V};
+  int gz[2] = {1, V}, mz[2] = {1, v_media};
   Tensor gl = tensor_create(gz, 2);
+  Tensor ml = tensor_create(mz, 2);           // logits restricted to image codes
+  Rng rng = rng_create(seed);
   for (int i = 0; i < T; i++) gpt_decode_step(g, &kv, qtext[i], &gl);
   int *gen = (int*)malloc((size_t)M * sizeof(int));
   for (int k = 0; k < M; k++) {
-    gen[k] = sample_argmax(&gl, 0);
-    if (gen[k] >= v_media) gen[k] = v_media - 1;
+    for (int j = 0; j < v_media; j++) ml.data[j] = gl.data[j];
+    gen[k] = sample_token(&ml, 0, temp, top_k, 1.0f, &rng);
     if (k < M - 1) gpt_decode_step(g, &kv, gen[k], &gl);
   }
   Image og = vqvae_decode(vq, gen, w, h);
-  free(gen); free(qtext); tensor_free(&gl); gpt_kvcache_free(&kv);
+  free(gen); free(qtext); tensor_free(&gl); tensor_free(&ml); gpt_kvcache_free(&kv);
   return og;
 }
 
@@ -230,7 +326,7 @@ int run_t2i(int argc, char **argv) {
   int vq_steps = (argc > 6) ? atoi(argv[6]) : 1200;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
-  Image og = t2i_generate(&vq, &g, w, h, T, argv[4]);
+  Image og = t2i_generate(&vq, &g, w, h, T, argv[4], 0.7f, 40, 1234);
   int ok = (image_save_ppm(argv[3], &og) == 0);
   printf("t2i: generated %dx%d for \"%s\" -> %s (%s)\n", w, h, argv[4], argv[3], ok ? "ok" : "FAILED");
   image_free(&og); vqvae_free(&vq); gpt_free(&g);
@@ -256,14 +352,16 @@ int run_t2i_train(int argc, char **argv) {
 
 int run_t2i_gen(int argc, char **argv) {
   if (argc < 5) {
-    fprintf(stderr, "usage: transformer t2i-gen <model-prefix> <out.ppm> <caption>\n");
+    fprintf(stderr, "usage: transformer t2i-gen <model-prefix> <out.ppm> <caption> [temp] [seed]\n");
     return 2;
   }
+  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.7f;
+  unsigned long long seed = (argc > 6) ? strtoull(argv[6], NULL, 10) : 1234ull;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_load(argv[2], &w, &h, &T, &vq, &g) != 0) return 1;
-  Image og = t2i_generate(&vq, &g, w, h, T, argv[4]);
+  Image og = t2i_generate(&vq, &g, w, h, T, argv[4], temp, 40, seed);
   int ok = (image_save_ppm(argv[3], &og) == 0);
-  printf("t2i-gen: generated %dx%d for \"%s\" -> %s (%s)\n", w, h, argv[4], argv[3], ok ? "ok" : "FAILED");
+  printf("t2i-gen: generated %dx%d for \"%s\" (temp %.2f) -> %s (%s)\n", w, h, argv[4], temp, argv[3], ok ? "ok" : "FAILED");
   image_free(&og); vqvae_free(&vq); gpt_free(&g);
   return ok ? 0 : 1;
 }

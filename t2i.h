@@ -16,6 +16,11 @@
 // Returns 0 on success.
 int run_t2i(int argc, char **argv);
 
+// Generate a from-scratch training set of colored-shape (caption, image) pairs so
+// the model learns real color+shape composition (no external dataset needed).
+//   transformer t2i-data <out-dir> [n] [size]
+int run_t2i_data(int argc, char **argv);
+
 // Train once and SAVE (<prefix>.gpt + <prefix>.vqt), then generate fast without
 // retraining. The webchat uses this split.
 //   transformer t2i-train <dataset-dir> <model-prefix> [gpt-steps] [vq-steps]
