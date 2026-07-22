@@ -43,5 +43,8 @@ agent_demo.txt
 *.wav
 vid_tmp/
 
+# Generated sample outputs (imggen/audgen demos) — keep locally, don't commit
+samples/
+
 # NOTE: memory.md is intentionally TRACKED (committed) so it travels via git
 # across machines — see it in the repo root.
