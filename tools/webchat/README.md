@@ -69,17 +69,21 @@ diffusion model *alongside* the engine (diffusion is a different architecture �
 it can't load into the transformer). The server has a hook:
 
 ```sh
-pip install diffusers transformers accelerate torch      # a few hundred MB
-cd tools/webchat
-go run . -root ../.. -imagegen "python tools/imagegen_diffusers.py"
+pip install diffusers transformers accelerate torch      # ~2-3 GB (torch is large)
+.\tools\webchat\webchat.exe                               # hook auto-enables
 ```
 
-Now in the chat, "a picture of the sun" (auto-detected as an image request) runs
+The hook **auto-enables** whenever `tools/imagegen_diffusers.py` is present — no
+flag needed. If `torch`/`diffusers` aren't installed, an image request shows the
+exact `pip install …` line inline (nothing crashes). Pass `-imagegen off` to
+disable it, or `-imagegen "<cmd>"` to point at a different text→image command.
+
+In the chat, "a picture of the sun" (auto-detected as an image request) runs
 `tools/imagegen_diffusers.py` and shows the generated image inline. Model:
 `$SD_MODEL` (default `stabilityai/sd-turbo` — 1-step, CPU-tolerant); steps
 `$SD_STEPS`. First run downloads the model (~2.5 GB); CPU inference is tens of
-seconds. Without the hook (or the deps), image requests fall back to the trained
-`t2i` model if present, else an honest note. Routing priority for image requests:
+seconds. Without the deps, image requests fall back to the trained `t2i` model if
+present, else an honest note. Routing priority for image requests:
 **diffusers hook → trained `t2i` model → note**.
 
 ## Honest limitations
