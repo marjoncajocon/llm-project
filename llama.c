@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
+#include <math.h>
 
 #include "matrix.h"
 #include "rmsnorm.h"
@@ -195,6 +197,99 @@ int llama_model_save(const char *path, const LlamaModel *m) {
   fclose(f);
   if (!ok) { fprintf(stderr, "Error: failed while writing '%s'\n", path); return 1; }
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// KV cache + incremental decode
+// ---------------------------------------------------------------------------
+
+LlamaKV llama_kv_create(const LlamaModel *m) {
+  LlamaKV kv;
+  kv.n_layers = m->n_layers;
+  kv.max_seq = m->max_seq;
+  kv.kv_dim = m->n_kv * m->head_dim;
+  kv.len = 0;
+  kv.k = (float**)malloc((size_t)m->n_layers * sizeof(float*));
+  kv.v = (float**)malloc((size_t)m->n_layers * sizeof(float*));
+  for (int l = 0; l < m->n_layers; l++) {
+    kv.k[l] = (float*)malloc((size_t)m->max_seq * kv.kv_dim * sizeof(float));
+    kv.v[l] = (float*)malloc((size_t)m->max_seq * kv.kv_dim * sizeof(float));
+  }
+  return kv;
+}
+
+void llama_kv_free(LlamaKV *kv) {
+  for (int l = 0; l < kv->n_layers; l++) { free(kv->k[l]); free(kv->v[l]); }
+  free(kv->k); free(kv->v);
+  kv->k = kv->v = NULL;
+}
+
+void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits) {
+  const int dm = m->d_model, hd = m->head_dim;
+  const int qd = m->n_heads * hd, kvd = m->n_kv * hd;
+  const int pos = kv->len;                 // this token's position
+  const int group = m->n_heads / m->n_kv;
+  const float scale = 1.0f / sqrtf((float)hd);
+
+  Tensor x = mat(1, dm);                     // running residual stream (1 row)
+  for (int j = 0; j < dm; j++) x.data[j] = m->wte.data[token * dm + j];
+
+  Tensor xn = mat(1, dm), q = mat(1, qd), k = mat(1, kvd), v = mat(1, kvd);
+  Tensor o = mat(1, qd), ao = mat(1, dm), hn = mat(1, dm), f = mat(1, dm);
+  float *sc = (float*)malloc((size_t)(pos + 1) * sizeof(float));
+  SwigluCache sc_ff = swiglu_cache_create(1, m->d_ff);
+
+  for (int l = 0; l < m->n_layers; l++) {
+    const LlamaBlock *b = &m->blocks[l];
+    // Attention
+    rmsnorm(&x, &b->attn_norm, &xn, m->eps);
+    matmul(&xn, &b->Wq, &q);
+    matmul(&xn, &b->Wk, &k);
+    matmul(&xn, &b->Wv, &v);
+    rope_heads_pos(&q, m->n_heads, m->rope_base, pos);
+    rope_heads_pos(&k, m->n_kv, m->rope_base, pos);
+    memcpy(&kv->k[l][pos * kvd], k.data, (size_t)kvd * sizeof(float));   // append to cache
+    memcpy(&kv->v[l][pos * kvd], v.data, (size_t)kvd * sizeof(float));
+
+    for (int head = 0; head < m->n_heads; head++) {
+      const int kvh = head / group;
+      const float *qh = &q.data[head * hd];
+      float maxs = -INFINITY;
+      for (int jj = 0; jj <= pos; jj++) {
+        const float *kj = &kv->k[l][jj * kvd + kvh * hd];
+        float dot = 0.0f;
+        for (int d = 0; d < hd; d++) dot += qh[d] * kj[d];
+        float s = dot * scale;
+        sc[jj] = s;
+        if (s > maxs) maxs = s;
+      }
+      float sum = 0.0f;
+      for (int jj = 0; jj <= pos; jj++) { float e = expf(sc[jj] - maxs); sc[jj] = e; sum += e; }
+      float inv = 1.0f / sum;
+      float *oh = &o.data[head * hd];
+      for (int d = 0; d < hd; d++) oh[d] = 0.0f;
+      for (int jj = 0; jj <= pos; jj++) {
+        float w = sc[jj] * inv;
+        const float *vj = &kv->v[l][jj * kvd + kvh * hd];
+        for (int d = 0; d < hd; d++) oh[d] += w * vj[d];
+      }
+    }
+    matmul(&o, &b->Wo, &ao);
+    for (int j = 0; j < dm; j++) x.data[j] += ao.data[j];       // residual
+
+    // Feed-forward
+    rmsnorm(&x, &b->ffn_norm, &hn, m->eps);
+    swiglu_forward(&hn, &b->Wgate, &b->Wup, &b->Wdown, &sc_ff, &f);
+    for (int j = 0; j < dm; j++) x.data[j] += f.data[j];        // residual
+  }
+
+  rmsnorm(&x, &m->final_norm, &hn, m->eps);
+  matmul(&hn, &m->lm_head, logits);          // (1, vocab)
+  kv->len = pos + 1;
+
+  free(sc); swiglu_cache_free(&sc_ff);
+  tensor_free(&x); tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
+  tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
 }
 
 int llama_model_load(const char *path, LlamaModel *out) {

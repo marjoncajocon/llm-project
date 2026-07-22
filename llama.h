@@ -70,4 +70,23 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
 int llama_model_save(const char *path, const LlamaModel *m);
 int llama_model_load(const char *path, LlamaModel *out);
 
+// ---------------------------------------------------------------------------
+// KV cache for incremental decode: caches K and V (n_kv * head_dim per position)
+// for every layer, so each new token computes only its own Q/K/V and attends
+// over the cache instead of re-running the whole prefix. O(n) per token.
+// ---------------------------------------------------------------------------
+typedef struct {
+  int n_layers, max_seq, kv_dim;   // kv_dim = n_kv * head_dim
+  int len;                         // number of positions currently cached
+  float **k;                       // n_layers x (max_seq * kv_dim)
+  float **v;
+} LlamaKV;
+
+LlamaKV llama_kv_create(const LlamaModel *m);
+void llama_kv_free(LlamaKV *kv);
+
+// Decode ONE token at position kv->len: append its K/V to the cache, attend over
+// positions 0..kv->len, and write logits (1, vocab). Advances kv->len.
+void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits);
+
 #endif // LLAMA_H

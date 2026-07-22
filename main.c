@@ -534,6 +534,10 @@ static int run_llama(int argc, char **argv) {
   const float top_p = 0.95f;
   Rng rng = rng_create(1234);
 
+  LlamaKV kv = llama_kv_create(&m);       // incremental decode (O(n) per token)
+  int lv[2] = {1, m.vocab};
+  Tensor logits = tensor_create(lv, 2);
+
   char line[8192];
   int *seq = (int*)malloc(m.max_seq * sizeof(int));
   while (fgets(line, sizeof(line), stdin)) {
@@ -547,13 +551,12 @@ static int run_llama(int argc, char **argv) {
     }
     if (n == 0) continue;
 
+    kv.len = 0;                                    // fresh cache per prompt
+    for (int i = 0; i < n; i++) llama_decode_step(&m, &kv, seq[i], &logits);  // prime with the prompt
     for (int s = 0; s < n_new && n < m.max_seq; s++) {
-      int ls[2] = {n, m.vocab};
-      Tensor logits = tensor_create(ls, 2);
-      llama_model_forward(&m, seq, n, &logits);
-      int nxt = sample_token(&logits, n - 1, temperature, top_k, top_p, &rng);
-      tensor_free(&logits);
+      int nxt = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
       seq[n++] = nxt;
+      llama_decode_step(&m, &kv, nxt, &logits);    // logits for the next step
     }
 
     printf("gen:");
@@ -562,6 +565,8 @@ static int run_llama(int argc, char **argv) {
     fflush(stdout);
   }
   free(seq);
+  tensor_free(&logits);
+  llama_kv_free(&kv);
   llama_model_free(&m);
   return 0;
 }

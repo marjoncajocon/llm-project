@@ -367,9 +367,23 @@ safetensors (header only), numpy, tokenizers. `model/smollm/*.bin` git-ignored.
 
 The from-scratch pure-C engine now loads and runs a real modern (LLaMA-family) LLM. 🏁
 
-Perf follow-ups (to make it usable, not just correct): **KV cache** for LlamaModel (currently a full
-re-forward per token — slow: ~seconds/token on 135M CPU) + SIMD/int8 quant. Block/model still
-forward-only (add backward for fine-tuning). Bigger models (Qwen2.5-0.5B) need attention-bias support.
+## Modern architecture — step 10: KV cache for LlamaModel — DONE (2026-07-22)
+
+`LlamaKV` + `llama_decode_step` in `llama.c` (declared in `llama.h`): caches K and V
+(`n_kv*head_dim` per position) for every layer, so each new token computes only its own Q/K/V and
+attends over the cache — O(n) per token instead of a full O(n·layers·d_model²) re-forward. Single-
+token path: embed → per layer {RMSNorm → q/k/v proj → `rope_heads_pos` at the token's position →
+append k,v to cache → single-query attention over cached 0..pos with GQA head sharing → Wo → resid →
+RMSNorm → SwiGLU → resid} → final RMSNorm → lm_head. Added `rope_heads_pos(x,n_heads,base,pos0)`
+(rope_heads = pos0 0). `main.c` `llama` generation now primes the cache with the prompt then samples
+via decode steps. **Bit-exact:** new selftest **part `[19]`** runs a sequence through
+`llama_model_forward` and token-by-token through `llama_decode_step` and compares per-position logits:
+max |diff| **0.00e+00** (like the GPT KV cache). Smoke test PASSED, `-Wall` clean. Re-ran SmolLM2-135M
+with the cache — same coherent output, faster.
+
+Perf follow-ups remaining: SIMD/int8 quant (smaller files + faster matmuls). Block/model still
+forward-only (add backward to fine-tune). Bigger models (Qwen2.5-0.5B) need attention-bias support in
+LlamaBlock.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

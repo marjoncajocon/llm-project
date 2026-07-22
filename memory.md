@@ -176,9 +176,11 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    engine: "The capital of France is" → "…the capital of the department of Loir-et-Cher. It is"
    (coherent grammar = weight map/RoPE/GQA/SwiGLU/RMSNorm/tokenizer all CORRECT). `model/smollm/*.bin`
    git-ignored; deps: tokenizers 0.22.2, huggingface_hub 1.8.0, safetensors 0.7.0. **The from-scratch
-   pure-C engine loads & runs a real LLaMA-family LLM.** Perf follow-ups to make it usable: **KV cache
-   for LlamaModel** (full re-forward per token now — slow) + SIMD/int8 quant. Qwen2.5 needs attn-bias
-   support. Block/model forward-only (add backward to fine-tune).
+   pure-C engine loads & runs a real LLaMA-family LLM.** ✅ **KV cache for LlamaModel**
+   (`LlamaKV` + `llama_decode_step` in `llama.c`: caches K/V per layer, single-query attention over
+   cache, O(n)/token; `rope_heads_pos` added; `llama` CLI primes cache w/ prompt then samples;
+   selftest `[19]`: decode == full forward **bit-exact 0.00e+00**). Perf remaining: SIMD/int8 quant.
+   Qwen2.5 needs attn-bias support. Block/model forward-only (add backward to fine-tune).
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

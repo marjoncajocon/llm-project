@@ -1129,6 +1129,42 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 19: LlamaModel KV-cache decode must match the full forward. Run the
+  // whole sequence through llama_model_forward, then token-by-token through
+  // llama_decode_step, and compare per-position logits (correctness gate for
+  // the incremental decode used by `transformer llama` generation).
+  // --------------------------------------------------------------------------
+  {
+    printf("[19] LlamaModel KV-cache decode == full forward\n");
+    const int vocab = 32, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    srand(13);
+    LlamaModel lm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    llama_model_randomize(&lm);
+    int ids[6] = {3, 7, 1, 9, 2, 5};
+
+    int fs[2] = {seq, vocab};
+    Tensor Lf = tensor_create(fs, 2);
+    llama_model_forward(&lm, ids, seq, &Lf);
+
+    LlamaKV kv = llama_kv_create(&lm);
+    int ds[2] = {1, vocab};
+    Tensor Ld = tensor_create(ds, 2);
+    float maxd = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step(&lm, &kv, ids[i], &Ld);
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(Ld.data[j] - Lf.data[i * vocab + j]);
+        if (d > maxd) maxd = d;
+      }
+    }
+    int kv_ok = (maxd < 1e-3f);
+    printf("    max |logit diff| over all %d positions = %.2e -> %s\n\n", seq, maxd, kv_ok ? "OK" : "FAIL");
+    all_ok &= kv_ok;
+    tensor_free(&Lf); tensor_free(&Ld);
+    llama_kv_free(&kv); llama_model_free(&lm);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;
