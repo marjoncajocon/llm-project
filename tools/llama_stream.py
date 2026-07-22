@@ -80,8 +80,12 @@ def main():
             break
         gen.append(tid)
         full = tok.decode(gen)
-        cut = full.find(args.stop)
-        if cut != -1:                       # model started a new turn -> stop
+        cut = -1
+        for st in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser", "\nHuman"):
+            i = full.find(st)
+            if i != -1 and (cut == -1 or i < cut):
+                cut = i
+        if cut != -1:                       # end marker / new turn -> stop
             piece = full[len(prev):cut]
             if piece:
                 emit({"d": piece})

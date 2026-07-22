@@ -641,10 +641,18 @@ static void hf_emit_delta(const char *full, int *prevlen) {
   *prevlen = fl;
 }
 
-// Truncate the decoded text at a hallucinated next turn ("\nUser"); returns 1 if hit.
+// Truncate the decoded text at an end-of-turn marker or a hallucinated next turn
+// (including <|endoftext|>/<|im_end|> emitted as literal text, which some models
+// do instead of the special token). Cuts at the EARLIEST match; returns 1 if hit.
 static int hf_stop(char *dec) {
-  char *s = strstr(dec, "\nUser");
-  if (s) { *s = '\0'; return 1; }
+  static const char *stops[] = {"<|endoftext|>", "<|im_end|>", "<|eot_id|>",
+                                "\nUser", "\nHuman", "\nuser", "\nhuman", NULL};
+  char *earliest = NULL;
+  for (int i = 0; stops[i]; i++) {
+    char *s = strstr(dec, stops[i]);
+    if (s && (!earliest || s < earliest)) earliest = s;
+  }
+  if (earliest) { *earliest = '\0'; return 1; }
   return 0;
 }
 

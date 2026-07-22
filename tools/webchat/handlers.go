@@ -287,8 +287,10 @@ func forwardDelta(c *wsConn, line string) {
 // trimAtStop cuts a reply at the first hallucinated next turn (the pure-C path
 // generates a fixed token count with no stop sequence).
 func trimAtStop(s string) string {
-	if i := strings.Index(s, "\nUser"); i >= 0 {
-		s = s[:i]
+	for _, st := range []string{"<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser", "\nHuman"} {
+		if i := strings.Index(s, st); i >= 0 {
+			s = s[:i]
+		}
 	}
 	return strings.TrimRight(s, "\n ")
 }

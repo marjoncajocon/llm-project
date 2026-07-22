@@ -62,7 +62,11 @@ def main():
             break
         gen.append(tid)
         full = enc.decode(gen)
-        cut = full.find(args.stop)
+        cut = -1
+        for st in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser", "\nHuman"):
+            i = full.find(st)
+            if i != -1 and (cut == -1 or i < cut):
+                cut = i
         if cut != -1:
             piece = full[len(prev):cut]
             if piece:
