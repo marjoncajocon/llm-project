@@ -81,7 +81,7 @@ def main():
         gen.append(tid)
         full = tok.decode(gen)
         cut = -1
-        for st in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser", "\nHuman"):
+        for st in ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "\nUser:", "\nHuman:", "\nYou:", "\nAssistant:", "\nAI:"):
             i = full.find(st)
             if i != -1 and (cut == -1 or i < cut):
                 cut = i

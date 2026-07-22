@@ -646,7 +646,7 @@ static void hf_emit_delta(const char *full, int *prevlen) {
 // do instead of the special token). Cuts at the EARLIEST match; returns 1 if hit.
 static int hf_stop(char *dec) {
   static const char *stops[] = {"<|endoftext|>", "<|im_end|>", "<|eot_id|>",
-                                "\nUser", "\nHuman", "\nuser", "\nhuman", NULL};
+                                "\nUser:", "\nHuman:", "\nYou:", "\nAssistant:", "\nAI:", NULL};
   char *earliest = NULL;
   for (int i = 0; stops[i]; i++) {
     char *s = strstr(dec, stops[i]);
