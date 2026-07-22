@@ -62,6 +62,26 @@ The server scans `model/<name>/`, reads the 4-byte checkpoint magic, and routes:
   tokenizer repo is looked up per known model, overridable with a
   `model/<name>/hf_tokenizer.txt` file.
 
+## Real text-to-image (HuggingFace diffusers)
+
+The engine's own text→image (`t2i`) is toy-scale. For **real** quality, run a
+diffusion model *alongside* the engine (diffusion is a different architecture —
+it can't load into the transformer). The server has a hook:
+
+```sh
+pip install diffusers transformers accelerate torch      # a few hundred MB
+cd tools/webchat
+go run . -root ../.. -imagegen "python tools/imagegen_diffusers.py"
+```
+
+Now in the chat, "a picture of the sun" (auto-detected as an image request) runs
+`tools/imagegen_diffusers.py` and shows the generated image inline. Model:
+`$SD_MODEL` (default `stabilityai/sd-turbo` — 1-step, CPU-tolerant); steps
+`$SD_STEPS`. First run downloads the model (~2.5 GB); CPU inference is tens of
+seconds. Without the hook (or the deps), image requests fall back to the trained
+`t2i` model if present, else an honest note. Routing priority for image requests:
+**diffusers hook → trained `t2i` model → note**.
+
 ## Honest limitations
 
 - **Toy-scale quality.** Image/audio generation *reconstruct* (overfit) one tiny

@@ -42,8 +42,10 @@ func handleChat(c *wsConn, msg map[string]any) {
 	case "image", "audio":
 		if attach != "" {
 			chatMedia(c, modality, text, attach) // teach-then-reproduce, inline
+		} else if modality == "image" && cfg.imagegen != "" {
+			chatDiffusers(c, text) // real diffusion model (HF diffusers) via the hook
 		} else if modality == "image" && t2iTrained() {
-			chatT2I(c, text) // generate from a pre-trained text->image model
+			chatT2I(c, text) // from-scratch text->image model
 		} else {
 			chatSay(c, mediaHint(modality))
 		}
@@ -98,6 +100,38 @@ func mediaHint(kind string) string {
 	return fmt.Sprintf("🎨 I detected an %s request. This engine has no trained text→%s model, "+
 		"so I can't generate one from words alone. Attach a target %s with 📎 and I'll run the "+
 		"teach-then-reproduce demo.", kind, kind, kind)
+}
+
+// chatDiffusers calls the configured external text->image command (e.g. the
+// diffusers/SD-Turbo script) — the prompt on stdin, an output PNG path appended —
+// and renders the returned image inline. This runs a real diffusion model beside
+// the engine (the engine can't load diffusion checkpoints itself).
+func chatDiffusers(c *wsConn, prompt string) {
+	parts := strings.Fields(cfg.imagegen)
+	if len(parts) == 0 {
+		chatSay(c, "⚠ imagegen command is empty")
+		return
+	}
+	dir, err := os.MkdirTemp("", "webchat")
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	defer os.RemoveAll(dir)
+	out := filepath.Join(dir, "gen.png")
+	chatSay(c, "🖼️ generating with the diffusion model… (first run downloads the model; CPU is slow)")
+	args := append(append([]string{}, parts[1:]...), out)
+	if _, se, err := runCmd(parts[0], args, prompt); err != nil {
+		chatSay(c, "\n⚠ image generation failed: "+lastLine(strings.TrimSpace(se)))
+		return
+	}
+	png, err := os.ReadFile(out)
+	if err != nil {
+		chatSay(c, "\n⚠ "+err.Error())
+		return
+	}
+	sendJSON(c, map[string]any{"op": "chat_media", "kind": "image",
+		"png_b64": base64.StdEncoding.EncodeToString(png)})
 }
 
 // t2iTrained reports whether a saved text->image model exists at model/t2i/.

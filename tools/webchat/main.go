@@ -20,9 +20,10 @@ import (
 var indexHTML []byte
 
 type config struct {
-	root   string
-	exe    string
-	python string
+	root     string
+	exe      string
+	python   string
+	imagegen string // optional external text->image command (e.g. diffusers)
 }
 
 var cfg config
@@ -32,10 +33,12 @@ func main() {
 	root := flag.String("root", "", "repo root (holds transformer + model/); default: auto-detect")
 	exe := flag.String("exe", "", "transformer binary (default: next to webchat, then <root>)")
 	python := flag.String("python", "python", "python interpreter for the tokenizer bridges")
+	imagegen := flag.String("imagegen", "", "external text->image command (prompt on stdin, PNG path appended), e.g. \"python tools/imagegen_diffusers.py\"")
 	flag.Parse()
 
 	cfg.root = resolveRoot(*root)
 	cfg.python = *python
+	cfg.imagegen = *imagegen
 	if *exe != "" {
 		cfg.exe = *exe
 	} else {
