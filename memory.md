@@ -195,8 +195,10 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    ✅ **q/k/v attention biases (Qwen2 support)** (`b_q/b_k/b_v` in LlamaBlock+QLlamaBlock, `bias_add`
    after q/k/v matmul in all paths; always-present, zero for LLaMA/SmolLM; convert reads q/k/v_proj.bias
    or zeros; checkpoint **v2**, TENSORS_PER_LAYER 9→12 — old v1 files must be re-converted). Smoke PASSED
-   with random biases; SmolLM2 v2 still coherent. Unlocks Qwen2.5-0.5B (rope_theta 1000000). Block/model
-   forward-only (add backward to fine-tune).
+   with random biases; SmolLM2 v2 still coherent. **Qwen2.5-0.5B RUNS** (rope_theta 1000000, q/k/v
+   biases): "The capital of France is" → "Paris. The population of Paris is ~1,67 million" (correct →
+   bias path proven); ~3.0 s / 20 tok int8. `model/qwen/*.bin` git-ignored. Block/model forward-only
+   (add backward to fine-tune). Two real models now run: SmolLM2-135M + Qwen2.5-0.5B.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

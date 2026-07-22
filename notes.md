@@ -454,7 +454,15 @@ zeros. Checkpoint **bumped to v2** (LLMA/LLMQ; `TENSORS_PER_LAYER` 9→12; biase
 LLMQ loader reads them as f32 like norms). Old v1 files must be re-converted (they're git-ignored).
 Verified: smoke test PASSED with random biases — `[18]` LLMA v2 round-trip 0.00e+00, `[19]` KV decode
 bit-exact, `[21]` int8 vs f32 0.96%. SmolLM2 re-converted (v2, zero biases) → identical coherent output.
-[Qwen2.5-0.5B convert+run measured separately.]
+
+**Qwen2.5-0.5B RUNS (the bias-using model):** `convert_llama.py --model Qwen/Qwen2.5-0.5B --int8`
+(vocab 151936, d_model 896, 24 layers, 14 q / 2 kv heads, head_dim 64, d_ff 4864, **rope_base
+1000000**, eps 1e-6, tied; q/k/v biases read). Generation via the int8 engine:
+`"The capital of France is"` → **"Paris. The population of Paris is approximately 1,67 million."**
+(FACTUALLY CORRECT — Qwen depends on its q/k/v biases, so a correct answer proves the bias path);
+`"Once upon a time"` → *"…a very, very sick little mouse. His name was Muffin…"*. Speed ~3.0 s for
+20 tokens int8 (0.5B, ~4× SmolLM2's size; the ~84 s first run was a one-time `tokenizer.json`
+download, 3.0 s once cached). `model/qwen/*.bin` git-ignored.
 
 Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
 Block/model forward-only (add backward to fine-tune).
