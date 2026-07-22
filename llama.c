@@ -27,6 +27,7 @@ LlamaBlock llama_block_create(int d_model, int n_heads, int n_kv, int head_dim,
   b.Wq = mat(d_model, qd);
   b.Wk = mat(d_model, kvd);
   b.Wv = mat(d_model, kvd);
+  b.b_q = vec(qd); b.b_k = vec(kvd); b.b_v = vec(kvd);
   b.Wo = mat(qd, d_model);
   b.ffn_norm = vec(d_model);
   b.Wgate = mat(d_model, d_ff);
@@ -37,7 +38,8 @@ LlamaBlock llama_block_create(int d_model, int n_heads, int n_kv, int head_dim,
 
 void llama_block_free(LlamaBlock *b) {
   tensor_free(&b->attn_norm); tensor_free(&b->Wq); tensor_free(&b->Wk);
-  tensor_free(&b->Wv); tensor_free(&b->Wo); tensor_free(&b->ffn_norm);
+  tensor_free(&b->Wv); tensor_free(&b->b_q); tensor_free(&b->b_k); tensor_free(&b->b_v);
+  tensor_free(&b->Wo); tensor_free(&b->ffn_norm);
   tensor_free(&b->Wgate); tensor_free(&b->Wup); tensor_free(&b->Wdown);
 }
 
@@ -54,6 +56,7 @@ void llama_block_randomize(LlamaBlock *b) {
   for (int i = 0; i < dn; i++) { b->attn_norm.data[i] = 1.0f; b->ffn_norm.data[i] = 1.0f; }
   float s = 0.15f;
   fill_rand(&b->Wq, s); fill_rand(&b->Wk, s); fill_rand(&b->Wv, s); fill_rand(&b->Wo, s);
+  fill_rand(&b->b_q, s); fill_rand(&b->b_k, s); fill_rand(&b->b_v, s);   // exercise the bias path
   fill_rand(&b->Wgate, s); fill_rand(&b->Wup, s); fill_rand(&b->Wdown, s);
 }
 
@@ -71,9 +74,9 @@ void llama_block_forward(const LlamaBlock *b, const Tensor *x, Tensor *out) {
 
   // --- Attention sub-layer ---
   rmsnorm(x, &b->attn_norm, &xn, b->eps);
-  matmul(&xn, &b->Wq, &q);
-  matmul(&xn, &b->Wk, &k);
-  matmul(&xn, &b->Wv, &v);
+  matmul(&xn, &b->Wq, &q); bias_add(&q, &b->b_q, &q);
+  matmul(&xn, &b->Wk, &k); bias_add(&k, &b->b_k, &k);
+  matmul(&xn, &b->Wv, &v); bias_add(&v, &b->b_v, &v);
   rope_heads(&q, b->n_heads, b->rope_base);
   rope_heads(&k, b->n_kv, b->rope_base);
   gqa_forward(&q, &k, &v, &gc, &o);
@@ -151,7 +154,8 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
 
 #define LLMA_MAGIC   0x414D4C4Cu  // 'LLMA' little-endian bytes L,L,M,A (f32 weights)
 #define LLMQ_MAGIC   0x514D4C4Cu  // 'LLMQ' little-endian bytes L,L,M,Q (int8 weights)
-#define LLMA_VERSION 1u
+#define LLMA_VERSION 2u           // v2 adds q/k/v attention biases (zero for LLaMA/SmolLM)
+#define TENSORS_PER_LAYER 12      // attn_norm, Wq,Wk,Wv, b_q,b_k,b_v, Wo, ffn_norm, Wgate,Wup,Wdown
 
 // Every weight tensor in a fixed canonical order shared by save and load, so the
 // two can never drift. 1 (wte) + 9 per layer + 2 (final_norm, lm_head).
@@ -164,6 +168,9 @@ static int llama_collect(const LlamaModel *m, const Tensor **list) {
     list[n++] = &b->Wq;
     list[n++] = &b->Wk;
     list[n++] = &b->Wv;
+    list[n++] = &b->b_q;
+    list[n++] = &b->b_k;
+    list[n++] = &b->b_v;
     list[n++] = &b->Wo;
     list[n++] = &b->ffn_norm;
     list[n++] = &b->Wgate;
@@ -189,7 +196,7 @@ int llama_model_save(const char *path, const LlamaModel *m) {
   ok &= (fwrite(cfg, sizeof(int32_t), 8, f) == 8);
   ok &= (fwrite(fcfg, sizeof(float), 2, f) == 2);
 
-  const Tensor **list = (const Tensor**)malloc((size_t)(1 + 9 * m->n_layers + 2) * sizeof(const Tensor*));
+  const Tensor **list = (const Tensor**)malloc((size_t)(1 + TENSORS_PER_LAYER * m->n_layers + 2) * sizeof(const Tensor*));
   int count = llama_collect(m, list);
   for (int i = 0; i < count && ok; i++) {
     size_t sz = (size_t)list[i]->size;
@@ -245,9 +252,9 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
     const LlamaBlock *b = &m->blocks[l];
     // Attention
     rmsnorm(&x, &b->attn_norm, &xn, m->eps);
-    matmul(&xn, &b->Wq, &q);
-    matmul(&xn, &b->Wk, &k);
-    matmul(&xn, &b->Wv, &v);
+    matmul(&xn, &b->Wq, &q); bias_add(&q, &b->b_q, &q);
+    matmul(&xn, &b->Wk, &k); bias_add(&k, &b->b_k, &k);
+    matmul(&xn, &b->Wv, &v); bias_add(&v, &b->b_v, &v);
     rope_heads_pos(&q, m->n_heads, m->rope_base, pos);
     rope_heads_pos(&k, m->n_kv, m->rope_base, pos);
     memcpy(&kv->k[l][pos * kvd], k.data, (size_t)kvd * sizeof(float));   // append to cache
@@ -317,7 +324,7 @@ int llama_model_load(const char *path, LlamaModel *out) {
                             cfg[6], cfg[7], fcfg[0], fcfg[1]);
 
   int ok = 1;
-  const Tensor **list = (const Tensor**)malloc((size_t)(1 + 9 * out->n_layers + 2) * sizeof(const Tensor*));
+  const Tensor **list = (const Tensor**)malloc((size_t)(1 + TENSORS_PER_LAYER * out->n_layers + 2) * sizeof(const Tensor*));
   int count = llama_collect(out, list);
   for (int i = 0; i < count && ok; i++) {
     const Tensor *t = list[i];
@@ -353,6 +360,7 @@ static QLlamaBlock q_block_create(int d_model, int n_heads, int n_kv, int head_d
   QLlamaBlock b;
   const int qd = n_heads * head_dim, kvd = n_kv * head_dim;
   b.attn_norm = vec(d_model); b.ffn_norm = vec(d_model);
+  b.b_q = vec(qd); b.b_k = vec(kvd); b.b_v = vec(kvd);
   b.Wq = qtensor_create(d_model, qd);
   b.Wk = qtensor_create(d_model, kvd);
   b.Wv = qtensor_create(d_model, kvd);
@@ -365,6 +373,7 @@ static QLlamaBlock q_block_create(int d_model, int n_heads, int n_kv, int head_d
 
 static void q_block_free(QLlamaBlock *b) {
   tensor_free(&b->attn_norm); tensor_free(&b->ffn_norm);
+  tensor_free(&b->b_q); tensor_free(&b->b_k); tensor_free(&b->b_v);
   qtensor_free(&b->Wq); qtensor_free(&b->Wk); qtensor_free(&b->Wv); qtensor_free(&b->Wo);
   qtensor_free(&b->Wgate); qtensor_free(&b->Wup); qtensor_free(&b->Wdown);
 }
@@ -400,6 +409,9 @@ QLlamaModel q_llama_quantize_from(const LlamaModel *s) {
     QLlamaBlock *b = &m.blocks[l];
     memcpy(b->attn_norm.data, a->attn_norm.data, dmb);
     memcpy(b->ffn_norm.data, a->ffn_norm.data, dmb);
+    memcpy(b->b_q.data, a->b_q.data, (size_t)a->b_q.size * sizeof(float));
+    memcpy(b->b_k.data, a->b_k.data, (size_t)a->b_k.size * sizeof(float));
+    memcpy(b->b_v.data, a->b_v.data, (size_t)a->b_v.size * sizeof(float));
     qtensor_quantize(&b->Wq, a->Wq.data); qtensor_quantize(&b->Wk, a->Wk.data);
     qtensor_quantize(&b->Wv, a->Wv.data); qtensor_quantize(&b->Wo, a->Wo.data);
     qtensor_quantize(&b->Wgate, a->Wgate.data); qtensor_quantize(&b->Wup, a->Wup.data);
@@ -443,9 +455,9 @@ void q_llama_decode_step(const QLlamaModel *m, LlamaKV *kv, int token, Tensor *l
   for (int l = 0; l < m->n_layers; l++) {
     const QLlamaBlock *b = &m->blocks[l];
     rmsnorm(&x, &b->attn_norm, &xn, m->eps);
-    qmatmul(&xn, &b->Wq, &q);
-    qmatmul(&xn, &b->Wk, &k);
-    qmatmul(&xn, &b->Wv, &v);
+    qmatmul(&xn, &b->Wq, &q); bias_add(&q, &b->b_q, &q);
+    qmatmul(&xn, &b->Wk, &k); bias_add(&k, &b->b_k, &k);
+    qmatmul(&xn, &b->Wv, &v); bias_add(&v, &b->b_v, &v);
     rope_heads_pos(&q, m->n_heads, m->rope_base, pos);
     rope_heads_pos(&k, m->n_kv, m->rope_base, pos);
     memcpy(&kv->k[l][pos * kvd], k.data, (size_t)kvd * sizeof(float));
@@ -532,7 +544,11 @@ int q_llama_model_load(const char *path, QLlamaModel *out) {
   for (int l = 0; l < out->n_layers && ok; l++) {
     QLlamaBlock *b = &out->blocks[l];
     ok &= (fread(b->attn_norm.data, sizeof(float), dmb, f) == dmb);
-    ok &= q_read(f, &b->Wq); ok &= q_read(f, &b->Wk); ok &= q_read(f, &b->Wv); ok &= q_read(f, &b->Wo);
+    ok &= q_read(f, &b->Wq); ok &= q_read(f, &b->Wk); ok &= q_read(f, &b->Wv);
+    ok &= (fread(b->b_q.data, sizeof(float), (size_t)b->b_q.size, f) == (size_t)b->b_q.size);
+    ok &= (fread(b->b_k.data, sizeof(float), (size_t)b->b_k.size, f) == (size_t)b->b_k.size);
+    ok &= (fread(b->b_v.data, sizeof(float), (size_t)b->b_v.size, f) == (size_t)b->b_v.size);
+    ok &= q_read(f, &b->Wo);
     ok &= (fread(b->ffn_norm.data, sizeof(float), dmb, f) == dmb);
     ok &= q_read(f, &b->Wgate); ok &= q_read(f, &b->Wup); ok &= q_read(f, &b->Wdown);
   }

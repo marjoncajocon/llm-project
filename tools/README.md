@@ -80,8 +80,9 @@ python tools/convert_llama.py --tiny t.bin                        # small format
 - HF linear weights are `(out, in)` (applied as `x@Wᵀ`); our matmul is `x@W` with `W (in, out)`, so
   each linear weight is **transposed**. Norm gains + the token embedding are copied as-is; tied
   models use `lm_head = embed_tokens.weightᵀ`.
-- **No attention biases** yet: fine for LLaMA/SmolLM; Qwen2 (which has q/k/v biases) would need
-  bias support first — the converter warns.
+- **q/k/v attention biases** are supported (LLMA/LLMQ v2): zero for LLaMA/SmolLM, read from
+  `q/k/v_proj.bias` for Qwen2/Qwen2.5. (`o_proj` and the MLP have no bias.) So both
+  `HuggingFaceTB/SmolLM2-*` and `Qwen/Qwen2.5-0.5B` convert and run.
 
 Requires Python 3 + NumPy + safetensors + huggingface_hub, and internet for the download.
 

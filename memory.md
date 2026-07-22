@@ -192,7 +192,11 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    doing a slow HEAD check on tokenizer.json, NOT the C engine. **FIXED:** `llama_tok.py`/`llama_chat.py`
    now use `hf_hub_download(local_files_only=True)` (one-time download fallback) → `llama_chat` dropped
    ~83 s → **1.3 s** (64×) for a 20-tok SmolLM2 int8 gen. Whole pipeline now ~1 s. Perf remaining: explicit AVX2/NEON intrinsics, block/prefill qmatmul, threading.
-   Qwen2.5 needs attn-bias support. Block/model forward-only (add backward to fine-tune).
+   ✅ **q/k/v attention biases (Qwen2 support)** (`b_q/b_k/b_v` in LlamaBlock+QLlamaBlock, `bias_add`
+   after q/k/v matmul in all paths; always-present, zero for LLaMA/SmolLM; convert reads q/k/v_proj.bias
+   or zeros; checkpoint **v2**, TENSORS_PER_LAYER 9→12 — old v1 files must be re-converted). Smoke PASSED
+   with random biases; SmolLM2 v2 still coherent. Unlocks Qwen2.5-0.5B (rope_theta 1000000). Block/model
+   forward-only (add backward to fine-tune).
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

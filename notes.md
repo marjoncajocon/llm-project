@@ -443,8 +443,21 @@ per-run Hub HEAD check. Result: `llama_chat` end-to-end dropped from ~83 s to 1.
 Concorde…"). So the whole pipeline (tokenize → C int8 generate → detokenize) is now ~1 s, matching the
 engine.**
 
+## Modern architecture — step 14: q/k/v attention biases (Qwen2 support) — DONE (2026-07-22)
+
+Qwen2/Qwen2.5 is LLaMA-family but adds **biases on q/k/v projections** (o_proj + MLP have none).
+Added `b_q`(n_heads·hd)/`b_k`/`b_v`(n_kv·hd) to `LlamaBlock` AND `QLlamaBlock` (f32, kept small),
+applied via `bias_add` right after the q/k/v matmul in every path (fp32 `llama_block_forward` +
+`llama_decode_step`, int8 `q_llama_decode_step`). **Always present, zero for bias-free models** (LLaMA/
+SmolLM), so no conditional logic; convert_llama.py reads `q/k/v_proj.bias` if present else writes
+zeros. Checkpoint **bumped to v2** (LLMA/LLMQ; `TENSORS_PER_LAYER` 9→12; biases are 1D f32, so the
+LLMQ loader reads them as f32 like norms). Old v1 files must be re-converted (they're git-ignored).
+Verified: smoke test PASSED with random biases — `[18]` LLMA v2 round-trip 0.00e+00, `[19]` KV decode
+bit-exact, `[21]` int8 vs f32 0.96%. SmolLM2 re-converted (v2, zero biases) → identical coherent output.
+[Qwen2.5-0.5B convert+run measured separately.]
+
 Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
-Block/model forward-only (add backward to fine-tune). Qwen2.5-0.5B needs attention-bias support.
+Block/model forward-only (add backward to fine-tune).
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

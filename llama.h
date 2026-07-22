@@ -22,6 +22,9 @@ typedef struct {
   Tensor Wq;          // (d_model, n_heads*head_dim)
   Tensor Wk;          // (d_model, n_kv*head_dim)
   Tensor Wv;          // (d_model, n_kv*head_dim)
+  Tensor b_q;         // (n_heads*head_dim)  q/k/v biases (zero for LLaMA/SmolLM;
+  Tensor b_k;         // (n_kv*head_dim)      nonzero for Qwen2). o_proj has none.
+  Tensor b_v;         // (n_kv*head_dim)
   Tensor Wo;          // (n_heads*head_dim, d_model)
   // Feed-forward (SwiGLU)
   Tensor ffn_norm;    // (d_model)
@@ -98,6 +101,7 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
 // ---------------------------------------------------------------------------
 typedef struct {
   Tensor attn_norm, ffn_norm;                      // f32
+  Tensor b_q, b_k, b_v;                            // f32 q/k/v biases (small; kept f32)
   QTensor Wq, Wk, Wv, Wo, Wgate, Wup, Wdown;       // int8
 } QLlamaBlock;
 

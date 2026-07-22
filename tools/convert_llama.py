@@ -28,7 +28,7 @@ import numpy as np
 
 MAGIC = 0x414D4C4C    # 'LLMA' little-endian bytes L,L,M,A (f32 weights)
 MAGIC_Q = 0x514D4C4C  # 'LLMQ' little-endian bytes L,L,M,Q (int8 weights)
-VERSION = 1
+VERSION = 2           # v2 adds q/k/v attention biases (zero for LLaMA/SmolLM, real for Qwen2)
 
 
 def f32(a):
@@ -90,7 +90,8 @@ def write_llma(path, ints, floats, tensors, int8=False):
 def build_order(wte, layers, final_norm, lm_head):
     order = [wte]
     for L in layers:
-        order += [L["attn_norm"], L["Wq"], L["Wk"], L["Wv"], L["Wo"],
+        order += [L["attn_norm"], L["Wq"], L["Wk"], L["Wv"],
+                  L["b_q"], L["b_k"], L["b_v"], L["Wo"],
                   L["ffn_norm"], L["Wgate"], L["Wup"], L["Wdown"]]
     order += [final_norm, lm_head]
     return order
@@ -120,10 +121,11 @@ def convert_hf(model, out, int8=False):
     def g(name):
         return f32(st[name])
 
-    if any(k.endswith("self_attn.q_proj.bias") for k in st):
-        print("WARNING: model has attention biases (e.g. Qwen2) which LlamaBlock "
-              "does not support yet — they are DROPPED; output will be wrong.", file=sys.stderr)
+    # q/k/v biases: present in Qwen2, absent (-> zero) in LLaMA/SmolLM. o_proj has none.
+    def bias(name, dim):
+        return f32(st[name]) if name in st else np.zeros(dim, "<f4")
 
+    qd, kvd = n_heads * head_dim, n_kv * head_dim
     layers = []
     for l in range(n_layers):
         p = f"model.layers.{l}."
@@ -132,6 +134,9 @@ def convert_hf(model, out, int8=False):
             "Wq": g(p + "self_attn.q_proj.weight").T,   # (out,in) -> (in,out)
             "Wk": g(p + "self_attn.k_proj.weight").T,
             "Wv": g(p + "self_attn.v_proj.weight").T,
+            "b_q": bias(p + "self_attn.q_proj.bias", qd),
+            "b_k": bias(p + "self_attn.k_proj.bias", kvd),
+            "b_v": bias(p + "self_attn.v_proj.bias", kvd),
             "Wo": g(p + "self_attn.o_proj.weight").T,
             "ffn_norm": g(p + "post_attention_layernorm.weight"),
             "Wgate": g(p + "mlp.gate_proj.weight").T,
@@ -161,7 +166,9 @@ def write_tiny(out):
     for _ in range(n_layers):
         layers.append({
             "attn_norm": np.ones(d_model, "<f4"),
-            "Wq": r(d_model, qd), "Wk": r(d_model, kvd), "Wv": r(d_model, kvd), "Wo": r(qd, d_model),
+            "Wq": r(d_model, qd), "Wk": r(d_model, kvd), "Wv": r(d_model, kvd),
+            "b_q": np.zeros(qd, "<f4"), "b_k": np.zeros(kvd, "<f4"), "b_v": np.zeros(kvd, "<f4"),
+            "Wo": r(qd, d_model),
             "ffn_norm": np.ones(d_model, "<f4"),
             "Wgate": r(d_model, d_ff), "Wup": r(d_model, d_ff), "Wdown": r(d_ff, d_model),
         })
