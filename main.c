@@ -19,6 +19,7 @@
 #include "agent.h"
 #include "caption.h"
 #include "text2media.h"
+#include "t2i.h"
 #include "image.h"
 #include "patch.h"
 #include "video.h"
@@ -622,6 +623,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "audgen") == 0) return run_audgen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "caption") == 0) return run_caption(argc, argv);
   if (argc > 1 && strcmp(argv[1], "text2media") == 0) return run_text2media(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "t2i") == 0) return run_t2i(argc, argv);
   // Bare `transformer` (no args) runs the built-in self-test. An UNRECOGNIZED
   // subcommand must NOT fall through to it (a typo like `trian` would otherwise
   // silently run the demo) — print usage and fail instead.
