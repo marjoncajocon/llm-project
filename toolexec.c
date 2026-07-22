@@ -23,9 +23,31 @@
 #define PCLOSE pclose
 #endif
 
+// Confine model-supplied file paths to the working directory. A path is safe
+// only if it is relative (no leading '/' or '\', no drive letter, no UNC) and
+// contains no ".." component — so a tool call can never read or overwrite files
+// outside the workspace (e.g. C:\Windows\..., ../../.ssh/authorized_keys).
+static int path_is_safe(const char *p) {
+  if (!p || !p[0]) return 0;
+  if (p[0] == '/' || p[0] == '\\') return 0;   // POSIX-absolute, Windows-root, UNC
+  if (p[1] == ':') return 0;                    // drive-letter absolute (C:...)
+  for (const char *s = p; *s; ) {
+    // s is always at the start of a path component here.
+    if (s[0] == '.' && s[1] == '.' && (s[2] == '\0' || s[2] == '/' || s[2] == '\\'))
+      return 0;                                 // whole ".." component -> traversal
+    while (*s && *s != '/' && *s != '\\') s++;   // skip to the separator
+    while (*s == '/' || *s == '\\') s++;         // skip the separator(s)
+  }
+  return 1;
+}
+
 int toolexec_run(const ToolCall *tc, char *obs, int obs_size) {
   switch (tc->kind) {
     case TOOL_WRITE_FILE: {
+      if (!path_is_safe(tc->path)) {
+        snprintf(obs, obs_size, "error: refused unsafe path '%s' (must be relative and stay within the working directory)", tc->path);
+        return 1;
+      }
       FILE *f = fopen(tc->path, "wb");
       if (!f) { snprintf(obs, obs_size, "error: cannot write '%s'", tc->path); return 1; }
       size_t n = strlen(tc->body);
@@ -35,6 +57,10 @@ int toolexec_run(const ToolCall *tc, char *obs, int obs_size) {
       return 0;
     }
     case TOOL_READ_FILE: {
+      if (!path_is_safe(tc->path)) {
+        snprintf(obs, obs_size, "error: refused unsafe path '%s' (must be relative and stay within the working directory)", tc->path);
+        return 1;
+      }
       FILE *f = fopen(tc->path, "rb");
       if (!f) { snprintf(obs, obs_size, "error: cannot read '%s'", tc->path); return 1; }
       int n = (int)fread(obs, 1, obs_size - 1, f);

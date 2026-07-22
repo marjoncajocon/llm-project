@@ -121,15 +121,22 @@ int agent_run(const char *goal, AgentBackend *backend, ApprovalMode mode) {
     }
 
     char action[1400];
+    // run_command executes arbitrary shell input from the model, so it is NEVER
+    // auto-approved: it always requires an explicit interactive y/N, even in
+    // APPROVAL_AUTO mode (where a non-interactive stdin denies it by default).
+    ApprovalMode step_mode = mode;
     switch (tc.kind) {
       case TOOL_WRITE_FILE:
         snprintf(action, sizeof(action), "write_file '%s' (%zu bytes)", tc.path, strlen(tc.body));
+        // Show the full content being written so approval is meaningful.
+        printf("--- content of %s ---\n%s\n--- end content ---\n", tc.path, tc.body);
         break;
       case TOOL_READ_FILE:
         snprintf(action, sizeof(action), "read_file '%s'", tc.path);
         break;
       case TOOL_RUN_COMMAND:
         snprintf(action, sizeof(action), "run_command: %s", tc.command);
+        step_mode = APPROVAL_ASK;
         break;
       default:
         snprintf(action, sizeof(action), "unknown");
@@ -137,7 +144,7 @@ int agent_run(const char *goal, AgentBackend *backend, ApprovalMode mode) {
     }
     printf("tool requested: %s\n", action);
 
-    if (!approval_confirm(mode, action)) {
+    if (!approval_confirm(step_mode, action)) {
       snprintf(obs, sizeof(obs), "denied by user");
     } else {
       toolexec_run(&tc, obs, sizeof(obs));
