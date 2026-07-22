@@ -98,6 +98,10 @@ func handleMessage(c *wsConn, msg map[string]any) {
 		sendJSON(c, map[string]any{"op": "models", "items": detectModels(cfg.root)})
 	case "chat":
 		handleChat(c, msg)
+	case "imggen":
+		handleImggen(c, msg)
+	case "audgen":
+		handleAudgen(c, msg)
 	default:
 		sendJSON(c, map[string]any{"op": "error", "text": "unknown op: " + op})
 	}

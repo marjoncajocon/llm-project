@@ -49,6 +49,12 @@
   .dot { width:8px; height:8px; border-radius:50%; background:#c04; display:inline-block; margin-right:6px; }
   .dot.on { background:#2ecc71; }
   .pill { font-size:11px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:2px 8px; }
+  .media { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  .media figure { margin:0; text-align:center; }
+  .media figcaption { font-size:11px; color:var(--muted); margin-top:4px; }
+  img.pix { image-rendering:pixelated; width:128px; height:128px; object-fit:contain;
+            border:1px solid var(--line); border-radius:8px; background:#000; }
+  audio { width:280px; }
 </style>
 </head>
 <body>
@@ -81,14 +87,29 @@
     <div class="note">Sampling is fixed in the engine (temp 0.8 / top-k 40 / top-p 0.95). “max new” applies to LLaMA-family models only.</div>
   </section>
 
-  <!-- IMAGE (Phase 2) -->
+  <!-- IMAGE -->
   <section class="view" id="view-image">
-    <div class="placeholder"><h3>Image</h3><p>Image generation panel arrives in the next build step.</p></div>
+    <div class="bar">
+      <input type="file" id="imgfile" accept="image/*">
+      <label>steps</label><input id="imgsteps" type="number" value="100" min="30" max="600" style="width:84px">
+      <label>levels</label><input id="imglevels" type="number" value="4" min="2" max="8" style="width:60px">
+      <button id="imggo">Reconstruct</button>
+    </div>
+    <div class="log" id="log-image">
+      <div class="note">Upload any image — it is downscaled to ≤16×16, tokenized (color-cube), and autoregressively reconstructed by a fresh tiny model that overfits this one input. Attention is O(pixels²) on CPU, so expect ~15–20 s. Toy-scale by design.</div>
+    </div>
   </section>
 
-  <!-- AUDIO (Phase 2) -->
+  <!-- AUDIO -->
   <section class="view" id="view-audio">
-    <div class="placeholder"><h3>Audio</h3><p>Audio generation panel arrives in the next build step.</p></div>
+    <div class="bar">
+      <input type="file" id="audfile" accept="audio/wav,audio/*">
+      <label>steps</label><input id="audsteps" type="number" value="100" min="30" max="600" style="width:84px">
+      <button id="audgo">Reconstruct</button>
+    </div>
+    <div class="log" id="log-audio">
+      <div class="note">Upload a 16-bit PCM WAV — trimmed to ≤256 samples (≈16 ms @16 kHz), µ-law tokenized, and reconstructed. Attention is O(samples²) on CPU, so expect ~10 s. Toy-scale.</div>
+    </div>
   </section>
 
   <!-- VIDEO (Phase 3) -->
@@ -119,9 +140,16 @@ function handle(m) {
   switch (m.op) {
     case "models": models = m.items || []; fillModels(); break;
     case "chat_result": addMsg("text", "bot", m.text || "(empty)", m.model); busy(false); break;
-    case "status": addMsg("text", "status", m.text); break;
-    case "error": addMsg("text", "err", "⚠ " + m.text); busy(false); break;
+    case "status": addMsg(activeView(), "status", m.text); break;
+    case "error": addMsg(activeView(), "err", "⚠ " + m.text); mediaBusy(false); busy(false); break;
+    case "image_result": showImage(m); mediaBusy(false); break;
+    case "audio_result": showAudio(m); mediaBusy(false); break;
   }
+}
+
+function activeView() {
+  const v = document.querySelector(".view.active");
+  return v ? v.id.replace("view-", "") : "text";
 }
 
 function fillModels() {
@@ -164,6 +192,67 @@ function sendPrompt() {
 $("#send").addEventListener("click", sendPrompt);
 $("#prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+});
+
+// ---- media (image / audio) ----
+function readFileB64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+let mediaSending = false;
+function mediaBusy(b) {
+  mediaSending = b;
+  $("#imggo").disabled = b; $("#audgo").disabled = b;
+}
+function addNode(view, node) {
+  const log = $("#log-" + view);
+  const div = document.createElement("div");
+  div.className = "msg bot";
+  div.appendChild(node);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+function showImage(m) {
+  const wrap = document.createElement("div");
+  wrap.className = "media";
+  const fig = (src, cap) => {
+    const f = document.createElement("figure");
+    const img = document.createElement("img"); img.className = "pix"; img.src = "data:image/png;base64," + src;
+    const c = document.createElement("figcaption"); c.textContent = cap;
+    f.appendChild(img); f.appendChild(c); return f;
+  };
+  if (m.input_png) wrap.appendChild(fig(m.input_png, `input ${m.w}×${m.h}`));
+  wrap.appendChild(fig(m.png_b64, "reconstruction"));
+  addNode("image", wrap);
+}
+function showAudio(m) {
+  const a = document.createElement("audio");
+  a.controls = true; a.src = "data:audio/wav;base64," + m.wav_b64;
+  const wrap = document.createElement("div");
+  wrap.appendChild(a);
+  const cap = document.createElement("div"); cap.className = "note"; cap.style.padding = "4px 0 0";
+  cap.textContent = `reconstructed ${m.frames} samples`;
+  wrap.appendChild(cap);
+  addNode("audio", wrap);
+}
+$("#imggo").addEventListener("click", async () => {
+  if (mediaSending) return;
+  const f = $("#imgfile").files[0];
+  if (!f) { addMsg("image", "err", "⚠ pick an image file"); return; }
+  mediaBusy(true); addMsg("image", "status", "generating… (~15–20 s, CPU)");
+  send({op:"imggen", png_b64: await readFileB64(f),
+        steps: parseInt($("#imgsteps").value)||500, levels: parseInt($("#imglevels").value)||4});
+});
+$("#audgo").addEventListener("click", async () => {
+  if (mediaSending) return;
+  const f = $("#audfile").files[0];
+  if (!f) { addMsg("audio", "err", "⚠ pick a WAV file"); return; }
+  mediaBusy(true); addMsg("audio", "status", "generating… (~10 s, CPU)");
+  send({op:"audgen", wav_b64: await readFileB64(f), steps: parseInt($("#audsteps").value)||100});
 });
 
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {

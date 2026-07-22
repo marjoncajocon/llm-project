@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// runTimeout bounds any single subprocess (generation can legitimately take tens
+// of seconds on long sequences, but should never run for minutes).
+const runTimeout = 4 * time.Minute
 
 // Model describes one model/<name>/ folder and how to chat with it.
 type Model struct {
@@ -154,9 +160,13 @@ func runChat(m Model, text string, n int) (string, string, error) {
 }
 
 // runCmd runs a subprocess with cwd = repo root (so model/, tools/*.py, and
-// relative checkpoint paths resolve as the CLIs expect).
+// relative checkpoint paths resolve as the CLIs expect). Media/large-model runs
+// can be slow (the engine's attention is O(seq^2) on CPU), so a generous context
+// timeout guards against a genuine runaway rather than a long-but-normal run.
 func runCmd(bin string, args []string, stdin string) (string, string, error) {
-	cmd := exec.Command(bin, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = cfg.root
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -165,6 +175,9 @@ func runCmd(bin string, args []string, stdin string) (string, string, error) {
 	cmd.Stdout = &so
 	cmd.Stderr = &se
 	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		err = fmt.Errorf("subprocess timed out after %s (try fewer steps / smaller input)", runTimeout)
+	}
 	return so.String(), se.String(), err
 }
 
