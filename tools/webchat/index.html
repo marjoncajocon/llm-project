@@ -76,11 +76,21 @@
       <label for="model">Model</label>
       <select id="model"><option>loading…</option></select>
       <span id="modelnote" class="pill"></span>
+      <label for="modality">reply</label>
+      <select id="modality">
+        <option value="auto">Auto-detect</option>
+        <option value="text">Text</option>
+        <option value="image">Image</option>
+        <option value="audio">Audio</option>
+        <option value="video">Video</option>
+      </select>
       <button id="clear" class="ghost" style="margin-left:auto">Clear</button>
     </div>
     <div class="log" id="log-text"></div>
     <div class="composer">
-      <textarea id="prompt" placeholder="Type a prompt and press Enter…" rows="1"></textarea>
+      <input type="file" id="attach" accept="image/*,audio/*" style="display:none">
+      <button id="attachbtn" class="ghost" title="attach a target image/audio (for the media demo)">📎</button>
+      <textarea id="prompt" placeholder="Ask anything — e.g. “write a C loop”, or “a picture of the sun” (attach a target)…" rows="1"></textarea>
       <button id="send">Send</button>
     </div>
     <div class="note">
@@ -160,6 +170,7 @@ function handle(m) {
   switch (m.op) {
     case "models": models = m.items || []; fillModels(); break;
     case "chat_delta": appendBot(m.text); break;
+    case "chat_media": showChatMedia(m); break;
     case "chat_done": finishBot(); busy(false); break;
     case "status": addMsg(activeView(), "status", m.text); break;
     case "error": addMsg(activeView(), "err", "⚠ " + m.text); finishBot(); mediaBusy(false); busy(false); break;
@@ -201,9 +212,10 @@ function addMsg(view, kind, text, who) {
 let sending = false;
 function busy(b) { sending = b; $("#send").disabled = b; $("#send").textContent = b ? "…" : "Send"; }
 
-// ---- conversation memory + live streaming ----
+// ---- conversation memory + live streaming + mixed media ----
 const history = [];          // [{role:"user"|"assistant", text}]
-let liveBot = null, liveText = "";
+let liveBot = null, liveText = "", liveMedia = null;
+let attachB64 = null, attachName = "";
 
 function buildPrompt(newText) {
   let p = "";
@@ -216,41 +228,63 @@ function appendBot(piece) {
   liveBot._body.textContent = liveText;
   const log = $("#log-text"); log.scrollTop = log.scrollHeight;
 }
+function showChatMedia(m) {
+  if (!liveBot) return;
+  if (liveBot._body && liveBot._body.parentNode === liveBot) liveBot.removeChild(liveBot._body);
+  let el;
+  if (m.kind === "image") { el = document.createElement("img"); el.className = "pix"; el.src = "data:image/png;base64," + m.png_b64; }
+  else if (m.kind === "audio") { el = document.createElement("audio"); el.controls = true; el.src = "data:audio/wav;base64," + m.wav_b64; }
+  if (el) liveBot.appendChild(el);
+  liveMedia = m.kind;
+  const log = $("#log-text"); log.scrollTop = log.scrollHeight;
+}
 function finishBot() {
   if (!liveBot) return;
-  const t = liveText.trim();
-  if (t === "") liveBot._body.textContent = "(no output)";
-  else liveBot._body.textContent = t;
-  history.push({role:"assistant", text: t});
-  liveBot = null; liveText = "";
+  if (liveMedia) {
+    history.push({role:"assistant", text:"[generated " + liveMedia + "]"});
+  } else {
+    const t = liveText.trim();
+    liveBot._body.textContent = (t === "") ? "(no output)" : t;
+    history.push({role:"assistant", text: t});
+  }
+  liveBot = null; liveText = ""; liveMedia = null;
 }
-function sendPrompt() {
+async function sendPrompt() {
   if (sending) return;
   const text = $("#prompt").value.trim();
   const m = currentModel();
   if (!text) return;
   if (!m) { addMsg("text", "err", "⚠ pick a model"); return; }
-  addMsg("text", "user", text, "you");
+  addMsg("text", "user", text + (attachB64 ? "  📎 " + attachName : ""), "you");
   $("#prompt").value = "";
   busy(true);
   const prompt = buildPrompt(text);
   history.push({role:"user", text});
-  // open a live assistant bubble that fills in token-by-token
-  liveText = "";
+  liveText = ""; liveMedia = null;
   liveBot = document.createElement("div");
   liveBot.className = "msg bot";
   liveBot.innerHTML = `<div class="who">${m.name}</div>`;
   liveBot._body = document.createTextNode("");
   liveBot.appendChild(liveBot._body);
   const log = $("#log-text"); log.appendChild(liveBot); log.scrollTop = log.scrollHeight;
-  send({op:"chat", model:m.name, text:prompt});  // no max: runs until the model finishes
+  const payload = {op:"chat", model:m.name, text, context:prompt, modality:$("#modality").value};
+  if (attachB64) payload.media_b64 = attachB64;
+  send(payload);
+  clearAttach();
 }
+function clearAttach() { attachB64 = null; attachName = ""; $("#attachbtn").textContent = "📎"; $("#attach").value = ""; }
+$("#attachbtn").addEventListener("click", () => $("#attach").click());
+$("#attach").addEventListener("change", async () => {
+  const f = $("#attach").files[0];
+  if (!f) return;
+  attachB64 = await readFileB64(f); attachName = f.name; $("#attachbtn").textContent = "📎✓";
+});
 $("#send").addEventListener("click", sendPrompt);
 $("#prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
 });
 $("#clear").addEventListener("click", () => {
-  history.length = 0; liveBot = null; liveText = "";
+  history.length = 0; liveBot = null; liveText = ""; liveMedia = null; clearAttach();
   $("#log-text").innerHTML = "";
 });
 

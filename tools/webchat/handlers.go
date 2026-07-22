@@ -11,29 +11,152 @@ import (
 	"strings"
 )
 
-// handleChat streams a reply for the client-built conversation prompt (text).
-// Routes by model type: pure-C text models have their own tokenizer and are fast
-// (one delta, no streaming); gpt2 / llama stream token deltas live via the Python
-// wrappers (tiktoken / tokenizers do the incremental detokenization).
+// handleChat is the unified ("mixed") chat: it auto-detects whether the message
+// asks for text / image / audio / video (or the client can force a modality) and
+// routes accordingly, rendering the result inline. Text is real; image/audio use
+// the toy teach-then-reproduce path (needs an attached target); video and true
+// zero-shot text->media aren't available (no trained media model) — those return
+// an honest note. The media branch is the seam to plug a real model into later.
+//
+// Message fields: model, text (raw user message), context (history-built prompt),
+// modality ("auto"|"text"|"image"|"audio"|"video"), media_b64 (optional attachment).
 func handleChat(c *wsConn, msg map[string]any) {
 	name, _ := msg["model"].(string)
 	text, _ := msg["text"].(string)
-	// Generous safety cap: generation stops naturally on EOS / the stop sequence
-	// (handled in the stream wrappers); this only bounds a runaway base model.
+	context, _ := msg["context"].(string)
+	if context == "" {
+		context = text
+	}
+	modality, _ := msg["modality"].(string)
+	attach, _ := msg["media_b64"].(string)
 	n := intField(msg, "n", 512)
 	if strings.TrimSpace(text) == "" {
 		sendJSON(c, errMsg(fmt.Errorf("empty prompt")))
 		return
 	}
-	m := findModel(cfg.root, name)
-	if m == nil {
-		sendJSON(c, errMsg(fmt.Errorf("unknown model: %s", name)))
-		return
+	if modality == "" || modality == "auto" {
+		modality = detectMediaIntent(text)
 	}
 
+	switch modality {
+	case "image", "audio":
+		if attach != "" {
+			chatMedia(c, modality, text, attach) // teach-then-reproduce, inline
+		} else {
+			chatSay(c, mediaHint(modality))
+		}
+	case "video":
+		chatSay(c, "🎬 I detected a video request. This engine has no video generation "+
+			"model or encoder, so I can't make one. Text and toy image/audio work; a real "+
+			"text→video model would plug in here.")
+	default: // text
+		m := findModel(cfg.root, name)
+		if m == nil {
+			sendJSON(c, errMsg(fmt.Errorf("unknown model: %s", name)))
+			return
+		}
+		streamText(c, m, context, n)
+	}
+	sendJSON(c, map[string]any{"op": "chat_done", "model": name})
+}
+
+// detectMediaIntent is a lightweight keyword classifier for the "auto" modality.
+// It's heuristic — the UI also offers a manual modality override.
+func detectMediaIntent(text string) string {
+	t := " " + strings.ToLower(text) + " "
+	has := func(words ...string) bool {
+		for _, w := range words {
+			if strings.Contains(t, " "+w) || strings.Contains(t, w+" ") || strings.Contains(t, w+"s ") {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("video", "movie", "clip", "animation", "gif"):
+		return "video"
+	case has("image", "picture", "photo", "draw", "drawing", "paint", "logo", "icon", "sketch", "selfie"):
+		return "image"
+	case has("audio", "sound", "music", "song", "beep", "tune", "voice", "melody", "noise"):
+		return "audio"
+	default:
+		return "text"
+	}
+}
+
+func chatSay(c *wsConn, s string) { sendJSON(c, map[string]any{"op": "chat_delta", "text": s}) }
+
+func mediaHint(kind string) string {
+	return fmt.Sprintf("🎨 I detected an %s request. This engine has no trained text→%s model, "+
+		"so I can't generate one from words alone (that needs a diffusion/VQ-VAE model + scale). "+
+		"Attach a target %s with 📎 and I'll run the teach-then-reproduce demo, or plug in a real "+
+		"model later.", kind, kind, kind)
+}
+
+// chatMedia runs the toy text->media path on an attached target and renders the
+// result inline in the chat. (This is where a real text->media model would slot.)
+func chatMedia(c *wsConn, kind, prompt, attachB64 string) {
+	data, err := decodeMediaB64(attachB64)
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	dir, err := os.MkdirTemp("", "webchat")
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	defer os.RemoveAll(dir)
+
+	if kind == "image" {
+		in, out := filepath.Join(dir, "t.ppm"), filepath.Join(dir, "o.ppm")
+		if _, _, err := imageBytesToPPM(data, in, 16); err != nil {
+			chatSay(c, "⚠ "+err.Error())
+			return
+		}
+		if _, _, err := runCmd(cfg.exe, []string{"text2media", in, out, prompt, "250"}, ""); err != nil {
+			chatSay(c, "⚠ "+err.Error())
+			return
+		}
+		png, err := ppmFileToPNG(out)
+		if err != nil {
+			chatSay(c, "⚠ "+err.Error())
+			return
+		}
+		sendJSON(c, map[string]any{"op": "chat_media", "kind": "image",
+			"png_b64": base64.StdEncoding.EncodeToString(png)})
+		return
+	}
+	// audio
+	wav, _, err := prepWav(data, 256)
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	in, out := filepath.Join(dir, "t.wav"), filepath.Join(dir, "o.wav")
+	if err := os.WriteFile(in, wav, 0o644); err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	if _, _, err := runCmd(cfg.exe, []string{"text2media", in, out, prompt, "250"}, ""); err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	outWav, err := os.ReadFile(out)
+	if err != nil {
+		chatSay(c, "⚠ "+err.Error())
+		return
+	}
+	sendJSON(c, map[string]any{"op": "chat_media", "kind": "audio",
+		"wav_b64": base64.StdEncoding.EncodeToString(outWav)})
+}
+
+// streamText routes the text path by model type (pure-C: one delta; gpt2/llama:
+// live token streaming via the Python wrappers).
+func streamText(c *wsConn, m *Model, prompt string, n int) {
 	switch m.Mode {
 	case "purec-text":
-		reply, _, err := runChat(*m, text, n)
+		reply, _, err := runChat(*m, prompt, n)
 		if err != nil {
 			sendJSON(c, errMsg(err))
 			return
@@ -43,26 +166,22 @@ func handleChat(c *wsConn, msg map[string]any) {
 		}
 	case "gpt2":
 		if err := runCmdStream(cfg.python,
-			[]string{"tools/gpt2_stream.py", "--name", m.Name}, text,
+			[]string{"tools/gpt2_stream.py", "--name", m.Name}, prompt,
 			func(line string) { forwardDelta(c, line) }); err != nil {
 			sendJSON(c, errMsg(err))
-			return
 		}
 	case "llama":
 		args := []string{"tools/llama_stream.py", "--ckpt", m.Ckpt, "--n", strconv.Itoa(n)}
 		if m.HFRepo != "" {
 			args = append(args, "--model", m.HFRepo)
 		}
-		if err := runCmdStream(cfg.python, args, text,
+		if err := runCmdStream(cfg.python, args, prompt,
 			func(line string) { forwardDelta(c, line) }); err != nil {
 			sendJSON(c, errMsg(err))
-			return
 		}
 	default:
 		sendJSON(c, errMsg(fmt.Errorf("unsupported model mode %q", m.Mode)))
-		return
 	}
-	sendJSON(c, map[string]any{"op": "chat_done", "model": name})
 }
 
 // forwardDelta parses a wrapper JSON line ({"d":"piece"}) and forwards the text.
