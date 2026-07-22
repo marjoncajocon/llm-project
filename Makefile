@@ -9,7 +9,7 @@ TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o rmsnorm.o rope.o swiglu.o gqa.o quant.o llama.o \
           toolcall.o toolexec.o approval.o agent.o corpus.o train.o \
-          image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o selftest.o main.o
+          image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o selftest.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
 ZIG            ?= zig
@@ -63,8 +63,9 @@ audiogen.o:   audiogen.h audio.h
 caption.o:    caption.h tensor.h image.h patch.h audio.h video.h model.h loss.h optim.h sampler.h
 text2media.o: text2media.h tensor.h image.h imagegen.h audio.h audiogen.h model.h loss.h optim.h sampler.h
 t2i.o:        t2i.h tensor.h image.h imagegen.h model.h loss.h optim.h sampler.h
+vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h matrix.h
-main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h
+main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.
 # Requires `zig` and a POSIX shell (Linux/macOS/WSL). No per-OS toolchain needed.
