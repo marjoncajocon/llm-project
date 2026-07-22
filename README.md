@@ -1,14 +1,37 @@
-# Minimal GPT-2 Style Transformer (Pure C11)
+# Pure-C LLM Engine — GPT-2-style Transformer, Agent & Multimodal (C11)
 
-A tiny, dependency-free GPT-2–style language model written in portable C11. It exists
-as a readable reference — every piece (tensors, matrix math, softmax, GELU, LayerNorm,
-multi-head causal attention, feed-forward, embeddings, sampling, checkpointing, and a
-byte-level BPE tokenizer) is small enough to read in one sitting.
+> **This is a big, actively-developed project — not a one-off demo.** It is a from-scratch,
+> dependency-free machine-learning stack written in portable C11, built up over many committed
+> steps and still growing along a real roadmap (see `notes.md`). "Minimal" here means *minimal
+> dependencies* (no libraries, no BLAS, no framework — just the C standard library and `-lm`),
+> **not** minimal scope. The scope is deliberately broad.
 
-The model starts from random weights and now **trains end-to-end** — full backpropagation
-through attention, feed-forward, LayerNorm and embeddings, with Adam and a cross-entropy
-loss, verified by numerical gradient checking. The demo overfits a tiny next-token task to
-~0 loss. See `notes.md` for the roadmap.
+**What's built (all from scratch, all in pure C):**
+- **Training** — full backpropagation through attention, feed-forward, LayerNorm and embeddings;
+  Adam; cross-entropy; **numerically gradient-checked**. Train on your own text (`transformer
+  train`) with configurable model size, train/val split, checkpointing and resume.
+- **Inference** — temperature / top-k / top-p sampling, a **bit-exact KV cache**, and a
+  token/text generation CLI.
+- **Real GPT-2** — loads actual Hugging Face GPT-2 weights (124M–1.5B) and generates coherent
+  text (`tools/gpt2_setup.py` → GPTC checkpoint).
+- **A tool-using agent** — a coding-agent loop (parse tool calls → approval gate → execute →
+  observe) with a pluggable backend, including a real-LLM backend (`tools/agent_llm.py`).
+- **Multimodal** — image / video / audio *understanding* (patch/frame/waveform embeddings, trained
+  via a shared multimodal path) **and** discrete-token media *generation* (image/audio/video),
+  including text→media and media→text.
+- **Portable** — one flat, readable module per concern; builds and runs on Linux, macOS, Windows,
+  and **WebAssembly**.
+
+**Where it's honest about scale:** quality is capped by what a from-scratch model on a CPU can be
+— outputs are toy-scale, and the media codecs are crude. The deliverable is a *correct, complete,
+extensible engine and pipeline*, not production fidelity. The roadmap (`notes.md`) lays out the
+path to bigger, genuinely useful models: **SIMD + int8/int4 quantization**, and **modern
+LLaMA-family architecture** support (RMSNorm, RoPE, SwiGLU, GQA + a SentencePiece tokenizer) so it
+can load small modern models — turning this into a from-scratch mini-`llama.cpp`.
+
+Every module (tensors, matrix math, softmax, GELU, LayerNorm, causal multi-head attention,
+feed-forward, embeddings, sampling, checkpointing, BPE tokenizer) is still small enough to read in
+one sitting — the codebase stays approachable even as the project grows.
 
 ## Project layout
 
