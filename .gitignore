@@ -40,6 +40,9 @@ data/*
 # Agent demo artifact
 agent_demo.txt
 
+# webchat Go server binary (POSIX build; the Windows .exe is caught by *.exe)
+tools/webchat/webchat
+
 # Image/video/audio media (data, not source) + the smoke-test temp dir
 *.ppm
 *.wav

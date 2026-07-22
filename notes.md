@@ -582,6 +582,36 @@ byte-identical numerics: grad `9.28e-04`, KV cache `0.00e+00`) and `-Wall` clean
 (`corpus.c` `ftell`/`int` narrowing); crawler retry/backoff + filename-collision dedup;
 `convert_llama.py` sharded-checkpoint support. See the review tables (in-session) for the full list.
 
+## Web testing frontend (Go + WebSocket) + `caption` subcommand — DONE (2026-07-22)
+
+`tools/webchat/` — a self-contained **Go** web server (stdlib only, hand-rolled RFC 6455 in
+`ws.go`, embedded single-page UI) that drives the engine from a browser for testing all
+modalities. Built in 4 phases, each committed:
+1. Server skeleton + **model switcher** + **text chat**. `models.go` scans `model/<name>/`, peeks
+   the 4-byte magic, and routes: GPTC+tok.bin → pure-C `generate --name`; GPTC/no-tok → GPT-2 via
+   `gpt2_chat.py`; LLMA/LLMQ → `llama_chat.py` (built-in SmolLM2/Qwen HF-tokenizer map, override via
+   `model/<name>/hf_tokenizer.txt`). Subprocesses run with cwd = repo root; stdout = result, stderr
+   = status.
+2. **Image + audio generation** panels. `media.go` does PPM(P6)↔PNG and WAV normalize/trim in Go
+   stdlib (no Pillow). imggen reconstructs an uploaded image; audgen an uploaded WAV (returned
+   browser-playable).
+3. **New C `caption` subcommand** (`caption.c/.h`) + **video** panel. `caption <img.ppm|aud.wav|
+   frames_dir> <text> [steps]` builds media embeddings via the existing patch/audio/video
+   front-ends, byte-level-tokenizes the caption, and runs the same train→generate as selftest's
+   `media_to_text` (teach-then-reproduce). Prints `caption: <text>` to stdout. Video panel extracts
+   frames via `video_to_frames.py` (ffmpeg) → caption + frames-GIF preview; degrades gracefully if
+   ffmpeg is absent. **Additive — smoke test stayed PASSED (grad 9.28e-04, KV 0.00e+00).**
+4. Docs + `.gitignore` (POSIX `webchat` binary; `*.exe` already covered).
+
+**Key gotcha found:** media/large-model runs are SLOW, not hung — attention is O(seq²) on CPU
+(audgen 512 samples/100 steps = 37 s vs 128 samples = 2.4 s). The webchat caps inputs (image
+≤16×16, audio ≤256 samples) + low default steps so each run is ~10 s, with a 4-min subprocess
+timeout as a safety net. **Honest ceiling:** generation reconstructs/overfits one input; caption is
+teach-then-reproduce on an untrained front-end (no trained multimodal checkpoint exists) — it proves
+the pipelines RUN on real media, it is not a real captioner. Deps: Go 1.23; Python+tiktoken/
+tokenizers only for the real models; ffmpeg only for video. Run: `cd tools/webchat && go run .
+-root ../..` → http://localhost:8080. See `tools/webchat/README.md`.
+
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
 **If a session ran out of usage / you're picking this up fresh, start here.**
@@ -604,7 +634,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
   optim.c rmsnorm.c rope.c swiglu.c gqa.c quant.c llama.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
-  video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
+  video.c audio.c imagegen.c audiogen.c caption.c selftest.c main.c -lm
 # On this Windows box, listing files explicitly is fragile — easiest is to glob:
 #   $c = (Get-ChildItem *.c | ForEach-Object { $_.Name }); zig cc -std=c11 -O2 -Wall -o transformer.exe @c -lm
 # (check.h is header-only — no .c to list. Add -DNDEBUG to disable the debug assertions.)

@@ -129,7 +129,26 @@ transformer agent --cmd "python tools/agent_mock.py" --goal "..."
 transformer agent --cmd "python tools/agent_llm.py" --goal "refactor X" --ask
 ```
 
+### `webchat/` — browser testing frontend (Go + WebSocket)
+
+A self-contained **Go** web server (`tools/webchat/`, stdlib only — no external modules) that
+drives the engine from a browser: **text chat** across every detected model, **image / audio
+generation**, and **image / audio / video "understanding"** (teach-then-reproduce captioning). It
+bridges each request to the CLI as a subprocess, and the model switcher classifies `model/<name>/`
+by checkpoint magic (pure-C `generate` vs the `gpt2_chat.py` / `llama_chat.py` bridges).
+
+```sh
+make                                   # build the engine first (repo root)
+cd tools/webchat && go run . -root ../..   # open http://localhost:8080
+```
+
+Needs Go 1.23+. Python (+ `tiktoken` / `tokenizers`) only for the real GPT-2 / SmolLM2 / Qwen
+models; **ffmpeg** only for the video panel. Quality is toy-scale by design (it proves the
+pipelines run on real media, not production fidelity). See `webchat/README.md` for the full guide.
+This is the one multi-file tool, so it lives in its own subfolder under `tools/`.
+
 ## Adding a tool
 
 Drop your script in this folder, keep it self-contained, and document its usage here.
-Do not add non-C source to the project root.
+Do not add non-C source to the project root. A multi-file tool (like `webchat/`) may use its own
+subfolder under `tools/`.

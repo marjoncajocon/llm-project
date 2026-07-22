@@ -388,6 +388,22 @@ python tools/convert_to_gptc.py <weights.npz> <model.bin> --n-heads <N>
 
 Expected `.npz` keys: `wte`, `wpe`, `blocks.{l}.{W_q,W_k,W_v,W_o,gamma1,beta1,gamma2,beta2,ff_W1,ff_b1,ff_W2,ff_b2}`, `ln_f_gamma`, `ln_f_beta`, `lm_head` (see the script's docstring for shapes). Load the result in C with `gpt_load("model.bin", &m)`.
 
+### Web testing UI — `tools/webchat/` (Go + WebSocket)
+
+A browser frontend for exercising every modality: text chat across all detected models (a
+switcher), image/audio generation, and image/audio/video "understanding" (teach-then-reproduce
+captioning, via the new `transformer caption` subcommand). Pure Go standard library; it bridges to
+the CLI as a subprocess.
+
+```sh
+make                                       # build the engine first
+cd tools/webchat && go run . -root ../..   # open http://localhost:8080
+```
+
+Needs Go 1.23+; Python (`tiktoken`/`tokenizers`) only for the real GPT-2/SmolLM2/Qwen models,
+ffmpeg only for the video panel. Quality is toy-scale by design — it proves the pipelines run on
+real media end-to-end. See `tools/webchat/README.md`.
+
 ---
 
 ## Programmatic guide (using the C API)

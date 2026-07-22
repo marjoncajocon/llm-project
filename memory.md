@@ -8,6 +8,23 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > **Sync rule (user request):** this file mirrors Claude's memory — whenever the assistant
 > updates its memory, it must also update `memory.md` here.
 
+> **▶▶ Web testing frontend (Go+WebSocket) + `caption` subcommand — ✅ DONE (2026-07-22):**
+> `tools/webchat/` = a self-contained **Go** web server (stdlib only, hand-rolled RFC 6455;
+> embedded single-page UI) to test ALL modalities from a browser. 4 committed phases (`5eb41eb`
+> text chat + model switcher; `59a12b5` image/audio gen; `14e7d5d` caption + video). **Model
+> switcher** (`models.go`) scans `model/<name>/`, peeks the 4-byte magic → routes GPTC+tok.bin to
+> pure-C `generate --name`, GPTC/no-tok to `gpt2_chat.py`, LLMA/LLMQ to `llama_chat.py` (SmolLM2/
+> Qwen HF-tok map). Media bridged in Go stdlib (PPM↔PNG, WAV) — no Pillow. **New C `caption`
+> subcommand** (`caption.c/.h`, wired in main.c+Makefile): `caption <img.ppm|aud.wav|frames_dir>
+> <text> [steps]` = teach-then-reproduce media→text via the existing patch/audio/video front-ends
+> + selftest's `media_to_text` path; prints `caption: <text>`; **additive, smoke stayed PASSED**.
+> Video needs **ffmpeg** (absent on this box → degrades w/ a clear error). **Gotcha:** media runs
+> are SLOW not hung — attention is O(seq²) on CPU (audgen 512smp/100steps=37s); webchat caps inputs
+> (img ≤16×16, aud ≤256 smp) + low steps (~10s) + a 4-min subprocess timeout. Honest ceiling:
+> reconstruct/overfit + teach-then-reproduce (no trained multimodal ckpt) — proves pipelines RUN on
+> real media, not a real captioner. Run: `cd tools/webchat && go run . -root ../..` → :8080. Go is
+> at `D:\env\go_lang` (go 1.23.12). See `tools/webchat/README.md`.
+>
 > **▶▶ Security/robustness hardening pass — ✅ DONE (2026-07-22):** a 5-agent code review of the
 > whole tree found the MATH correct (softmax/GELU/RMSNorm/RoPE/GQA/cross-entropy/int8 all
 > verified) but bugs at the **trust boundaries**. Fixed the top of the list — 4 criticals + every
