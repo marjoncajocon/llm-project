@@ -159,8 +159,11 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    ✅ **Multi-block MODEL** (`LlamaModel` in `llama.c`: wte embedding → N blocks → final RMSNorm →
    lm_head; no positional term; forward-only; selftest `[18]`: 3-layer forward finite + model-level
    causality 0.00e+00). **All 8 `make cross` targets build with the new modules incl. wasm32-wasi.**
-   Remaining to actually run a real model: `convert_llama.py` (HF safetensors→layout, RoPE Q/K
-   permutation, tokenizer) + a load path + a checkpoint format for LlamaModel.
+   ✅ **LLMA checkpoint** (`llama_model_save/load` in `llama.c`: flat binary, magic+config+weights in a
+   shared canonical order like GPTC; selftest `[18]` round-trip bit-exact 0.00e+00; cross-compiles incl.
+   wasm). Remaining to run a REAL model: `convert_llama.py` (HF safetensors→LLMA layout, RoPE Q/K
+   weight un-permutation, tokenizer bridge) + a `generate`-style CLI for LlamaModel. Then load & run
+   SmolLM2-135M / Qwen2.5-0.5B. Also SIMD/int8 quant for speed.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

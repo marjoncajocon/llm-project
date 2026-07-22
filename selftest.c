@@ -1102,9 +1102,28 @@ int run_selftest(void) {
       if (d > last_diff) last_diff = d;
     }
     int lm_ok = finite && (past_diff < 1e-6f) && (last_diff > 1e-4f);
-    printf("    finite=%d | causality: earlier-token logits max|diff|=%.2e (==0) last-token |diff|=%.2e (>0) -> %s\n\n",
+    printf("    finite=%d | causality: earlier-token logits max|diff|=%.2e (==0) last-token |diff|=%.2e (>0) -> %s\n",
            finite, past_diff, last_diff, lm_ok ? "OK" : "FAIL");
     all_ok &= lm_ok;
+
+    // LLMA checkpoint round-trip: save -> load -> forward must be bit-identical.
+    int rt_ok = 0;
+    if (llama_model_save("llama_ckpt.tmp", &lm) == 0) {
+      LlamaModel lm2;
+      if (llama_model_load("llama_ckpt.tmp", &lm2) == 0) {
+        Tensor L3 = tensor_create(ls, 2);
+        llama_model_forward(&lm2, ids, seq, &L3);
+        float md = 0.0f;
+        for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L3.data[i] - L1.data[i]); if (d > md) md = d; }
+        rt_ok = (md == 0.0f);
+        printf("    LLMA checkpoint round-trip: max |logit diff| = %.2e -> %s\n\n", md, rt_ok ? "OK" : "FAIL");
+        tensor_free(&L3);
+        llama_model_free(&lm2);
+      }
+    }
+    remove("llama_ckpt.tmp");
+    all_ok &= rt_ok;
+
     llama_model_free(&lm);
     tensor_free(&L1); tensor_free(&L2);
   }

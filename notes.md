@@ -298,10 +298,22 @@ modules (rmsnorm/rope/swiglu/gqa/llama) — x86_64/aarch64 linux-gnu, linux-musl
 windows-gnu, x86_64/aarch64 macos, and **wasm32-wasi** (the new modules are pure standard C + math +
 malloc, no platform code). `-Wall` clean everywhere.
 
-Next: **`convert_llama.py`** (HF safetensors → our weight layout, handling the HF RoPE Q/K weight
-permutation + tokenizer) + a load path, so we can load and generate from a real small modern model
-(SmolLM2-135M / Qwen2.5-0.5B). Also pending: SIMD/int8 quant for speed; a `GPTC`-style checkpoint
-format for LlamaModel. (Block/model are forward-only; add backward if we want to fine-tune.)
+## Modern architecture — step 7: LLMA checkpoint format + C loader — DONE (2026-07-22)
+
+`llama_model_save`/`llama_model_load` in `llama.c` (declared in `llama.h`) — a flat binary **`LLMA`**
+format mirroring `GPTC`: magic + version + 8 config ints (vocab, d_model, n_layers, n_heads, n_kv,
+head_dim, d_ff, max_seq) + 2 floats (rope_base, eps) + every weight's float32 in a fixed canonical
+order driven by a shared `llama_collect` (1 wte + 9/layer + final_norm + lm_head), so save/load can't
+drift. `load` builds a matching model then reads weights in. Verified: selftest **part `[18]`** now
+also does a **round-trip** — save → load → forward → logits **bit-identical** to the original
+(max |diff| 0.00e+00). All targets still cross-compile (re-checked wasm32-wasi + aarch64-macos with
+the stdio checkpoint code). Smoke test PASSED, `-Wall` clean.
+
+Next: **`convert_llama.py`** — HF safetensors → this `LLMA` layout, handling the HF RoPE Q/K weight
+permutation (HF's rotate_half expects a permuted q_proj/k_proj vs our interleaved-free half-split;
+converter must un-permute) + emit the config; plus a tokenizer bridge and a `generate`-style CLI for
+`LlamaModel`. Then we can load & generate from SmolLM2-135M / Qwen2.5-0.5B. Also pending: SIMD/int8
+quant for speed. (Block/model still forward-only; add backward if we want to fine-tune.)
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

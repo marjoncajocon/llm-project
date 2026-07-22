@@ -1,7 +1,9 @@
 // llama.c - A modern (LLaMA-family) transformer block (forward / inference)
 #include "llama.h"
 
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #include "matrix.h"
 #include "rmsnorm.h"
@@ -138,4 +140,97 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
   matmul(&hn, &m->lm_head, logits);            // (seq_len, vocab)
 
   tensor_free(&a); tensor_free(&b); tensor_free(&hn);
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint I/O ('LLMA' flat binary)
+// ---------------------------------------------------------------------------
+
+#define LLMA_MAGIC   0x414D4C4Cu  // 'LLMA' little-endian bytes L,L,M,A
+#define LLMA_VERSION 1u
+
+// Every weight tensor in a fixed canonical order shared by save and load, so the
+// two can never drift. 1 (wte) + 9 per layer + 2 (final_norm, lm_head).
+static int llama_collect(const LlamaModel *m, const Tensor **list) {
+  int n = 0;
+  list[n++] = &m->wte;
+  for (int l = 0; l < m->n_layers; l++) {
+    const LlamaBlock *b = &m->blocks[l];
+    list[n++] = &b->attn_norm;
+    list[n++] = &b->Wq;
+    list[n++] = &b->Wk;
+    list[n++] = &b->Wv;
+    list[n++] = &b->Wo;
+    list[n++] = &b->ffn_norm;
+    list[n++] = &b->Wgate;
+    list[n++] = &b->Wup;
+    list[n++] = &b->Wdown;
+  }
+  list[n++] = &m->final_norm;
+  list[n++] = &m->lm_head;
+  return n;
+}
+
+int llama_model_save(const char *path, const LlamaModel *m) {
+  FILE *f = fopen(path, "wb");
+  if (!f) { fprintf(stderr, "Error: cannot open '%s' for writing\n", path); return 1; }
+
+  uint32_t header[2] = {LLMA_MAGIC, LLMA_VERSION};
+  int32_t cfg[8] = {m->vocab, m->d_model, m->n_layers, m->n_heads,
+                    m->n_kv, m->head_dim, m->d_ff, m->max_seq};
+  float fcfg[2] = {m->rope_base, m->eps};
+
+  int ok = 1;
+  ok &= (fwrite(header, sizeof(uint32_t), 2, f) == 2);
+  ok &= (fwrite(cfg, sizeof(int32_t), 8, f) == 8);
+  ok &= (fwrite(fcfg, sizeof(float), 2, f) == 2);
+
+  const Tensor **list = (const Tensor**)malloc((size_t)(1 + 9 * m->n_layers + 2) * sizeof(const Tensor*));
+  int count = llama_collect(m, list);
+  for (int i = 0; i < count && ok; i++) {
+    size_t sz = (size_t)list[i]->size;
+    ok &= (fwrite(list[i]->data, sizeof(float), sz, f) == sz);
+  }
+  free(list);
+  fclose(f);
+  if (!ok) { fprintf(stderr, "Error: failed while writing '%s'\n", path); return 1; }
+  return 0;
+}
+
+int llama_model_load(const char *path, LlamaModel *out) {
+  FILE *f = fopen(path, "rb");
+  if (!f) { fprintf(stderr, "Error: cannot open '%s' for reading\n", path); return 1; }
+
+  uint32_t header[2];
+  int32_t cfg[8];
+  float fcfg[2];
+  if (fread(header, sizeof(uint32_t), 2, f) != 2 ||
+      fread(cfg, sizeof(int32_t), 8, f) != 8 ||
+      fread(fcfg, sizeof(float), 2, f) != 2) {
+    fprintf(stderr, "Error: '%s' is truncated (bad header)\n", path);
+    fclose(f); return 1;
+  }
+  if (header[0] != LLMA_MAGIC || header[1] != LLMA_VERSION) {
+    fprintf(stderr, "Error: '%s' is not a v%u LLMA checkpoint\n", path, LLMA_VERSION);
+    fclose(f); return 1;
+  }
+
+  *out = llama_model_create(cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
+                            cfg[6], cfg[7], fcfg[0], fcfg[1]);
+
+  int ok = 1;
+  const Tensor **list = (const Tensor**)malloc((size_t)(1 + 9 * out->n_layers + 2) * sizeof(const Tensor*));
+  int count = llama_collect(out, list);
+  for (int i = 0; i < count && ok; i++) {
+    size_t sz = (size_t)list[i]->size;
+    ok &= (fread(list[i]->data, sizeof(float), sz, f) == sz);
+  }
+  free(list);
+  fclose(f);
+  if (!ok) {
+    fprintf(stderr, "Error: '%s' is truncated (bad weights)\n", path);
+    llama_model_free(out);
+    return 1;
+  }
+  return 0;
 }

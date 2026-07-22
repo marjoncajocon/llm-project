@@ -63,4 +63,11 @@ void llama_model_randomize(LlamaModel *m);
 // Forward: token ids (length seq_len) -> logits (seq_len, vocab). Causal.
 void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tensor *logits);
 
+// Checkpoint I/O: flat binary 'LLMA' format (magic + version + config + every
+// weight's float32 in a fixed canonical order shared by save and load).
+// llama_model_load builds a matching model, then reads the weights into it.
+// Return 0 on success, nonzero on error.
+int llama_model_save(const char *path, const LlamaModel *m);
+int llama_model_load(const char *path, LlamaModel *out);
+
 #endif // LLAMA_H
