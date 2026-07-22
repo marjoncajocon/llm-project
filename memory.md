@@ -161,9 +161,14 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    causality 0.00e+00). **All 8 `make cross` targets build with the new modules incl. wasm32-wasi.**
    ✅ **LLMA checkpoint** (`llama_model_save/load` in `llama.c`: flat binary, magic+config+weights in a
    shared canonical order like GPTC; selftest `[18]` round-trip bit-exact 0.00e+00; cross-compiles incl.
-   wasm). Remaining to run a REAL model: `convert_llama.py` (HF safetensors→LLMA layout, RoPE Q/K
-   weight un-permutation, tokenizer bridge) + a `generate`-style CLI for LlamaModel. Then load & run
-   SmolLM2-135M / Qwen2.5-0.5B. Also SIMD/int8 quant for speed.
+   wasm). ✅ **convert_llama.py + `llama` CLI**
+   (`tools/convert_llama.py`: HF LLaMA-family safetensors→LLMA; **NO RoPE permutation needed** — rope.c
+   is HF half-split, so HF q/k load directly; transposes linear weights (HF (out,in)→our (in,out)),
+   tied lm_head=wte^T, warns on Qwen2 attn biases (unsupported); `--tiny` no-download test file.
+   `main.c` `llama <ckpt>` subcommand: token-ids→next-token argmax. Verified Python-write→C-load→forward
+   with --tiny, cross-compiles). Remaining to run a REAL model: a **tokenizer bridge** (SmolLM/Qwen BPE)
+   + a **text generate path** for LlamaModel, then download+convert+generate SmolLM2-135M. Also SIMD/int8
+   quant. Real-model correctness only fully proven once we generate.
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;

@@ -56,6 +56,29 @@ transformer train data/wiki --out ml.bin --tok ml.tok --steps 10000
 Standard library only (urllib); needs internet. Sets a descriptive User-Agent and rate-limits
 per Wikipedia's guidelines.
 
+### `convert_llama.py`
+
+Convert a HuggingFace **LLaMA-family** model (SmolLM2, Qwen2.5, Llama, …) into this project's
+**LLMA** checkpoint, loadable in C via `transformer llama <model.bin>` (`LlamaModel` — the modern
+RMSNorm+RoPE+GQA+SwiGLU architecture in `llama.c`).
+
+```sh
+pip install numpy safetensors huggingface_hub
+python tools/convert_llama.py --model HuggingFaceTB/SmolLM2-135M --out model/smollm/model.bin
+echo "1 2 3 4 5" | transformer llama model/smollm/model.bin      # token-in -> next-token argmax
+python tools/convert_llama.py --tiny t.bin                        # small format-test file (no download)
+```
+
+- **No RoPE weight permutation** is needed: `rope.c` uses HF's half-split ("rotate_half")
+  convention, so HF `q_proj`/`k_proj` load directly.
+- HF linear weights are `(out, in)` (applied as `x@Wᵀ`); our matmul is `x@W` with `W (in, out)`, so
+  each linear weight is **transposed**. Norm gains + the token embedding are copied as-is; tied
+  models use `lm_head = embed_tokens.weightᵀ`.
+- **No attention biases** yet: fine for LLaMA/SmolLM; Qwen2 (which has q/k/v biases) would need
+  bias support first — the converter warns.
+
+Requires Python 3 + NumPy + safetensors + huggingface_hub, and internet for the download.
+
 ### `agent_mock.py` / `agent_llm.py` — model backends for the agent loop
 
 The C agent (`agent --cmd "<prog>"`) writes the running transcript to a temp file, passes its

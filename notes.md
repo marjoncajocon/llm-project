@@ -309,11 +309,33 @@ also does a **round-trip** — save → load → forward → logits **bit-identi
 (max |diff| 0.00e+00). All targets still cross-compile (re-checked wasm32-wasi + aarch64-macos with
 the stdio checkpoint code). Smoke test PASSED, `-Wall` clean.
 
-Next: **`convert_llama.py`** — HF safetensors → this `LLMA` layout, handling the HF RoPE Q/K weight
-permutation (HF's rotate_half expects a permuted q_proj/k_proj vs our interleaved-free half-split;
-converter must un-permute) + emit the config; plus a tokenizer bridge and a `generate`-style CLI for
-`LlamaModel`. Then we can load & generate from SmolLM2-135M / Qwen2.5-0.5B. Also pending: SIMD/int8
-quant for speed. (Block/model still forward-only; add backward if we want to fine-tune.)
+## Modern architecture — step 8: convert_llama.py + `llama` CLI — DONE (2026-07-22)
+
+`tools/convert_llama.py` — HF LLaMA-family safetensors -> our `LLMA` checkpoint. **KEY CORRECTION to
+earlier notes: NO RoPE Q/K permutation is needed.** rope.c implements HF's half-split ("rotate_half")
+convention, so HF-format `q_proj`/`k_proj` load directly (the permutation is only for
+Meta-interleaved->HF conversion, which doesn't apply to HF-native models like SmolLM2/Qwen2.5). The
+converter transposes every linear weight (HF stores (out,in), applied `x@W^T`; our matmul is `x@W`,
+W (in,out)), copies norm gains + token embedding as-is, uses `lm_head = embed_tokens.weight^T` for
+tied models, and reads config.json for dims/rope_theta/eps/tie. Warns (doesn't handle) attention
+biases (Qwen2 has q/k/v biases; LlamaBlock has none). `--tiny PATH` writes a small deterministic
+checkpoint with no download.
+
+`main.c` new **`llama <checkpoint.bin>`** subcommand: loads an LLMA model and forwards over
+space-separated token IDs from stdin, printing the next-token argmax (token-in/token-out; verifies the
+converter + seeds the generate path).
+
+Verified (no download): `convert_llama.py --tiny t.bin` -> `transformer llama t.bin` loads the
+PYTHON-written file (config parsed: vocab 32 / d_model 8 / 2 layers / 4 heads / 2 kv) and forwards to
+finite logits + argmax -- proving the Python<->C byte format (magic, config order, weight
+order/layout, LE float32) matches end-to-end. Smoke test PASSED; wasm32-wasi + linux-musl still
+cross-compile with the new `llama` subcommand.
+
+Next: a **tokenizer bridge** (SmolLM/Qwen BPE, like `gpt2_tok.py`) + a **text generate path** for
+LlamaModel (a KV cache would help speed), then download SmolLM2-135M, convert, and generate real
+modern text. Also pending: SIMD/int8 quant. The *real-model* correctness (name-map/transpose ->
+coherent text) is only fully proven once we generate. Block/model still forward-only (add backward for
+fine-tuning).
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

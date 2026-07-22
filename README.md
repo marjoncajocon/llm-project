@@ -83,7 +83,7 @@ defined in the matching `.c`.
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
 | `selftest.h` / `selftest.c`       | Built-in smoke test (`run_selftest`): the default `transformer` run           |
-| `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`) |
+| `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
 | `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py` |

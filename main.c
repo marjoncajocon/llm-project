@@ -23,6 +23,7 @@
 #include "audio.h"
 #include "imagegen.h"
 #include "audiogen.h"
+#include "llama.h"
 #include "selftest.h"
 
 // Portable "make directory if absent" (ignores already-exists).
@@ -507,7 +508,59 @@ static int run_audgen(int argc, char **argv) {
   return rc;
 }
 
+// ============================================================================
+// `llama` subcommand: load an LLMA checkpoint (modern LlamaModel — see
+// tools/convert_llama.py) and run a forward pass over space-separated token IDs
+// from stdin, printing the next-token argmax per line. Token-in/token-out (a
+// tokenizer bridge + text generation come next). Verifies the converter output.
+// ============================================================================
+static int run_llama(int argc, char **argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: transformer llama <checkpoint.bin>\n"
+                    "  reads space-separated token IDs per stdin line; prints next-token argmax\n");
+    return 2;
+  }
+  LlamaModel m;
+  if (llama_model_load(argv[2], &m) != 0) return 1;
+  fprintf(stderr, "loaded LLMA: vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
+          m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+
+  char line[8192];
+  int *ids = (int*)malloc(m.max_seq * sizeof(int));
+  while (fgets(line, sizeof(line), stdin)) {
+    char *p = line;
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+    int n = 0;
+    for (char *t = strtok(p, " \t\r\n"); t && n < m.max_seq; t = strtok(NULL, " \t\r\n")) {
+      int id = atoi(t);
+      if (id < 0 || id >= m.vocab) { fprintf(stderr, "skip out-of-range id %d (vocab %d)\n", id, m.vocab); continue; }
+      ids[n++] = id;
+    }
+    if (n == 0) continue;
+
+    int ls[2] = {n, m.vocab};
+    Tensor logits = tensor_create(ls, 2);
+    llama_model_forward(&m, ids, n, &logits);
+
+    const float *last = &logits.data[(n - 1) * m.vocab];
+    int best = 0, finite = 1;
+    float bv = last[0];
+    for (int j = 0; j < m.vocab; j++) {
+      float v = last[j];
+      if (!isfinite(v)) finite = 0;
+      if (v > bv) { bv = v; best = j; }
+    }
+    printf("llama: %d tokens -> next argmax = %d (logit %.4f) finite=%d\n", n, best, bv, finite);
+    fflush(stdout);
+    tensor_free(&logits);
+  }
+  free(ids);
+  llama_model_free(&m);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);
   if (argc > 1 && strcmp(argv[1], "train") == 0) return run_train(argc, argv);
