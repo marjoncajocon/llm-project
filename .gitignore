@@ -35,6 +35,7 @@ data/*
 !data/sample.txt
 !data/identity.txt
 !data/instruct.txt
+!data/sft.txt
 
 # Agent demo artifact
 agent_demo.txt

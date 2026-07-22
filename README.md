@@ -256,10 +256,29 @@ echo "Q: the task is finished" | transformer generate --name instruct
 
 Verified: a small model learns to route each held-in instruction to its correct response.
 (Note: keep `--merges` low so the BPE tokens stay fine-grained enough for prompts to align to
-token boundaries.) **Honest scale:** at this size the model *memorizes* the pairs — the value is
-seeing the SFT technique work end-to-end on real data via the CLI; generalizing to unseen
-instructions needs far more data + a bigger model. The precise, deterministic (masked-loss)
-version of the same idea is verified in the smoke test as part `[9]`.
+token boundaries.)
+
+**True masked SFT (`--sft`).** The run above trains on the whole token stream (the model
+*memorizes* the corpus). Real SFT supervises **only the response** and masks the prompt — that's
+the `--sft` mode. The file is one `prompt<TAB>response` example per line (`data/sft.txt`); the
+loss is computed on the response tokens only (prompt + padding get target `-1` = ignored), so the
+model is trained to *produce* the answer, not reconstruct the prompt:
+
+```sh
+transformer train data/sft.txt --sft --name sft --d-model 96 --layers 3 \
+  --heads 4 --merges 48 --steps 3000 --lr 1e-3
+echo "read notes.txt" | transformer generate --name sft
+#   -> <tool name="read_file" path="notes.txt"></tool>   (then filler — no stop token yet)
+```
+
+Verified: every instruction routes to its exact tool-call/`<done>` response. This is the same
+loss the smoke-test part `[9]` uses, now available on your own data. (`generate` always emits a
+fixed number of tokens and there is no EOS token, so the correct response is the *leading* part of
+the output; a stop token is a small future add.)
+
+**Honest scale:** at this size the model *memorizes* the pairs — the value is seeing the SFT
+technique work end-to-end on real data via the CLI; generalizing to unseen instructions needs far
+more data + a bigger model.
 
 ### `transformer generate [model.bin] [tok.bin]`
 

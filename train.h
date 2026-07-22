@@ -18,6 +18,7 @@ typedef struct {
   const char *resume;      // NULL => fresh model; else path to a checkpoint to continue
   int checkpoint_every;    // save every N steps (0 => only at the end)
   float val_frac;          // fraction of tokens held out for validation loss (e.g. 0.1)
+  int sft;                 // 1 => masked instruction-tuning (SFT) mode (prompt<TAB>response lines)
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).

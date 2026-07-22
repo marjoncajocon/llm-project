@@ -29,7 +29,114 @@ TrainConfig train_default_config(void) {
   c.resume = NULL;
   c.checkpoint_every = 0;
   c.val_frac = 0.1f;
+  c.sft = 0;
   return c;
+}
+
+// ---------------------------------------------------------------------------
+// Masked instruction tuning (SFT). Input file: one example per line, formatted
+// "prompt<TAB>response". We build the sequence [prompt ++ response] and supervise
+// ONLY the response tokens (prompt positions and end-padding get target -1 =
+// ignored in cross-entropy). This is the real SFT loss: the model is trained to
+// PRODUCE the response given the prompt, not to reconstruct the prompt. (Smoke
+// test part [9] is the same idea, hand-built and deterministic.)
+// ---------------------------------------------------------------------------
+static int train_sft(char *text, const TrainConfig *cfg) {
+  if (cfg->d_model % cfg->n_heads != 0) {
+    fprintf(stderr, "error: d_model (%d) must be divisible by heads (%d)\n",
+            cfg->d_model, cfg->n_heads);
+    return 1;
+  }
+  srand(cfg->seed);
+
+  Tokenizer tok = tokenizer_create_bytelevel();
+  tokenizer_train(&tok, text, cfg->num_merges);
+
+  // Upper bound on the number of examples = number of newlines + 1.
+  int maxex = 1;
+  for (char *p = text; *p; p++) if (*p == '\n') maxex++;
+  int **P = (int**)malloc(maxex * sizeof(int*)), *PL = (int*)malloc(maxex * sizeof(int));
+  int **R = (int**)malloc(maxex * sizeof(int*)), *RL = (int*)malloc(maxex * sizeof(int));
+  int nex = 0, maxL = 0;
+
+  char *line = strtok(text, "\n");
+  while (line) {
+    char *tab = strchr(line, '\t');
+    if (tab) {
+      *tab = '\0';
+      char *prompt = line, *resp = tab + 1;
+      size_t rl = strlen(resp);                  // strip a trailing CR (Windows files)
+      if (rl && resp[rl - 1] == '\r') resp[rl - 1] = '\0';
+      if (prompt[0] && resp[0]) {
+        int t[4096], r[4096];
+        int T = tokenizer_encode(&tok, prompt, t, 4096);
+        int Rn = tokenizer_encode(&tok, resp, r, 4096);
+        if (T >= 1 && Rn >= 1 && T + Rn <= 4096) {
+          P[nex] = (int*)malloc(T * sizeof(int));  memcpy(P[nex], t, T * sizeof(int)); PL[nex] = T;
+          R[nex] = (int*)malloc(Rn * sizeof(int)); memcpy(R[nex], r, Rn * sizeof(int)); RL[nex] = Rn;
+          if (T + Rn > maxL) maxL = T + Rn;
+          nex++;
+        }
+      }
+    }
+    line = strtok(NULL, "\n");
+  }
+
+  if (nex == 0) {
+    fprintf(stderr, "error: SFT file has no 'prompt<TAB>response' lines\n");
+    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok); return 1;
+  }
+
+  // Build padded, masked training sequences (all length maxL).
+  int **seq = (int**)malloc(nex * sizeof(int*));
+  int **tgt = (int**)malloc(nex * sizeof(int*));
+  for (int e = 0; e < nex; e++) {
+    seq[e] = (int*)malloc(maxL * sizeof(int));
+    tgt[e] = (int*)malloc(maxL * sizeof(int));
+    int T = PL[e], Rn = RL[e];
+    for (int j = 0; j < T; j++) seq[e][j] = P[e][j];
+    for (int j = 0; j < Rn; j++) seq[e][T + j] = R[e][j];
+    for (int j = T + Rn; j < maxL; j++) seq[e][j] = 0;      // pad
+    for (int j = 0; j < maxL; j++) tgt[e][j] = -1;          // mask everything...
+    for (int j = T - 1; j <= T + Rn - 2; j++) tgt[e][j] = seq[e][j + 1];  // ...supervise response only
+  }
+
+  const int d_ff = (cfg->d_ff > 0) ? cfg->d_ff : 4 * cfg->d_model;
+  GPT model = gpt_create(tok.vocab_size, cfg->d_model, cfg->n_heads, cfg->n_layers, d_ff, maxL);
+  printf("SFT: %d examples | vocab %d | seq len (padded) %d | d_model=%d layers=%d lr=%g\n",
+         nex, tok.vocab_size, maxL, cfg->d_model, cfg->n_layers, cfg->lr);
+
+  GPTActs acts = gpt_acts_create(&model, maxL);
+  int lshape[2] = {maxL, tok.vocab_size};
+  Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
+  Tensor *params[1024];
+  int n_params = gpt_collect_params(&model, params);
+  Adam opt = adam_create(params, n_params, cfg->lr);
+
+  const int steps = cfg->steps;
+  const int report = steps < 10 ? 1 : steps / 10;
+  for (int s = 0; s < steps; s++) {
+    int e = rand() % nex;
+    gpt_forward_train(&model, seq[e], maxL, &acts, &logits);
+    float loss = cross_entropy_forward(&logits, tgt[e], &probs);   // averages over response tokens only
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, tgt[e], &logits);
+    gpt_backward(&model, seq[e], maxL, &acts, &logits);
+    adam_step(&opt, params, n_params);
+    if (s % report == 0 || s == steps - 1)
+      printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+  }
+
+  int rc = 0;
+  if (gpt_save(cfg->out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
+  if (tokenizer_save(&tok, cfg->out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
+  if (rc == 0) printf("saved SFT model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
+
+  for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); free(seq[e]); free(tgt[e]); }
+  free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
+  adam_free(&opt); tensor_free(&logits); tensor_free(&probs);
+  gpt_acts_free(&acts); gpt_free(&model); tokenizer_free(&tok);
+  return rc;
 }
 
 // Average cross-entropy over `nwin` random windows whose start lies in [lo, hi-ctx).
@@ -61,6 +168,13 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
   char *text = corpus_read(data_path, &text_len);   // file or directory of *.txt
   if (!text) { fprintf(stderr, "error: cannot read '%s'\n", data_path); return 1; }
   if (text_len < 8) { fprintf(stderr, "error: '%s' is too small\n", data_path); free(text); return 1; }
+
+  // Masked instruction-tuning path ("prompt<TAB>response" lines); builds fresh (no resume).
+  if (cfg->sft) {
+    int rc = train_sft(text, cfg);
+    free(text);
+    return rc;
+  }
 
   srand(cfg->seed);
 

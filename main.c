@@ -218,7 +218,9 @@ static void train_usage(void) {
     "  --heads N     attention heads (default 4)         --d-ff N    FFN dim (default 4*d_model)\n"
     "  --ctx N       context window (default 64)         --lr F      learning rate (default 3e-4)\n"
     "  --seed N      RNG seed (default 1234)             --val-frac F  held-out fraction (default 0.1)\n"
-    "  --resume F    continue training a saved model     --checkpoint-every N  save every N steps\n");
+    "  --resume F    continue training a saved model     --checkpoint-every N  save every N steps\n"
+    "  --sft         masked instruction tuning: file is 'prompt<TAB>response' lines,\n"
+    "                loss on the response only (true SFT). See data/sft.txt.\n");
 }
 
 static int run_train(int argc, char **argv) {
@@ -247,6 +249,7 @@ static int run_train(int argc, char **argv) {
     else if (strcmp(f, "--resume") == 0)  { NEED_VAL(); cfg.resume = argv[++i]; }
     else if (strcmp(f, "--checkpoint-every") == 0) { NEED_VAL(); cfg.checkpoint_every = atoi(argv[++i]); }
     else if (strcmp(f, "--val-frac") == 0){ NEED_VAL(); cfg.val_frac = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--sft") == 0)     { cfg.sft = 1; }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }

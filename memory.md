@@ -151,7 +151,13 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
 3. **Instruction tuning (SFT)** — supervised fine-tune on `(instruction → good response)` pairs;
    this is the step that makes a base model FOLLOW instructions instead of just continuing text.
    Same machinery as our supervised next-token training — just the right data (could include our
-   `<tool …>` agent format). This is the most feasible "real recipe" experiment to demo here.
+   `<tool …>` agent format). **DONE here** three ways: (a) smoke-test part `[9]` (masked, hand-built,
+   deterministic); (b) whole-stream demo on `data/instruct.txt` (`Q:`/`A:`, memorizes the stream —
+   keep `--merges` LOW for routing); (c) **true masked SFT** `transformer train data/sft.txt --sft`
+   (`prompt<TAB>response` lines; `train_sft()` in `train.c` supervises the RESPONSE tokens only,
+   prompt+padding masked with target −1). Verified: each instruction routes to its exact tool-call/
+   `<done>`. Limitation: no EOS token yet, so the correct response is the *leading* part of the
+   fixed-length `generate` output.
 4. **RLHF / DPO** — align to helpful/correct/human-preferred outputs. Anthropic's **Constitutional
    AI** is a *published* paper.
 5. **Tool-use / agentic training** — train on tool-call formats (fits our `agent.c` `<tool>`/`<done>`

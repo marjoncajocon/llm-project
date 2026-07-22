@@ -197,8 +197,21 @@ finished`→`<done>Task complete.</done>`, `write hello to notes.txt`→`write_f
 prompt doesn't align to a token boundary and routing drifts (first run at merges 200 emitted valid
 blocks but wrong routing). `model/instruct/*.bin` git-ignored; `data/instruct.txt` tracked (added
 `.gitignore` exception). Honest: memorizes at this scale — technique works, generalization needs
-more data + bigger model. Next: the modern-architecture (RMSNorm/RoPE/SwiGLU/GQA) + quantization
-roadmap, or a masked-loss SFT training mode in `train.c` (part `[9]` is the masked version).
+more data + bigger model.
+
+**Masked-SFT training mode (`--sft`) — DONE (2026-07-22):** true response-only SFT in `train.c`,
+not whole-stream memorization. New `TrainConfig.sft` + `--sft` flag + `train_sft()`. File format:
+one `prompt<TAB>response` example per line (`data/sft.txt`, tracked). Builds `[prompt ++ response]`
+padded to the max length; targets `-1` (ignored) on the prompt positions AND the end-padding, so
+`cross_entropy` (which already averages over target≥0 only) supervises the RESPONSE tokens only —
+identical loss to smoke-test `[9]`, now on real data. Random example per step; no resume for SFT.
+Verified: `train data/sft.txt --sft --name sft --d-model 96 --layers 3 --heads 4 --merges 48
+--steps 3000 --lr 1e-3` → sft-loss 5.92 → 0.0003; all 12 instructions route to their exact
+tool-call/`<done>` response (read_file, run_command pwd/make test/rm, write_file, `<done>`).
+`model/sft/*.bin` git-ignored. KNOWN LIMITATION: no EOS token + `generate` emits a fixed 40 tokens,
+so the correct response is the LEADING part of the output, then filler — a stop token is a small
+future add. Build `-Wall` clean, smoke test still PASSED. Next: EOS/stop token, or the
+modern-architecture (RMSNorm/RoPE/SwiGLU/GQA) + quantization roadmap.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

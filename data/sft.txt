@@ -1,0 +1,12 @@
+write hello to notes.txt	<tool name="write_file" path="notes.txt">hello</tool>
+read notes.txt	<tool name="read_file" path="notes.txt"></tool>
+list the files here	<tool name="run_command" command="ls"></tool>
+show the git status	<tool name="run_command" command="git status"></tool>
+create a file readme.md with the text start	<tool name="write_file" path="readme.md">start</tool>
+read the file config.txt	<tool name="read_file" path="config.txt"></tool>
+run the tests	<tool name="run_command" command="make test"></tool>
+delete temp.log	<tool name="run_command" command="rm temp.log"></tool>
+print the current directory	<tool name="run_command" command="pwd"></tool>
+save the word done to out.txt	<tool name="write_file" path="out.txt">done</tool>
+the task is finished	<done>Task complete.</done>
+stop now	<done>Stopping as requested.</done>
