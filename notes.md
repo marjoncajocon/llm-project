@@ -171,9 +171,21 @@ script → parses its `<done>` → stops). Smoke test still `PASSED`, `-Wall` cl
 call is untested here (no `anthropic` pkg / no key) — it's the standard Messages API shape from
 the `claude-api` skill; `agent_mock.py` remains the offline/no-key fallback.
 
-**Backups (not needed now, still open):** (a) code health — split the 12-part smoke test out of
-`main.c` (~1000 lines) into `selftest.c`; (b) dataset-trained `imggen`/`audgen` (learn from a
+**Backups:** (a) ✅ DONE (2026-07-22) — code health: smoke test split out of `main.c` into
+`selftest.c` (see below); (b) still open — dataset-trained `imggen`/`audgen` (learn from a
 folder, not one input).
+
+## Code health — smoke test split into selftest.c — DONE (2026-07-22)
+
+Moved the 12-part built-in smoke test (`run_demo`, renamed **`run_selftest`**) plus its three
+private helpers (`cond_gen`, `media_to_text`, `gpt_loss`) out of `main.c` into new
+**`selftest.c` / `selftest.h`**. `main.c` is now just CLI dispatch: **995 → 367 lines**.
+`main()` calls `run_selftest()`. `selftest.c` keeps its own tiny portable `ensure_dir` (for the
+`vid_tmp` test frames) so the modules stay decoupled; `main.c` still has its own for
+`model_paths`. Makefile: added `selftest.o` to `OBJS` + a header-dep rule (cross-build picks it
+up via `SRCS = $(OBJS:.o=.c)`). **Behavior byte-identical**: same `PASSED`, gradient check
+`9.28e-04` (|grad|>1e-2), KV cache `0.00e+00`, same losses; `-Wall` clean. (Also fixed the
+CONTINUATION-GUIDE build command, which had been missing the media `.c` files.)
 
 ## ▶ CONTINUATION GUIDE — resume here (read this first)
 
@@ -192,7 +204,8 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c main.c -lm
+  optim.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
 .\transformer.exe            # must print: Output validation: PASSED
 ```
 Then clean: `Remove-Item transformer.exe,*.o,*.bin,*.wasm,xbuild_* -ErrorAction SilentlyContinue`.

@@ -43,6 +43,7 @@ defined in the matching `.c`.
 | `audiogen.h` / `audiogen.c`       | Audio ↔ tokens (µ-law) for autoregressive audio **generation** (Phase G) |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
+| `selftest.h` / `selftest.c`       | Built-in smoke test (`run_selftest`): the default `transformer` run           |
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
@@ -124,7 +125,7 @@ node --experimental-wasi-unstable-preview1 run.js transformer.wasm   # Node's bu
 ### `transformer` (the demo binary)
 
 Runs the full pipeline and prints a report. It takes no arguments today; edit the config
-constants at the top of `main()` in `main.c` to change vocab size, dimensions, heads,
+constants at the top of `run_selftest()` in `selftest.c` to change vocab size, dimensions, heads,
 layers, prompt, or number of generated tokens.
 
 ```sh
@@ -392,7 +393,7 @@ gpt_backward(&m, ids, seq_len, &acts, &logits);   // grads into every parameter
 adam_step(&opt, params, n);
 ```
 
-Gradients are verified in `main.c` by **end-to-end numerical gradient checking** (analytic
+Gradients are verified in `selftest.c` by **end-to-end numerical gradient checking** (analytic
 `grad` vs `(L(+ε) − L(−ε)) / 2ε`) across the whole model, then it trains the GPT on a
 next-token task and overfits it to ~0 loss. (Note: float32 finite-difference checking has a
 noise floor for tiny gradients, so the check trusts well-conditioned entries; see `notes.md`.)

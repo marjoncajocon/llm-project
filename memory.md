@@ -20,8 +20,15 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > command-backend round trip; smoke test PASSED. Live LLM call untested (no `anthropic` pkg / key);
 > `agent_mock.py` remains the offline fallback.
 >
-> **Next candidates (backups, still open):** (a) split the 12-part smoke test out of `main.c`
-> (~1000 lines) into `selftest.c`; (b) dataset-trained `imggen`/`audgen` (learn from a folder).
+> **Code health — DONE (2026-07-22):** the 12-part smoke test (`run_demo` → **`run_selftest`**) +
+> its private helpers (`cond_gen`, `media_to_text`, `gpt_loss`) moved from `main.c` into new
+> **`selftest.c`/`selftest.h`**; `main.c` is now CLI dispatch only (995 → 367 lines). Makefile +
+> README + notes updated (`selftest.o` in OBJS). Behavior byte-identical (PASSED, grad 9.28e-04,
+> KV 0.00e+00). Build now lists `selftest.c` (the notes build cmd also gained the media `.c`
+> files it had been missing).
+>
+> **Next candidate (still open):** dataset-trained `imggen`/`audgen` (learn from a folder, not
+> one input).
 
 _Last updated: 2026-07-22._
 
