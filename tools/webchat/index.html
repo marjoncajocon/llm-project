@@ -76,7 +76,7 @@
       <label for="model">Model</label>
       <select id="model"><option>loading…</option></select>
       <label for="ntok">max new</label>
-      <input id="ntok" type="number" value="40" min="1" max="256" style="width:72px">
+      <input id="ntok" type="number" value="128" min="1" max="512" style="width:72px">
       <span id="modelnote" class="pill"></span>
     </div>
     <div class="log" id="log-text"></div>
@@ -84,7 +84,12 @@
       <textarea id="prompt" placeholder="Type a prompt and press Enter…" rows="1"></textarea>
       <button id="send">Send</button>
     </div>
-    <div class="note">Sampling is fixed in the engine (temp 0.8 / top-k 40 / top-p 0.95). “max new” applies to LLaMA-family models only.</div>
+    <div class="note">
+      For a real answer (e.g. code), pick a <b>real</b> model: <b>Qwen2.5</b> writes working C.
+      The toy models (marvin/instruct/sft) only know their tiny training data and just ramble.
+      Raise <b>max new</b> so long answers aren’t cut off — a full program needs ~200+ (Qwen/SmolLM
+      only; toy + GPT-2 are fixed at 40 in the engine). Sampling is fixed (temp 0.8 / top-k 40 / top-p 0.95).
+    </div>
   </section>
 
   <!-- IMAGE -->
