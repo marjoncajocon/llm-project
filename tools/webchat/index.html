@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>transformer webchat</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --fg:#e6e9ef; --muted:#98a2b3; --accent:#5b9dff; --accent2:#7c5cff;
+    --user:#243044; --bot:#1b2530; --err:#3a1f22; --ok:#1f3a2a;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+  header { padding:12px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px;
+           align-items:center; flex-wrap:wrap; background:var(--panel); }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.2px; }
+  header .sub { color:var(--muted); font-size:12px; }
+  .tabs { display:flex; gap:4px; margin-left:auto; }
+  .tab { padding:6px 12px; border-radius:8px; cursor:pointer; color:var(--muted);
+         background:transparent; border:1px solid transparent; }
+  .tab.active { color:var(--fg); background:var(--panel2); border-color:var(--line); }
+  main { flex:1; overflow:hidden; display:flex; }
+  .view { flex:1; display:none; flex-direction:column; overflow:hidden; }
+  .view.active { display:flex; }
+  .bar { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:10px;
+         align-items:center; flex-wrap:wrap; background:var(--panel); }
+  select, input, button, textarea {
+    font:inherit; color:var(--fg); background:var(--panel2); border:1px solid var(--line);
+    border-radius:8px; padding:8px 10px; }
+  button { cursor:pointer; background:var(--accent); border-color:var(--accent); color:#08101f; font-weight:600; }
+  button.ghost { background:var(--panel2); color:var(--fg); border-color:var(--line); font-weight:500; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  label { color:var(--muted); font-size:12px; }
+  .log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:min(720px,90%); padding:10px 12px; border-radius:12px; white-space:pre-wrap;
+         word-break:break-word; border:1px solid var(--line); }
+  .msg.user { align-self:flex-end; background:var(--user); }
+  .msg.bot  { align-self:flex-start; background:var(--bot); }
+  .msg.status { align-self:center; background:transparent; border:none; color:var(--muted);
+                font-size:12px; max-width:100%; }
+  .msg.err  { align-self:center; background:var(--err); border-color:#5a2b30; }
+  .msg .who { font-size:11px; color:var(--muted); margin-bottom:3px; }
+  .composer { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); background:var(--panel); }
+  .composer textarea { flex:1; resize:none; min-height:44px; max-height:160px; }
+  .note { color:var(--muted); font-size:12px; padding:0 16px 10px; }
+  .placeholder { margin:auto; text-align:center; color:var(--muted); max-width:520px; padding:24px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#c04; display:inline-block; margin-right:6px; }
+  .dot.on { background:#2ecc71; }
+  .pill { font-size:11px; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:2px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>transformer <span class="sub">webchat</span></h1>
+  <span id="conn" class="pill"><span class="dot"></span>connecting…</span>
+  <div class="tabs">
+    <div class="tab active" data-view="text">Text</div>
+    <div class="tab" data-view="image">Image</div>
+    <div class="tab" data-view="audio">Audio</div>
+    <div class="tab" data-view="video">Video</div>
+  </div>
+</header>
+
+<main>
+  <!-- TEXT -->
+  <section class="view active" id="view-text">
+    <div class="bar">
+      <label for="model">Model</label>
+      <select id="model"><option>loading…</option></select>
+      <label for="ntok">max new</label>
+      <input id="ntok" type="number" value="40" min="1" max="256" style="width:72px">
+      <span id="modelnote" class="pill"></span>
+    </div>
+    <div class="log" id="log-text"></div>
+    <div class="composer">
+      <textarea id="prompt" placeholder="Type a prompt and press Enter…" rows="1"></textarea>
+      <button id="send">Send</button>
+    </div>
+    <div class="note">Sampling is fixed in the engine (temp 0.8 / top-k 40 / top-p 0.95). “max new” applies to LLaMA-family models only.</div>
+  </section>
+
+  <!-- IMAGE (Phase 2) -->
+  <section class="view" id="view-image">
+    <div class="placeholder"><h3>Image</h3><p>Image generation panel arrives in the next build step.</p></div>
+  </section>
+
+  <!-- AUDIO (Phase 2) -->
+  <section class="view" id="view-audio">
+    <div class="placeholder"><h3>Audio</h3><p>Audio generation panel arrives in the next build step.</p></div>
+  </section>
+
+  <!-- VIDEO (Phase 3) -->
+  <section class="view" id="view-video">
+    <div class="placeholder"><h3>Video</h3><p>Video understanding panel arrives in a later build step.</p></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let ws, models = [];
+
+function setConn(ok, txt) {
+  const el = $("#conn");
+  el.innerHTML = `<span class="dot${ok ? " on" : ""}"></span>${txt}`;
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { setConn(true, "connected"); send({op:"list_models"}); };
+  ws.onclose = () => { setConn(false, "disconnected — retrying"); setTimeout(connect, 1500); };
+  ws.onerror = () => setConn(false, "error");
+  ws.onmessage = ev => handle(JSON.parse(ev.data));
+}
+function send(obj) { ws && ws.readyState === 1 && ws.send(JSON.stringify(obj)); }
+
+function handle(m) {
+  switch (m.op) {
+    case "models": models = m.items || []; fillModels(); break;
+    case "chat_result": addMsg("text", "bot", m.text || "(empty)", m.model); busy(false); break;
+    case "status": addMsg("text", "status", m.text); break;
+    case "error": addMsg("text", "err", "⚠ " + m.text); busy(false); break;
+  }
+}
+
+function fillModels() {
+  const sel = $("#model");
+  if (!models.length) { sel.innerHTML = `<option value="">no models found in model/</option>`; return; }
+  sel.innerHTML = models.map(m => `<option value="${m.name}">${m.label}</option>`).join("");
+  updateNote();
+}
+function currentModel() { return models.find(m => m.name === $("#model").value); }
+function updateNote() {
+  const m = currentModel(); const note = $("#modelnote");
+  if (!m) { note.textContent = ""; return; }
+  note.textContent = m.needs_python ? "needs Python" : "pure C";
+}
+$("#model").addEventListener("change", updateNote);
+
+function addMsg(view, kind, text, who) {
+  const log = $("#log-" + view);
+  const div = document.createElement("div");
+  div.className = "msg " + kind;
+  if (who) div.innerHTML = `<div class="who">${who}</div>`;
+  div.appendChild(document.createTextNode(text));
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+let sending = false;
+function busy(b) { sending = b; $("#send").disabled = b; $("#send").textContent = b ? "…" : "Send"; }
+function sendPrompt() {
+  if (sending) return;
+  const text = $("#prompt").value.trim();
+  const m = currentModel();
+  if (!text) return;
+  if (!m) { addMsg("text", "err", "⚠ pick a model"); return; }
+  addMsg("text", "user", text, "you");
+  $("#prompt").value = "";
+  busy(true);
+  send({op:"chat", model:m.name, text, n: parseInt($("#ntok").value) || 40});
+}
+$("#send").addEventListener("click", sendPrompt);
+$("#prompt").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+});
+
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+  document.querySelectorAll(".view").forEach(x => x.classList.remove("active"));
+  t.classList.add("active");
+  $("#view-" + t.dataset.view).classList.add("active");
+}));
+
+connect();
+</script>
+</body>
+</html>
