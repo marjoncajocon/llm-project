@@ -3,6 +3,8 @@
 
 #include <stdlib.h>
 
+#include "check.h"
+
 // ===========================================================================
 // Persistent thread pool (internal to matrix.c).
 //
@@ -189,6 +191,7 @@ static void mm_fwd_rows(int i0, int i1, void *ctx) {
 }
 
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
+  tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
   MMFwd t = { A->data, B->data, C->data, K, N };
   if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_fwd_rows(0, M, &t); return; }
@@ -197,6 +200,8 @@ void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
 
 // Matrix Addition: C = A + B (element-wise)
 void matadd(const Tensor *A, const Tensor *B, Tensor *C) {
+  tf_check_same_size(A, B);
+  tf_check_same_size(A, C);
   for (size_t i = 0; i < A->size; i++) {
     C->data[i] = A->data[i] + B->data[i];
   }
@@ -204,6 +209,7 @@ void matadd(const Tensor *A, const Tensor *B, Tensor *C) {
 
 // Scale matrix: C = A * scalar
 void matscale(const Tensor *A, float scalar, Tensor *C) {
+  tf_check_same_size(A, C);
   for (size_t i = 0; i < A->size; i++) {
     C->data[i] = A->data[i] * scalar;
   }
@@ -211,6 +217,7 @@ void matscale(const Tensor *A, float scalar, Tensor *C) {
 
 // Row-broadcast bias add: out[i,j] = x[i,j] + bias[j]
 void bias_add(const Tensor *x, const Tensor *bias, Tensor *out) {
+  tf_check_bias_add(x, bias, out);
   const int M = x->shape[0];
   const int N = x->shape[1];
   for (int i = 0; i < M; i++) {
@@ -253,6 +260,7 @@ static void mm_bwd_dB(int k0, int k1, void *ctx) {
 
 // Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
+  tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
   MMBwd t = { A, B, C, M, K, N };
   if ((size_t)M * N * K < MM_THREAD_THRESHOLD) {
@@ -266,6 +274,8 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
 
 // Backward of C = A + B: dA += dC, dB += dC
 void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B) {
+  tf_check_same_size(C, A);
+  tf_check_same_size(C, B);
   for (size_t i = 0; i < C->size; i++) {
     A->grad[i] += C->grad[i];
     B->grad[i] += C->grad[i];

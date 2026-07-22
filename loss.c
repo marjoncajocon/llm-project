@@ -4,6 +4,7 @@
 #include <math.h>
 
 #include "activation.h"
+#include "check.h"
 
 // Softmax cross-entropy over rows. Rows whose target is < 0 are IGNORED (no loss,
 // no gradient) — used to supervise only some positions (e.g. caption tokens in a
@@ -19,6 +20,7 @@ float cross_entropy_forward(const Tensor *logits, const int *targets, Tensor *pr
   int nvalid = 0;
   for (int i = 0; i < N; i++) {
     if (targets[i] < 0) continue;          // ignored position
+    tf_check_target_id(targets[i], V);
     float p = probs->data[i * V + targets[i]];
     loss -= logf(p > 1e-12f ? p : 1e-12f);  // guard against log(0)
     nvalid++;
@@ -39,6 +41,7 @@ void cross_entropy_backward(const Tensor *probs, const int *targets, Tensor *log
 
   for (int i = 0; i < N; i++) {
     if (targets[i] < 0) continue;          // ignored -> zero gradient
+    tf_check_target_id(targets[i], V);
     for (int j = 0; j < V; j++) {
       float g = probs->data[i * V + j];
       if (j == targets[i]) g -= 1.0f;

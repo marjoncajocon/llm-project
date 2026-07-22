@@ -30,7 +30,7 @@ $(TARGET): $(OBJS)
 
 # Header dependencies (rebuild dependents when a header changes).
 tensor.o:     tensor.h
-matrix.o:     matrix.h tensor.h
+matrix.o:     matrix.h tensor.h check.h
 activation.o: activation.h tensor.h
 layernorm.o:  layernorm.h tensor.h
 rmsnorm.o:    rmsnorm.h tensor.h
@@ -41,12 +41,12 @@ quant.o:      quant.h
 llama.o:      llama.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h quant.h
 feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h
-embedding.o:  embedding.h tensor.h
+embedding.o:  embedding.h tensor.h check.h
 sampler.o:    sampler.h tensor.h
 model.o:      model.h tensor.h embedding.h attention.h layernorm.h matrix.h feedforward.h sampler.h
 checkpoint.o: checkpoint.h model.h tensor.h
 tokenizer.o:  tokenizer.h
-loss.o:       loss.h tensor.h activation.h
+loss.o:       loss.h tensor.h activation.h check.h
 optim.o:      optim.h tensor.h
 toolcall.o:   toolcall.h
 toolexec.o:   toolexec.h toolcall.h
