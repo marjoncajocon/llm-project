@@ -84,12 +84,6 @@ static const char *T2I_SHAPES[] = {"circle", "square", "triangle", "diamond", "c
 #define T2I_NCOLORS ((int)(sizeof(T2I_COLORS) / sizeof(T2I_COLORS[0])))
 #define T2I_NSHAPES ((int)(sizeof(T2I_SHAPES) / sizeof(T2I_SHAPES[0])))
 
-// tiny LCG so the jitter is reproducible without touching global rand().
-static float urand(unsigned int *s) {
-  *s = *s * 1103515245u + 12345u;
-  return (float)(*s >> 8) / 16777216.0f;   // [0,1)
-}
-
 // Is point (dx,dy) relative to the shape center inside the shape of radius rad?
 static int shape_hit(int shape, float dx, float dy, float rad) {
   float ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
@@ -106,16 +100,15 @@ static int shape_hit(int shape, float dx, float dy, float rad) {
   return 0;
 }
 
-static void draw_pair(const char *dir, int idx, int size, int shape, int color, unsigned int *rng) {
+static void draw_pair(const char *dir, int idx, int size, int shape, int color) {
   Image im; im.h = size; im.w = size; im.c = 3;
   im.data = (float*)malloc((size_t)size * size * 3 * sizeof(float));
-  float bg = 0.06f + 0.06f * urand(rng);                 // dark background
+  const float bg = 0.08f;                                // fixed dark background
   for (int i = 0; i < size * size * 3; i++) im.data[i] = bg;
 
-  float jit = size * 0.10f;
-  float cx = size * 0.5f + jit * (urand(rng) - 0.5f);
-  float cy = size * 0.5f + jit * (urand(rng) - 0.5f);
-  float rad = size * (0.28f + 0.08f * urand(rng));
+  // Deterministic: each (color, shape) caption maps to exactly one image, so the
+  // tiny model can actually learn the mapping (variety can be added later).
+  float cx = size * 0.5f, cy = size * 0.5f, rad = size * 0.32f;
   const NamedColor *col = &T2I_COLORS[color];
 
   for (int y = 0; y < size; y++)
@@ -146,9 +139,8 @@ int run_t2i_data(int argc, char **argv) {
   if (size % T2I_PATCH) { fprintf(stderr, "error: size must be divisible by %d\n", T2I_PATCH); return 1; }
   ensure_dirs(dir);
   T2I_MKDIR(dir);
-  unsigned int rng = 20240607u;
   for (int i = 0; i < n; i++)
-    draw_pair(dir, i, size, i % T2I_NSHAPES, (i / T2I_NSHAPES) % T2I_NCOLORS, &rng);
+    draw_pair(dir, i, size, i % T2I_NSHAPES, (i / T2I_NSHAPES) % T2I_NCOLORS);
   printf("t2i-data: wrote %d pairs (%dx%d, %d shapes x %d colors) -> %s\n",
          n, size, size, T2I_NSHAPES, T2I_NCOLORS, dir);
   return 0;
@@ -203,34 +195,58 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
   fprintf(stderr, "t2i: %d pairs, %dx%d -> %d codes/img, vocab %d, GPT %d steps\n",
           N, w, h, M, V, gpt_steps);
 
-  // stage 2: GPT over [caption | codes] (larger than a single-pair overfit needs,
-  // so it can hold the whole color x shape distribution).
-  GPT g = gpt_create(V, 128, 4, 6, 512, total);
+  // stage 2: GPT over [caption | codes] — sized to hold the color x shape
+  // distribution while staying fast enough to actually converge.
+  GPT g = gpt_create(V, 96, 4, 4, 384, total);
   GPTActs a = gpt_acts_create(&g, total);
   int lz[2] = {total, V};
   Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
   Tensor **par = (Tensor**)malloc((size_t)gpt_param_count(&g) * sizeof(Tensor*));
   int np = gpt_collect_params(&g, par);
-  Adam opt = adam_create(par, np, 0.005f);
+  Adam opt = adam_create(par, np, 0.003f);
   int *seq = (int*)malloc((size_t)total * sizeof(int));
   int *tgt = (int*)malloc((size_t)total * sizeof(int));
 
+  // Minibatch gradient accumulation: gpt_backward zeros+fills the param grads for
+  // ONE example, so we sum each example's grads into a shadow buffer and average
+  // before the optimizer step. Batch-1 SGD is too noisy to converge on the exact
+  // per-position code grids (colors learn either way; sharp shapes need this).
+  const int BATCH = 8;
+  float **gacc = (float**)malloc((size_t)np * sizeof(float*));
+  for (int p = 0; p < np; p++) gacc[p] = (float*)calloc((size_t)par[p]->size, sizeof(float));
+
   srand(1234);
   for (int s = 0; s < gpt_steps; s++) {
-    int e = rand() % N;
-    for (int i = 0; i < T; i++) seq[i] = txttok[e][i];
-    for (int j = 0; j < M; j++) seq[T + j] = codetok[e][j];
-    for (int i = 0; i < total; i++) tgt[i] = -1;
-    for (int k = 0; k < M; k++) tgt[T - 1 + k] = codetok[e][k];
-    gpt_forward_train(&g, seq, total, &a, &lo);
-    float loss = cross_entropy_forward(&lo, tgt, &pr);
-    tensor_zero_grad(&lo);
-    cross_entropy_backward(&pr, tgt, &lo);
-    gpt_backward(&g, seq, total, &a, &lo);
+    for (int p = 0; p < np; p++) memset(gacc[p], 0, (size_t)par[p]->size * sizeof(float));
+    float loss = 0.0f;
+    for (int b = 0; b < BATCH; b++) {
+      int e = rand() % N;
+      for (int i = 0; i < T; i++) seq[i] = txttok[e][i];
+      for (int j = 0; j < M; j++) seq[T + j] = codetok[e][j];
+      for (int i = 0; i < total; i++) tgt[i] = -1;
+      for (int k = 0; k < M; k++) tgt[T - 1 + k] = codetok[e][k];
+      gpt_forward_train(&g, seq, total, &a, &lo);
+      loss += cross_entropy_forward(&lo, tgt, &pr);
+      tensor_zero_grad(&lo);
+      cross_entropy_backward(&pr, tgt, &lo);
+      gpt_backward(&g, seq, total, &a, &lo);
+      for (int p = 0; p < np; p++) {
+        const float *gs = par[p]->grad; float *gd = gacc[p]; int sz = par[p]->size;
+        for (int i = 0; i < sz; i++) gd[i] += gs[i];
+      }
+    }
+    const float inv = 1.0f / (float)BATCH;
+    for (int p = 0; p < np; p++) {
+      float *gd = par[p]->grad; const float *ga = gacc[p]; int sz = par[p]->size;
+      for (int i = 0; i < sz; i++) gd[i] = ga[i] * inv;
+    }
     adam_step(&opt, par, np);
-    if (s % 100 == 0 || s == gpt_steps - 1)
-      fprintf(stderr, "  gpt step %d/%d loss %.4f\n", s, gpt_steps, loss);
+    if (s % 50 == 0 || s == gpt_steps - 1)
+      fprintf(stderr, "  gpt step %d/%d loss %.4f\n", s, gpt_steps, loss * inv);
   }
+
+  for (int p = 0; p < np; p++) free(gacc[p]);
+  free(gacc);
 
   adam_free(&opt); tensor_free(&lo); tensor_free(&pr); gpt_acts_free(&a);
   free(seq); free(tgt); free(par);
@@ -326,7 +342,7 @@ int run_t2i(int argc, char **argv) {
   int vq_steps = (argc > 6) ? atoi(argv[6]) : 1200;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
-  Image og = t2i_generate(&vq, &g, w, h, T, argv[4], 0.7f, 40, 1234);
+  Image og = t2i_generate(&vq, &g, w, h, T, argv[4], 0.3f, 40, 1234);
   int ok = (image_save_ppm(argv[3], &og) == 0);
   printf("t2i: generated %dx%d for \"%s\" -> %s (%s)\n", w, h, argv[4], argv[3], ok ? "ok" : "FAILED");
   image_free(&og); vqvae_free(&vq); gpt_free(&g);
@@ -339,7 +355,7 @@ int run_t2i_train(int argc, char **argv) {
                     "  saves <prefix>.gpt and <prefix>.vqt (train once, then t2i-gen many times)\n");
     return 2;
   }
-  int gpt_steps = (argc > 4) ? atoi(argv[4]) : 2000;
+  int gpt_steps = (argc > 4) ? atoi(argv[4]) : 900;   // each step = a minibatch
   int vq_steps = (argc > 5) ? atoi(argv[5]) : 1500;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
@@ -350,12 +366,37 @@ int run_t2i_train(int argc, char **argv) {
   return rc;
 }
 
+int run_t2i_recon(int argc, char **argv) {
+  if (argc < 5) {
+    fprintf(stderr, "usage: transformer t2i-recon <model-prefix> <in.ppm> <out.ppm>\n");
+    return 2;
+  }
+  VQVAE vq; GPT g; int w, h, T;
+  if (t2i_load(argv[2], &w, &h, &T, &vq, &g) != 0) return 1;
+  Image im = image_load_ppm(argv[3]);
+  if (!im.data) { fprintf(stderr, "error: cannot load '%s'\n", argv[3]); vqvae_free(&vq); gpt_free(&g); return 1; }
+  int nc = vqvae_ncodes(&vq, im.w, im.h);
+  int *codes = (int*)malloc((size_t)nc * sizeof(int));
+  vqvae_encode(&vq, &im, codes);
+  int distinct = 0; char *seen = (char*)calloc((size_t)vq.K, 1);
+  for (int i = 0; i < nc; i++) if (!seen[codes[i]]) { seen[codes[i]] = 1; distinct++; }
+  Image og = vqvae_decode(&vq, codes, im.w, im.h);
+  double err = 0.0; int npix = im.w * im.h * im.c;
+  for (int i = 0; i < npix; i++) { double d = og.data[i] - im.data[i]; err += d * d; }
+  err /= npix;
+  int ok = (image_save_ppm(argv[4], &og) == 0);
+  printf("t2i-recon: %dx%d | %d codes, %d distinct of K=%d | recon MSE %.5f -> %s (%s)\n",
+         im.w, im.h, nc, distinct, vq.K, err, argv[4], ok ? "ok" : "FAILED");
+  free(codes); free(seen); image_free(&og); image_free(&im); vqvae_free(&vq); gpt_free(&g);
+  return ok ? 0 : 1;
+}
+
 int run_t2i_gen(int argc, char **argv) {
   if (argc < 5) {
     fprintf(stderr, "usage: transformer t2i-gen <model-prefix> <out.ppm> <caption> [temp] [seed]\n");
     return 2;
   }
-  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.7f;
+  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.3f;
   unsigned long long seed = (argc > 6) ? strtoull(argv[6], NULL, 10) : 1234ull;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_load(argv[2], &w, &h, &T, &vq, &g) != 0) return 1;

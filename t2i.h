@@ -28,4 +28,9 @@ int run_t2i_data(int argc, char **argv);
 int run_t2i_train(int argc, char **argv);
 int run_t2i_gen(int argc, char **argv);
 
+// Debug: round-trip an image through a trained model's VQ codec ONLY (no GPT),
+// reporting reconstruction error + codebook usage — isolates codec vs transformer.
+//   transformer t2i-recon <model-prefix> <in.ppm> <out.ppm>
+int run_t2i_recon(int argc, char **argv);
+
 #endif // T2I_H
