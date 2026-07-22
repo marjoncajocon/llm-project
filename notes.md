@@ -393,10 +393,25 @@ Verified: selftest **part `[20]`** — `A@dequant(quant(W))` vs `A@W` L2 rel err
 int8 weights 4× smaller). **Real model: SmolLM2-135M f32 621 MB → int8 156 MB (4×)**, and the int8
 checkpoint still generates coherent text. Smoke test PASSED, `-Wall` clean.
 
-Perf follow-ups remaining: **in-memory int8 + a quantized matmul** (RAM 4× + compute speedup — the
-next real speed win; today int8 is dequantized to f32 at load so RAM/compute are unchanged), SIMD.
-Block/model still forward-only (add backward to fine-tune). Bigger models (Qwen2.5-0.5B) need
-attention-bias support in LlamaBlock.
+## Modern architecture — step 12: in-memory int8 + quantized matmul — DONE (2026-07-22)
+
+The runtime quantization (not just storage): weights stay int8 IN MEMORY and are consumed by a
+quantized matmul — 4× less RAM and 4× less weight memory traffic in the matmul inner loop.
+- `quant.h/.c`: `QTensor` (int8 + per-column scale kept in memory) + `qmatmul` (`C[m,j] =
+  scale[j]·Σ_k A[m,k]·q[k,j]`, i-k-j cache-friendly order, reads int8 weights = 1 byte vs f32 4).
+- `llama.h/.c`: `QLlamaModel`/`QLlamaBlock` (int8 wte + block linears + lm_head; f32 norms),
+  `q_llama_model_load` (loads LLMQ WITHOUT dequantizing — keeps int8), `q_llama_decode_step` (KV-cache
+  decode via qmatmul; dequantizes the embedding row per token; inline quantized SwiGLU),
+  `q_llama_kv_create`, `q_llama_quantize_from` (build from an fp32 model, for tests).
+- `main.c` `llama` peeks the magic: **LLMQ → in-memory int8 path**, LLMA → f32 path (auto).
+Verified: selftest **part `[21]`** — quantize a small fp32 model, run `q_llama_decode_step` per token,
+compare to `llama_model_forward`: L2 rel error **6.38e-03** (<1%, tiny-dim; real models lower). Smoke
+test PASSED, `-Wall` clean. `transformer llama model_int8.bin` now runs the true int8 model (4× less
+RAM than the 621 MB f32 in memory too). [timing of SmolLM2 int8 in-memory measured separately.]
+
+Perf follow-ups: **thread qmatmul** (decode is M=1 so single-threaded, but memory-bound → int8 helps
+regardless; batch/prefill would want threading), SIMD. Block/model forward-only (add backward to
+fine-tune). Qwen2.5-0.5B needs attention-bias support in LlamaBlock.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

@@ -1202,6 +1202,43 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 21: the in-memory int8 quantized model (QLlamaModel + qmatmul) must
+  // match the fp32 model within quantization error. Quantize a small fp32 model,
+  // run q_llama_decode_step per token, and compare to llama_model_forward.
+  // --------------------------------------------------------------------------
+  {
+    printf("[21] Quantized (int8, in-memory) LlamaModel decode ~= fp32 forward\n");
+    const int vocab = 32, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    srand(17);
+    LlamaModel fm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    llama_model_randomize(&fm);
+    int ids[6] = {3, 7, 1, 9, 2, 5};
+    int fs[2] = {seq, vocab};
+    Tensor Lf = tensor_create(fs, 2);
+    llama_model_forward(&fm, ids, seq, &Lf);
+
+    QLlamaModel qm = q_llama_quantize_from(&fm);
+    LlamaKV kv = q_llama_kv_create(&qm);
+    int ds[2] = {1, vocab};
+    Tensor Ld = tensor_create(ds, 2);
+    float num = 0.0f, den = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      q_llama_decode_step(&qm, &kv, ids[i], &Ld);
+      for (int j = 0; j < vocab; j++) {
+        float d = Ld.data[j] - Lf.data[i * vocab + j];
+        num += d * d;
+        den += Lf.data[i * vocab + j] * Lf.data[i * vocab + j];
+      }
+    }
+    float rel = sqrtf(num / den);
+    int qm_ok = (rel < 0.15f);   // tiny dims amplify int8 noise (real models ~<1%)
+    printf("    int8 decode vs f32 forward: L2 rel error = %.2e -> %s\n\n", rel, qm_ok ? "OK" : "FAIL");
+    all_ok &= qm_ok;
+    tensor_free(&Lf); tensor_free(&Ld);
+    llama_kv_free(&kv); q_llama_model_free(&qm); llama_model_free(&fm);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

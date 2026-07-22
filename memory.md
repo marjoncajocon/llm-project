@@ -182,7 +182,10 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    selftest `[19]`: decode == full forward **bit-exact 0.00e+00**). ✅ **int8 quantization (LLMQ)** (`quant.c` per-column int8;
    `convert_llama.py --int8` → LLMQ ~4× smaller; `llama_model_load` dequants on load, forward unchanged
    = storage/download win; selftest `[20]` matmul L2 rel err 0.68%; SmolLM2 621 MB → 156 MB, still
-   coherent). Perf remaining: **in-memory int8 + quantized matmul** (RAM/compute win — next), SIMD.
+   coherent). ✅ **in-memory int8 + quantized matmul**
+   (`QTensor`+`qmatmul` in quant.c; `QLlamaModel`/`q_llama_decode_step`/`q_llama_model_load` keep int8
+   in RAM, decode via qmatmul; `main.c llama` auto-detects LLMQ→int8 path, LLMA→f32; selftest `[21]`
+   int8 decode vs f32 forward L2 rel err 0.64%; 4× less RAM). Perf remaining: **thread qmatmul**, SIMD.
    Qwen2.5 needs attn-bias support. Block/model forward-only (add backward to fine-tune).
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).

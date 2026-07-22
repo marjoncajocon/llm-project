@@ -517,57 +517,94 @@ static int run_audgen(int argc, char **argv) {
 //   transformer llama <checkpoint.bin> [n_new=40]
 // Note: re-runs the full forward per step (no KV cache yet) — slow on big models.
 // ============================================================================
+// Parse one stdin line of space-separated token IDs into seq[]; returns count.
+static int llama_parse_ids(char *line, int *seq, int vocab, int max_seq) {
+  char *p = line;
+  if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+  int n = 0;
+  for (char *t = strtok(p, " \t\r\n"); t && n < max_seq; t = strtok(NULL, " \t\r\n")) {
+    int id = atoi(t);
+    if (id < 0 || id >= vocab) { fprintf(stderr, "skip out-of-range id %d (vocab %d)\n", id, vocab); continue; }
+    seq[n++] = id;
+  }
+  return n;
+}
+
+static void llama_print_gen(const int *seq, int n) {
+  printf("gen:");
+  for (int i = 0; i < n; i++) printf(" %d", seq[i]);
+  printf("\n");
+  fflush(stdout);
+}
+
 static int run_llama(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: transformer llama <checkpoint.bin> [n_new=40]\n"
+                    "  LLMA (f32) or LLMQ (int8, in-memory quantized) checkpoint;\n"
                     "  reads space-separated token IDs per stdin line; prints 'gen: <ids>'\n");
     return 2;
   }
   const int n_new = (argc > 3) ? atoi(argv[3]) : 40;
-  LlamaModel m;
-  if (llama_model_load(argv[2], &m) != 0) return 1;
-  fprintf(stderr, "loaded LLMA: vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
-          m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+
+  // Peek the magic to pick the f32 (LLMA) vs int8 in-memory (LLMQ) path.
+  FILE *pf = fopen(argv[2], "rb");
+  if (!pf) { fprintf(stderr, "Error: cannot open '%s'\n", argv[2]); return 1; }
+  unsigned int magic = 0;
+  if (fread(&magic, sizeof(unsigned int), 1, pf) != 1) { fclose(pf); fprintf(stderr, "Error: '%s' too small\n", argv[2]); return 1; }
+  fclose(pf);
+  const int is_q = (magic == 0x514D4C4Cu);   // 'LLMQ'
 
   const float temperature = 0.8f;
   const int top_k = 40;
   const float top_p = 0.95f;
   Rng rng = rng_create(1234);
-
-  LlamaKV kv = llama_kv_create(&m);       // incremental decode (O(n) per token)
-  int lv[2] = {1, m.vocab};
-  Tensor logits = tensor_create(lv, 2);
-
   char line[8192];
-  int *seq = (int*)malloc(m.max_seq * sizeof(int));
-  while (fgets(line, sizeof(line), stdin)) {
-    char *p = line;
-    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
-    int n = 0;
-    for (char *t = strtok(p, " \t\r\n"); t && n < m.max_seq; t = strtok(NULL, " \t\r\n")) {
-      int id = atoi(t);
-      if (id < 0 || id >= m.vocab) { fprintf(stderr, "skip out-of-range id %d (vocab %d)\n", id, m.vocab); continue; }
-      seq[n++] = id;
-    }
-    if (n == 0) continue;
 
-    kv.len = 0;                                    // fresh cache per prompt
-    for (int i = 0; i < n; i++) llama_decode_step(&m, &kv, seq[i], &logits);  // prime with the prompt
-    for (int s = 0; s < n_new && n < m.max_seq; s++) {
-      int nxt = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
-      seq[n++] = nxt;
-      llama_decode_step(&m, &kv, nxt, &logits);    // logits for the next step
+  if (is_q) {
+    QLlamaModel m;
+    if (q_llama_model_load(argv[2], &m) != 0) return 1;
+    fprintf(stderr, "loaded LLMQ (int8, in-memory): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
+            m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+    LlamaKV kv = q_llama_kv_create(&m);
+    int lv[2] = {1, m.vocab};
+    Tensor logits = tensor_create(lv, 2);
+    int *seq = (int*)malloc(m.max_seq * sizeof(int));
+    while (fgets(line, sizeof(line), stdin)) {
+      int n = llama_parse_ids(line, seq, m.vocab, m.max_seq);
+      if (n == 0) continue;
+      kv.len = 0;
+      for (int i = 0; i < n; i++) q_llama_decode_step(&m, &kv, seq[i], &logits);
+      for (int s = 0; s < n_new && n < m.max_seq; s++) {
+        int nxt = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
+        seq[n++] = nxt;
+        q_llama_decode_step(&m, &kv, nxt, &logits);
+      }
+      llama_print_gen(seq, n);
     }
-
-    printf("gen:");
-    for (int i = 0; i < n; i++) printf(" %d", seq[i]);
-    printf("\n");
-    fflush(stdout);
+    free(seq); tensor_free(&logits); llama_kv_free(&kv); q_llama_model_free(&m);
+  } else {
+    LlamaModel m;
+    if (llama_model_load(argv[2], &m) != 0) return 1;
+    fprintf(stderr, "loaded LLMA (f32): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
+            m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+    LlamaKV kv = llama_kv_create(&m);
+    int lv[2] = {1, m.vocab};
+    Tensor logits = tensor_create(lv, 2);
+    int *seq = (int*)malloc(m.max_seq * sizeof(int));
+    while (fgets(line, sizeof(line), stdin)) {
+      int n = llama_parse_ids(line, seq, m.vocab, m.max_seq);
+      if (n == 0) continue;
+      kv.len = 0;
+      for (int i = 0; i < n; i++) llama_decode_step(&m, &kv, seq[i], &logits);
+      for (int s = 0; s < n_new && n < m.max_seq; s++) {
+        int nxt = sample_token(&logits, 0, temperature, top_k, top_p, &rng);
+        seq[n++] = nxt;
+        llama_decode_step(&m, &kv, nxt, &logits);
+      }
+      llama_print_gen(seq, n);
+    }
+    free(seq); tensor_free(&logits); llama_kv_free(&kv); llama_model_free(&m);
   }
-  free(seq);
-  tensor_free(&logits);
-  llama_kv_free(&kv);
-  llama_model_free(&m);
   return 0;
 }
 

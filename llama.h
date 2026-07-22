@@ -12,6 +12,7 @@
 #define LLAMA_H
 
 #include "tensor.h"
+#include "quant.h"
 
 typedef struct {
   int d_model, n_heads, n_kv, head_dim, d_ff;
@@ -88,5 +89,38 @@ void llama_kv_free(LlamaKV *kv);
 // Decode ONE token at position kv->len: append its K/V to the cache, attend over
 // positions 0..kv->len, and write logits (1, vocab). Advances kv->len.
 void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits);
+
+// ---------------------------------------------------------------------------
+// Quantized (int8, in-memory) model: same architecture, but the big weights
+// (embedding, all block linears, output head) are kept as int8 QTensors and
+// consumed via qmatmul — 4x less RAM and less memory traffic. Norms stay f32.
+// Loads the 'LLMQ' checkpoint WITHOUT dequantizing. Decode-only (for generation).
+// ---------------------------------------------------------------------------
+typedef struct {
+  Tensor attn_norm, ffn_norm;                      // f32
+  QTensor Wq, Wk, Wv, Wo, Wgate, Wup, Wdown;       // int8
+} QLlamaBlock;
+
+typedef struct {
+  int vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq;
+  float rope_base, eps;
+  QTensor wte;          // int8 (dequantized one row per token at embed time)
+  QLlamaBlock *blocks;
+  Tensor final_norm;    // f32
+  QTensor lm_head;      // int8
+} QLlamaModel;
+
+void q_llama_model_free(QLlamaModel *m);
+
+// Build a quantized model by quantizing an fp32 LlamaModel's weights (for tests).
+QLlamaModel q_llama_quantize_from(const LlamaModel *src);
+
+// Load an 'LLMQ' checkpoint into a quantized model (int8 kept in memory).
+// Returns 0 on success, nonzero on error (incl. a non-LLMQ file).
+int q_llama_model_load(const char *path, QLlamaModel *out);
+
+// Incremental decode with the (f32) KV cache, using int8 weights via qmatmul.
+void q_llama_decode_step(const QLlamaModel *m, LlamaKV *kv, int token, Tensor *logits);
+LlamaKV q_llama_kv_create(const QLlamaModel *m);
 
 #endif // LLAMA_H
