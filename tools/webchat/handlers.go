@@ -271,6 +271,87 @@ func handleCaption(c *wsConn, msg map[string]any) {
 	sendJSON(c, res)
 }
 
+// text2media: teach-then-reproduce text -> image / audio. Uses the uploaded
+// media as the target the model learns to generate from the text prompt, then
+// returns the regenerated media (which reproduces the target).
+func handleText2media(c *wsConn, msg map[string]any) {
+	kind, _ := msg["kind"].(string)
+	text, _ := msg["text"].(string)
+	if strings.TrimSpace(text) == "" {
+		sendJSON(c, errMsg(fmt.Errorf("enter a text prompt")))
+		return
+	}
+	steps := intField(msg, "steps", 300)
+	data, err := decodeMediaB64(msg["media_b64"])
+	if err != nil {
+		sendJSON(c, errMsg(err))
+		return
+	}
+	dir, err := os.MkdirTemp("", "webchat")
+	if err != nil {
+		sendJSON(c, errMsg(err))
+		return
+	}
+	defer os.RemoveAll(dir)
+
+	switch kind {
+	case "image":
+		in := filepath.Join(dir, "t.ppm")
+		out := filepath.Join(dir, "o.ppm")
+		w, h, err := imageBytesToPPM(data, in, 16)
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		_, se, err := runCmd(cfg.exe, []string{"text2media", in, out, text, strconv.Itoa(steps)}, "")
+		if se != "" {
+			sendJSON(c, statusMsg(se))
+		}
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		inPNG, _ := ppmFileToPNG(in)
+		outPNG, err := ppmFileToPNG(out)
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		sendJSON(c, map[string]any{"op": "image_result",
+			"input_png": base64.StdEncoding.EncodeToString(inPNG),
+			"png_b64":   base64.StdEncoding.EncodeToString(outPNG), "w": w, "h": h})
+	case "audio":
+		wav, _, err := prepWav(data, 256)
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		in := filepath.Join(dir, "t.wav")
+		out := filepath.Join(dir, "o.wav")
+		if err := os.WriteFile(in, wav, 0o644); err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		_, se, err := runCmd(cfg.exe, []string{"text2media", in, out, text, strconv.Itoa(steps)}, "")
+		if se != "" {
+			sendJSON(c, statusMsg(se))
+		}
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		outWav, err := os.ReadFile(out)
+		if err != nil {
+			sendJSON(c, errMsg(err))
+			return
+		}
+		sendJSON(c, map[string]any{"op": "audio_result",
+			"wav_b64": base64.StdEncoding.EncodeToString(outWav)})
+	default:
+		sendJSON(c, errMsg(fmt.Errorf("text2media kind must be image or audio")))
+	}
+}
+
 func decodeMediaB64(v any) ([]byte, error) {
 	s, _ := v.(string)
 	if s == "" {

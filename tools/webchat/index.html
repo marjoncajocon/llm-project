@@ -98,11 +98,13 @@
       <label>steps</label><input id="imgsteps" type="number" value="100" min="30" max="600" style="width:84px">
       <label>levels</label><input id="imglevels" type="number" value="4" min="2" max="8" style="width:60px">
       <button id="imggo">Reconstruct</button>
-      <input id="imgcap" type="text" placeholder="caption to teach…" style="min-width:150px">
+      <input id="imgcap" type="text" placeholder="caption to teach…" style="min-width:130px">
       <button id="imgcapgo" class="ghost">Caption</button>
+      <input id="imgprompt" type="text" placeholder="text prompt…" style="min-width:110px">
+      <button id="imgt2m" class="ghost">Text→Img</button>
     </div>
     <div class="log" id="log-image">
-      <div class="note">Upload any image — it is downscaled to ≤16×16, tokenized (color-cube), and autoregressively reconstructed by a fresh tiny model that overfits this one input. Attention is O(pixels²) on CPU, so expect ~15–20 s. Toy-scale by design.</div>
+      <div class="note">Upload any image (downscaled to ≤16×16). <b>Reconstruct</b> rebuilds it; <b>Caption</b> teaches a caption then reproduces it; <b>Text→Img</b> teaches “prompt → this image”, then regenerates the image from the prompt (teach-then-reproduce, not zero-shot text-to-image). Toy-scale by design.</div>
     </div>
   </section>
 
@@ -112,11 +114,13 @@
       <input type="file" id="audfile" accept="audio/wav,audio/*">
       <label>steps</label><input id="audsteps" type="number" value="100" min="30" max="600" style="width:84px">
       <button id="audgo">Reconstruct</button>
-      <input id="audcap" type="text" placeholder="caption to teach…" style="min-width:150px">
+      <input id="audcap" type="text" placeholder="caption to teach…" style="min-width:130px">
       <button id="audcapgo" class="ghost">Caption</button>
+      <input id="audprompt" type="text" placeholder="text prompt…" style="min-width:110px">
+      <button id="audt2m" class="ghost">Text→Aud</button>
     </div>
     <div class="log" id="log-audio">
-      <div class="note">Upload a 16-bit PCM WAV — trimmed to ≤256 samples (≈16 ms @16 kHz), µ-law tokenized, and reconstructed. Attention is O(samples²) on CPU, so expect ~10 s. Toy-scale.</div>
+      <div class="note">Upload a 16-bit PCM WAV (≤256 samples). <b>Reconstruct</b> rebuilds it; <b>Caption</b> teaches + reproduces a caption; <b>Text→Aud</b> teaches “prompt → this clip”, then regenerates the audio from the prompt (teach-then-reproduce). Toy-scale.</div>
     </div>
   </section>
 
@@ -262,7 +266,7 @@ function readFileB64(file) {
 let mediaSending = false;
 function mediaBusy(b) {
   mediaSending = b;
-  ["#imggo","#audgo","#imgcapgo","#audcapgo","#vidgo"].forEach(id => $(id).disabled = b);
+  ["#imggo","#audgo","#imgcapgo","#audcapgo","#vidgo","#imgt2m","#audt2m"].forEach(id => $(id).disabled = b);
 }
 function addNode(view, node) {
   const log = $("#log-" + view);
@@ -338,6 +342,19 @@ async function doCaption(view, fileSel, capSel, stepsSel, kind) {
 $("#imgcapgo").addEventListener("click", () => doCaption("image", "#imgfile", "#imgcap", "#imgsteps", "image"));
 $("#audcapgo").addEventListener("click", () => doCaption("audio", "#audfile", "#audcap", "#audsteps", "audio"));
 $("#vidgo").addEventListener("click", () => doCaption("video", "#vidfile", "#vidcap", "#vidsteps", "video"));
+
+// ---- text -> media (teach-then-reproduce) ----
+async function doText2media(view, fileSel, promptSel, stepsSel, kind) {
+  if (mediaSending) return;
+  const f = $(fileSel).files[0];
+  const prompt = $(promptSel).value.trim();
+  if (!f) { addMsg(view, "err", "⚠ upload a target file for the model to learn"); return; }
+  if (!prompt) { addMsg(view, "err", "⚠ type a text prompt"); return; }
+  mediaBusy(true); addMsg(view, "status", `learning “${prompt}” → media… (~15–30 s, CPU)`);
+  send({op:"text2media", kind, media_b64: await readFileB64(f), text: prompt, steps: parseInt($(stepsSel).value)||300});
+}
+$("#imgt2m").addEventListener("click", () => doText2media("image", "#imgfile", "#imgprompt", "#imgsteps", "image"));
+$("#audt2m").addEventListener("click", () => doText2media("audio", "#audfile", "#audprompt", "#audsteps", "audio"));
 
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
