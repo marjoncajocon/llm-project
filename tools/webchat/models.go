@@ -67,7 +67,9 @@ func findModel(root, name string) *Model {
 func classify(root, name string) *Model {
 	folder := filepath.Join(root, "model", name)
 	ckptRel := ""
-	for _, cand := range []string{"model.bin", "model_int8.bin"} {
+	// Prefer the int8 (LLMQ) checkpoint when present: it streams 4x less memory
+	// and its decode matmul is threaded, so it's faster than the f32 path.
+	for _, cand := range []string{"model_int8.bin", "model.bin"} {
 		if _, err := os.Stat(filepath.Join(folder, cand)); err == nil {
 			ckptRel = "model/" + name + "/" + cand
 			break
