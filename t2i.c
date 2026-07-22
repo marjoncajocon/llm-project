@@ -100,15 +100,25 @@ static int shape_hit(int shape, float dx, float dy, float rad) {
   return 0;
 }
 
-static void draw_pair(const char *dir, int idx, int size, int shape, int color) {
+// tiny LCG so per-variant jitter is reproducible without touching global rand().
+static float urand(unsigned int *s) {
+  *s = *s * 1103515245u + 12345u;
+  return (float)(*s >> 8) / 16777216.0f;   // [0,1)
+}
+
+static void draw_pair(const char *dir, int idx, int size, int shape, int color, unsigned int seed) {
   Image im; im.h = size; im.w = size; im.c = 3;
   im.data = (float*)malloc((size_t)size * size * 3 * sizeof(float));
   const float bg = 0.08f;                                // fixed dark background
   for (int i = 0; i < size * size * 3; i++) im.data[i] = bg;
 
-  // Deterministic: each (color, shape) caption maps to exactly one image, so the
-  // tiny model can actually learn the mapping (variety can be added later).
-  float cx = size * 0.5f, cy = size * 0.5f, rad = size * 0.32f;
+  // Jitter position + size per variant so the model learns the color+shape CONCEPT
+  // (generalizes across placements) instead of memorizing one fixed image.
+  unsigned int rng = seed;
+  float jit = size * 0.18f;
+  float cx = size * 0.5f + jit * (urand(&rng) - 0.5f);
+  float cy = size * 0.5f + jit * (urand(&rng) - 0.5f);
+  float rad = size * (0.27f + 0.08f * urand(&rng));
   const NamedColor *col = &T2I_COLORS[color];
 
   for (int y = 0; y < size; y++)
@@ -134,13 +144,16 @@ int run_t2i_data(int argc, char **argv) {
     return 2;
   }
   const char *dir = argv[2];
-  int n = (argc > 3) ? atoi(argv[3]) : 240;
+  int n = (argc > 3) ? atoi(argv[3]) : 480;
   int size = (argc > 4) ? atoi(argv[4]) : 16;
   if (size % T2I_PATCH) { fprintf(stderr, "error: size must be divisible by %d\n", T2I_PATCH); return 1; }
   ensure_dirs(dir);
   T2I_MKDIR(dir);
+  // cycle every (shape, color); a distinct per-index seed makes each repeat a
+  // different jittered variant, so the model sees many placements per caption.
   for (int i = 0; i < n; i++)
-    draw_pair(dir, i, size, i % T2I_NSHAPES, (i / T2I_NSHAPES) % T2I_NCOLORS);
+    draw_pair(dir, i, size, i % T2I_NSHAPES, (i / T2I_NSHAPES) % T2I_NCOLORS,
+              1000u + (unsigned)i * 2654435761u);
   printf("t2i-data: wrote %d pairs (%dx%d, %d shapes x %d colors) -> %s\n",
          n, size, size, T2I_NSHAPES, T2I_NCOLORS, dir);
   return 0;
@@ -215,8 +228,12 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
   float **gacc = (float**)malloc((size_t)np * sizeof(float*));
   for (int p = 0; p < np; p++) gacc[p] = (float*)calloc((size_t)par[p]->size, sizeof(float));
 
+  const float base_lr = opt.lr;
   srand(1234);
   for (int s = 0; s < gpt_steps; s++) {
+    // Linear LR decay to 0.1x: high LR early to move fast, low LR late so the
+    // model settles cleanly instead of bouncing around the minimum.
+    opt.lr = base_lr * (1.0f - 0.9f * (float)s / (float)(gpt_steps > 1 ? gpt_steps - 1 : 1));
     for (int p = 0; p < np; p++) memset(gacc[p], 0, (size_t)par[p]->size * sizeof(float));
     float loss = 0.0f;
     for (int b = 0; b < BATCH; b++) {
@@ -342,7 +359,7 @@ int run_t2i(int argc, char **argv) {
   int vq_steps = (argc > 6) ? atoi(argv[6]) : 1200;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
-  Image og = t2i_generate(&vq, &g, w, h, T, argv[4], 0.3f, 40, 1234);
+  Image og = t2i_generate(&vq, &g, w, h, T, argv[4], 0.6f, 40, 1234);
   int ok = (image_save_ppm(argv[3], &og) == 0);
   printf("t2i: generated %dx%d for \"%s\" -> %s (%s)\n", w, h, argv[4], argv[3], ok ? "ok" : "FAILED");
   image_free(&og); vqvae_free(&vq); gpt_free(&g);
@@ -355,7 +372,7 @@ int run_t2i_train(int argc, char **argv) {
                     "  saves <prefix>.gpt and <prefix>.vqt (train once, then t2i-gen many times)\n");
     return 2;
   }
-  int gpt_steps = (argc > 4) ? atoi(argv[4]) : 900;   // each step = a minibatch
+  int gpt_steps = (argc > 4) ? atoi(argv[4]) : 1800;  // each step = a minibatch
   int vq_steps = (argc > 5) ? atoi(argv[5]) : 1500;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
@@ -396,7 +413,7 @@ int run_t2i_gen(int argc, char **argv) {
     fprintf(stderr, "usage: transformer t2i-gen <model-prefix> <out.ppm> <caption> [temp] [seed]\n");
     return 2;
   }
-  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.3f;
+  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.6f;
   unsigned long long seed = (argc > 6) ? strtoull(argv[6], NULL, 10) : 1234ull;
   VQVAE vq; GPT g; int w, h, T;
   if (t2i_load(argv[2], &w, &h, &T, &vq, &g) != 0) return 1;
