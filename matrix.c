@@ -191,20 +191,20 @@ static void mm_fwd_rows(int i0, int i1, void *ctx) {
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
   MMFwd t = { A->data, B->data, C->data, K, N };
-  if ((long)M * N * K < MM_THREAD_THRESHOLD) { mm_fwd_rows(0, M, &t); return; }
+  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_fwd_rows(0, M, &t); return; }
   parallel_for(M, mm_fwd_rows, &t);
 }
 
 // Matrix Addition: C = A + B (element-wise)
 void matadd(const Tensor *A, const Tensor *B, Tensor *C) {
-  for (int i = 0; i < A->size; i++) {
+  for (size_t i = 0; i < A->size; i++) {
     C->data[i] = A->data[i] + B->data[i];
   }
 }
 
 // Scale matrix: C = A * scalar
 void matscale(const Tensor *A, float scalar, Tensor *C) {
-  for (int i = 0; i < A->size; i++) {
+  for (size_t i = 0; i < A->size; i++) {
     C->data[i] = A->data[i] * scalar;
   }
 }
@@ -215,7 +215,7 @@ void bias_add(const Tensor *x, const Tensor *bias, Tensor *out) {
   const int N = x->shape[1];
   for (int i = 0; i < M; i++) {
     for (int j = 0; j < N; j++) {
-      out->data[i * N + j] = x->data[i * N + j] + bias->data[j];
+      out->data[(size_t)i * N + j] = x->data[(size_t)i * N + j] + bias->data[j];
     }
   }
 }
@@ -232,8 +232,8 @@ static void mm_bwd_dA(int i0, int i1, void *ctx) {
   for (int i = i0; i < i1; i++) {
     for (int k = 0; k < K; k++) {
       float sum = 0.0f;
-      for (int j = 0; j < N; j++) sum += t->C->grad[i * N + j] * t->B->data[k * N + j];
-      t->A->grad[i * K + k] += sum;
+      for (int j = 0; j < N; j++) sum += t->C->grad[(size_t)i * N + j] * t->B->data[(size_t)k * N + j];
+      t->A->grad[(size_t)i * K + k] += sum;
     }
   }
 }
@@ -245,8 +245,8 @@ static void mm_bwd_dB(int k0, int k1, void *ctx) {
   for (int k = k0; k < k1; k++) {
     for (int j = 0; j < N; j++) {
       float sum = 0.0f;
-      for (int i = 0; i < M; i++) sum += t->A->data[i * K + k] * t->C->grad[i * N + j];
-      t->B->grad[k * N + j] += sum;
+      for (int i = 0; i < M; i++) sum += t->A->data[(size_t)i * K + k] * t->C->grad[(size_t)i * N + j];
+      t->B->grad[(size_t)k * N + j] += sum;
     }
   }
 }
@@ -255,7 +255,7 @@ static void mm_bwd_dB(int k0, int k1, void *ctx) {
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
   MMBwd t = { A, B, C, M, K, N };
-  if ((long)M * N * K < MM_THREAD_THRESHOLD) {
+  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) {
     mm_bwd_dA(0, M, &t);
     mm_bwd_dB(0, K, &t);
     return;
@@ -266,7 +266,7 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
 
 // Backward of C = A + B: dA += dC, dB += dC
 void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B) {
-  for (int i = 0; i < C->size; i++) {
+  for (size_t i = 0; i < C->size; i++) {
     A->grad[i] += C->grad[i];
     B->grad[i] += C->grad[i];
   }
@@ -279,7 +279,7 @@ void bias_add_backward(const Tensor *out, const Tensor *bias_grad) {
   for (int j = 0; j < N; j++) {
     float sum = 0.0f;
     for (int i = 0; i < M; i++) {
-      sum += out->grad[i * N + j];
+      sum += out->grad[(size_t)i * N + j];
     }
     bias_grad->grad[j] += sum;
   }

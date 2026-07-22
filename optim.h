@@ -9,7 +9,7 @@
 typedef struct {
   float *m;        // first moment (mean of grads)
   float *v;        // second moment (mean of squared grads)
-  int total;       // total number of scalar parameters
+  size_t total;    // total number of scalar parameters (size_t: no 2^31 overflow)
   int t;           // time step (for bias correction)
   float lr;        // learning rate
   float beta1;     // first-moment decay

@@ -2,6 +2,8 @@
 #ifndef TENSOR_H
 #define TENSOR_H
 
+#include <stddef.h>   // size_t
+
 // ============================================================================
 // Tensor Structure Definition
 // ============================================================================
@@ -10,7 +12,7 @@ typedef struct {
   float *grad;      // Gradient array (for future backprop)
   int *shape;       // Array of dimension sizes
   int ndim;         // Number of dimensions
-  int size;         // Total number of elements
+  size_t size;      // Total number of elements (size_t: no 2^31 overflow)
 } Tensor;
 
 // ============================================================================

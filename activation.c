@@ -37,7 +37,7 @@ void softmax_rowwise(const Tensor *input, Tensor *output) {
 // gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 void gelu(const Tensor *input, Tensor *output) {
   const float k = 0.7978845608028654f;  // sqrt(2/pi)
-  for (int i = 0; i < input->size; i++) {
+  for (size_t i = 0; i < input->size; i++) {
     float x = input->data[i];
     float inner = k * (x + 0.044715f * x * x * x);
     output->data[i] = 0.5f * x * (1.0f + tanhf(inner));
@@ -48,7 +48,7 @@ void gelu(const Tensor *input, Tensor *output) {
 void gelu_backward(const Tensor *input, const Tensor *output) {
   const float k = 0.7978845608028654f;  // sqrt(2/pi)
   const float a = 0.044715f;
-  for (int i = 0; i < input->size; i++) {
+  for (size_t i = 0; i < input->size; i++) {
     float x = input->data[i];
     float inner = k * (x + a * x * x * x);
     float t = tanhf(inner);

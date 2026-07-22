@@ -82,9 +82,10 @@ int gpt_save(const char *path, const GPT *m) {
   return 0;
 }
 
-// A tensor's element count is stored in an int (Tensor.size), so a config whose
-// weights would exceed INT_MAX elements must be rejected before allocation — an
-// overflow there wraps to a small/negative size and corrupts memory downstream.
+// Tensor.size is size_t (allocation is overflow-safe), but the embedding/forward
+// path still indexes these weights with int arithmetic (e.g. token*d_model), so a
+// weight with more than INT_MAX elements would overflow those indices. Reject such
+// configs up front until the forward index math is migrated to size_t too.
 static int prod_fits_int(long long a, long long b) {
   return a > 0 && b > 0 && a <= (long long)INT_MAX / b;
 }

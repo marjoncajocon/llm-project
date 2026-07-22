@@ -307,7 +307,8 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
 // Guards against corrupt/hostile checkpoints (the primary input path of this
 // tool): non-positive/huge dims, n_kv=0 (division by zero in decode), GQA groups
 // that don't divide evenly (out-of-bounds K/V reads), and 2D weight element
-// counts that overflow the int Tensor.size. Returns 1 if sane, 0 otherwise.
+// counts above INT_MAX (the forward/embedding path still indexes with int
+// arithmetic, even though Tensor.size is now size_t). Returns 1 if sane, else 0.
 static int llama_config_valid(const int32_t *cfg) {
   const int32_t MAXD = 1000000;
   for (int i = 0; i < 8; i++)
@@ -318,7 +319,7 @@ static int llama_config_valid(const int32_t *cfg) {
   long long qd = (long long)n_heads * head_dim;
   long long kvd = (long long)n_kv * head_dim;
   if (qd > MAXD || kvd > MAXD) return 0;
-  // Every 2D weight's element count must fit in int (Tensor.size is int).
+  // Every 2D weight's element count must fit in int (forward path indexes in int).
   if ((long long)vocab * d_model > (long long)INT_MAX) return 0;   // wte / lm_head
   if ((long long)d_model * d_ff > (long long)INT_MAX) return 0;    // SwiGLU weights
   if (qd * d_model > (long long)INT_MAX) return 0;                 // Wq / Wo

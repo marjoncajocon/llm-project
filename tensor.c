@@ -36,10 +36,10 @@ Tensor tensor_create(int *shape, int ndim) {
   t.shape = (int*)malloc(ndim * sizeof(int));
   memcpy(t.shape, shape, ndim * sizeof(int));
 
-  // Calculate total size
+  // Calculate total size (accumulate in size_t so the product never wraps).
   t.size = 1;
   for (int i = 0; i < ndim; i++) {
-    t.size *= shape[i];
+    t.size *= (size_t)shape[i];
   }
 
   // Allocate aligned memory for data and gradients
@@ -66,7 +66,7 @@ void tensor_free(Tensor *t) {
 // Fill tensor with random values (Xavier initialization)
 void tensor_init_random(Tensor *t) {
   float scale = sqrtf(2.0f / t->shape[t->ndim - 1]);
-  for (int i = 0; i < t->size; i++) {
+  for (size_t i = 0; i < t->size; i++) {
     // Divide in double so RAND_MAX (which may exceed float's exact range on
     // some platforms) doesn't lose precision. Result r is in [0, 1].
     float r = (float)((double)rand() / (double)RAND_MAX);

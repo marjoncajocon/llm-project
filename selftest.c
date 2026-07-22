@@ -266,8 +266,8 @@ int run_selftest(void) {
   float max_rel = 0.0f, max_rel_cond = 0.0f;
   for (int p = 0; p < n_params; p++) {
     Tensor *param = params[p];
-    int step = param->size > 2 ? param->size / 2 : 1;
-    for (int k = 0; k < param->size; k += step) {
+    size_t step = param->size > 2 ? param->size / 2 : 1;
+    for (size_t k = 0; k < param->size; k += step) {
       float base = param->data[k];
       param->data[k] = base + eps;
       float lp = gpt_loss(&model, &acts, ids, seq_len, targets, &logits, &probs);
@@ -387,9 +387,9 @@ int run_selftest(void) {
     patch_embed(&im, patch, &Wp, &bp, &pemb);
     gpt_forward_multimodal(&model, &pemb, cap, np, mm_seq, &amm, &mmlog);
     int finite = 1;
-    for (int i = 0; i < mmlog.size; i++)
+    for (size_t i = 0; i < mmlog.size; i++)
       if (isnan(mmlog.data[i]) || isinf(mmlog.data[i])) { finite = 0; break; }
-    int e3_ok = (mmlog.size == total * vocab) && finite;
+    int e3_ok = (mmlog.size == (size_t)(total * vocab)) && finite;
     printf("[5] Image: %d patches + %d text -> GPT multimodal logits (%d, %d) -> %s\n",
            np, mm_seq, total, vocab, e3_ok ? "OK" : "FAIL");
 

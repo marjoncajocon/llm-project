@@ -1,12 +1,13 @@
 // optim.c - Adam optimizer
 #include "optim.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-static int count_params(Tensor **params, int n_params) {
-  int total = 0;
+static size_t count_params(Tensor **params, int n_params) {
+  size_t total = 0;
   for (int i = 0; i < n_params; i++) total += params[i]->size;
   return total;
 }
@@ -16,6 +17,10 @@ Adam adam_create(Tensor **params, int n_params, float lr) {
   o.total = count_params(params, n_params);
   o.m = (float*)malloc(o.total * sizeof(float));
   o.v = (float*)malloc(o.total * sizeof(float));
+  if (!o.m || !o.v) {
+    fprintf(stderr, "Error: Adam allocation failed (%zu params)\n", o.total);
+    exit(EXIT_FAILURE);
+  }
   memset(o.m, 0, o.total * sizeof(float));
   memset(o.v, 0, o.total * sizeof(float));
   o.t = 0;
@@ -32,10 +37,10 @@ void adam_step(Adam *o, Tensor **params, int n_params) {
   float bc1 = 1.0f - powf(o->beta1, (float)o->t);
   float bc2 = 1.0f - powf(o->beta2, (float)o->t);
 
-  int idx = 0;  // running index into the flat m/v buffers
+  size_t idx = 0;  // running index into the flat m/v buffers
   for (int p = 0; p < n_params; p++) {
     Tensor *param = params[p];
-    for (int i = 0; i < param->size; i++, idx++) {
+    for (size_t i = 0; i < param->size; i++, idx++) {
       float g = param->grad[i];
       o->m[idx] = o->beta1 * o->m[idx] + (1.0f - o->beta1) * g;
       o->v[idx] = o->beta2 * o->v[idx] + (1.0f - o->beta2) * g * g;
