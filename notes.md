@@ -241,8 +241,20 @@ replaces learned positions. **Half-split ("rotate_half") convention matching Hug
 Verified: new selftest **part `[14]`** — (1) numerical gradient check 1.38e-03 (< 1e-2); (2) the
 DEFINING RoPE property `<RoPE(q,m),RoPE(k,n)>` depends only on `(m-n)`: q@{1,4}, k@{2,5} (offset 1
 both) -> dot -0.6568 == -0.6568, rel 1.8e-07. Smoke test PASSED, `-Wall` clean. (Perf note: `powf`
-in the inner loop; precompute cos/sin tables when wiring into the model.) Next: SwiGLU, then GQA,
-then `convert_llama.py` + a modern-arch model path to load small modern models (SmolLM/Qwen).
+in the inner loop; precompute cos/sin tables when wiring into the model.)
+
+## Modern architecture — step 3: SwiGLU — DONE (2026-07-22)
+
+Gated feed-forward network (`swiglu.h`/`swiglu.c`), the LLaMA-family replacement for the GPT-2
+GELU MLP. No biases: `g = x@W_gate`, `u = x@W_up`, `h = SiLU(g) (*) u`, `y = h@W_down`
+(`SiLU(z) = z*sigmoid(z)`; `W_gate`/`W_up`: (d_model,d_ff); `W_down`: (d_ff,d_model)). Reuses
+`matmul`/`matmul_backward`; a `SwigluCache` holds g/u/a/h so backward runs without recompute.
+Backward: `dh` via `matmul_backward`, then `da=dh*u`, `du=dh*a`, `dg=da*SiLU'(g)`
+(`SiLU'(z)=s(1+z(1-s))`), then `matmul_backward` for x/W_gate/W_up. Verified: new selftest
+**part `[15]`** numerically gradient-checks all four tensors (x, W_gate, W_up, W_down) — max rel
+error **1.17e-03** (< 1e-2). Smoke test PASSED, `-Wall` clean. Next: **GQA** (grouped-query
+attention), then `convert_llama.py` + a modern-arch model path to load small modern models
+(SmolLM/Qwen).
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
@@ -301,7 +313,7 @@ and **Python** (`D:\env\python\python-3.9.10.amd64\python.exe` + numpy). Node at
 ```
 zig cc -std=c11 -O2 -Wall -o transformer.exe tensor.c matrix.c activation.c layernorm.c \
   feedforward.c attention.c embedding.c sampler.c model.c checkpoint.c tokenizer.c loss.c \
-  optim.c rmsnorm.c rope.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
+  optim.c rmsnorm.c rope.c swiglu.c toolcall.c toolexec.c approval.c agent.c corpus.c train.c image.c patch.c \
   video.c audio.c imagegen.c audiogen.c selftest.c main.c -lm
 .\transformer.exe            # must print: Output validation: PASSED
 ```

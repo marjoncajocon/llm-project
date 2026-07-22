@@ -25,6 +25,7 @@
 #include "audiogen.h"
 #include "rmsnorm.h"
 #include "rope.h"
+#include "swiglu.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -920,6 +921,58 @@ int run_selftest(void) {
            max_cond, dot1, dot2, rel_dp, rope_ok ? "OK" : "FAIL");
     all_ok &= rope_ok;
     tensor_free(&x); tensor_free(&y); tensor_free(&p); tensor_free(&pr);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 15: SwiGLU (LLaMA-family gated FFN, replaces the GELU MLP) — forward +
+  // numerical gradient check over all four tensors (x, W_gate, W_up, W_down).
+  // --------------------------------------------------------------------------
+  {
+    printf("[15] SwiGLU (LLaMA-family FFN): forward + gradient check\n");
+    const int n = 3, dm = 4, df = 6;
+    int xs[2] = {n, dm}, wgs[2] = {dm, df}, wds[2] = {df, dm}, ys[2] = {n, dm};
+    Tensor x = tensor_create(xs, 2), y = tensor_create(ys, 2);
+    Tensor Wg = tensor_create(wgs, 2), Wu = tensor_create(wgs, 2), Wd = tensor_create(wds, 2);
+    SwigluCache c = swiglu_cache_create(n, df);
+    for (int i = 0; i < n * dm; i++) x.data[i] = ((i * 13 % 100) / 50.0f) - 1.0f;
+    for (int i = 0; i < dm * df; i++) {
+      Wg.data[i] = ((i * 7 % 100) / 50.0f - 1.0f) * 0.5f;
+      Wu.data[i] = ((i * 19 % 100) / 50.0f - 1.0f) * 0.5f;
+    }
+    for (int i = 0; i < df * dm; i++) Wd.data[i] = ((i * 11 % 100) / 50.0f - 1.0f) * 0.5f;
+    float w[12];
+    for (int i = 0; i < n * dm; i++) w[i] = ((i * 23 % 100) / 50.0f) - 1.0f;
+
+    // Analytic grads (L = sum(w * y), dL/dy = w).
+    swiglu_forward(&x, &Wg, &Wu, &Wd, &c, &y);
+    tensor_zero_grad(&x); tensor_zero_grad(&Wg); tensor_zero_grad(&Wu); tensor_zero_grad(&Wd);
+    for (int i = 0; i < n * dm; i++) y.grad[i] = w[i];
+    swiglu_backward(&x, &Wg, &Wu, &Wd, &c, &y);
+
+    // Numerical grads over all four parameter tensors.
+    const float h = 1e-3f;
+    float max_cond = 0.0f;
+    Tensor *ps[4] = {&x, &Wg, &Wu, &Wd};
+    for (int pi = 0; pi < 4; pi++) {
+      Tensor *T = ps[pi];
+      int sz = T->shape[0] * T->shape[1];
+      for (int k = 0; k < sz; k++) {
+        float s = T->data[k];
+        T->data[k] = s + h; swiglu_forward(&x, &Wg, &Wu, &Wd, &c, &y);
+        float lp = 0.0f; for (int i = 0; i < n * dm; i++) lp += w[i] * y.data[i];
+        T->data[k] = s - h; swiglu_forward(&x, &Wg, &Wu, &Wd, &c, &y);
+        float lm = 0.0f; for (int i = 0; i < n * dm; i++) lm += w[i] * y.data[i];
+        T->data[k] = s;
+        float num = (lp - lm) / (2.0f * h), rel = fabsf(num - T->grad[k]) / (fabsf(T->grad[k]) + 1e-3f);
+        if (fabsf(T->grad[k]) > 1e-2f && rel > max_cond) max_cond = rel;
+      }
+    }
+    int sw_ok = (max_cond < 1e-2f);
+    printf("    gradient check (x, W_gate, W_up, W_down): max rel error %.2e (|grad|>1e-2) -> %s\n\n",
+           max_cond, sw_ok ? "OK" : "FAIL");
+    all_ok &= sw_ok;
+    swiglu_cache_free(&c);
+    tensor_free(&x); tensor_free(&y); tensor_free(&Wg); tensor_free(&Wu); tensor_free(&Wd);
   }
 
   // --------------------------------------------------------------------------
