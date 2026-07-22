@@ -94,6 +94,8 @@
       <label>steps</label><input id="imgsteps" type="number" value="100" min="30" max="600" style="width:84px">
       <label>levels</label><input id="imglevels" type="number" value="4" min="2" max="8" style="width:60px">
       <button id="imggo">Reconstruct</button>
+      <input id="imgcap" type="text" placeholder="caption to teach…" style="min-width:150px">
+      <button id="imgcapgo" class="ghost">Caption</button>
     </div>
     <div class="log" id="log-image">
       <div class="note">Upload any image — it is downscaled to ≤16×16, tokenized (color-cube), and autoregressively reconstructed by a fresh tiny model that overfits this one input. Attention is O(pixels²) on CPU, so expect ~15–20 s. Toy-scale by design.</div>
@@ -106,15 +108,25 @@
       <input type="file" id="audfile" accept="audio/wav,audio/*">
       <label>steps</label><input id="audsteps" type="number" value="100" min="30" max="600" style="width:84px">
       <button id="audgo">Reconstruct</button>
+      <input id="audcap" type="text" placeholder="caption to teach…" style="min-width:150px">
+      <button id="audcapgo" class="ghost">Caption</button>
     </div>
     <div class="log" id="log-audio">
       <div class="note">Upload a 16-bit PCM WAV — trimmed to ≤256 samples (≈16 ms @16 kHz), µ-law tokenized, and reconstructed. Attention is O(samples²) on CPU, so expect ~10 s. Toy-scale.</div>
     </div>
   </section>
 
-  <!-- VIDEO (Phase 3) -->
+  <!-- VIDEO -->
   <section class="view" id="view-video">
-    <div class="placeholder"><h3>Video</h3><p>Video understanding panel arrives in a later build step.</p></div>
+    <div class="bar">
+      <input type="file" id="vidfile" accept="video/*">
+      <input id="vidcap" type="text" placeholder="caption to teach, e.g. 'a person waving'" style="flex:1;min-width:180px">
+      <label>steps</label><input id="vidsteps" type="number" value="200" min="30" max="600" style="width:84px">
+      <button id="vidgo">Caption</button>
+    </div>
+    <div class="log" id="log-video">
+      <div class="note">Upload a short video — frames are extracted (needs <b>ffmpeg</b> on PATH), embedded, and a tiny model is <i>taught</i> your caption then reproduces it. This is teach-then-reproduce: the multimodal front-end is untrained, so it proves the pipeline runs on your real frames end-to-end — not a real captioner. A frames preview (GIF) is shown.</div>
+    </div>
   </section>
 </main>
 
@@ -144,6 +156,7 @@ function handle(m) {
     case "error": addMsg(activeView(), "err", "⚠ " + m.text); mediaBusy(false); busy(false); break;
     case "image_result": showImage(m); mediaBusy(false); break;
     case "audio_result": showAudio(m); mediaBusy(false); break;
+    case "caption_result": showCaption(m); mediaBusy(false); break;
   }
 }
 
@@ -206,7 +219,7 @@ function readFileB64(file) {
 let mediaSending = false;
 function mediaBusy(b) {
   mediaSending = b;
-  $("#imggo").disabled = b; $("#audgo").disabled = b;
+  ["#imggo","#audgo","#imgcapgo","#audcapgo","#vidgo"].forEach(id => $(id).disabled = b);
 }
 function addNode(view, node) {
   const log = $("#log-" + view);
@@ -254,6 +267,34 @@ $("#audgo").addEventListener("click", async () => {
   mediaBusy(true); addMsg("audio", "status", "generating… (~10 s, CPU)");
   send({op:"audgen", wav_b64: await readFileB64(f), steps: parseInt($("#audsteps").value)||100});
 });
+
+// ---- caption (teach-then-reproduce) ----
+function showCaption(m) {
+  const view = m.kind === "video" ? "video" : m.kind;
+  const wrap = document.createElement("div");
+  if (m.gif_b64) {
+    const img = document.createElement("img"); img.className = "pix"; img.src = "data:image/gif;base64," + m.gif_b64;
+    wrap.appendChild(img);
+    const br = document.createElement("div"); br.style.height = "6px"; wrap.appendChild(br);
+  }
+  const t = document.createElement("div");
+  t.innerHTML = `<div class="who">reproduced caption</div>`;
+  t.appendChild(document.createTextNode(m.text || "(empty)"));
+  wrap.appendChild(t);
+  addNode(view, wrap);
+}
+async function doCaption(view, fileSel, capSel, stepsSel, kind) {
+  if (mediaSending) return;
+  const f = $(fileSel).files[0];
+  const cap = $(capSel).value.trim();
+  if (!f) { addMsg(view, "err", "⚠ pick a file"); return; }
+  if (!cap) { addMsg(view, "err", "⚠ type a caption to teach"); return; }
+  mediaBusy(true); addMsg(view, "status", `teaching “${cap}”… (~15–30 s, CPU)`);
+  send({op:"caption", kind, media_b64: await readFileB64(f), caption: cap, steps: parseInt($(stepsSel).value)||200});
+}
+$("#imgcapgo").addEventListener("click", () => doCaption("image", "#imgfile", "#imgcap", "#imgsteps", "image"));
+$("#audcapgo").addEventListener("click", () => doCaption("audio", "#audfile", "#audcap", "#audsteps", "audio"));
+$("#vidgo").addEventListener("click", () => doCaption("video", "#vidfile", "#vidcap", "#vidsteps", "video"));
 
 document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));

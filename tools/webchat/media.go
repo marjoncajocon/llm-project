@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	_ "image/gif"  // register decoders for image.Decode
-	_ "image/jpeg" // ...
+	"image/color/palette"
+	"image/draw"
+	"image/gif"
+	_ "image/jpeg" // register decoder for image.Decode
 	"image/png"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // ---- images -------------------------------------------------------------
@@ -171,6 +174,34 @@ func ppmInt(r *bufio.Reader) (int, error) {
 		n = n*10 + int(c-'0')
 	}
 	return n, nil
+}
+
+// framesToGIF assembles frame_0000.ppm, frame_0001.ppm, ... (up to maxFrames)
+// from dir into an animated GIF for a preview of what the engine ingested.
+func framesToGIF(dir string, maxFrames int) ([]byte, error) {
+	g := &gif.GIF{}
+	for i := 0; i < maxFrames; i++ {
+		data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("frame_%04d.ppm", i)))
+		if err != nil {
+			break
+		}
+		img, err := decodeP6(data)
+		if err != nil {
+			break
+		}
+		pal := image.NewPaletted(img.Bounds(), palette.Plan9)
+		draw.Draw(pal, pal.Bounds(), img, img.Bounds().Min, draw.Src)
+		g.Image = append(g.Image, pal)
+		g.Delay = append(g.Delay, 40) // 0.4s per frame
+	}
+	if len(g.Image) == 0 {
+		return nil, errors.New("no frames to render")
+	}
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, g); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ---- audio --------------------------------------------------------------

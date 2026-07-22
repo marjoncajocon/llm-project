@@ -102,6 +102,8 @@ func handleMessage(c *wsConn, msg map[string]any) {
 		handleImggen(c, msg)
 	case "audgen":
 		handleAudgen(c, msg)
+	case "caption":
+		handleCaption(c, msg)
 	default:
 		sendJSON(c, map[string]any{"op": "error", "text": "unknown op: " + op})
 	}

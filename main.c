@@ -17,6 +17,7 @@
 #include "tokenizer.h"
 #include "train.h"
 #include "agent.h"
+#include "caption.h"
 #include "image.h"
 #include "patch.h"
 #include "video.h"
@@ -615,6 +616,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "train") == 0) return run_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "imggen") == 0) return run_imggen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "audgen") == 0) return run_audgen(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "caption") == 0) return run_caption(argc, argv);
   // Bare `transformer` (no args) runs the built-in self-test. An UNRECOGNIZED
   // subcommand must NOT fall through to it (a typo like `trian` would otherwise
   // silently run the demo) — print usage and fail instead.
