@@ -417,9 +417,29 @@ compute speedup needs **SIMD int8×int8→int32 dot-products (AVX2/AVX-512 VNNI)
 instruction, and that requires **activation quantization** (int8 activations) + SIMD intrinsics — a
 bigger, separate step. So this step's honest win is RAM/size, not latency.
 
-Perf follow-ups (for actual speed): **SIMD + activation quant (int8×int8) matmul**; also thread
-qmatmul. Block/model forward-only (add backward to fine-tune). Qwen2.5-0.5B needs attention-bias
-support in LlamaBlock.
+## Modern architecture — step 13: int8×int8 qmatmul (real speedup) + timing CORRECTION — DONE (2026-07-22)
+
+Rewrote `qmatmul` (quant.c) to the **int8×int8→int32** path: quantize the activation row to int8
+(per-row scale) on the fly, accumulate `acc[j] += qa[k]*qw[k,j]` in **int32** (contiguous int8×int8,
+auto-vectorizes to wide integer MACs under `-O3 -march=native`), then dequantize `a_scale·W.scale·acc`.
+int32 accumulator is safe (127²·K « 2³¹). Accuracy: selftest `[21]` now **7.47e-03** (vs 6.38e-03 with
+f32 activations — activation quant adds negligible error). Smoke test PASSED, `-Wall` clean.
+
+**Measured (token-IDs fed directly, `-O3 -march=native` AVX2 build, 30 tokens):**
+`int8 (int8×int8 SIMD) 0.9 s vs fp32 2.3 s → 2.5× faster.` Real compute speedup. Output stays
+coherent (int8 SmolLM2: "…There is a square in Paris called the Place de la Concorde…").
+
+**⚠️ TIMING CORRECTION (important):** the earlier "~85 s" llama_chat numbers were **NOT the C engine** —
+they were Python-side **huggingface_hub doing a slow (rate-limited, unauthenticated) HEAD check on
+tokenizer.json** every run. Feeding token IDs straight to `transformer llama` shows the engine is
+seconds, not minutes (fp32 2.3 s, int8 0.9 s / 30 tokens). So: (a) the int8 SIMD speedup is real and
+2.5×; (b) fix llama_chat/gpt2 tooling to cache/offline the tokenizer (`HF_HUB_OFFLINE=1` /
+`local_files_only`) so the wrapper isn't dominated by an HF metadata call. The earlier "no speedup"
+finding (step 12) was for the *f32-activation* qmatmul and was correct for that version; int8×int8 is
+the one that's actually faster.
+
+Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
+Block/model forward-only (add backward to fine-tune). Qwen2.5-0.5B needs attention-bias support.
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

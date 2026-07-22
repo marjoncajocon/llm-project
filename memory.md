@@ -185,7 +185,12 @@ training_method`. The pipeline that turns raw next-token prediction into a codin
    coherent). ✅ **in-memory int8 + quantized matmul**
    (`QTensor`+`qmatmul` in quant.c; `QLlamaModel`/`q_llama_decode_step`/`q_llama_model_load` keep int8
    in RAM, decode via qmatmul; `main.c llama` auto-detects LLMQ→int8 path, LLMA→f32; selftest `[21]`
-   int8 decode vs f32 forward L2 rel err 0.64%; 4× less RAM). Perf remaining: **thread qmatmul**, SIMD.
+   int8 decode vs f32 forward L2 rel err 0.64%; 4× less RAM). ✅ **int8×int8 qmatmul (real speedup)**
+   (quant.c qmatmul now quantizes activations to int8 + int32 accumulate, auto-vectorizes under
+   `-O3 -march=native`; selftest `[21]` 0.75%). **Measured (token-IDs direct, AVX2 build, 30 tok):
+   int8 0.9 s vs fp32 2.3 s = 2.5× faster.** ⚠️ CORRECTION: earlier "~85 s" was Python huggingface_hub
+   doing a slow HEAD check on tokenizer.json, NOT the C engine (engine is seconds; fix tooling with
+   `HF_HUB_OFFLINE=1`). Perf remaining: explicit AVX2/NEON intrinsics, block/prefill qmatmul, threading.
    Qwen2.5 needs attn-bias support. Block/model forward-only (add backward to fine-tune).
 2. **Pretraining** — next-token prediction on HUGE text **+ code** corpora. This project does this
    at toy scale (`transformer train`).
