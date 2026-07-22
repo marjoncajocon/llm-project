@@ -34,6 +34,7 @@ data/*
 !data/README.MD
 !data/sample.txt
 !data/identity.txt
+!data/instruct.txt
 
 # Agent demo artifact
 agent_demo.txt

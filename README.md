@@ -237,6 +237,30 @@ echo "machine learning is" | transformer generate ml.bin ml.tok
 The crawler fetches plain-text Wikipedia extracts and follows article links (breadth-first)
 so the text stays topically *connected*. Then `train` ingests the whole `data/wiki/` folder.
 
+### Instruction tuning (SFT) on your own data
+
+This is **stage 3 of the recipe** (see the "5 stages" in `memory.md`) — the step that makes a
+model *follow instructions* instead of just continuing text. `data/instruct.txt` is a tiny
+example dataset of `Q: <instruction>` / `A: <response>` pairs whose answers are the agent's
+tool-call format (`<tool …>` / `<done>`). Train on it, then feed an instruction and watch the
+model produce the matching tool call:
+
+```sh
+transformer train data/instruct.txt --name instruct --d-model 96 --layers 3 \
+  --heads 4 --ctx 96 --merges 48 --steps 4000 --lr 1e-3
+echo "Q: read notes.txt"      | transformer generate --name instruct
+#   -> A: <tool name="read_file" path="notes.txt"></tool>
+echo "Q: the task is finished" | transformer generate --name instruct
+#   -> A: <done>Task complete.</done>
+```
+
+Verified: a small model learns to route each held-in instruction to its correct response.
+(Note: keep `--merges` low so the BPE tokens stay fine-grained enough for prompts to align to
+token boundaries.) **Honest scale:** at this size the model *memorizes* the pairs — the value is
+seeing the SFT technique work end-to-end on real data via the CLI; generalizing to unseen
+instructions needs far more data + a bigger model. The precise, deterministic (masked-loss)
+version of the same idea is verified in the smoke test as part `[9]`.
+
 ### `transformer generate [model.bin] [tok.bin]`
 
 A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`),

@@ -184,9 +184,21 @@ completion. Then feeds each prompt through the KV cache and greedily generates: 
 → `7 8 9`, prompt B `[3,4,5]` → `11 12`. Two distinct prompts → two distinct correct responses =
 instruction-following in miniature. Verified: `[9] ... loss 3.19 → 0.0001 | A OK | B OK`, smoke
 test still `PASSED`, `-Wall` clean. (Toy scale — it memorizes; the *technique* is the real thing.)
-This is the "start step by step" first step toward the recipe; next candidates: a real SFT
-dataset via `transformer train` on `instruction → <tool …>` data, then the modern-architecture /
-quantization roadmap.
+This is the "start step by step" first step toward the recipe.
+
+**Real SFT dataset via the CLI — DONE (2026-07-22):** `data/instruct.txt` (tracked; `Q:`/`A:`
+instruction→response pairs whose answers are the agent's `<tool …>`/`<done>` format). Trained a
+real small model: `transformer train data/instruct.txt --name instruct --d-model 96 --layers 3
+--heads 4 --ctx 96 --merges 48 --steps 4000 --lr 1e-3` (loss ~0.07). Verified routing — each
+held-in instruction generates its correct response: `read notes.txt`→`read_file`, `run the
+tests`→`run_command make test`, `delete temp.log`→`run_command rm temp.log`, `the task is
+finished`→`<done>Task complete.</done>`, `write hello to notes.txt`→`write_file`. KEY GOTCHA:
+`--merges` must stay LOW (48, not 200) — coarse BPE merges whole lines into single tokens so the
+prompt doesn't align to a token boundary and routing drifts (first run at merges 200 emitted valid
+blocks but wrong routing). `model/instruct/*.bin` git-ignored; `data/instruct.txt` tracked (added
+`.gitignore` exception). Honest: memorizes at this scale — technique works, generalization needs
+more data + bigger model. Next: the modern-architecture (RMSNorm/RoPE/SwiGLU/GQA) + quantization
+roadmap, or a masked-loss SFT training mode in `train.c` (part `[9]` is the masked version).
 
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 

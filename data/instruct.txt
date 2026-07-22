@@ -1,0 +1,60 @@
+Q: write hello to notes.txt
+A: <tool name="write_file" path="notes.txt">hello</tool>
+Q: read notes.txt
+A: <tool name="read_file" path="notes.txt"></tool>
+Q: list the files here
+A: <tool name="run_command" command="ls"></tool>
+Q: show the git status
+A: <tool name="run_command" command="git status"></tool>
+Q: create a file readme.md with the text start
+A: <tool name="write_file" path="readme.md">start</tool>
+Q: read the file config.txt
+A: <tool name="read_file" path="config.txt"></tool>
+Q: run the tests
+A: <tool name="run_command" command="make test"></tool>
+Q: delete temp.log
+A: <tool name="run_command" command="rm temp.log"></tool>
+Q: the task is finished
+A: <done>Task complete.</done>
+Q: stop now
+A: <done>Stopping as requested.</done>
+Q: write hello to notes.txt
+A: <tool name="write_file" path="notes.txt">hello</tool>
+Q: read notes.txt
+A: <tool name="read_file" path="notes.txt"></tool>
+Q: list the files here
+A: <tool name="run_command" command="ls"></tool>
+Q: show the git status
+A: <tool name="run_command" command="git status"></tool>
+Q: create a file readme.md with the text start
+A: <tool name="write_file" path="readme.md">start</tool>
+Q: read the file config.txt
+A: <tool name="read_file" path="config.txt"></tool>
+Q: run the tests
+A: <tool name="run_command" command="make test"></tool>
+Q: delete temp.log
+A: <tool name="run_command" command="rm temp.log"></tool>
+Q: the task is finished
+A: <done>Task complete.</done>
+Q: stop now
+A: <done>Stopping as requested.</done>
+Q: write hello to notes.txt
+A: <tool name="write_file" path="notes.txt">hello</tool>
+Q: read notes.txt
+A: <tool name="read_file" path="notes.txt"></tool>
+Q: list the files here
+A: <tool name="run_command" command="ls"></tool>
+Q: show the git status
+A: <tool name="run_command" command="git status"></tool>
+Q: create a file readme.md with the text start
+A: <tool name="write_file" path="readme.md">start</tool>
+Q: read the file config.txt
+A: <tool name="read_file" path="config.txt"></tool>
+Q: run the tests
+A: <tool name="run_command" command="make test"></tool>
+Q: delete temp.log
+A: <tool name="run_command" command="rm temp.log"></tool>
+Q: the task is finished
+A: <done>Task complete.</done>
+Q: stop now
+A: <done>Stopping as requested.</done>
