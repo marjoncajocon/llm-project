@@ -349,17 +349,19 @@ smoke-tested (Output validation PASSED); grad-check + KV bit-exact untouched (al
    - RESULT (VERIFIED via montage): every "a <color> <shape>" caption -> correct color AND a
      recognizable shape. Clean from-scratch pure-C text-to-image.
 
-**IN PROGRESS -- generalization (commit 4294e91, WIP, NOT validated):**
+**generalization (commit 4294e91 code) -- VALIDATED 2026-07-23:**
    - Reintroduced per-variant position/size jitter (seeded per index) + linear LR decay to 0.1x.
      Defaults now: `t2i-data` n=480, `t2i-train` 1800 steps, gen temp 0.6.
    - Prior no-decay run (1400 steps) UNDERTRAINED: loss plateaued ~0.25, confused blue->green,
-     blobby shapes. LR decay + gentler jitter were added to fix that, but the confirming train
-     was STOPPED (user paused). `model/t2i/t2i` on disk = that undertrained 0.25 model (ignored).
-   - **RESUME:** rebuild (zig cc), `transformer t2i-data <dir> 480 16`,
-     `transformer t2i-train <dir> model/t2i/t2i 1800 1800`, then verify (same caption x several
-     seeds -> varied but CORRECT color+shape). If colors still confused: train longer / bigger
-     model (d=128) / gentler jitter. The crisp memorized demo used the pre-4294e91 deterministic
-     generator (no jitter).
+     blobby shapes. LR decay + gentler jitter fixed that.
+   - **CONFIRMING RUN (2026-07-23):** `t2i-data data\t2i 480 16` then
+     `t2i-train data\t2i model\t2i\t2i 1800 1800`. VQ recon_mse ~0.005; GPT loss **6.50 -> 0.093**
+     (blew past the old 0.25 plateau ~step 1400 as LR decayed). Model on disk is now the GOOD one.
+   - **VERIFIED via montage** (each caption x 4 seeds): all 5 shapes {circle, square, triangle,
+     diamond, cross} render recognizably; all 8 colors {red green blue yellow cyan magenta orange
+     purple} render DISTINCT + CORRECT (blue->green confusion GONE). Outputs vary per seed but keep
+     correct color+shape => real generalization, not memorization. Nit: orange skews slightly toward
+     yellow. NOTE: shape vocab is those 5 only -- out-of-vocab captions (e.g. "star") -> a blob.
 
 **THEN (user-requested next): richer concepts** -- multi-object scenes + spatial relations
 ("on the left"), more shapes -> real compositionality.
