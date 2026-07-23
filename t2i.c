@@ -31,7 +31,7 @@
 #define T2I_MKDIR(p) mkdir(p, 0755)
 #endif
 
-#define T2I_CAPTION_LEN 48
+#define T2I_CAPTION_LEN 5   // structured tokens: [color1, shape1, rel, color2, shape2]
 #define T2I_MAX_PAIRS   4096
 #define T2I_PATCH       2
 #define T2I_LDIM        16
@@ -48,14 +48,8 @@ static int read_text_file(const char *path, char *buf, int cap) {
   return n;
 }
 
-// Caption -> fixed-length text tokens, offset above the image-code vocab.
-static void encode_caption(const char *s, int v_media, int *out) {
-  int len = (int)strlen(s);
-  for (int j = 0; j < T2I_CAPTION_LEN; j++) {
-    int b = (j < len) ? (unsigned char)s[j] : 0;
-    out[j] = b + v_media;
-  }
-}
+// encode_caption (a structured-token parser) is defined below, after the color / shape /
+// relation vocab tables it depends on.
 
 // Make each directory prefix of `prefix` (so gpt_save's file can be written).
 static void ensure_dirs(const char *prefix) {
@@ -85,6 +79,58 @@ static const char *T2I_RELS[] = {"left of", "right of", "above", "below"};
 #define T2I_NCOLORS ((int)(sizeof(T2I_COLORS) / sizeof(T2I_COLORS[0])))
 #define T2I_NSHAPES ((int)(sizeof(T2I_SHAPES) / sizeof(T2I_SHAPES[0])))
 #define T2I_NRELS   ((int)(sizeof(T2I_RELS) / sizeof(T2I_RELS[0])))
+
+// Structured caption tokens: each color / shape / relation is ONE dedicated token id above the
+// image-code vocab (image codes 0..T2I_K-1). This gives the GPT a clean one-hot concept signal
+// (especially the relation word) instead of a diffuse byte string — the fix for weak relation
+// control (raw-byte captions left "above"/"below" conflated).
+#define T2I_TOK_COLOR(i) (T2I_K + (i))                                  // 8 colors
+#define T2I_TOK_SHAPE(i) (T2I_K + T2I_NCOLORS + (i))                    // 5 shapes
+#define T2I_TOK_REL(i)   (T2I_K + T2I_NCOLORS + T2I_NSHAPES + (i))      // 4 relations
+#define T2I_TOK_PAD      (T2I_K + T2I_NCOLORS + T2I_NSHAPES + T2I_NRELS)
+#define T2I_VOCAB        (T2I_TOK_PAD + 1)
+
+static int match_word_color(const char *w, int len) {
+  for (int i = 0; i < T2I_NCOLORS; i++)
+    if ((int)strlen(T2I_COLORS[i].name) == len && strncmp(w, T2I_COLORS[i].name, (size_t)len) == 0)
+      return T2I_TOK_COLOR(i);
+  return -1;
+}
+static int match_word_shape(const char *w, int len) {
+  for (int i = 0; i < T2I_NSHAPES; i++)
+    if ((int)strlen(T2I_SHAPES[i]) == len && strncmp(w, T2I_SHAPES[i], (size_t)len) == 0)
+      return T2I_TOK_SHAPE(i);
+  return -1;
+}
+// Relations are matched by their unique FIRST word (left/right/above/below); a trailing "of"
+// then matches nothing and is skipped, so both 1- and 2-word relation phrases parse cleanly.
+static int match_word_rel(const char *w, int len) {
+  static const char *first[] = {"left", "right", "above", "below"};
+  for (int i = 0; i < T2I_NRELS; i++)
+    if ((int)strlen(first[i]) == len && strncmp(w, first[i], (size_t)len) == 0)
+      return T2I_TOK_REL(i);
+  return -1;
+}
+
+// Parse "a <c1> <s1> <rel> a <c2> <s2>" into up to T2I_CAPTION_LEN structured tokens
+// [c1, s1, rel, c2, s2]; unmatched words ("a", "of") are skipped, short parses are PAD-filled.
+static void encode_caption(const char *s, int v_media, int *out) {
+  (void)v_media;                       // structured token ids are absolute now
+  int n = 0;
+  const char *p = s;
+  while (*p && n < T2I_CAPTION_LEN) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    const char *w = p;
+    while (*p && *p != ' ') p++;
+    int len = (int)(p - w);
+    int tok = match_word_color(w, len);
+    if (tok < 0) tok = match_word_shape(w, len);
+    if (tok < 0) tok = match_word_rel(w, len);
+    if (tok >= 0) out[n++] = tok;
+  }
+  while (n < T2I_CAPTION_LEN) out[n++] = T2I_TOK_PAD;
+}
 
 // Is point (dx,dy) relative to the shape center inside the shape of radius rad?
 static int shape_hit(int shape, float dx, float dy, float rad) {
@@ -204,7 +250,7 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
                      const char *ckpt_prefix, int ckpt_every,
                      VQVAE *vq_out, GPT *g_out, int *w_out, int *h_out, int *T_out) {
   const int T = T2I_CAPTION_LEN;
-  const int v_media = T2I_K, v_text = 256, V = v_media + v_text;
+  const int v_media = T2I_K, V = T2I_VOCAB;
 
   Image *imgs = (Image*)malloc(T2I_MAX_PAIRS * sizeof(Image));
   int **txttok = (int**)malloc(T2I_MAX_PAIRS * sizeof(int*));
@@ -247,9 +293,10 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
   fprintf(stderr, "t2i: %d pairs, %dx%d -> %d codes/img, vocab %d, GPT %d steps\n",
           N, w, h, M, V, gpt_steps);
 
-  // stage 2: GPT over [caption | codes] — sized to hold the color x shape x
-  // relation (two-object) distribution while staying fast enough to converge.
-  GPT g = gpt_create(V, 128, 4, 4, 512, total);
+  // stage 2: GPT over [caption | codes]. Structured caption tokens shorten the sequence
+  // (T=5 vs 48 bytes), which frees budget to widen the model (d 128->160) for the harder
+  // two-object relation task while still completing within the runtime window.
+  GPT g = gpt_create(V, 160, 4, 4, 640, total);
   GPTActs a = gpt_acts_create(&g, total);
   int lz[2] = {total, V};
   Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
