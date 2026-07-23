@@ -370,3 +370,35 @@ Build: `$c=(Get-ChildItem *.c|%{$_.Name}); D:\env\zig\zig.exe cc -std=c11 -O2 -W
 transformer.exe @c -lm`. Both exes (transformer.exe, tools/webchat/webchat.exe) left built.
 Montage helper (view PPMs): scratchpad ppm_montage.py (stdlib zlib PNG).
 
+
+## 2026-07-23 -- Session: two-object compositional t2i + checkpointing (RESUME HERE)
+
+Extended single-object t2i to **two-object scenes with spatial relations** (commit 4a4d880,
+all `t2i.c`). Caption "a <c1> <s1> <rel> a <c2> <s2>", rel in {left of, right of, above, below}.
+`draw_scene` places obj1 in the named half (jittered); `run_t2i_data` randomly samples
+(c1,s1,rel,c2,s2) per index over a 6400-combo space >> dataset. `T2I_CAPTION_LEN` 32->48,
+GPT d 96->128 / dff 512.
+
+**Checkpointing added:** `t2i_build` gained ckpt_prefix/every; `run_t2i_train` saves every 300
+GPT steps (two runs got killed near ~90 min -- the runtime wall on this box). Verified on disk.
+
+**RESULT (24px/d128/2200 steps, 768 scenes, loss 0.054) -- PARTIAL SUCCESS** (relation-swap +
+unseen-pairing montages):
+  - Horizontal relations (left of / right of) LEARNED -- correct position across seeds and on
+    unseen pairings.
+  - Vertical relations (above / below) CONFLATED -- both render blue-top/red-bottom. Likely
+    raster-order AR: left/right repeats every scanline, above/below must commit at first codes.
+  - Colors mostly right but 2nd object bleeds (blue->magenta) sometimes (small objects at 24px).
+
+**32px scale-up (d160) FAILED on CPU:** ~3.6-5 s/step at seq 304 -> only ~1300 steps fit before
+the ~90-min kill vs 2200 needed; UNDERTRAINED, colors collapsed (all red/orange). Reverted to
+24px/d128. 32px two-object > this machine's training budget.
+
+**On disk:** `model/t2i_scenes/t2i.*` = restored 24px partial model (0.054); dataset
+`data/t2i_scenes` (768 @ 24px). Reproduce: `t2i-data data\t2i_scenes 768 24` +
+`t2i-train data\t2i_scenes model\t2i_scenes\t2i 2200 2000` (deterministic).
+
+**NEXT (fix vertical relations / bleed, all fit 24px): (1) dedicated relation/color/shape vocab
+tokens instead of raw caption bytes -- highest leverage; (2) d160 + 2600 steps; (3) 1200 scenes.
+Brute-force 32px+ is off the table until faster compute.**
+

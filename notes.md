@@ -1468,9 +1468,52 @@ smoke-tested (Output validation PASSED); grad-check + KV bit-exact untouched (al
      NOTE: shape vocab is those 5 only -- out-of-vocab captions (e.g. "star") -> a colored blob.
 
 **THEN (user-requested next): richer concepts** -- multi-object scenes + spatial relations
-("on the left"), more shapes -> real compositionality.
+("on the left"), more shapes -> real compositionality. **DONE (partial) 2026-07-23, see below.**
 
 Build: `$c=(Get-ChildItem *.c|%{$_.Name}); D:\env\zig\zig.exe cc -std=c11 -O2 -Wall -o
 transformer.exe @c -lm`. Both exes (transformer.exe, tools/webchat/webchat.exe) left built.
 Montage helper (view PPMs): scratchpad ppm_montage.py (stdlib zlib PNG).
+
+
+## 2026-07-23 -- Session: two-object compositional t2i + checkpointing (RESUME HERE)
+
+Extended the single-object t2i to **two-object scenes with spatial relations** (commit
+4a4d880, all in `t2i.c`). Caption = "a <c1> <s1> <rel> a <c2> <s2>", rel in
+{left of, right of, above, below}. `draw_scene` places obj1 in the named half (left/top for
+left-of/above, right/bottom for right-of/below), each jittered; `run_t2i_data` now RANDOMLY
+samples (c1,s1,rel,c2,s2) per index over a 6400-combo space >> dataset (forces relation
+generalization across unseen pairings). Also `T2I_CAPTION_LEN` 32->48, GPT d 96->128 / dff 512.
+
+**NEW: checkpointing.** `t2i_build` gained ckpt_prefix/ckpt_every params; `run_t2i_train` saves
+the model every 300 GPT steps (dir created BEFORE the loop). A long/interruptible run keeps
+usable weights -- added because two background runs got killed near ~90 min (the effective
+runtime wall on this box). `t2i_save` forward-declared. VERIFIED on disk mid-run.
+
+**RESULT (24px/d128/2200 steps, 768 scenes, loss 6.59 -> 0.054) -- PARTIAL SUCCESS.** Verified
+via relation-swap montage ("a red circle <rel> a blue square" x seeds, temp 0.4) + unseen-pairing
+montage:
+  - **Horizontal relations LEARNED:** "left of" -> red left/blue right; "right of" -> red
+    right/blue left. Position correct across seeds AND on object pairings never trained together.
+  - **Vertical relations CONFLATED:** "above" and "below" both render blue-top/red-bottom (only
+    "below" is then correct). Hypothesis: raster-order AR generation re-expresses left/right in
+    every scanline but must commit above/below at the very first codes -> weaker signal.
+  - **Colors mostly right, but 2nd object bleeds** (blue->magenta) in some samples -- small
+    (~12px) objects at 24px stress the VQ codec.
+
+**32px scale-up ATTEMPT (d160, user-requested) -- FAILED on this CPU.** Measured ~3.6-5 s/GPT
+step at seq 304 (256 codes/img), so only ~1300 steps fit before the ~90-min kill wall vs the
+2200 that 24px needs. Result: UNDERTRAINED, **color collapse** (everything red/orange, blue
+gone) -- WORSE than 24px. Reverted source to the committed 24px/d128 config. LESSON: 32px
+two-object exceeds this machine's from-scratch training budget within the runtime window.
+
+**On disk now:** `model/t2i_scenes/t2i.gpt`+`.vqt` = the restored 24px partial model (loss 0.054).
+Dataset `data/t2i_scenes` (768 @ 24px). Reproduce: `t2i-data data\t2i_scenes 768 24` then
+`t2i-train data\t2i_scenes model\t2i_scenes\t2i 2200 2000` (deterministic -> 0.054).
+
+**NEXT options to fix vertical relations / color bleed (all fit 24px budget):**
+  1. **Relation/color/shape as dedicated vocab tokens** (not raw caption bytes) -> stronger,
+     cleaner conditioning; likely the highest-leverage fix for the vertical-relation conflation.
+  2. Bigger model at 24px (d160) + more steps (2600) -- still completes in the runtime window.
+  3. More data (1200+ scenes) for better pairing coverage.
+  Brute-force resolution (32px+) is OFF THE TABLE until faster compute (SIMD/threads/GPU).
 
