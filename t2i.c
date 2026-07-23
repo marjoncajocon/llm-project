@@ -31,7 +31,7 @@
 #define T2I_MKDIR(p) mkdir(p, 0755)
 #endif
 
-#define T2I_CAPTION_LEN 32
+#define T2I_CAPTION_LEN 48
 #define T2I_MAX_PAIRS   4096
 #define T2I_PATCH       2
 #define T2I_LDIM        16
@@ -81,8 +81,10 @@ static const NamedColor T2I_COLORS[] = {
   {"orange", 0.95f, 0.55f, 0.10f}, {"purple", 0.55f, 0.20f, 0.75f},
 };
 static const char *T2I_SHAPES[] = {"circle", "square", "triangle", "diamond", "cross"};
+static const char *T2I_RELS[] = {"left of", "right of", "above", "below"};
 #define T2I_NCOLORS ((int)(sizeof(T2I_COLORS) / sizeof(T2I_COLORS[0])))
 #define T2I_NSHAPES ((int)(sizeof(T2I_SHAPES) / sizeof(T2I_SHAPES[0])))
+#define T2I_NRELS   ((int)(sizeof(T2I_RELS) / sizeof(T2I_RELS[0])))
 
 // Is point (dx,dy) relative to the shape center inside the shape of radius rad?
 static int shape_hit(int shape, float dx, float dy, float rad) {
@@ -106,63 +108,100 @@ static float urand(unsigned int *s) {
   return (float)(*s >> 8) / 16777216.0f;   // [0,1)
 }
 
-static void draw_pair(const char *dir, int idx, int size, int shape, int color, unsigned int seed) {
+// Paint one filled shape (color) into `im` centered at (cx,cy) with radius rad.
+static void paint_shape(Image *im, int size, float cx, float cy, float rad,
+                        int shape, const NamedColor *col) {
+  for (int y = 0; y < size; y++)
+    for (int x = 0; x < size; x++)
+      if (shape_hit(shape, (x + 0.5f) - cx, (y + 0.5f) - cy, rad)) {
+        size_t p = ((size_t)y * size + x) * 3;
+        im->data[p] = col->r; im->data[p + 1] = col->g; im->data[p + 2] = col->b;
+      }
+}
+
+// Two-object scene with a spatial relation, caption "a <c1> <s1> <rel> a <c2> <s2>".
+// obj1 is placed relative to obj2 as stated: "left of"/"above" put obj1 in the
+// left/top half, "right of"/"below" put it in the right/bottom half. Each object
+// is jittered within its half so the model learns the RELATION concept (which side
+// each object sits on) rather than memorizing fixed pixels.
+static void draw_scene(const char *dir, int idx, int size,
+                       int c1, int s1, int c2, int s2, int rel, unsigned int seed) {
   Image im; im.h = size; im.w = size; im.c = 3;
   im.data = (float*)malloc((size_t)size * size * 3 * sizeof(float));
   const float bg = 0.08f;                                // fixed dark background
   for (int i = 0; i < size * size * 3; i++) im.data[i] = bg;
 
-  // Jitter position + size per variant so the model learns the color+shape CONCEPT
-  // (generalizes across placements) instead of memorizing one fixed image.
   unsigned int rng = seed;
-  float jit = size * 0.18f;
-  float cx = size * 0.5f + jit * (urand(&rng) - 0.5f);
-  float cy = size * 0.5f + jit * (urand(&rng) - 0.5f);
-  float rad = size * (0.27f + 0.08f * urand(&rng));
-  const NamedColor *col = &T2I_COLORS[color];
-
-  for (int y = 0; y < size; y++)
-    for (int x = 0; x < size; x++)
-      if (shape_hit(shape, (x + 0.5f) - cx, (y + 0.5f) - cy, rad)) {
-        size_t p = ((size_t)y * size + x) * 3;
-        im.data[p] = col->r; im.data[p + 1] = col->g; im.data[p + 2] = col->b;
-      }
+  float rad = size * (0.11f + 0.03f * urand(&rng));      // smaller: two per image
+  float near = size * 0.27f, far = size * 0.73f;         // the two half-centers
+  float jit = size * 0.08f;
+  int horizontal = (rel == 0 || rel == 1);               // left of / right of
+  int first_far = (rel == 1 || rel == 3);                // right of / below -> obj1 far
+  float x1, y1, x2, y2;
+  if (horizontal) {
+    x1 = first_far ? far : near; x2 = first_far ? near : far;
+    y1 = y2 = size * 0.5f;
+  } else {
+    y1 = first_far ? far : near; y2 = first_far ? near : far;
+    x1 = x2 = size * 0.5f;
+  }
+  x1 += jit * (urand(&rng) - 0.5f); y1 += jit * (urand(&rng) - 0.5f);
+  x2 += jit * (urand(&rng) - 0.5f); y2 += jit * (urand(&rng) - 0.5f);
+  paint_shape(&im, size, x1, y1, rad, s1, &T2I_COLORS[c1]);
+  paint_shape(&im, size, x2, y2, rad, s2, &T2I_COLORS[c2]);
 
   char ip[600], cp[600];
   snprintf(ip, sizeof(ip), "%s/img_%04d.ppm", dir, idx);
   snprintf(cp, sizeof(cp), "%s/cap_%04d.txt", dir, idx);
   image_save_ppm(ip, &im);
   FILE *cf = fopen(cp, "wb");
-  if (cf) { fprintf(cf, "a %s %s", col->name, T2I_SHAPES[shape]); fclose(cf); }
+  if (cf) {
+    fprintf(cf, "a %s %s %s a %s %s", T2I_COLORS[c1].name, T2I_SHAPES[s1],
+            T2I_RELS[rel], T2I_COLORS[c2].name, T2I_SHAPES[s2]);
+    fclose(cf);
+  }
   image_free(&im);
 }
 
 int run_t2i_data(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: transformer t2i-data <out-dir> [n] [size]\n"
-                    "  writes n colored-shape (caption,image) pairs (default 240, 16px)\n");
+                    "  writes n two-object-scene (caption,image) pairs with spatial\n"
+                    "  relations left/right/above/below (default 768, 24px)\n");
     return 2;
   }
   const char *dir = argv[2];
-  int n = (argc > 3) ? atoi(argv[3]) : 480;
-  int size = (argc > 4) ? atoi(argv[4]) : 16;
+  int n = (argc > 3) ? atoi(argv[3]) : 768;
+  int size = (argc > 4) ? atoi(argv[4]) : 24;
   if (size % T2I_PATCH) { fprintf(stderr, "error: size must be divisible by %d\n", T2I_PATCH); return 1; }
   ensure_dirs(dir);
   T2I_MKDIR(dir);
-  // cycle every (shape, color); a distinct per-index seed makes each repeat a
-  // different jittered variant, so the model sees many placements per caption.
-  for (int i = 0; i < n; i++)
-    draw_pair(dir, i, size, i % T2I_NSHAPES, (i / T2I_NSHAPES) % T2I_NCOLORS,
-              1000u + (unsigned)i * 2654435761u);
-  printf("t2i-data: wrote %d pairs (%dx%d, %d shapes x %d colors) -> %s\n",
-         n, size, size, T2I_NSHAPES, T2I_NCOLORS, dir);
+  // Randomly sample (color1,shape1,rel,color2,shape2) per index with a reproducible
+  // per-index seed. The space (8*5*4*8*5 = 6400) is far larger than n, so the model
+  // must GENERALIZE the relation across object pairings it never saw together.
+  for (int i = 0; i < n; i++) {
+    unsigned int r = 2654435761u * (unsigned)(i + 1) + 12345u;
+    int c1 = (int)(urand(&r) * T2I_NCOLORS); if (c1 >= T2I_NCOLORS) c1 = T2I_NCOLORS - 1;
+    int s1 = (int)(urand(&r) * T2I_NSHAPES); if (s1 >= T2I_NSHAPES) s1 = T2I_NSHAPES - 1;
+    int rel = (int)(urand(&r) * T2I_NRELS);  if (rel >= T2I_NRELS) rel = T2I_NRELS - 1;
+    int c2 = (int)(urand(&r) * T2I_NCOLORS); if (c2 >= T2I_NCOLORS) c2 = T2I_NCOLORS - 1;
+    int s2 = (int)(urand(&r) * T2I_NSHAPES); if (s2 >= T2I_NSHAPES) s2 = T2I_NSHAPES - 1;
+    draw_scene(dir, i, size, c1, s1, c2, s2, rel, 1000u + (unsigned)i * 2654435761u);
+  }
+  printf("t2i-data: wrote %d two-object scenes (%dx%d, %d shapes x %d colors x %d relations) -> %s\n",
+         n, size, size, T2I_NSHAPES, T2I_NCOLORS, T2I_NRELS, dir);
   return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Build (train the VQ-VAE + GPT on a captioned-image folder)
 // ---------------------------------------------------------------------------
+static int t2i_save(const char *prefix, int w, int h, int T, const VQVAE *vq, const GPT *g);
+
+// ckpt_prefix != NULL + ckpt_every > 0 saves the model every ckpt_every GPT steps
+// (and after the last), so a long run survives being interrupted with usable weights.
 static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
+                     const char *ckpt_prefix, int ckpt_every,
                      VQVAE *vq_out, GPT *g_out, int *w_out, int *h_out, int *T_out) {
   const int T = T2I_CAPTION_LEN;
   const int v_media = T2I_K, v_text = 256, V = v_media + v_text;
@@ -208,9 +247,9 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
   fprintf(stderr, "t2i: %d pairs, %dx%d -> %d codes/img, vocab %d, GPT %d steps\n",
           N, w, h, M, V, gpt_steps);
 
-  // stage 2: GPT over [caption | codes] — sized to hold the color x shape
-  // distribution while staying fast enough to actually converge.
-  GPT g = gpt_create(V, 96, 4, 4, 384, total);
+  // stage 2: GPT over [caption | codes] — sized to hold the color x shape x
+  // relation (two-object) distribution while staying fast enough to converge.
+  GPT g = gpt_create(V, 128, 4, 4, 512, total);
   GPTActs a = gpt_acts_create(&g, total);
   int lz[2] = {total, V};
   Tensor lo = tensor_create(lz, 2), pr = tensor_create(lz, 2);
@@ -260,6 +299,10 @@ static int t2i_build(const char *dir, int gpt_steps, int vq_steps,
     adam_step(&opt, par, np);
     if (s % 50 == 0 || s == gpt_steps - 1)
       fprintf(stderr, "  gpt step %d/%d loss %.4f\n", s, gpt_steps, loss * inv);
+    if (ckpt_prefix && ckpt_every > 0 && s > 0 && s % ckpt_every == 0) {
+      if (t2i_save(ckpt_prefix, w, h, T, &vq, &g) == 0)
+        fprintf(stderr, "  [checkpoint] saved %s at step %d\n", ckpt_prefix, s);
+    }
   }
 
   for (int p = 0; p < np; p++) free(gacc[p]);
@@ -358,7 +401,7 @@ int run_t2i(int argc, char **argv) {
   int gpt_steps = (argc > 5) ? atoi(argv[5]) : 1500;
   int vq_steps = (argc > 6) ? atoi(argv[6]) : 1200;
   VQVAE vq; GPT g; int w, h, T;
-  if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
+  if (t2i_build(argv[2], gpt_steps, vq_steps, NULL, 0, &vq, &g, &w, &h, &T) != 0) return 1;
   Image og = t2i_generate(&vq, &g, w, h, T, argv[4], 0.6f, 40, 1234);
   int ok = (image_save_ppm(argv[3], &og) == 0);
   printf("t2i: generated %dx%d for \"%s\" -> %s (%s)\n", w, h, argv[4], argv[3], ok ? "ok" : "FAILED");
@@ -375,8 +418,9 @@ int run_t2i_train(int argc, char **argv) {
   int gpt_steps = (argc > 4) ? atoi(argv[4]) : 1800;  // each step = a minibatch
   int vq_steps = (argc > 5) ? atoi(argv[5]) : 1500;
   VQVAE vq; GPT g; int w, h, T;
-  if (t2i_build(argv[2], gpt_steps, vq_steps, &vq, &g, &w, &h, &T) != 0) return 1;
-  ensure_dirs(argv[3]);
+  ensure_dirs(argv[3]);                               // needed before mid-run checkpoints
+  // checkpoint every ~300 steps so a long/interruptible run keeps usable weights.
+  if (t2i_build(argv[2], gpt_steps, vq_steps, argv[3], 300, &vq, &g, &w, &h, &T) != 0) return 1;
   int rc = t2i_save(argv[3], w, h, T, &vq, &g);
   printf("t2i-train: %s -> %s.gpt + %s.vqt (%s)\n", argv[2], argv[3], argv[3], rc == 0 ? "saved" : "FAILED");
   vqvae_free(&vq); gpt_free(&g);
