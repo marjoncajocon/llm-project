@@ -402,3 +402,20 @@ the ~90-min kill vs 2200 needed; UNDERTRAINED, colors collapsed (all red/orange)
 tokens instead of raw caption bytes -- highest leverage; (2) d160 + 2600 steps; (3) 1200 scenes.
 Brute-force 32px+ is off the table until faster compute.**
 
+
+## 2026-07-23 (eve) -- Structured caption tokens (WIP, NOT validated) -- RESUME HERE
+
+Implemented option (1) above -- **structured caption tokens** (commit 964846a, build clean).
+`encode_caption` now PARSES "a <c1> <s1> <rel> a <c2> <s2>" into 5 dedicated tokens
+[c1,s1,rel,c2,s2] (`match_word_color/shape/rel`; T2I_TOK_COLOR/SHAPE/REL/PAD; T2I_VOCAB=274).
+`T2I_CAPTION_LEN` 48->5 (seq 192->149); GPT d 128->160, dff 512->640. Runs ~0.76 s/step
+(~30 min / 2200 steps). Sanity OK (vocab 274, loss5.51~=ln274). **Training STOPPED at step
+450/2200 (user home) -- NOT validated, no good model on disk (ignore model/t2i_tok step-300 ckpt).**
+
+**RESUME (~30 min):** rebuild (zig cc) -> `t2i-data data\t2i_tok 1000 24` (or reuse existing) ->
+`t2i-train data\t2i_tok model\t2i_tok\t2i 2200 2000` -> VALIDATE with relation-swap montage
+("a red circle <rel> a blue square" x seeds, t2i-gen temp 0.4, recreate scratchpad ppm_montage.py).
+SUCCESS = "above" puts red on TOP / "below" red on BOTTOM (byte-caption model conflated them).
+Baseline to beat: byte-caption model `model/t2i_scenes` (commit 4a4d880, loss 0.054, vertical
+conflated). See notes.md "Structured caption tokens" for the full step list.
+

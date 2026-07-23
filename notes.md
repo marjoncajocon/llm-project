@@ -1517,3 +1517,39 @@ Dataset `data/t2i_scenes` (768 @ 24px). Reproduce: `t2i-data data\t2i_scenes 768
   3. More data (1200+ scenes) for better pairing coverage.
   Brute-force resolution (32px+) is OFF THE TABLE until faster compute (SIMD/threads/GPU).
 
+
+## 2026-07-23 (eve) -- Structured caption tokens (WIP, NOT validated) -- ▶▶ RESUME HERE
+
+Started the highest-leverage fix for the vertical-relation conflation: **structured caption
+tokens** (commit 964846a) -- each color/shape/relation is now ONE dedicated vocab token instead
+of raw caption bytes, giving the GPT a clean one-hot concept signal (esp. the relation word).
+
+**Code done + committed (964846a), build clean:**
+  - `encode_caption` rewritten as a parser: "a <c1> <s1> <rel> a <c2> <s2>" -> 5 tokens
+    [c1,s1,rel,c2,s2] via `match_word_color/shape/rel` (relation matched by unique first word;
+    "a"/"of" skipped; PAD-filled). Token layout above image codes: `T2I_TOK_COLOR/SHAPE/REL/PAD`,
+    `T2I_VOCAB` = 274.
+  - `T2I_CAPTION_LEN` 48->5; sequence 192->149. GPT d 128->160, dff 512->640 (shorter seq +
+    smaller vocab freed the budget). Runs ~0.76 s/step => ~30 min for 2200 steps (was ~90).
+  - Sanity checks PASSED: parser traced correct; vocab 274; step-0 loss 5.51 ~= ln(274).
+
+**NOT validated -- training was STOPPED at step 450/2200 (loss ~0.20, user going home).** No good
+structured-token model on disk (only an early step-300 checkpoint under `model/t2i_tok/`, ignore it).
+
+**▶▶ RESUME (one command each, ~30 min total):**
+  1. Rebuild: `$c=(Get-ChildItem *.c|%{$_.Name}); D:\env\zig\zig.exe cc -std=c11 -O2 -Wall -o transformer.exe @c -lm`
+  2. Data (already on disk as `data/t2i_tok`, 1000 @ 24px; regen if missing):
+     `.\transformer.exe t2i-data data\t2i_tok 1000 24`
+  3. Train: `.\transformer.exe t2i-train data\t2i_tok model\t2i_tok\t2i 2200 2000`  (checkpoints /300)
+  4. VALIDATE (the whole point -- does above/below disentangle now?): relation-swap montage,
+     `.\transformer.exe t2i-gen model\t2i_tok\t2i <out.ppm> "a red circle <rel> a blue square" 0.4 <seed>`
+     for rel in {left of, right of, above, below} x a few seeds; montage via scratchpad
+     `ppm_montage.py` (recreate it -- stdlib zlib PNG, cols=3 scale=10). SUCCESS = above puts red
+     on TOP, below puts red on BOTTOM (byte-caption model conflated them to blue-top/red-bottom).
+  5. If vertical now works: commit result + update notes/memory; then compare vs the byte-caption
+     partial model (`model/t2i_scenes`). If still conflated: try more steps (2800) / d192, or
+     reconsider raster-order (generate codes in an order that expresses vertical early).
+
+Prior baseline to beat (byte captions, commit 4a4d880, model `model/t2i_scenes`, loss 0.054):
+horizontal relations OK, vertical CONFLATED, some 2nd-object color bleed.
+
