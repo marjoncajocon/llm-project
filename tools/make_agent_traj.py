@@ -34,6 +34,24 @@ WORDS = ["hello", "done", "start", "ok todo", "first line", "the result is 42",
 DONE = ["Task complete.", "All steps done.", "Finished the task."]
 
 
+def contents_from(files):
+    """A LARGE, varied pool of write-file contents.
+
+    Drawing every write's content from the tiny fixed WORDS list lets a small
+    model MEMORIZE the content set instead of learning to COPY the content out of
+    the prompt -- observed as: it copies novel FIRST-write content fine but drops
+    the SECOND write's content (which it only ever saw as one of ~10 words) to an
+    empty body. Mixing in readable phrases derived from the (varied) wiki slugs
+    makes the content vocabulary big enough that copy-from-prompt is the only way
+    to fit, in EVERY position."""
+    pool = list(WORDS)
+    for s in files:
+        phrase = s.replace("_", " ").strip()
+        if 2 <= len(phrase) <= 24 and phrase not in pool:
+            pool.append(phrase)
+    return pool
+
+
 def slugs_from_wiki(wiki_dir, limit=300):
     out = []
     if wiki_dir and os.path.isdir(wiki_dir):
@@ -71,11 +89,11 @@ def tool_run(c):
     return '<tool name="run_command" command="%s"></tool>' % c
 
 
-def build_tasks(rng, files, cmds):
+def build_tasks(rng, files, cmds, contents):
     """Return (goal, [(action, observation), ...]) for one random task."""
     f1 = rng.choice(files) + rng.choice(EXTS)
     f2 = rng.choice(files) + rng.choice(EXTS)
-    w = rng.choice(WORDS)
+    w = rng.choice(contents)
     c = rng.choice(cmds)
     kind = rng.random()
 
@@ -92,7 +110,7 @@ def build_tasks(rng, files, cmds):
         # w2 != w keeps the two steps distinguishable.
         w2 = w
         while w2 == w:
-            w2 = rng.choice(WORDS)
+            w2 = rng.choice(contents)
         goal = "create %s with %s, then create %s with %s" % (f1, w, f2, w2)
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_write(f2, w2), "wrote %d bytes to %s" % (len(w2), f2))]
@@ -181,11 +199,12 @@ def main():
     rng = random.Random(args.seed)
     files = slugs_from_wiki(args.wiki)
     cmds = commands_from(args.commands)
+    contents = contents_from(files)          # large, varied write-content pool
     rng.shuffle(files)
 
     rows, steps_hist = [], {}
     for _ in range(args.n):
-        goal, steps = build_tasks(rng, files, cmds)
+        goal, steps = build_tasks(rng, files, cmds, contents)
         steps_hist[len(steps)] = steps_hist.get(len(steps), 0) + 1
         for prompt, resp in emit_pairs(goal, steps, rng, args.reason):
             rows.append("%s\t%s" % (prompt.replace("\t", " "), resp))
@@ -193,7 +212,8 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(rows) + "\n")
-    print("wrote %d pairs from %d tasks -> %s" % (len(rows), args.n, args.out))
+    print("wrote %d pairs from %d tasks -> %s (%d-word content pool)"
+          % (len(rows), args.n, args.out, len(contents)))
     print("  task lengths (steps -> count): %s"
           % ", ".join("%d:%d" % (k, v) for k, v in sorted(steps_hist.items())))
 
