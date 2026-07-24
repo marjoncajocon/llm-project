@@ -2038,3 +2038,43 @@ Contrast with the 12-example model (session 9): 62% on novel args, GARBLING them
 copy-the-argument mapping. `tools/sft_memtest.py` committed as the reusable probe.
 
 (Also stopped the session-9 Wikipedia crawl at 383 articles on request; incremental writes kept.)
+
+## 2026-07-24 (12) -- Mixed SFT data: FIXED the catastrophic narrowing (tool-only -> tool + prose)
+
+The "why is the sky blue" probe (session 11 follow-up) showed the tool-only SFT narrows SmolLM2 so
+hard it answers EVERY prompt with a tool call -- e.g. `<tool run_command "peter_blue">`. Fixed by
+mixing general Q&A into the SFT so ONE model learns the boundary: instruction -> tool call,
+question -> prose.
+
+**New tools (committed):**
+  - `make_qa.py`: each crawled Wikipedia article -> "what is <title>?" + first-sentence definition
+    (grounded prose). 378 pairs from 383 articles. `data/qa_sample.txt` (120) committed.
+  - `mix_sft.py`: interleave/shuffle several prompt<TAB>response files, optional per-file cap to
+    balance the mix.
+  - scratchpad `eval_mixed.py`: scores BOTH skills (tool routing + does a QUESTION stay prose).
+
+**Run:** 50/50 mix = 400 tool-call + 378 Q&A -> 700 train / 78 test. LoRA rank 16, batch 4, 400
+steps. NOTE it was SLOW (~60 min vs ~16 for tool-only): the long Wikipedia answers push maxL ~3x,
+and every sequence pads to maxL. Loss ended 0.43 (higher/noisier than tool-only 0.11 -- EXPECTED,
+the model cannot memorize long prose; we want prose, not verbatim recall).
+
+**RESULT -- the mix keeps tool routing AND restores prose:**
+  - held-out tool routing: **44/44 = 100%** (skill fully kept)
+  - held-out general questions answered as PROSE not a tool call: **34/34 = 100%**
+  - off-topic probe, 6 unseen questions: **6/6 prose**, mostly correct (Paris, Shakespeare wrote
+    Hamlet, gravity = attraction, computer = programmable machine). "why is the sky blue" ->
+    "The sky is blue because it is a transparent liquid" -- PROSE (the fact is wrong, but that is
+    the 135M base's knowledge limit, NOT a routing failure; the tool-only model forced a tool call
+    here).
+
+Before/after on the exact user example:
+  tool-only:  why is the sky blue -> <tool name="run_command" command="peter_blue"></tool>
+  mixed:      why is the sky blue -> The sky is blue because it is a transparent liquid.
+
+This is how real assistants are built: instruction data mixed with general data so one model does
+both. The catastrophic-forgetting trade-off (session 11) is resolved. No C changed; smoke test
+unaffected.
+
+**NEXT:** multi-step planning (transcript-aware SFT: observation -> next tool) is the remaining
+frontier; the mixed run's slowness argues for per-example (not global-maxL) padding or length
+bucketing; CI still absent.

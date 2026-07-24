@@ -91,7 +91,7 @@ defined in the matching `.c`.
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
-| `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py`, `crawl_stackoverflow.py`, `make_sft.py`, `agent_local.py`, `upgrade_llma.py` |
+| `tools/`                          | Non-C helpers: crawlers (`crawl_wikipedia.py`, `crawl_stackoverflow.py`), SFT data (`make_sft.py`, `make_qa.py`, `mix_sft.py`, `sft_memtest.py`), `agent_local.py`, `upgrade_llma.py`, GPT-2/LLaMA converters |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -533,6 +533,30 @@ The small model still doesn't *plan* multi-step tasks — it routes one instruct
 the training vocabulary: asked to run `cargo build` (a CLI absent from the crawled `git/bash/docker/
 npm/python` tags), it substitutes the familiar `docker build` — it copies commands from the
 distribution it saw, it does not know CLIs it never met.
+
+**Mixed data fixes catastrophic narrowing.** Training on tool calls *alone* narrows the model so
+hard it answers **every** prompt with a tool call — `why is the sky blue` →
+`<tool name="run_command" command="peter_blue">`. `tools/make_qa.py` turns each crawled Wikipedia
+article into a `what is <title>? → definition` pair, and `tools/mix_sft.py` interleaves those with
+the tool-call data. A model trained on the 50/50 mix learns the **boundary**:
+
+```sh
+python tools/make_qa.py --wiki data/wiki --out data/qa.txt --n 400
+python tools/mix_sft.py --out data/mixed.txt data/toolcalls.txt data/qa.txt
+transformer llama-train data/mixed.txt --sft --resume model/smollm/model.bin \
+  --hf-tok model/smollm/tok.hf --lora-r 16 --lora-alpha 32 --batch 4 --steps 400 --out smol_mixed.bin
+```
+
+| model | held-out tool routing | general question → prose |
+| --- | --- | --- |
+| tool-call only | 100% | **0%** — forces a tool call every time |
+| 50/50 tool + Q&A mix | **100%** (kept) | **100%** — `why is the sky blue` → "The sky is blue because…" |
+
+So the mix keeps tool-routing intact *and* restores prose answers. The answers' factual accuracy is
+limited by the 135M base (`why is the sky blue → "…a transparent liquid"` is wrong), but the model
+now correctly *distinguishes an instruction from a question* — the capability the tool-only fine-tune
+destroyed. A real assistant is built exactly this way: instruction-following data mixed with general
+data so one model does both.
 
 ### `transformer imggen` / `audgen` (generate media to a file)
 

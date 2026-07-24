@@ -62,3 +62,4 @@ samples/
 
 # NOTE: memory.md is intentionally TRACKED (committed) so it travels via git
 # across machines — see it in the repo root.
+!data/qa_sample.txt
