@@ -1518,7 +1518,7 @@ Dataset `data/t2i_scenes` (768 @ 24px). Reproduce: `t2i-data data\t2i_scenes 768
   Brute-force resolution (32px+) is OFF THE TABLE until faster compute (SIMD/threads/GPU).
 
 
-## 2026-07-23 (eve) -- Structured caption tokens (WIP, NOT validated) -- ▶▶ RESUME HERE
+## 2026-07-23 (eve) -- Structured caption tokens (WIP) -- SUPERSEDED, see 2026-07-24 below
 
 Started the highest-leverage fix for the vertical-relation conflation: **structured caption
 tokens** (commit 964846a) -- each color/shape/relation is now ONE dedicated vocab token instead
@@ -1552,4 +1552,58 @@ structured-token model on disk (only an early step-300 checkpoint under `model/t
 
 Prior baseline to beat (byte captions, commit 4a4d880, model `model/t2i_scenes`, loss 0.054):
 horizontal relations OK, vertical CONFLATED, some 2nd-object color bleed.
+
+
+## 2026-07-24 -- Structured caption tokens VALIDATED (relations fixed; color is the new wall)
+
+Finished the run above and validated it **objectively** instead of by eyeballing a montage.
+Result: **the structured-token fix WORKED -- vertical relations are no longer conflated.** The
+bottleneck moved to **color fidelity, and that is the VQ-VAE's fault, not the GPT's.**
+
+**Run:** rebuilt clean, VQ 2000 steps (recon_mse 0.0019), GPT 2200 steps requested but the run was
+KILLED at ~step 1900 (loss ~0.11). The **step-1800 checkpoint** is what is on disk in
+`model/t2i_tok/` and what every number below was measured on -- checkpointing/300 saved the run.
+
+**New tooling (the real deliverable -- don't eyeball montages again):**
+  - `tools/t2i_score.py` -- assigns each pixel to the nearest `T2I_COLORS` entry, takes per-color
+    centroids, and scores **two separate axes**: color fidelity (did both requested colors render?)
+    and relation accuracy (given both rendered, is obj1 on the stated side?). Conflating these is
+    exactly what made the first read of the montage wrong.
+  - `tools/ppm_montage.py` -- tile PPMs into one scaled PNG (stdlib zlib, no deps).
+
+**CALIBRATE FIRST -- ground-truth `data/t2i_tok/img_*.ppm` scored by the same tool:**
+  color fidelity **100%** (24/24), relation accuracy **88%** (21/24). So ~88% is the measurement
+  CEILING for relations (jittered shapes straddle the midline); 100% is the ceiling for color.
+
+**Measured (step-1800 model, temp 0.4):**
+
+| what                              | color fidelity | relation accuracy   |
+|-----------------------------------|----------------|---------------------|
+| ground truth (ceiling)            | 100% (24/24)   | 88% (21/24)         |
+| VQ-VAE **reconstruction** of it   | **67%** (16/24)| 75% (12/16)         |
+| GPT generation, all 8 colors      | 33% (16/48)    | **81%** (13/16)     |
+| GPT generation, 4 "safe" colors   | 30% (17/56)    | 71% (12/17)         |
+
+**Conclusions (this is the important part):**
+  1. **Relations are essentially SOLVED, vertical included.** 81% vs an 88% ceiling. Per-relation on
+     the all-colors run: above **6/6**, below 5/7. The byte-caption baseline had ZERO vertical
+     sensitivity (always blue-top/red-bottom); dedicated relation tokens fixed it. Goal achieved.
+  2. **Color fidelity is the new wall, and it is capped by the VQ-VAE.** Reconstructing *training*
+     images -- no GPT involved -- already loses a color 33% of the time. So even a perfect GPT could
+     not exceed ~67%. More GPT steps CANNOT fix this.
+  3. Dominant failure is **blue -> cyan**, plus magenta->purple and orange->yellow: adjacent hues
+     collapsing, i.e. codebook resolution/collapse. A single image uses only **14 distinct codes of
+     K=256**, so the codebook is nowhere near saturated -- this smells like codebook COLLAPSE (dead
+     entries) rather than K being too small.
+  4. My first eyeball read of the montage said "relations only 1/3 right, strong word-order bias".
+     That was WRONG -- the failures I was counting were mostly color failures. Measure, don't squint.
+
+**▶▶ NEXT (highest leverage first):**
+  1. **Fix VQ-VAE color fidelity** -- the actual blocker. Try: dead-code restart / EMA codebook
+     updates (reinit unused entries to jittered encoder outputs), a commitment-cost tweak, or
+     bump `T2I_LDIM` 16->32. Re-measure with the recon row of the table above (target: 100%).
+     Worth adding an aggregate codebook-utilization printout across the dataset to confirm collapse.
+  2. Only then, finish/extend GPT training (the 2200-step run never completed; ~30 min).
+  3. Horizontal-relation sample sizes were tiny (n=1..4) because color failures ate them --
+     re-measure relations properly once color fidelity is fixed.
 
