@@ -478,20 +478,19 @@ and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2
 - [x] Execution-oriented -- APPLIED. agent.c/toolcall.c/toolexec.c parse -> approve -> execute ->
   observe real tool calls over multiple steps; SFT labels are executable tool calls; observations
   come from real execution.
-- [~] High-quality synthetic data -- GATE BUILT + retrain #1 RE-MEASURED (2026-07-24); retrain #2
-  validating the one fix found. `tools/clean_sft.py` VERIFIES each pair (reject a tool call whose
-  path/write-content/command-file arg is not grounded in the prompt; whole-token match so "ok" !=
-  inside "cook"; empty write body rejected), DEDUPES exact+near-dup lines (conservative -- variety
-  kept), BALANCES action-type x task-length with full logging. Validated on an adversarial probe:
-  4/4 rejects + 4/4 keeps. Retrain #1 on the clean 1545-pair corpus (LoRA r16/a32, loss 3.12->~0.07)
-  gave: correct routing incl. prose-vs-tool; a live agent_local.py multi-step run (write "world" ->
-  read -> <done>, hello.txt held "world"); generalization 90% novel filenames / 70% novel commands
-  (misses = char copy-slips, still right tool). Found ONE gap -- the model drops a SECOND write's
-  NOVEL content to an empty body (in-vocab words copy fine) because content came from one 10-word
-  pool = memorizable. FIXED at source (commit 6e0b15e): make_agent_traj.py draws content from WORDS +
-  wiki-slug phrases = 308 words, forcing copy in every position. Retrain #2 on the widened corpus is
-  running -> model/smollm/reason_clean.bin; flip to [x] once the 2nd-write case copies (non-empty) and
-  nothing regressed. Gate commit 113db78. Remaining: base-model factual errors; optional entropy filter.
+- [x] High-quality synthetic data -- DONE 2026-07-24. `tools/clean_sft.py` VERIFIES each pair (reject
+  a tool call whose path/write-content/command-file arg is not grounded in the prompt; whole-token
+  match so "ok" != inside "cook"; empty write body rejected), DEDUPES exact+near-dup lines (variety
+  kept), BALANCES action-type x task-length with full logging. Validated on an adversarial probe (4/4
+  rejects + 4/4 keeps). Fixed two_writes "ok" bug AND widened write-content 10->308 words
+  (make_agent_traj.py) so copy generalizes in every position. Clean corpus = 1547 pairs (0 rejected,
+  62 dups). KEY GOTCHA: retrain #2 DIVERGED (loss ->7.7, garbage) because train.c `grad_clip`
+  defaults to 0.0 (clipping OFF); the harder widened data needs it. Retrain #3 with `--clip 1.0`
+  (recipe-recommended) is STABLE (loss 3.0->0.12) and gave: 2nd-write novel content now copied
+  (was empty); routing/prose-vs-tool intact; live agent_local.py multi-step run (write "world"->read->
+  <done>, hello.txt held "world"); generalization 100% novel filenames / 70% novel commands (misses =
+  char copy-slips, still right tool). => model/smollm/reason_clean.bin. Commits: gate 113db78,
+  content-widen 6e0b15e. RULE: LoRA-SFT MUST pass --clip 1.0.
 
 ## FUTURE WORK -- long-horizon research roadmap (requested 2026-07-24)
 
@@ -559,26 +558,28 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (next session) -- validate the 2nd-position copy fix (retrain #2 running)
+## >>> RESUME HERE (next session) -- near-term checklist DONE; pick the next lever
 
-Data-quality GATE is DONE (tools/clean_sft.py: verify+dedupe+balance; commit 113db78). Retrain #1
-on the clean corpus worked end to end (routing/planning/prose/generalization; see the checklist
-item above) and exposed ONE gap: the model drops a SECOND write's NOVEL content to an empty body.
-Fixed by widening the write-content vocabulary (commit 6e0b15e). **Retrain #2 is running in the
-background** on the widened corpus -> `model/smollm/reason_clean.bin` (r16/alpha32, batch 4, lr 3e-3
-warmup 30; ~2-3 h at seq-len 160). NEXT when it finishes:
-  1. Re-probe the exact case (feed to `.\transformer.exe hfgen model/smollm/reason_clean.bin
-     model/smollm/tok.hf 48 0.1` on stdin): `GOAL: create a.txt with foo, then create b.txt with bar
-     | MODEL: <tool name="write_file" path="a.txt">foo</tool> | OBSERVATION: wrote 3 bytes to a.txt`
-     -> expect `write_file path="b.txt">bar<` (NON-empty).
-  2. `python tools/sft_memtest.py .\transformer.exe model/smollm/reason_clean.bin model/smollm/tok.hf
-     data/clean_reason.txt` (expect >=90% A / >=70% B; ignore C -- artifact for <think> data) + a
-     live tools/agent_local.py multi-step run.
-  3. If the 2nd-write case copies and nothing regressed, flip high-quality synthetic data [~] -> [x]
-     here AND in notes.md.
-Rebuild the clean corpus any time: `python tools/make_agent_traj.py --out data/traj_reason.txt --n
-300 --wiki data/wiki --commands data/so_commands.txt --reason` then `python tools/clean_sft.py
---shuffle --balance --report data/clean_report.txt --out data/clean_reason.txt data/traj_reason.txt
-data/qa.txt data/toolcalls.txt`. Live agent (space-free paths, from repo root): `.\transformer.exe
-agent --cmd "D:\env\python\python-3.9.10.amd64\python.exe tools/agent_local.py
+All three near-term items are [x]: reasoning-dense, execution-oriented, and (now) high-quality
+synthetic data. The data-quality gate (clean_sft.py verify+dedupe+balance, commit 113db78) + the
+two_writes/content-vocab fixes (6e0b15e) + a STABLE retrain (`--clip 1.0`) produced
+`model/smollm/reason_clean.bin`: routes, plans multi-step with <think> reasoning, answers prose, and
+generalizes (100% novel filenames / 70% novel commands) incl. the previously-empty 2nd-write copy.
+
+Candidate NEXT levers (ask the user which):
+  1. Make `--clip 1.0` the train.c DEFAULT (small stability hardening; rebuild + smoke test; note the
+     prior batch/lr perf tables were measured unclipped).
+  2. Cut training time: length-bucketed batches instead of global-maxL padding (seq-len 164 pads every
+     short tool-call to the longest QA prose; ~2-3 h -> much less).
+  3. Grow/vary data (3+ step chains, more real commands, harder Q&A) -> re-clean -> retrain.
+  4. Start a long-horizon roadmap item (PRMs, multi-agent debate, ...).
+
+Rebuild clean corpus + retrain (the validated recipe, note --clip 1.0):
+`python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki --commands
+data/so_commands.txt --reason` then `python tools/clean_sft.py --shuffle --balance --report
+data/clean_report.txt --out data/clean_reason.txt data/traj_reason.txt data/qa.txt data/toolcalls.txt`
+then `.\transformer.exe llama-train data/clean_reason.txt --sft --hf-tok model/smollm/tok.hf --resume
+model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4 --steps 350 --lr 3e-3 --warmup 30
+--min-lr 1e-4 --clip 1.0 --out model/smollm/reason_clean.bin`. Live agent (space-free paths, from repo
+root): `.\transformer.exe agent --cmd "D:\env\python\python-3.9.10.amd64\python.exe tools/agent_local.py
 model/smollm/reason_clean.bin model/smollm/tok.hf" --goal "..."`.

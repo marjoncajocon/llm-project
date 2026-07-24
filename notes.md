@@ -2115,14 +2115,17 @@ artifact, not a planning failure. Fix: template should copy real content.
   executable tool calls (not chat). Observations come from real execution (write/read/run), and
   the trajectory data mirrors toolexec.c's real observation strings.
 
-- [~] **High-quality synthetic data.** PARTIALLY applied. Built generators grounded in real data:
-  mined real shell commands from Stack Overflow (crawl_stackoverflow.py), wiki-grounded Q&A
-  (make_qa.py), templated tool calls (make_sft.py), multi-step trajectories (make_agent_traj.py),
-  and a memorization probe (sft_memtest.py) that proved generalization. Quality GAPS remain: the
-  two-write "ok" content bug, factual errors from the 135M base, no output VERIFICATION, no dedup
-  across generators, no difficulty balancing. To fully apply: verify each synthetic example is
-  self-consistent (e.g. content actually copyable from the goal), dedupe, and balance task
-  difficulty; consider filtering by whether the trained model can solve held-out variants.
+- [x] **High-quality synthetic data.** APPLIED 2026-07-24. Built `tools/clean_sft.py` -- the
+  verify + dedupe + balance GATE between the generators and training: rejects any tool call whose
+  path/write-content/command-file arg is not grounded in the prompt (whole-token match; empty write
+  body rejected), drops exact/near-dup lines (conservative -- variety kept), and caps over-
+  represented action types to factor x median with full logging (no silent truncation). Validated on
+  an adversarial probe (4/4 rejects + 4/4 keeps). Fixed the two_writes "ok" bug AND widened the write-
+  content pool 10 -> 308 words (make_agent_traj.py) so copy generalizes in every position. Clean
+  corpus = 1547 pairs (0 rejected, 62 dups removed). Retrained SmolLM2-135M LoRA-SFT on it (with
+  `--clip 1.0` -- REQUIRED; unclipped it diverges) -> routes, plans multi-step w/ reasoning, answers
+  prose, and generalizes 100%/70% on unmemorizable args incl. the previously-empty 2nd-write copy.
+  Remaining (optional): entropy/solvability filtering; factual errors from the 135M base need scale.
 
 See [[planned-next-step]] in agent memory. Reasoning-dense is the top unchecked item.
 
@@ -2268,32 +2271,56 @@ lr 3e-3 warmup 30 -> cosine 1e-4):** loss **3.12 -> ~0.07** (min at step 280; bo
     strips <think> from the OUTPUT but compares against the <think>-wrapped training LABEL, so a
     reasoning-dense response can never exact-match -- ignore C for reasoning data (A/B are valid).
 
-**Limitation found + FIXED at source (commit 6e0b15e):** the model copies novel FIRST-write content
-fine but drops the SECOND write's content to an EMPTY body when it's a word unseen in that position
-(`create a.txt with foo, then create b.txt with bar` -> `write b.txt` empty; but in-vocab "done"/
-"finished" copy fine). Root cause = DISTRIBUTION not integrity: every write's content came from one
+**Limitation found + FIXED at source (commit 6e0b15e):** retrain #1's model copied novel FIRST-write
+content fine but dropped the SECOND write's content to an EMPTY body when it was a word unseen in that
+position (`create a.txt with foo, then create b.txt with bar` -> `write b.txt` empty; in-vocab "done"/
+"finished" copied fine). Root cause = DISTRIBUTION not integrity: every write's content came from one
 10-word WORDS pool, so 2nd-write content could be MEMORIZED. Training data was clean (64 2nd-writes,
 0 empty). Fix: make_agent_traj.py now draws content from WORDS + wiki-slug phrases = **308 words**
 (49 distinct 2nd-write contents vs ~10), so copy-from-prompt is forced in every position. Rebuilt
 clean_reason.txt (1547 pairs, 0 rejected, 62 dups removed).
 
-## >>> RESUME HERE (next session) -- validate the 2nd-position copy fix (retrain #2 running)
+**Retrain #2 DIVERGED -> TRAINING-STABILITY BUG FOUND (grad clip was OFF).** Re-running on the harder
+widened-content data with the SAME flags, loss fell to 0.67 (step 105) then EXPLODED to 7.7 (step 210)
+and stayed 5-7; the model emitted `</</</tool` garbage. Root cause in train.c: **`grad_clip` defaults
+to 0.0 and clip only runs `if (grad_clip > 0)`** -- BOTH earlier retrains ran UNCLIPPED. The easy
+10-word data never spiked; the varied 308-word content hit an unclipped gradient explosion. (The
+AdamW+`clip_grad_norm` machinery existed since 2026-07-24 (2); I just never passed the flag.) Retrain
+#2 also overwrote #1's good model -- expected, same --out.
 
-The data-quality GATE is built + applied (verify + dedupe + balance, commit 113db78), the two_writes
-bug is fixed (regenerate), and the write-content vocabulary is widened to force position-independent
-copy (commit 6e0b15e). Retrain #1 validated the cleaned data end to end (routing/planning/prose/
-generalization all good) and exposed ONE gap -- 2nd-write novel-content copy -- now addressed in the
-data. **Retrain #2 is running in the background** on the widened corpus (same flags) ->
-`model/smollm/reason_clean.bin`. NEXT when it finishes:
-  1. Re-probe the exact failing case: feed the transcript `GOAL: create a.txt with foo, then create
-     b.txt with bar | MODEL: <write a.txt foo> | OBSERVATION: wrote 3 bytes to a.txt` -> expect
-     `write_file path="b.txt">bar<` (NON-empty). If fixed, the widened pool worked.
-  2. Re-run `sft_memtest.py` (expect >=90% A / >=70% B, no regression) + a live agent multi-step run.
-  3. If the 2nd-write case now copies and nothing regressed, flip high-quality synthetic data
-     [~] -> [x] in this file AND memory.md.
-Re-probe/regen commands: see the memory.md RESUME block (make_agent_traj --reason then clean_sft).
+**Retrain #3 (add `--clip 1.0`) = STABLE + FIXES THE GAP + IMPROVES GENERALIZATION.** Same data/flags
+plus `--clip 1.0` (the recipe's recommended value): loss 3.0 -> ~0.12, NO explosion (step 210 = 1.05,
+was 7.7). Re-measured `reason_clean.bin`:
+  - **The exact failing case is FIXED:** `...create b.txt with bar` -> `<tool write_file path="b.txt">bar</tool>`
+    (non-empty); multi-word novel content `quantum flux` also copied verbatim.
+  - **Routing intact:** novel filename `zzblarg.log` copied; "what is gravity" -> PROSE; run_command routed.
+  - **Live agent multi-step run:** write "world" -> read -> <done>, hello.txt held "world".
+  - **Generalization (sft_memtest): novel filenames 20/20 (100%, up from 90%), novel commands 14/20
+    (70%, steady)** -- misses are char copy-slips on random consonant runs, all still routed to
+    run_command (= not memorization). C baseline 20% is the same <think> measurement artifact (ignore).
 
-Status recap: near-term checklist = reasoning-dense [x], execution-oriented [x], high-quality
-synthetic data [~ -> pending retrain #2 validation of the 2nd-position fix]. Long-horizon research
-roadmap recorded above. Keep 2-space, C-only-flat-root rules; training is slow (~2-3 h) due to
-global-maxL padding (a real future lever: length-bucketed batches instead of one global max).
+=> **high-quality synthetic data flips [~] -> [x].** The near-term checklist is now all done:
+reasoning-dense [x], execution-oriented [x], high-quality synthetic data [x] (verified + deduped +
+balanced, retrained + validated). **Required recipe note: LoRA-SFT must pass `--clip 1.0`** -- without
+it a harder dataset can diverge (train.c default grad_clip=0). Follow-up worth doing: make grad_clip
+default to 1.0 in train.c (behavior change to all 4 train loops + a rebuild/smoke test; the prior
+batch/lr measurement tables were taken unclipped, so note that if changed).
+
+## >>> RESUME HERE (next session) -- near-term checklist DONE; pick the next lever
+
+The remaining [~] item (high-quality synthetic data) is now [x]: `tools/clean_sft.py` verify+dedupe+
+balance gate (commit 113db78), two_writes + content-vocab fixes in make_agent_traj.py (6e0b15e), and
+a stable retrain (`--clip 1.0`) on the clean 1547-pair corpus -> `model/smollm/reason_clean.bin` that
+routes, plans multi-step with reasoning, answers prose, and generalizes (100%/70% on unmemorizable
+args) incl. the previously-failing 2nd-write copy. All three near-term items are done.
+
+Candidate NEXT levers (pick per user):
+  1. **Make `--clip 1.0` the train.c default** (small, high-value stability hardening; rebuild + smoke
+     test; note the unclipped prior perf tables).
+  2. **Cut training time** -- length-bucketed batches instead of global-maxL padding (seq-len 164 now
+     pads every short tool-call sequence to the longest QA prose); ~2-3 h -> much less.
+  3. **Grow/vary the data further** -- more task templates (3+ step chains, mixed read/run/write),
+     more real commands (rust/go SO tags), harder Q&A; then re-clean + retrain.
+  4. **Start a long-horizon roadmap item** (PRMs, multi-agent debate, etc. -- see roadmap above).
+Rebuild the clean corpus + retrain commands: see the memory.md RESUME block. Keep 2-space,
+C-only-flat-root rules; training ~2-3 h due to global-maxL padding.
