@@ -240,7 +240,11 @@ static void train_usage(void) {
     "architecture (RMSNorm+RoPE+GQA+SwiGLU) and writes an LLMA checkpoint that\n"
     "`transformer llama` generates from. Two extra flags:\n"
     "  --kv-heads N      GQA key/value heads (default = --heads, i.e. plain MHA)\n"
-    "  --rope-base F     RoPE frequency base (default 10000)\n");
+    "  --rope-base F     RoPE frequency base (default 10000)\n"
+    "  --lora-r N        LoRA rank: FREEZE the base and train only low-rank adapters\n"
+    "                    on Wq/Wk/Wv/Wo (merged into the weights before saving).\n"
+    "                    Pair with --resume to fine-tune a pretrained checkpoint.\n"
+    "  --lora-alpha F    LoRA scaling (scale = alpha / r; default alpha = r)\n");
 }
 
 // Shared by `train` (GPT) and `llama-train` (modern LLaMA-family) — the flags are
@@ -278,6 +282,8 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
     else if (strcmp(f, "--kv-heads") == 0 && llama) { NEED_VAL(); cfg.n_kv = atoi(argv[++i]); }
     else if (strcmp(f, "--rope-base") == 0 && llama) { NEED_VAL(); cfg.rope_base = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
+    else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }

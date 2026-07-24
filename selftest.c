@@ -1428,6 +1428,194 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 24: LoRA fine-tuning of a FROZEN base model. Four gates:
+  //   (a) at init (B == 0) the adapted forward is BIT-IDENTICAL to the base —
+  //       the property that makes attaching adapters to a pretrained checkpoint
+  //       safe,
+  //   (b) numerical gradient check over every adapter tensor,
+  //   (c) training only the adapters drives the loss down,
+  //   (d) the base weights are BYTE-for-BYTE unchanged afterwards (truly frozen).
+  // --------------------------------------------------------------------------
+  {
+    const int vocab = 24, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 5;
+    const int rank = 4;
+    printf("[24] LoRA fine-tuning (rank %d) on a frozen LLaMA-family base\n", rank);
+    srand(31);
+    LlamaModel bm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64,
+                                             10000.0f, 1e-5f);
+    llama_model_randomize(&bm);
+    LlamaActs bacts = llama_acts_create(&bm, seq);
+    LlamaLora lo = llama_lora_create(&bm, rank, 8.0f);
+    llama_lora_init(&lo);
+    LlamaLoraActs la = llama_lora_acts_create(&bm, &lo, seq);
+
+    int ids[5]     = {5, 2, 8, 1, 6};
+    int targets[5] = {2, 8, 1, 6, 4};
+    int ls[2] = {seq, vocab};
+    Tensor blog = tensor_create(ls, 2), bprob = tensor_create(ls, 2);
+    Tensor base_ref = tensor_create(ls, 2);
+
+    // (a) B == 0 at init => adapted output must equal the base exactly.
+    llama_forward_train(&bm, ids, seq, &bacts, &base_ref);
+    llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+    float init_diff = 0.0f;
+    for (int i = 0; i < seq * vocab; i++) {
+      float d = fabsf(blog.data[i] - base_ref.data[i]);
+      if (d > init_diff) init_diff = d;
+    }
+    int init_ok = (init_diff == 0.0f);
+    printf("    at init (B=0): adapted == base, max |diff| = %.2e -> %s\n",
+           init_diff, init_ok ? "OK" : "FAIL");
+    all_ok &= init_ok;
+
+    // Snapshot every base weight so (d) can prove nothing moved.
+    Tensor **bp = (Tensor**)malloc((size_t)llama_param_count(&bm) * sizeof(Tensor*));
+    int n_bp = llama_collect_params(&bm, bp);
+    size_t base_total = 0;
+    for (int p = 0; p < n_bp; p++) base_total += bp[p]->size;
+    float *snapshot = (float*)malloc(base_total * sizeof(float));
+    size_t at = 0;
+    for (int p = 0; p < n_bp; p++) {
+      memcpy(&snapshot[at], bp[p]->data, bp[p]->size * sizeof(float));
+      at += bp[p]->size;
+    }
+
+    Tensor **lp = (Tensor**)malloc((size_t)llama_lora_param_count(&lo) * sizeof(Tensor*));
+    int n_lp2 = llama_lora_collect_params(&lo, lp);
+
+    // Give B some nonzero values first: with B == 0 the gradient wrt A is
+    // identically zero, so a check at init would be vacuous.
+    for (int p = 0; p < n_lp2; p++)
+      for (size_t k = 0; k < lp[p]->size; k++)
+        lp[p]->data[k] += 0.05f * (float)((int)((k * 37 + (size_t)p * 11) % 13) - 6);
+
+    llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+    cross_entropy_forward(&blog, targets, &bprob);
+    tensor_zero_grad(&blog);
+    cross_entropy_backward(&bprob, targets, &blog);
+    llama_backward_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+
+    // (b) central-difference check over the adapter tensors.
+    const float ceps = 1e-2f;
+    float lo_max = 0.0f, lo_cond = 0.0f;
+    for (int p = 0; p < n_lp2; p++) {
+      Tensor *param = lp[p];
+      size_t step = param->size > 2 ? param->size / 2 : 1;
+      for (size_t k = 0; k < param->size; k += step) {
+        float base = param->data[k];
+        param->data[k] = base + ceps;
+        llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+        float lpv = cross_entropy_forward(&blog, targets, &bprob);
+        param->data[k] = base - ceps;
+        llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+        float lmv = cross_entropy_forward(&blog, targets, &bprob);
+        param->data[k] = base;
+        float numeric = (lpv - lmv) / (2.0f * ceps);
+        float analytic = param->grad[k];
+        float rel = fabsf(analytic - numeric) / (fabsf(analytic) + fabsf(numeric) + 1e-8f);
+        if (rel > lo_max) lo_max = rel;
+        if (fabsf(analytic) > 1e-2f && rel > lo_cond) lo_cond = rel;
+      }
+    }
+    int lo_grad_ok = (lo_cond < 1e-2f);
+    printf("    gradient check (%d adapter tensors): max rel error %.2e (all) | %.2e (|grad|>1e-2) -> %s\n",
+           n_lp2, lo_max, lo_cond, lo_grad_ok ? "OK" : "FAIL");
+    all_ok &= lo_grad_ok;
+
+    // (c) The realistic scenario: PRETRAIN the base on task A, freeze it, then
+    //     adapt to a DIFFERENT task B with adapters only. (Adapting a randomly
+    //     initialized base is not a fair test — attention-only adapters have no
+    //     useful representation to steer, and the loss plateaus near ln(vocab).)
+    Tensor **bpar = (Tensor**)malloc((size_t)llama_param_count(&bm) * sizeof(Tensor*));
+    int n_bpar = llama_collect_params(&bm, bpar);
+    Adam pre = adam_create(bpar, n_bpar, 0.02f);
+    for (int s = 0; s < 300; s++) {
+      llama_forward_train(&bm, ids, seq, &bacts, &blog);
+      cross_entropy_forward(&blog, targets, &bprob);
+      tensor_zero_grad(&blog);
+      cross_entropy_backward(&bprob, targets, &blog);
+      llama_backward(&bm, ids, seq, &bacts, &blog);
+      adam_step(&pre, bpar, n_bpar);
+    }
+    llama_forward_train(&bm, ids, seq, &bacts, &blog);
+    float task_a = cross_entropy_forward(&blog, targets, &bprob);
+    adam_free(&pre); free(bpar);
+
+    // Fresh adapters (A random, B = 0) on the now-pretrained base.
+    llama_lora_init(&lo);
+
+    // Re-snapshot AFTER pretraining — that is the base the adapters must not touch.
+    at = 0;
+    for (int p = 0; p < n_bp; p++) {
+      memcpy(&snapshot[at], bp[p]->data, bp[p]->size * sizeof(float));
+      at += bp[p]->size;
+    }
+
+    // Task B: a different next-token mapping the frozen base was never trained on.
+    int targets_b[5] = {7, 3, 5, 2, 9};
+    llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+    float lo_first = cross_entropy_forward(&blog, targets_b, &bprob);
+
+    const int lo_steps = 400;
+    Adam lo_opt = adam_create(lp, n_lp2, 0.05f);
+    float lo_last = lo_first;
+    for (int s = 0; s < lo_steps; s++) {
+      llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+      lo_last = cross_entropy_forward(&blog, targets_b, &bprob);
+      tensor_zero_grad(&blog);
+      cross_entropy_backward(&bprob, targets_b, &blog);
+      llama_backward_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+      adam_step(&lo_opt, lp, n_lp2);
+    }
+    int lo_train_ok = (lo_last < lo_first * 0.5f) && isfinite(lo_last);
+    printf("    base pretrained on task A (loss %.4f), then ADAPTERS ONLY on a new task B:\n"
+           "      %d steps, loss %.4f -> %.4f -> %s\n",
+           task_a, lo_steps, lo_first, lo_last, lo_train_ok ? "OK" : "FAIL");
+    all_ok &= lo_train_ok;
+
+    // (d) the frozen base must be byte-for-byte identical.
+    at = 0;
+    int frozen = 1;
+    for (int p = 0; p < n_bp && frozen; p++) {
+      if (memcmp(&snapshot[at], bp[p]->data, bp[p]->size * sizeof(float)) != 0) frozen = 0;
+      at += bp[p]->size;
+    }
+    size_t n_lora_scalars = 0;
+    for (int p = 0; p < n_lp2; p++) n_lora_scalars += lp[p]->size;
+    printf("    base frozen: %zu base scalars unchanged=%d | trained %zu adapter scalars (%.1f%%) -> %s\n",
+           base_total, frozen, n_lora_scalars,
+           100.0 * (double)n_lora_scalars / (double)base_total, frozen ? "OK" : "FAIL");
+    all_ok &= frozen;
+
+    // (e) Merging the adapters into the base must reproduce the adapted output —
+    //     that equivalence is what lets a fine-tune ship as an ordinary LLMA
+    //     checkpoint with no adapter support at inference time.
+    llama_forward_train_lora(&bm, ids, seq, &bacts, &blog, &lo, &la);
+    Tensor merged = tensor_create(ls, 2);
+    llama_lora_merge(&bm, &lo);
+    llama_forward_train(&bm, ids, seq, &bacts, &merged);
+    float mdiff = 0.0f, mscale = 0.0f;
+    for (int i = 0; i < seq * vocab; i++) {
+      float d = fabsf(merged.data[i] - blog.data[i]);
+      if (d > mdiff) mdiff = d;
+      if (fabsf(blog.data[i]) > mscale) mscale = fabsf(blog.data[i]);
+    }
+    // Not bit-exact: merging reassociates the arithmetic (W + scale*A@B applied
+    // once, vs the correction added after the projection), so judge relatively.
+    int merge_ok = (mdiff / (mscale + 1e-6f) < 1e-4f);
+    printf("    merge adapters into base: max |diff| %.2e vs |logit| %.2e (rel %.2e) -> %s\n\n",
+           mdiff, mscale, mdiff / (mscale + 1e-6f), merge_ok ? "OK" : "FAIL");
+    all_ok &= merge_ok;
+    tensor_free(&merged);
+
+    adam_free(&lo_opt);
+    free(snapshot); free(bp); free(lp);
+    tensor_free(&blog); tensor_free(&bprob); tensor_free(&base_ref);
+    llama_lora_acts_free(&la); llama_lora_free(&lo);
+    llama_acts_free(&bacts); llama_model_free(&bm);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

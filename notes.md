@@ -1739,3 +1739,55 @@ The CLI paths are verified manually (selftest.c has no CLI harness) -- worth aut
 
 **NEXT:** LoRA adapters on top of this (freeze base, rank-r A/B on the attn/FFN projections; base
 can stay int8 via `quant.c`), then SIMD `matmul`, then batching/grad-accumulation (still batch=1).
+
+## 2026-07-24 (5) -- LoRA adapters: mechanism VALIDATED, payoff needs a real pretrained base
+
+Fourth roadmap item. Freeze the base, train low-rank adapters beside it.
+
+**Added `lora.{h,c}`** (pure C11): `LoraAdapter` (A: d_in x r, B: r x d_out, scale = alpha/r),
+`LoraCache`, `lora_forward` (y += scale * (x@A)@B) and `lora_backward`. The backward reuses
+`matmul_backward` twice by parking scale*dy on a cache tensor, rather than hand-rolling transposes.
+**B is initialized to ZERO** so an adapted model is bit-identical to its base at step 0 -- the
+property that makes attaching adapters to a pretrained checkpoint safe.
+
+**Wired into `llamatrain.{h,c}`:** `LlamaLora` (adapters on Wq/Wk/Wv/Wo of every layer),
+`LlamaLoraActs`, `llama_forward_train_lora` / `llama_backward_lora` (passing `lo == NULL` is
+exactly the old path, so the existing functions now just delegate), `llama_lora_collect_params`
+(8 per layer), and **`llama_lora_merge`** (W += scale*A@B, then zero B) so a fine-tune ships as an
+ORDINARY LLMA checkpoint with no adapter support or cost at inference.
+
+**CLI:** `llama-train --lora-r N --lora-alpha F`. Freezing is done by handing Adam only the
+adapters. NOTE the honest limit: the backward still fills base gradients (matmul_backward computes
+dx and dW together, so dx cannot be had without dW) -- the saving is the Adam moments, which
+dominate optimizer memory, NOT the gradient buffers.
+
+**Also fixed a real bug found while testing:** `--sft` took its branch BEFORE the resume logic, so
+`--sft --resume` silently ignored the checkpoint and LoRA was adapting a RANDOM base. Now SFT
+resumes properly: it reuses the BASE's tokenizer (a fresh one would assign different ids to the
+same text, making pretrained embeddings meaningless), grows the vocab by one for the EOS slot via
+`copy_weights_grow` (wte is (vocab,d_model) so its old block is contiguous, but lm_head is
+(d_model,vocab) where vocab is the STRIDE -- it must be copied row by row), and errors out if the
+SFT sequences exceed the base's ctx.
+
+**Verified -- new selftest part [24], five gates:**
+  - at init (B=0) adapted == base, max |diff| **0.00e+00**
+  - gradient check over all 16 adapter tensors: **5.51e-04** conditioned (gate < 1e-2)
+  - base pretrained on task A (loss 0.0007), then ADAPTERS ONLY on a new task B:
+    loss **10.8467 -> 2.1921**
+  - base **byte-for-byte frozen** after 400 adapter steps (1608 base scalars unchanged)
+  - **merge equivalence**: merged model vs adapted model rel diff **1.82e-07** (not bit-exact --
+    merging reassociates the arithmetic -- so judged relatively)
+
+**HONEST RESULT (important):** LoRA only pays off on a GENUINELY pretrained base. A test designed
+the naive way -- adapters on a randomly initialized base -- plateaus near ln(vocab) and I had to
+restructure part [24] to pretrain first. Same story end to end: LoRA fine-tuning one of our toy
+bases (440-byte corpus, d_model 64) reaches SFT loss ~2.5 and generates **garbage**, while a FULL
+fine-tune of the same data reaches 0.0125 and emits the exact tool call. Frozen embeddings and a
+frozen lm_head simply cannot represent the new tokens, and attention-only adapters can't fix it.
+The parameter saving is likewise scale-dependent: 27.9% of the base on the tiny smoke-test model
+(rank 4 vs d_model 8 is nearly full rank) vs a few percent at d_model 576 / r=8. README says all
+of this explicitly.
+
+**NEXT:** the missing ingredient is a real pretrained base -- convert SmolLM2-135M to LLMA
+(`tools/convert_llama.py` exists) and LoRA-SFT that. Before that is practical: SIMD `matmul`
+(matrix.c is still scalar + thread pool), then batching/grad-accumulation (still batch=1).

@@ -93,8 +93,9 @@ static void llama_acts_zero_grad(LlamaActs *a) {
 // Forward (caching)
 // ---------------------------------------------------------------------------
 
-void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
-                         LlamaActs *a, Tensor *logits) {
+void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
+                              LlamaActs *a, Tensor *logits,
+                              const LlamaLora *lo, LlamaLoraActs *la) {
   const int dm = m->d_model;
 
   // Token embedding. No positional term — RoPE carries position inside attention.
@@ -111,10 +112,16 @@ void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
     matmul(&a->xn[l], &b->Wq, &a->q[l]); bias_add(&a->q[l], &b->b_q, &a->q[l]);
     matmul(&a->xn[l], &b->Wk, &a->k[l]); bias_add(&a->k[l], &b->b_k, &a->k[l]);
     matmul(&a->xn[l], &b->Wv, &a->v[l]); bias_add(&a->v[l], &b->b_v, &a->v[l]);
+    if (lo) {                                         // low-rank corrections on q/k/v
+      lora_forward(&lo->q[l], &a->xn[l], &a->q[l], &la->q[l]);
+      lora_forward(&lo->k[l], &a->xn[l], &a->k[l], &la->k[l]);
+      lora_forward(&lo->v[l], &a->xn[l], &a->v[l], &la->v[l]);
+    }
     rope_heads(&a->q[l], b->n_heads, b->rope_base);   // in place: q/k become POST-RoPE
     rope_heads(&a->k[l], b->n_kv, b->rope_base);
     gqa_forward(&a->q[l], &a->k[l], &a->v[l], &a->gc[l], &a->o[l]);
     matmul(&a->o[l], &b->Wo, &a->ao[l]);
+    if (lo) lora_forward(&lo->o[l], &a->o[l], &a->ao[l], &la->o[l]);
     matadd(x, &a->ao[l], &a->h[l]);                   // residual
 
     // --- Feed-forward sub-layer ---
@@ -127,16 +134,30 @@ void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
   matmul(&a->final_hn, &m->lm_head, logits);          // (seq_len, vocab)
 }
 
+void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
+                         LlamaActs *a, Tensor *logits) {
+  llama_forward_train_lora(m, ids, seq_len, a, logits, NULL, NULL);
+}
+
 // ---------------------------------------------------------------------------
 // Backward
 // ---------------------------------------------------------------------------
 
-void llama_backward(LlamaModel *m, const int *ids, int seq_len,
-                    LlamaActs *a, Tensor *logits) {
+void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
+                         LlamaActs *a, Tensor *logits,
+                         const LlamaLora *lo, LlamaLoraActs *la) {
   const int dm = m->d_model;
 
   llama_zero_grad(m);
   llama_acts_zero_grad(a);
+  if (lo) {
+    for (int l = 0; l < lo->n_layers; l++) {
+      tensor_zero_grad(&lo->q[l].A); tensor_zero_grad(&lo->q[l].B);
+      tensor_zero_grad(&lo->k[l].A); tensor_zero_grad(&lo->k[l].B);
+      tensor_zero_grad(&lo->v[l].A); tensor_zero_grad(&lo->v[l].B);
+      tensor_zero_grad(&lo->o[l].A); tensor_zero_grad(&lo->o[l].B);
+    }
+  }
 
   // logits = final_hn @ lm_head
   matmul_backward(&a->final_hn, &m->lm_head, logits);
@@ -157,6 +178,7 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
     // --- Attention sub-layer (reverse) ---
     matadd_backward(&a->h[l], x, &a->ao[l]);          // dx += dh (residual), dao += dh
     matmul_backward(&a->o[l], &b->Wo, &a->ao[l]);
+    if (lo) lora_backward(&lo->o[l], &a->o[l], &a->ao[l], &la->o[l]);
     gqa_backward(&a->q[l], &a->k[l], &a->v[l], &a->gc[l], &a->o[l]);
     // RoPE is in place, so this REPLACES q/k grads with their pre-rotation form.
     rope_heads_backward(&a->q[l], b->n_heads, b->rope_base);
@@ -167,6 +189,11 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
     matmul_backward(&a->xn[l], &b->Wq, &a->q[l]);
     matmul_backward(&a->xn[l], &b->Wk, &a->k[l]);
     matmul_backward(&a->xn[l], &b->Wv, &a->v[l]);
+    if (lo) {   // q/k/v adapters saw the SAME xn, and add into its gradient too
+      lora_backward(&lo->q[l], &a->xn[l], &a->q[l], &la->q[l]);
+      lora_backward(&lo->k[l], &a->xn[l], &a->k[l], &la->k[l]);
+      lora_backward(&lo->v[l], &a->xn[l], &a->v[l], &la->v[l]);
+    }
     rmsnorm_backward(x, &b->attn_norm, &a->xn[l], &b->attn_norm, b->eps);
   }
 
@@ -174,6 +201,11 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
   for (int i = 0; i < seq_len; i++)
     for (int j = 0; j < dm; j++)
       m->wte.grad[ids[i] * dm + j] += a->emb.grad[i * dm + j];
+}
+
+void llama_backward(LlamaModel *m, const int *ids, int seq_len,
+                    LlamaActs *a, Tensor *logits) {
+  llama_backward_lora(m, ids, seq_len, a, logits, NULL, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,4 +244,112 @@ void llama_zero_grad(LlamaModel *m) {
   int n = llama_collect_params(m, list);
   for (int i = 0; i < n; i++) tensor_zero_grad(list[i]);
   free(list);
+}
+
+// ---------------------------------------------------------------------------
+// LoRA adapters over a LlamaModel
+// ---------------------------------------------------------------------------
+
+static LoraAdapter *adapters(int n_layers, int d_in, int d_out, int r, float alpha) {
+  LoraAdapter *arr = (LoraAdapter*)malloc((size_t)n_layers * sizeof(LoraAdapter));
+  for (int l = 0; l < n_layers; l++) arr[l] = lora_create(d_in, d_out, r, alpha);
+  return arr;
+}
+
+static void free_adapters(LoraAdapter *arr, int n_layers) {
+  for (int l = 0; l < n_layers; l++) lora_free(&arr[l]);
+  free(arr);
+}
+
+LlamaLora llama_lora_create(const LlamaModel *m, int r, float alpha) {
+  LlamaLora lo;
+  const int dm = m->d_model;
+  const int qd = m->n_heads * m->head_dim, kvd = m->n_kv * m->head_dim;
+  lo.n_layers = m->n_layers;
+  lo.r = r;
+  lo.q = adapters(m->n_layers, dm, qd, r, alpha);   // Wq: (d_model, n_heads*head_dim)
+  lo.k = adapters(m->n_layers, dm, kvd, r, alpha);  // Wk/Wv: (d_model, n_kv*head_dim)
+  lo.v = adapters(m->n_layers, dm, kvd, r, alpha);
+  lo.o = adapters(m->n_layers, qd, dm, r, alpha);   // Wo: (n_heads*head_dim, d_model)
+  return lo;
+}
+
+void llama_lora_free(LlamaLora *lo) {
+  free_adapters(lo->q, lo->n_layers);
+  free_adapters(lo->k, lo->n_layers);
+  free_adapters(lo->v, lo->n_layers);
+  free_adapters(lo->o, lo->n_layers);
+  lo->q = lo->k = lo->v = lo->o = NULL;
+}
+
+void llama_lora_init(LlamaLora *lo) {
+  for (int l = 0; l < lo->n_layers; l++) {
+    lora_init(&lo->q[l]); lora_init(&lo->k[l]);
+    lora_init(&lo->v[l]); lora_init(&lo->o[l]);
+  }
+}
+
+static LoraCache *caches(int n_layers, int seq_len, int r, int d_out) {
+  LoraCache *arr = (LoraCache*)malloc((size_t)n_layers * sizeof(LoraCache));
+  for (int l = 0; l < n_layers; l++) arr[l] = lora_cache_create(seq_len, r, d_out);
+  return arr;
+}
+
+static void free_caches(LoraCache *arr, int n_layers) {
+  for (int l = 0; l < n_layers; l++) lora_cache_free(&arr[l]);
+  free(arr);
+}
+
+LlamaLoraActs llama_lora_acts_create(const LlamaModel *m, const LlamaLora *lo, int seq_len) {
+  LlamaLoraActs la;
+  const int dm = m->d_model;
+  const int qd = m->n_heads * m->head_dim, kvd = m->n_kv * m->head_dim;
+  la.n_layers = m->n_layers;
+  la.q = caches(m->n_layers, seq_len, lo->r, qd);
+  la.k = caches(m->n_layers, seq_len, lo->r, kvd);
+  la.v = caches(m->n_layers, seq_len, lo->r, kvd);
+  la.o = caches(m->n_layers, seq_len, lo->r, dm);
+  return la;
+}
+
+void llama_lora_acts_free(LlamaLoraActs *la) {
+  free_caches(la->q, la->n_layers);
+  free_caches(la->k, la->n_layers);
+  free_caches(la->v, la->n_layers);
+  free_caches(la->o, la->n_layers);
+  la->q = la->k = la->v = la->o = NULL;
+}
+
+// W += scale * (A @ B), then zero B so re-merging is a no-op.
+static void merge_one(Tensor *W, LoraAdapter *l) {
+  int s[2] = {l->d_in, l->d_out};
+  Tensor delta = tensor_create(s, 2);
+  matmul(&l->A, &l->B, &delta);
+  for (size_t i = 0; i < W->size; i++) W->data[i] += l->scale * delta.data[i];
+  for (size_t i = 0; i < l->B.size; i++) l->B.data[i] = 0.0f;
+  tensor_free(&delta);
+}
+
+void llama_lora_merge(LlamaModel *m, LlamaLora *lo) {
+  for (int l = 0; l < lo->n_layers; l++) {
+    merge_one(&m->blocks[l].Wq, &lo->q[l]);
+    merge_one(&m->blocks[l].Wk, &lo->k[l]);
+    merge_one(&m->blocks[l].Wv, &lo->v[l]);
+    merge_one(&m->blocks[l].Wo, &lo->o[l]);
+  }
+}
+
+int llama_lora_param_count(const LlamaLora *lo) {
+  return 8 * lo->n_layers;   // A and B for each of q, k, v, o
+}
+
+int llama_lora_collect_params(LlamaLora *lo, Tensor **list) {
+  int n = 0;
+  for (int l = 0; l < lo->n_layers; l++) {
+    list[n++] = &lo->q[l].A; list[n++] = &lo->q[l].B;
+    list[n++] = &lo->k[l].A; list[n++] = &lo->k[l].B;
+    list[n++] = &lo->v[l].A; list[n++] = &lo->v[l].B;
+    list[n++] = &lo->o[l].A; list[n++] = &lo->o[l].B;
+  }
+  return n;
 }

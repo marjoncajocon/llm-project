@@ -40,6 +40,8 @@ TrainConfig train_default_config(void) {
   c.lr_min = -1.0f;
   c.n_kv = 0;              // 0 => n_heads (plain multi-head, no GQA sharing)
   c.rope_base = 10000.0f;
+  c.lora_r = 0;            // 0 => full fine-tune (no adapters)
+  c.lora_alpha = 0.0f;     // 0 => alpha = r, i.e. scale 1
   return c;
 }
 
@@ -360,30 +362,88 @@ static int llama_geometry(const TrainConfig *cfg, int *head_dim, int *n_kv, int 
 }
 
 // Forward-only mean loss over `nwin` random windows starting in [lo, hi-ctx).
+// `adapters`/`ladapt` may be NULL (full fine-tune); when set, the val loss
+// includes the LoRA correction, as it must to be comparable with the train loss.
 static float llama_eval_split(LlamaModel *m, const int *toks, int lo, int hi, int ctx,
                               LlamaActs *acts, Tensor *logits, Tensor *probs,
-                              int *inp, int *tgt, int nwin) {
+                              int *inp, int *tgt, int nwin,
+                              const LlamaLora *adapters, LlamaLoraActs *ladapt) {
   int count = hi - ctx - lo;
   if (count < 1) return -1.0f;
   float sum = 0.0f;
   for (int w = 0; w < nwin; w++) {
     int start = lo + (rand() % count);
     for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
-    llama_forward_train(m, inp, ctx, acts, logits);
+    llama_forward_train_lora(m, inp, ctx, acts, logits, adapters, ladapt);
     sum += cross_entropy_forward(logits, tgt, probs);
   }
   return sum / nwin;
 }
 
+// LoRA scale convention: alpha defaults to r, i.e. scale 1.
+static float lora_alpha_of(const TrainConfig *cfg) {
+  return (cfg->lora_alpha > 0.0f) ? cfg->lora_alpha : (float)cfg->lora_r;
+}
+
+// Copy every weight from a loaded (inference, grad == NULL) model into a trainable
+// one. The two agree on every dimension EXCEPT possibly the vocabulary: SFT needs
+// one extra slot for EOS, so a base trained with vocab V is grown to V+1 here.
+// wte is (vocab, d_model) — rows, so the old block is contiguous — but lm_head is
+// (d_model, vocab), where vocab is the STRIDE, so it must be copied row by row.
+static void copy_weights_grow(LlamaModel *dst, LlamaModel *src) {
+  Tensor **s = (Tensor**)malloc((size_t)llama_param_count(src) * sizeof(Tensor*));
+  Tensor **d = (Tensor**)malloc((size_t)llama_param_count(dst) * sizeof(Tensor*));
+  int ns = llama_collect_params(src, s), nd = llama_collect_params(dst, d);
+  for (int i = 0; i < ns && i < nd; i++) {
+    if (s[i]->size == d[i]->size) {
+      memcpy(d[i]->data, s[i]->data, s[i]->size * sizeof(float));
+    } else if (s[i]->ndim == 2 && d[i]->ndim == 2 && s[i]->shape[0] == d[i]->shape[0]) {
+      // Same rows, wider columns (lm_head): copy each row's prefix.
+      const int rows = s[i]->shape[0], sc = s[i]->shape[1], dc = d[i]->shape[1];
+      for (int r = 0; r < rows; r++)
+        memcpy(&d[i]->data[(size_t)r * dc], &s[i]->data[(size_t)r * sc], (size_t)sc * sizeof(float));
+    } else {
+      // Fewer rows, same columns (wte): the old block is contiguous.
+      memcpy(d[i]->data, s[i]->data, s[i]->size * sizeof(float));
+    }
+  }
+  free(s); free(d);
+}
+
 // Masked instruction tuning for the LLaMA path — same "prompt<TAB>response"
 // format, EOS slot and -1 masking as train_sft() above.
 static int llama_train_sft(char *text, const TrainConfig *cfg) {
-  int head_dim, n_kv, d_ff;
-  if (!llama_geometry(cfg, &head_dim, &n_kv, &d_ff)) return 1;
+  const int resuming = (cfg->resume != NULL);
+  int head_dim = 0, n_kv = 0, d_ff = 0;
+  if (!resuming && !llama_geometry(cfg, &head_dim, &n_kv, &d_ff)) return 1;
   srand(cfg->seed);
 
-  Tokenizer tok = tokenizer_create_bytelevel();
-  tokenizer_train(&tok, text, cfg->num_merges);
+  // Fine-tuning MUST reuse the base model's tokenizer — a freshly trained one
+  // would assign different ids to the same text, making the pretrained
+  // embeddings meaningless. Fresh runs train a tokenizer on the SFT text.
+  Tokenizer tok;
+  LlamaModel loaded;
+  if (resuming) {
+    if (llama_model_load(cfg->resume, &loaded) != 0) {
+      fprintf(stderr, "error: cannot load model '%s'\n", cfg->resume);
+      return 1;
+    }
+    if (tokenizer_load(&tok, cfg->out_tok) != 0) {
+      fprintf(stderr, "error: cannot load tokenizer '%s' (needed to resume)\n", cfg->out_tok);
+      llama_model_free(&loaded);
+      return 1;
+    }
+    if (loaded.vocab < tok.vocab_size) {
+      fprintf(stderr, "error: model vocab %d < tokenizer vocab %d\n", loaded.vocab, tok.vocab_size);
+      tokenizer_free(&tok); llama_model_free(&loaded);
+      return 1;
+    }
+    printf("resumed LLMA model %s (vocab %d, d_model %d, layers %d, heads %d, kv %d)\n",
+           cfg->resume, loaded.vocab, loaded.d_model, loaded.n_layers, loaded.n_heads, loaded.n_kv);
+  } else {
+    tok = tokenizer_create_bytelevel();
+    tokenizer_train(&tok, text, cfg->num_merges);
+  }
 
   int maxex = 1;
   for (char *p = text; *p; p++) if (*p == '\n') maxex++;
@@ -416,7 +476,16 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
 
   if (nex == 0) {
     fprintf(stderr, "error: SFT file has no 'prompt<TAB>response' lines\n");
-    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok); return 1;
+    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok);
+    if (resuming) llama_model_free(&loaded);
+    return 1;
+  }
+  if (resuming && maxL > loaded.max_seq) {
+    fprintf(stderr, "error: SFT sequences need %d positions but the base model's ctx is %d\n",
+            maxL, loaded.max_seq);
+    for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); }
+    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok); llama_model_free(&loaded);
+    return 1;
   }
 
   const int EOS = tok.vocab_size;
@@ -434,18 +503,48 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     for (int j = T - 1; j <= T + Rn - 1; j++) tgt[e][j] = seq[e][j + 1];
   }
 
-  LlamaModel model = llama_model_create_train(tok.vocab_size + 1, cfg->d_model, cfg->n_layers,
-                                              cfg->n_heads, n_kv, head_dim, d_ff, maxL,
-                                              cfg->rope_base, 1e-5f);
-  llama_model_randomize(&model);
-  printf("LLaMA SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
-         nex, tok.vocab_size, maxL, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, cfg->lr);
+  LlamaModel model;
+  if (resuming) {
+    // Grow the vocab by one for the EOS slot if the base doesn't already have it,
+    // keeping every other dimension (and max_seq, so the KV geometry still fits).
+    const int vocab = (loaded.vocab > tok.vocab_size) ? loaded.vocab : tok.vocab_size + 1;
+    model = llama_model_create_train(vocab, loaded.d_model, loaded.n_layers, loaded.n_heads,
+                                     loaded.n_kv, loaded.head_dim, loaded.d_ff,
+                                     loaded.max_seq, loaded.rope_base, loaded.eps);
+    llama_model_randomize(&model);          // the new EOS row/column starts random
+    copy_weights_grow(&model, &loaded);     // ...then every pretrained weight lands on top
+    llama_model_free(&loaded);
+    printf("LLaMA SFT (fine-tune): %d examples | vocab %d (+EOS -> %d) | seq len %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
+           nex, tok.vocab_size, vocab, maxL, model.d_model, model.n_layers, model.n_heads, model.n_kv, cfg->lr);
+  } else {
+    model = llama_model_create_train(tok.vocab_size + 1, cfg->d_model, cfg->n_layers,
+                                     cfg->n_heads, n_kv, head_dim, d_ff, maxL,
+                                     cfg->rope_base, 1e-5f);
+    llama_model_randomize(&model);
+    printf("LLaMA SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
+           nex, tok.vocab_size, maxL, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, cfg->lr);
+  }
 
   LlamaActs acts = llama_acts_create(&model, maxL);
   int lshape[2] = {maxL, model.vocab};
   Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
-  Tensor **params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
-  int n_params = llama_collect_params(&model, params);
+
+  // LoRA: freeze the base and hand Adam only the adapters.
+  const int use_lora = (cfg->lora_r > 0);
+  LlamaLora lora; LlamaLoraActs lacts;
+  Tensor **params; int n_params;
+  if (use_lora) {
+    lora = llama_lora_create(&model, cfg->lora_r, lora_alpha_of(cfg));
+    llama_lora_init(&lora);
+    lacts = llama_lora_acts_create(&model, &lora, maxL);
+    params = (Tensor**)malloc((size_t)llama_lora_param_count(&lora) * sizeof(Tensor*));
+    n_params = llama_lora_collect_params(&lora, params);
+    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo, base FROZEN (%d adapter tensors)\n",
+           cfg->lora_r, lora_alpha_of(cfg), n_params);
+  } else {
+    params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
+    n_params = llama_collect_params(&model, params);
+  }
   Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
   print_recipe(cfg);
 
@@ -453,16 +552,25 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   const int report = steps < 10 ? 1 : steps / 10;
   for (int s = 0; s < steps; s++) {
     int e = rand() % nex;
-    llama_forward_train(&model, seq[e], maxL, &acts, &logits);
+    llama_forward_train_lora(&model, seq[e], maxL, &acts, &logits,
+                             use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     float loss = cross_entropy_forward(&logits, tgt[e], &probs);
     tensor_zero_grad(&logits);
     cross_entropy_backward(&probs, tgt[e], &logits);
-    llama_backward(&model, seq[e], maxL, &acts, &logits);
+    llama_backward_lora(&model, seq[e], maxL, &acts, &logits,
+                        use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
     if (s % report == 0 || s == steps - 1)
       printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+  }
+
+  // Fold the adapters into the weights so the result saves as an ordinary LLMA
+  // checkpoint that `transformer llama` runs with no adapter support.
+  if (use_lora) {
+    llama_lora_merge(&model, &lora);
+    printf("  LoRA: merged adapters into the base weights\n");
   }
 
   int rc = 0;
@@ -473,6 +581,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); free(seq[e]); free(tgt[e]); }
   free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
   free(params);
+  if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
   adam_free(&opt); tensor_free(&logits); tensor_free(&probs);
   llama_acts_free(&acts); llama_model_free(&model); tokenizer_free(&tok);
   return rc;
@@ -516,12 +625,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
     LlamaModel t = llama_model_create_train(model.vocab, model.d_model, model.n_layers,
                                             model.n_heads, model.n_kv, model.head_dim,
                                             model.d_ff, model.max_seq, model.rope_base, model.eps);
-    Tensor **src = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
-    Tensor **dst = (Tensor**)malloc((size_t)llama_param_count(&t) * sizeof(Tensor*));
-    int ns = llama_collect_params(&model, src), nd = llama_collect_params(&t, dst);
-    for (int i = 0; i < ns && i < nd; i++)
-      memcpy(dst[i]->data, src[i]->data, src[i]->size * sizeof(float));
-    free(src); free(dst);
+    copy_weights_grow(&t, &model);
     llama_model_free(&model);
     model = t;
     printf("resumed LLMA model %s (vocab %d, d_model %d, layers %d, heads %d, kv %d)\n",
@@ -561,8 +665,25 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
   LlamaActs acts = llama_acts_create(&model, ctx);
   int lshape[2] = {ctx, model.vocab};
   Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
-  Tensor **params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
-  int n_params = llama_collect_params(&model, params);
+
+  // LoRA: freeze the base and optimize only the adapters.
+  const int use_lora = (cfg->lora_r > 0);
+  LlamaLora lora; LlamaLoraActs lacts;
+  Tensor **params; int n_params;
+  if (use_lora) {
+    lora = llama_lora_create(&model, cfg->lora_r, lora_alpha_of(cfg));
+    llama_lora_init(&lora);
+    lacts = llama_lora_acts_create(&model, &lora, ctx);
+    params = (Tensor**)malloc((size_t)llama_lora_param_count(&lora) * sizeof(Tensor*));
+    n_params = llama_lora_collect_params(&lora, params);
+    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo, base FROZEN (%d adapter tensors)\n",
+           cfg->lora_r, lora_alpha_of(cfg), n_params);
+    if (cfg->checkpoint_every > 0)
+      printf("  LoRA: --checkpoint-every ignored (adapters are merged only at the end)\n");
+  } else {
+    params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
+    n_params = llama_collect_params(&model, params);
+  }
   Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
   print_recipe(cfg);
 
@@ -576,25 +697,30 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
   for (int s = 0; s < steps; s++) {
     int start = rand() % train_starts;
     for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
-    llama_forward_train(&model, inp, ctx, &acts, &logits);
+    llama_forward_train_lora(&model, inp, ctx, &acts, &logits,
+                             use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     float loss = cross_entropy_forward(&logits, tgt, &probs);
     tensor_zero_grad(&logits);
     cross_entropy_backward(&probs, tgt, &logits);
-    llama_backward(&model, inp, ctx, &acts, &logits);
+    llama_backward_lora(&model, inp, ctx, &acts, &logits,
+                        use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
 
     if (s % report == 0 || s == steps - 1) {
       if (has_val) {
-        float vl = llama_eval_split(&model, toks, n_train, n_toks, ctx, &acts, &logits, &probs, inp, tgt, 8);
+        float vl = llama_eval_split(&model, toks, n_train, n_toks, ctx, &acts, &logits, &probs, inp, tgt, 8,
+                                    use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
         printf("  step %5d/%d  train %.4f  val %.4f\n", s, steps, loss, vl);
       } else {
         printf("  step %5d/%d  train %.4f  val n/a\n", s, steps, loss);
       }
     }
 
-    if (cfg->checkpoint_every > 0 && s > 0 && s % cfg->checkpoint_every == 0) {
+    // Intermediate checkpoints are skipped under LoRA: merging mid-run would zero
+    // B and desync Adam's moments for it, so adapters are folded in only at the end.
+    if (!use_lora && cfg->checkpoint_every > 0 && s > 0 && s % cfg->checkpoint_every == 0) {
       int cok = (llama_model_save(cfg->out_model, &model) == 0);
       cok = (tokenizer_save(&tok, cfg->out_tok) == 0) && cok;
       if (cok) printf("  [checkpoint] saved at step %d -> %s\n", s, cfg->out_model);
@@ -602,7 +728,11 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
     }
   }
 
-  // 5. Final save (LLMA — `transformer llama <out>` can generate from it).
+  // 5. Fold adapters in (if any), then save.
+  if (use_lora) {
+    llama_lora_merge(&model, &lora);
+    printf("  LoRA: merged adapters into the base weights\n");
+  }
   int rc = 0;
   if (llama_model_save(cfg->out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
   if (tokenizer_save(&tok, cfg->out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
@@ -610,6 +740,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
 
   free(inp); free(tgt); free(toks);
   free(params);
+  if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
   adam_free(&opt);
   tensor_free(&logits); tensor_free(&probs);
   llama_acts_free(&acts);

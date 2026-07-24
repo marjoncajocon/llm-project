@@ -65,6 +65,7 @@ defined in the matching `.c`.
 | `quant.h` / `quant.c`             | int8 per-channel weight quantize/dequantize (for the LLMQ checkpoint) |
 | `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode |
 | `llamatrain.h` / `llamatrain.c`   | **Training** the LLaMA-family model: cached-activation forward + full backward |
+| `lora.h` / `lora.c`               | LoRA low-rank adapters (`y += scale·(x·A)·B`) for fine-tuning a frozen base |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |
@@ -343,6 +344,35 @@ echo "the task is finished" | transformer llama ls.bin 40 ls.tok
 
 Verified: both routed to the exact tool call and stopped cleanly at EOS. (At this size the model
 memorizes the pairs — the point is the modern-architecture SFT pipeline running end to end.)
+
+#### LoRA fine-tuning (`--lora-r`)
+
+`--lora-r N` **freezes the base** and trains only low-rank adapters (`lora.c`) on `Wq/Wk/Wv/Wo`:
+`y = x·W + (alpha/r)·(x·A)·B`, with `A: (d_in, r)` and `B: (r, d_out)`. `B` starts at **zero**, so
+an adapted model is bit-identical to its base before the first step. The adapters are **merged into
+the weights before saving** (`W += scale·A·B`), so the output is an ordinary LLMA checkpoint that
+`transformer llama` runs with no adapter support and no inference-time cost.
+
+```sh
+# fine-tune a pretrained checkpoint; --tok must be the BASE's tokenizer
+transformer llama-train data/sft.txt --sft --resume base.bin \
+  --lora-r 8 --lora-alpha 16 --steps 600 --lr 5e-3 --clip 1.0 \
+  --out lora.bin --tok base.tok
+```
+
+Fine-tuning reuses the base's tokenizer (a fresh one would assign different ids to the same text,
+making the pretrained embeddings meaningless) and grows the vocab by one for the SFT `EOS` slot.
+`--checkpoint-every` is ignored under LoRA — merging mid-run would zero `B` and desync Adam's
+moments for it, so adapters are folded in only at the end.
+
+> **Honest scope.** The mechanism is verified in the smoke test (part `[24]`): zero-init
+> equivalence, a numerical gradient check on the adapters, a frozen-base byte-comparison, and
+> merge equivalence. But **LoRA only pays off on a genuinely pretrained base.** Adapting one of the
+> toy models here (trained on a 440-byte corpus) reaches SFT loss ~2.5 and emits garbage, where a
+> full fine-tune of the same data reaches 0.0125 and emits the exact tool call — the frozen
+> embeddings and `lm_head` simply cannot represent the new tokens, and attention adapters alone
+> can't fix that. The parameter saving is also only visible at scale: on the tiny smoke-test model
+> the adapters are 27.9% of the base, whereas at `d_model` 576 with `r=8` they are a few percent.
 
 ### `transformer generate [model.bin] [tok.bin]`
 

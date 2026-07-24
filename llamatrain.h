@@ -24,6 +24,7 @@
 #include "llama.h"
 #include "gqa.h"
 #include "swiglu.h"
+#include "lora.h"
 
 // Activations cached by the training forward, consumed by llama_backward.
 // One set of per-layer tensors, plus the two model-level ones. Every tensor here
@@ -71,5 +72,60 @@ int llama_collect_params(LlamaModel *m, Tensor **list);
 
 // Zero the gradient of every parameter.
 void llama_zero_grad(LlamaModel *m);
+
+// ---------------------------------------------------------------------------
+// LoRA fine-tuning: adapters on the four attention projections of every layer
+// (Wq, Wk, Wv, Wo — the conventional choice), with the base model FROZEN.
+//
+//   LlamaLora lo = llama_lora_create(&m, 8, 16.0f);  llama_lora_init(&lo);
+//   LlamaLoraActs la = llama_lora_acts_create(&m, &lo, seq_len);
+//   llama_forward_train_lora(&m, ids, n, &acts, &logits, &lo, &la);
+//   ... cross_entropy_backward ...
+//   llama_backward_lora(&m, ids, n, &acts, &logits, &lo, &la);
+//   adam_step(&opt, lora_params, n_lora);   // ONLY the adapters are optimized
+//
+// Freezing is achieved by handing Adam only the adapter tensors. The backward
+// still fills the base gradients (matmul_backward computes dx and dW together,
+// so dx cannot be had without dW), but nothing consumes them — so the saving is
+// the Adam moments, which dominate optimizer memory, not the gradient buffers.
+// ---------------------------------------------------------------------------
+typedef struct {
+  int n_layers, r;
+  LoraAdapter *q, *k, *v, *o;   // n_layers each
+} LlamaLora;
+
+// r = rank, alpha = LoRA scaling (scale = alpha / r).
+LlamaLora llama_lora_create(const LlamaModel *m, int r, float alpha);
+void llama_lora_free(LlamaLora *lo);
+
+// A <- small random, B <- 0, so the adapted model starts bit-identical to the base.
+void llama_lora_init(LlamaLora *lo);
+
+// Per-layer adapter activation caches for a given sequence length.
+typedef struct {
+  int n_layers;
+  LoraCache *q, *k, *v, *o;
+} LlamaLoraActs;
+
+LlamaLoraActs llama_lora_acts_create(const LlamaModel *m, const LlamaLora *lo, int seq_len);
+void llama_lora_acts_free(LlamaLoraActs *la);
+
+// Trainable adapter tensors (== 8 * n_layers: an A and a B per projection).
+int llama_lora_param_count(const LlamaLora *lo);
+int llama_lora_collect_params(LlamaLora *lo, Tensor **list);
+
+// Fold the learned corrections into the base weights (W += scale * A @ B) and
+// reset the adapters to zero, so the result is an ORDINARY LlamaModel that
+// llama_model_save writes as a normal LLMA checkpoint and `transformer llama`
+// runs with no adapter support and no inference-time cost.
+void llama_lora_merge(LlamaModel *m, LlamaLora *lo);
+
+// Forward / backward with adapters. Passing lo == NULL is exactly the plain path.
+void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
+                              LlamaActs *a, Tensor *logits,
+                              const LlamaLora *lo, LlamaLoraActs *la);
+void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
+                         LlamaActs *a, Tensor *logits,
+                         const LlamaLora *lo, LlamaLoraActs *la);
 
 #endif // LLAMATRAIN_H

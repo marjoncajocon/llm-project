@@ -27,6 +27,8 @@ typedef struct {
   // --- LLaMA-family only (llama_train_run); ignored by the GPT trainer ---
   int n_kv;                // KV heads for GQA (0 => n_heads, i.e. plain multi-head)
   float rope_base;         // RoPE frequency base (10000 is standard)
+  int lora_r;              // LoRA rank; > 0 => freeze the base, train adapters only
+  float lora_alpha;        // LoRA scaling (scale = alpha / r); 0 => use r (scale 1)
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).

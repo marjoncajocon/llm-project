@@ -7,7 +7,7 @@ LDLIBS  = -lm -pthread
 
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
-          embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o rmsnorm.o rope.o swiglu.o gqa.o quant.o llama.o llamatrain.o \
+          embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o rmsnorm.o rope.o swiglu.o gqa.o quant.o llama.o lora.o llamatrain.o \
           toolcall.o toolexec.o approval.o agent.o corpus.o train.o \
           image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o selftest.o main.o
 
@@ -39,7 +39,8 @@ swiglu.o:     swiglu.h tensor.h matrix.h
 gqa.o:        gqa.h tensor.h
 quant.o:      quant.h matrix.h tensor.h
 llama.o:      llama.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h quant.h
-llamatrain.o: llamatrain.h llama.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h
+lora.o:       lora.h tensor.h matrix.h
+llamatrain.o: llamatrain.h llama.h lora.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h
 feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h
 embedding.o:  embedding.h tensor.h check.h
@@ -54,7 +55,7 @@ toolexec.o:   toolexec.h toolcall.h
 approval.o:   approval.h
 agent.o:      agent.h approval.h toolcall.h toolexec.h
 corpus.o:     corpus.h
-train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h
+train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h llama.h llamatrain.h
 image.o:      image.h
 patch.o:      patch.h tensor.h image.h matrix.h
 video.o:      video.h tensor.h image.h patch.h
@@ -66,7 +67,7 @@ text2media.o: text2media.h tensor.h image.h imagegen.h audio.h audiogen.h model.
 t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h checkpoint.h
 vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 hftok.o:      hftok.h
-selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h llamatrain.h matrix.h
+selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h
 main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.
