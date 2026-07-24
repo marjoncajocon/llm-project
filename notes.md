@@ -2252,29 +2252,48 @@ nothing capped). Report -> data/clean_report.txt. clean_sft.py SUPERSEDES the mi
 merges + cleans in one pass). Only the two tools are tracked (commit 113db78); the data/*.txt are
 git-ignored + regenerable.
 
-**Retrain LAUNCHED (background, in progress):** `transformer llama-train data/clean_reason.txt --sft
---hf-tok model/smollm/tok.hf --resume model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4
---steps 350 --lr 3e-3 --warmup 30 --min-lr 1e-4 --out model/smollm/reason_clean.bin`. TIMING REALITY:
-~30 s/step at seq-len 160 (global-maxL padding, driven by the long QA prose) => ~2-3 h for 350 steps,
-NOT the "~55 min" older note (that predated adding toolcalls.txt / the longer padded set). A 3-step
-dry run confirmed the cleaned data loads + trains (1545 ex, 240 LoRA adapter tensors, base frozen).
+**Retrain #1 DONE + RE-MEASURED (350 steps, ~2.5 h, base model_v2.bin, LoRA r16/a32 batch 4,
+lr 3e-3 warmup 30 -> cosine 1e-4):** loss **3.12 -> ~0.07** (min at step 280; bounces 0.5-0.7 late
+= per-batch noise on the cosine floor). Re-measured the cleaned-data model `reason_clean.bin`:
+  - **Routing (temp 0.1):** read_file / write_file / run_command all correct; "what is gravity" ->
+    PROSE (not forced into a tool call); novel filename `quantum_widget.log` copied verbatim.
+  - **Multi-step planning + reasoning + stop:** live `agent_local.py` run on "create hello.txt
+    containing world and read it back" -> <think>create</think>write_file "world" (auto-approved) ->
+    <think>read to verify</think>read_file -> <think>goal complete</think><done>; **hello.txt held
+    "world".** The real parse->approve->execute loop, reasoning-dense, ending correctly.
+  - **Generalization (sft_memtest, gibberish args that cannot be memorized):** novel filenames
+    **18/20 (90%)**, novel commands **14/20 (70%)** -- misses are character-level copy SLIPS on
+    random consonant runs (cngh4<-ctngh4, "make" substituted), all still routed to the right tool =
+    not memorization. NOTE the "C baseline 24%" line is a **measurement artifact**: sft_memtest
+    strips <think> from the OUTPUT but compares against the <think>-wrapped training LABEL, so a
+    reasoning-dense response can never exact-match -- ignore C for reasoning data (A/B are valid).
 
-## >>> RESUME HERE (next session) -- re-measure the cleaned-data retrain
+**Limitation found + FIXED at source (commit 6e0b15e):** the model copies novel FIRST-write content
+fine but drops the SECOND write's content to an EMPTY body when it's a word unseen in that position
+(`create a.txt with foo, then create b.txt with bar` -> `write b.txt` empty; but in-vocab "done"/
+"finished" copy fine). Root cause = DISTRIBUTION not integrity: every write's content came from one
+10-word WORDS pool, so 2nd-write content could be MEMORIZED. Training data was clean (64 2nd-writes,
+0 empty). Fix: make_agent_traj.py now draws content from WORDS + wiki-slug phrases = **308 words**
+(49 distinct 2nd-write contents vs ~10), so copy-from-prompt is forced in every position. Rebuilt
+clean_reason.txt (1547 pairs, 0 rejected, 62 dups removed).
 
-The data-quality GATE is built + applied (verify + dedupe + balance, commit 113db78) and the
-generator bug is fixed. A 350-step LoRA-SFT retrain on the cleaned 1545-pair corpus was launched in
-the background (-> `model/smollm/reason_clean.bin`). NEXT when it finishes:
-  1. Check the loss curve in scratchpad/train_reason.log (prior reasoning run reached ~0.88).
-  2. Re-measure GENERALIZATION: `python tools/sft_memtest.py .\transformer.exe
-     model/smollm/reason_clean.bin model/smollm/tok.hf data/clean_reason.txt` (random-gibberish
-     args -> copy rate; the decisive not-memorized signal, needs no held-out split).
-  3. Re-measure tool-vs-prose routing + off-topic probe: `python tools/eval_mixed.py .\transformer.exe
-     model/smollm/reason_clean.bin model/smollm/tok.hf <tool.tsv> data/qa.txt`.
-  4. Live multi-step agent run via tools/agent_local.py on "create hello.txt containing world and
-     read it back" -> expect write -> read -> <done> with grounded <think> rationales.
-If the cleaned data holds or improves the numbers, flip high-quality synthetic data [~] -> [x].
+## >>> RESUME HERE (next session) -- validate the 2nd-position copy fix (retrain #2 running)
+
+The data-quality GATE is built + applied (verify + dedupe + balance, commit 113db78), the two_writes
+bug is fixed (regenerate), and the write-content vocabulary is widened to force position-independent
+copy (commit 6e0b15e). Retrain #1 validated the cleaned data end to end (routing/planning/prose/
+generalization all good) and exposed ONE gap -- 2nd-write novel-content copy -- now addressed in the
+data. **Retrain #2 is running in the background** on the widened corpus (same flags) ->
+`model/smollm/reason_clean.bin`. NEXT when it finishes:
+  1. Re-probe the exact failing case: feed the transcript `GOAL: create a.txt with foo, then create
+     b.txt with bar | MODEL: <write a.txt foo> | OBSERVATION: wrote 3 bytes to a.txt` -> expect
+     `write_file path="b.txt">bar<` (NON-empty). If fixed, the widened pool worked.
+  2. Re-run `sft_memtest.py` (expect >=90% A / >=70% B, no regression) + a live agent multi-step run.
+  3. If the 2nd-write case now copies and nothing regressed, flip high-quality synthetic data
+     [~] -> [x] in this file AND memory.md.
+Re-probe/regen commands: see the memory.md RESUME block (make_agent_traj --reason then clean_sft).
 
 Status recap: near-term checklist = reasoning-dense [x], execution-oriented [x], high-quality
-synthetic data [~ -> pending the retrain re-measure above]. Long-horizon research roadmap recorded
-above. Keep 2-space, C-only-flat-root rules; training is slow (~2-3 h) due to global-maxL padding
-(a real future lever: length-bucketed batches instead of one global max would cut most of it).
+synthetic data [~ -> pending retrain #2 validation of the 2nd-position fix]. Long-horizon research
+roadmap recorded above. Keep 2-space, C-only-flat-root rules; training is slow (~2-3 h) due to
+global-maxL padding (a real future lever: length-bucketed batches instead of one global max).

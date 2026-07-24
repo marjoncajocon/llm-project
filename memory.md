@@ -478,16 +478,20 @@ and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2
 - [x] Execution-oriented -- APPLIED. agent.c/toolcall.c/toolexec.c parse -> approve -> execute ->
   observe real tool calls over multiple steps; SFT labels are executable tool calls; observations
   come from real execution.
-- [~] High-quality synthetic data -- GATE BUILT (2026-07-24), retrain re-measure pending.
-  `tools/clean_sft.py` VERIFIES each pair (reject a tool call whose path/write-content/command-file
-  arg is not grounded in the prompt; whole-token match so "ok" != inside "cook"; empty write body
-  rejected), DEDUPES exact+near-dup lines (conservative -- variety kept), and BALANCES action-type x
-  task-length with full logging (no silent truncation). Validated on an adversarial probe: 4/4
-  correct rejects + 4/4 correct keeps. Fixed the two_writes "ok" bug at source in make_agent_traj.py
-  (2nd content now a varied word copied from the goal). Clean corpus data/clean_reason.txt = 1545
-  pairs (62 dups removed). A 350-step LoRA-SFT retrain on it is running -> model/smollm/reason_clean.bin;
-  flip to [x] once sft_memtest / eval_mixed / a live agent run confirm the cleaned data holds or
-  improves the numbers. Remaining gaps: base-model factual errors; optional entropy/solvability filter.
+- [~] High-quality synthetic data -- GATE BUILT + retrain #1 RE-MEASURED (2026-07-24); retrain #2
+  validating the one fix found. `tools/clean_sft.py` VERIFIES each pair (reject a tool call whose
+  path/write-content/command-file arg is not grounded in the prompt; whole-token match so "ok" !=
+  inside "cook"; empty write body rejected), DEDUPES exact+near-dup lines (conservative -- variety
+  kept), BALANCES action-type x task-length with full logging. Validated on an adversarial probe:
+  4/4 rejects + 4/4 keeps. Retrain #1 on the clean 1545-pair corpus (LoRA r16/a32, loss 3.12->~0.07)
+  gave: correct routing incl. prose-vs-tool; a live agent_local.py multi-step run (write "world" ->
+  read -> <done>, hello.txt held "world"); generalization 90% novel filenames / 70% novel commands
+  (misses = char copy-slips, still right tool). Found ONE gap -- the model drops a SECOND write's
+  NOVEL content to an empty body (in-vocab words copy fine) because content came from one 10-word
+  pool = memorizable. FIXED at source (commit 6e0b15e): make_agent_traj.py draws content from WORDS +
+  wiki-slug phrases = 308 words, forcing copy in every position. Retrain #2 on the widened corpus is
+  running -> model/smollm/reason_clean.bin; flip to [x] once the 2nd-write case copies (non-empty) and
+  nothing regressed. Gate commit 113db78. Remaining: base-model factual errors; optional entropy filter.
 
 ## FUTURE WORK -- long-horizon research roadmap (requested 2026-07-24)
 
@@ -555,18 +559,26 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (next session) -- re-measure the cleaned-data retrain
+## >>> RESUME HERE (next session) -- validate the 2nd-position copy fix (retrain #2 running)
 
-Data-quality GATE is DONE (tools/clean_sft.py: verify + dedupe + balance; commit 113db78) and the
-two_writes generator bug is fixed. A 350-step LoRA-SFT retrain of SmolLM2-135M on the cleaned
-1545-pair corpus (data/clean_reason.txt) was launched in the background ->
-`model/smollm/reason_clean.bin` (r16/alpha32, batch 4, lr 3e-3 warmup 30; ~2-3 h at seq-len 160).
-NEXT when it finishes: (1) loss curve in scratchpad/train_reason.log (prior ~0.88); (2)
-`python tools/sft_memtest.py .\transformer.exe model/smollm/reason_clean.bin model/smollm/tok.hf
-data/clean_reason.txt` (generalization); (3) `python tools/eval_mixed.py ...` (tool-vs-prose +
-off-topic probe); (4) a live tools/agent_local.py multi-step run. If numbers hold/improve, flip
-high-quality synthetic data [~] -> [x]. Rebuild the clean corpus any time with:
-`python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki
---commands data/so_commands.txt --reason` then `python tools/clean_sft.py --shuffle --balance
---report data/clean_report.txt --out data/clean_reason.txt data/traj_reason.txt data/qa.txt
-data/toolcalls.txt`.
+Data-quality GATE is DONE (tools/clean_sft.py: verify+dedupe+balance; commit 113db78). Retrain #1
+on the clean corpus worked end to end (routing/planning/prose/generalization; see the checklist
+item above) and exposed ONE gap: the model drops a SECOND write's NOVEL content to an empty body.
+Fixed by widening the write-content vocabulary (commit 6e0b15e). **Retrain #2 is running in the
+background** on the widened corpus -> `model/smollm/reason_clean.bin` (r16/alpha32, batch 4, lr 3e-3
+warmup 30; ~2-3 h at seq-len 160). NEXT when it finishes:
+  1. Re-probe the exact case (feed to `.\transformer.exe hfgen model/smollm/reason_clean.bin
+     model/smollm/tok.hf 48 0.1` on stdin): `GOAL: create a.txt with foo, then create b.txt with bar
+     | MODEL: <tool name="write_file" path="a.txt">foo</tool> | OBSERVATION: wrote 3 bytes to a.txt`
+     -> expect `write_file path="b.txt">bar<` (NON-empty).
+  2. `python tools/sft_memtest.py .\transformer.exe model/smollm/reason_clean.bin model/smollm/tok.hf
+     data/clean_reason.txt` (expect >=90% A / >=70% B; ignore C -- artifact for <think> data) + a
+     live tools/agent_local.py multi-step run.
+  3. If the 2nd-write case copies and nothing regressed, flip high-quality synthetic data [~] -> [x]
+     here AND in notes.md.
+Rebuild the clean corpus any time: `python tools/make_agent_traj.py --out data/traj_reason.txt --n
+300 --wiki data/wiki --commands data/so_commands.txt --reason` then `python tools/clean_sft.py
+--shuffle --balance --report data/clean_report.txt --out data/clean_reason.txt data/traj_reason.txt
+data/qa.txt data/toolcalls.txt`. Live agent (space-free paths, from repo root): `.\transformer.exe
+agent --cmd "D:\env\python\python-3.9.10.amd64\python.exe tools/agent_local.py
+model/smollm/reason_clean.bin model/smollm/tok.hf" --goal "..."`.
