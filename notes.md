@@ -2210,3 +2210,28 @@ noisier than 0.46 without reasoning -- EXPECTED, the think spans add token varie
   action + stop were chosen from the transcript. Reasoning-dense + multi-step + execution, together.
 
 So the near-term checklist item flips: reasoning-dense is now [x] APPLIED (was [ ]).
+
+## >>> RESUME HERE (next session) -- highest-value next step (user, 2026-07-24 eve)
+
+Continuing at home. The agreed NEXT task is the one remaining [~] item:
+**make the synthetic data HIGH-QUALITY -- verified + deduplicated.** This is now the main thing
+gating the 135M agent (reasoning-dense, multi-step, execution all work; data quality is the wall).
+
+Concrete plan:
+  1. VERIFY each synthetic example is self-consistent -- every argument in the response must be
+     copyable from the prompt. This directly fixes the known two_writes bug in make_agent_traj.py
+     (the 2nd file's content is hardcoded "ok" instead of taken from the goal), and would catch
+     any future arg/goal mismatch. Add a checker that rejects a pair whose tool args are not
+     present in the prompt text.
+  2. DEDUPE across generators (make_sft / make_qa / make_agent_traj / mixes) -- exact and near-dup
+     prompt<TAB>response lines waste training and inflate held-out scores.
+  3. BALANCE difficulty / task-length distribution; log what was dropped (no silent truncation).
+  4. Optional: filter by whether the current model already solves held-out variants (keep the
+     informative examples) -- a cheap step toward the "entropy-based data filtering" roadmap item.
+
+Then retrain the reasoning-dense multi-step model on the cleaned data and re-measure with
+sft_memtest.py (generalization) + eval_mixed.py (tool vs prose) + a live multi-step agent run.
+
+Status recap: near-term checklist = reasoning-dense [x], execution-oriented [x], high-quality
+synthetic data [~]  <-- this is the resume target. Long-horizon research roadmap recorded above.
+Keep 2-space, C-only-flat-root rules; training is slow (~55 min) due to global-maxL padding.

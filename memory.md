@@ -548,3 +548,13 @@ multi-agent cognition), not incremental engine work. The current repo provides O
 the "long-term procedural memory / execution model" (the fine-tuned tool-using agent). Everything
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
+
+## >>> RESUME HERE (next session, user 2026-07-24 eve) -- highest-value next step
+
+Continuing at home. NEXT = the remaining [~] item: make synthetic data HIGH-QUALITY (verified +
+deduplicated). It is the main wall for the 135M agent now (reasoning-dense/multi-step/execution
+all work). Plan: (1) VERIFY each pair -- every tool arg in the response must be copyable from the
+prompt (fixes the two_writes hardcoded-"ok" bug in make_agent_traj.py); (2) DEDUPE across
+generators; (3) balance difficulty, log drops; (4) optional entropy-style filter by what the model
+already solves. Then retrain reasoning-dense multi-step + re-measure with sft_memtest.py,
+eval_mixed.py, and a live agent run.
