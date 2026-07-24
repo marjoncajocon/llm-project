@@ -92,6 +92,12 @@ void gpt_forward_multimodal(GPT *m, const Tensor *img_emb, const int *token_ids,
 void gpt_backward(GPT *m, const int *token_ids, int seq_len,
                   GPTActs *a, Tensor *logits);
 
+// Same, but does NOT zero the parameter gradients first, so B micro-batches
+// accumulate into one effective batch of B. Call gpt_zero_grad once up front,
+// run B of these, then scale_grads(params, n, 1/B) before clipping and stepping.
+void gpt_backward_accum(GPT *m, const int *token_ids, int seq_len,
+                        GPTActs *a, Tensor *logits);
+
 // Backward for gpt_forward_multimodal. Expects logits->grad set. Accumulates
 // gradients into the model params and, for the image positions, writes the patch
 // embedding gradient into img_emb->grad (feed that to patch_embed_backward to

@@ -104,6 +104,14 @@ float clip_grad_norm(Tensor **params, int n_params, float max_norm) {
   return total;
 }
 
+void scale_grads(Tensor **params, int n_params, float s) {
+  for (int p = 0; p < n_params; p++) {
+    Tensor *t = params[p];
+    if (!t->grad) continue;
+    for (size_t i = 0; i < t->size; i++) t->grad[i] *= s;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Learning-rate schedules
 // ---------------------------------------------------------------------------

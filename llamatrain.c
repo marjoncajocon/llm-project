@@ -143,21 +143,20 @@ void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
 // Backward
 // ---------------------------------------------------------------------------
 
-void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
-                         LlamaActs *a, Tensor *logits,
-                         const LlamaLora *lo, LlamaLoraActs *la) {
+// zero_params = 0 leaves the parameter gradients alone so several micro-batches
+// accumulate into one effective batch (activation grads are still zeroed — those
+// belong to the current sequence).
+static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
+                                LlamaActs *a, Tensor *logits,
+                                const LlamaLora *lo, LlamaLoraActs *la,
+                                int zero_params) {
   const int dm = m->d_model;
 
-  llama_zero_grad(m);
-  llama_acts_zero_grad(a);
-  if (lo) {
-    for (int l = 0; l < lo->n_layers; l++) {
-      tensor_zero_grad(&lo->q[l].A); tensor_zero_grad(&lo->q[l].B);
-      tensor_zero_grad(&lo->k[l].A); tensor_zero_grad(&lo->k[l].B);
-      tensor_zero_grad(&lo->v[l].A); tensor_zero_grad(&lo->v[l].B);
-      tensor_zero_grad(&lo->o[l].A); tensor_zero_grad(&lo->o[l].B);
-    }
+  if (zero_params) {
+    llama_zero_grad(m);
+    if (lo) llama_lora_zero_grad(lo);
   }
+  llama_acts_zero_grad(a);
 
   // Under LoRA the base is frozen, so every base weight gradient is dead work:
   // take the input-gradient-only path for each big projection (roughly halves
@@ -219,9 +218,21 @@ void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
         m->wte.grad[ids[i] * dm + j] += a->emb.grad[i * dm + j];
 }
 
+void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
+                         LlamaActs *a, Tensor *logits,
+                         const LlamaLora *lo, LlamaLoraActs *la) {
+  llama_backward_impl(m, ids, seq_len, a, logits, lo, la, 1);
+}
+
+void llama_backward_accum(LlamaModel *m, const int *ids, int seq_len,
+                          LlamaActs *a, Tensor *logits,
+                          const LlamaLora *lo, LlamaLoraActs *la) {
+  llama_backward_impl(m, ids, seq_len, a, logits, lo, la, 0);
+}
+
 void llama_backward(LlamaModel *m, const int *ids, int seq_len,
                     LlamaActs *a, Tensor *logits) {
-  llama_backward_lora(m, ids, seq_len, a, logits, NULL, NULL);
+  llama_backward_impl(m, ids, seq_len, a, logits, NULL, NULL, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +363,15 @@ void llama_lora_merge(LlamaModel *m, LlamaLora *lo) {
     merge_one(&m->blocks[l].Wk, &lo->k[l]);
     merge_one(&m->blocks[l].Wv, &lo->v[l]);
     merge_one(&m->blocks[l].Wo, &lo->o[l]);
+  }
+}
+
+void llama_lora_zero_grad(const LlamaLora *lo) {
+  for (int l = 0; l < lo->n_layers; l++) {
+    tensor_zero_grad(&lo->q[l].A); tensor_zero_grad(&lo->q[l].B);
+    tensor_zero_grad(&lo->k[l].A); tensor_zero_grad(&lo->k[l].B);
+    tensor_zero_grad(&lo->v[l].A); tensor_zero_grad(&lo->v[l].B);
+    tensor_zero_grad(&lo->o[l].A); tensor_zero_grad(&lo->o[l].B);
   }
 }
 

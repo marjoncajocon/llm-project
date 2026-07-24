@@ -235,6 +235,9 @@ static void train_usage(void) {
     "  --weight-decay F  AdamW decoupled decay on weight matrices (biases/norms exempt)\n"
     "  --clip F          global grad-norm clip (1.0 is the usual choice)\n"
     "  --warmup N        linear LR warmup steps      --min-lr F  cosine floor LR\n"
+    "  --batch N         sequences per optimizer step (gradient accumulation;\n"
+    "                    default 1). Costs N forward+backward passes per step but\n"
+    "                    gives a far less noisy gradient.\n"
     "\n"
     "`llama-train` takes the SAME flags but trains the modern LLaMA-family\n"
     "architecture (RMSNorm+RoPE+GQA+SwiGLU) and writes an LLMA checkpoint that\n"
@@ -283,6 +286,7 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--clip") == 0)    { NEED_VAL(); cfg.grad_clip = (float)atof(argv[++i]); }
     else if (strcmp(f, "--warmup") == 0)  { NEED_VAL(); cfg.warmup = atoi(argv[++i]); }
     else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--batch") == 0)   { NEED_VAL(); cfg.batch = atoi(argv[++i]); }
     else if (strcmp(f, "--kv-heads") == 0 && llama) { NEED_VAL(); cfg.n_kv = atoi(argv[++i]); }
     else if (strcmp(f, "--rope-base") == 0 && llama) { NEED_VAL(); cfg.rope_base = (float)atof(argv[++i]); }
     else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }

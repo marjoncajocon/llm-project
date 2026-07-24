@@ -1616,6 +1616,101 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 25: gradient ACCUMULATION (--batch). The claim being tested is exact:
+  // accumulating two different sequences and scaling by 1/2 must equal the MEAN
+  // of their individually computed gradients. If that failed, --batch would
+  // silently train on something other than the batch gradient.
+  // --------------------------------------------------------------------------
+  {
+    const int vocab = 20, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 4;
+    printf("[25] Gradient accumulation (--batch): accum/B == mean of per-sample grads\n");
+    srand(41);
+    LlamaModel am = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 32,
+                                             10000.0f, 1e-5f);
+    llama_model_randomize(&am);
+    LlamaActs aa = llama_acts_create(&am, seq);
+    int ls2[2] = {seq, vocab};
+    Tensor alog = tensor_create(ls2, 2), aprob = tensor_create(ls2, 2);
+
+    int idsA[4] = {3, 1, 7, 2}, tgtA[4] = {1, 7, 2, 9};
+    int idsB[4] = {5, 8, 2, 6}, tgtB[4] = {8, 2, 6, 4};
+
+    Tensor **ap = (Tensor**)malloc((size_t)llama_param_count(&am) * sizeof(Tensor*));
+    int n_ap = llama_collect_params(&am, ap);
+    size_t tot = 0;
+    for (int p = 0; p < n_ap; p++) tot += ap[p]->size;
+    float *gA = (float*)malloc(tot * sizeof(float));
+    float *gB = (float*)malloc(tot * sizeof(float));
+
+    // Individual gradients.
+    llama_forward_train(&am, idsA, seq, &aa, &alog);
+    cross_entropy_forward(&alog, tgtA, &aprob);
+    tensor_zero_grad(&alog); cross_entropy_backward(&aprob, tgtA, &alog);
+    llama_backward(&am, idsA, seq, &aa, &alog);
+    size_t at2 = 0;
+    for (int p = 0; p < n_ap; p++) { memcpy(&gA[at2], ap[p]->grad, ap[p]->size * sizeof(float)); at2 += ap[p]->size; }
+
+    llama_forward_train(&am, idsB, seq, &aa, &alog);
+    cross_entropy_forward(&alog, tgtB, &aprob);
+    tensor_zero_grad(&alog); cross_entropy_backward(&aprob, tgtB, &alog);
+    llama_backward(&am, idsB, seq, &aa, &alog);
+    at2 = 0;
+    for (int p = 0; p < n_ap; p++) { memcpy(&gB[at2], ap[p]->grad, ap[p]->size * sizeof(float)); at2 += ap[p]->size; }
+
+    // Accumulated over both, then scaled by 1/2 — exactly what --batch 2 does.
+    llama_zero_grad(&am);
+    llama_forward_train(&am, idsA, seq, &aa, &alog);
+    cross_entropy_forward(&alog, tgtA, &aprob);
+    tensor_zero_grad(&alog); cross_entropy_backward(&aprob, tgtA, &alog);
+    llama_backward_accum(&am, idsA, seq, &aa, &alog, NULL, NULL);
+    llama_forward_train(&am, idsB, seq, &aa, &alog);
+    cross_entropy_forward(&alog, tgtB, &aprob);
+    tensor_zero_grad(&alog); cross_entropy_backward(&aprob, tgtB, &alog);
+    llama_backward_accum(&am, idsB, seq, &aa, &alog, NULL, NULL);
+    scale_grads(ap, n_ap, 0.5f);
+
+    float amax = 0.0f, gmax = 0.0f;
+    at2 = 0;
+    for (int p = 0; p < n_ap; p++) {
+      for (size_t k = 0; k < ap[p]->size; k++) {
+        float want = 0.5f * (gA[at2 + k] + gB[at2 + k]);
+        float d = fabsf(ap[p]->grad[k] - want);
+        if (d > amax) amax = d;
+        if (fabsf(want) > gmax) gmax = fabsf(want);
+      }
+      at2 += ap[p]->size;
+    }
+    int acc_ok = (amax / (gmax + 1e-9f) < 1e-5f);
+    printf("    accum(2)/2 vs mean of separate grads: max |diff| %.2e vs |grad| %.2e (rel %.2e) -> %s\n",
+           amax, gmax, amax / (gmax + 1e-9f), acc_ok ? "OK" : "FAIL");
+    all_ok &= acc_ok;
+
+    // A single accumulated micro-batch must equal the plain backward exactly.
+    llama_zero_grad(&am);
+    llama_forward_train(&am, idsA, seq, &aa, &alog);
+    cross_entropy_forward(&alog, tgtA, &aprob);
+    tensor_zero_grad(&alog); cross_entropy_backward(&aprob, tgtA, &alog);
+    llama_backward_accum(&am, idsA, seq, &aa, &alog, NULL, NULL);
+    float one_max = 0.0f;
+    at2 = 0;
+    for (int p = 0; p < n_ap; p++) {
+      for (size_t k = 0; k < ap[p]->size; k++) {
+        float d = fabsf(ap[p]->grad[k] - gA[at2 + k]);
+        if (d > one_max) one_max = d;
+      }
+      at2 += ap[p]->size;
+    }
+    int one_ok = (one_max == 0.0f);
+    printf("    batch=1 accumulate == plain backward: max |diff| %.2e -> %s\n\n",
+           one_max, one_ok ? "OK" : "FAIL");
+    all_ok &= one_ok;
+
+    free(gA); free(gB); free(ap);
+    tensor_free(&alog); tensor_free(&aprob);
+    llama_acts_free(&aa); llama_model_free(&am);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

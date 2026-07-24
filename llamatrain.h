@@ -128,4 +128,15 @@ void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
                          LlamaActs *a, Tensor *logits,
                          const LlamaLora *lo, LlamaLoraActs *la);
 
+// Same, but does NOT zero the parameter gradients first, so B micro-batches
+// accumulate into one effective batch of B. Zero once up front (llama_zero_grad,
+// plus llama_lora_zero_grad when adapters are in use), run B of these, then
+// scale_grads(params, n, 1/B) before clipping and stepping.
+void llama_backward_accum(LlamaModel *m, const int *ids, int seq_len,
+                          LlamaActs *a, Tensor *logits,
+                          const LlamaLora *lo, LlamaLoraActs *la);
+
+// Zero every adapter gradient (the LoRA counterpart of llama_zero_grad).
+void llama_lora_zero_grad(const LlamaLora *lo);
+
 #endif // LLAMATRAIN_H

@@ -1892,3 +1892,47 @@ All 8 cross targets -Wall clean, `Output validation: PASSED`, exit 0.
 **NEXT:** batching / grad-accumulation (still batch=1) would make longer fine-tunes meaningfully
 better; a bigger/real SFT dataset would move it from memorization toward generalization; CI still
 absent; lm_head dA still parallelizes over M (starves at small M).
+
+## 2026-07-24 (8) -- Gradient accumulation (--batch): training is no longer batch=1
+
+Seventh roadmap item. Every trainer here took ONE sequence per optimizer step, which makes the
+gradient very noisy -- and that interacts badly with the AdamW + clipping added earlier (a
+batch-of-1 grad norm is dominated by sampling noise, so the clip threshold means little).
+
+**Added:**
+  - `optim.{h,c}`: `scale_grads(params, n, s)` -- turns an accumulated SUM into the MEAN. Applied
+    BEFORE clipping, so the clip threshold means the same thing at any batch size.
+  - `model.{h,c}`: `gpt_backward_accum` and `llamatrain.{h,c}`: `llama_backward_accum`, plus
+    public `llama_lora_zero_grad`. Both are the existing backward with `zero_params = 0`, via a
+    shared `*_impl(..., int zero_params)`; activation grads are STILL zeroed every micro-step
+    (they belong to the current sequence) while parameter grads accumulate.
+  - `train.c`: all FOUR loops (GPT corpus, GPT SFT, LLaMA corpus, LLaMA SFT) now zero once, run B
+    micro-batches, scale by 1/B, then clip + step. New `--batch N` flag.
+
+**Verified -- new selftest part [25], against the exact definition:**
+  - accumulating two DIFFERENT sequences and scaling by 1/2 equals the MEAN of their individually
+    computed gradients: rel **7.64e-10**.
+  - `--batch 1` accumulate is **bit-identical** to the plain backward (**0.00e+00**), so the
+    default path cannot have regressed.
+  Every other gradient check reports its usual value; KV cache still 0.00e+00.
+
+**HONEST measurement (all runs process the SAME 400 sequences of `data/sft.txt`):**
+
+| run | optimizer steps | final loss |
+|---|---|---|
+| `--batch 1 --lr 1e-3`  | 400 | **0.0124** |
+| `--batch 8 --lr 1e-3`  |  50 | **1.87** (badly undertrained) |
+| `--batch 8 --lr 8e-3`  |  50 | **0.0265** |
+| `--batch 8 --lr 1e-3`, 400 steps (8x compute) | 400 | **0.0093** |
+
+So: **batching at fixed compute is a LOSS unless the learning rate is scaled with it** -- 1.87 vs
+0.0265 is purely the LR. With the LR scaled, batch=8 roughly matches batch=1 at equal compute
+while using an eighth of the optimizer steps. Spending the extra compute gives the best loss.
+A less noisy gradient buys stability and larger usable LRs, NOT a free win. README says so, with
+these numbers, so nobody turns on `--batch` expecting magic.
+
+All 8 cross targets -Wall clean, `Output validation: PASSED`, exit 0.
+
+**NEXT:** a real/bigger SFT dataset (12 examples means memorization, not generalization) is now the
+main thing holding the agent back; CI is still absent; lm_head`s dA still parallelizes over M and
+starves at small M.

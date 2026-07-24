@@ -319,8 +319,11 @@ void gpt_forward_multimodal(GPT *m, const Tensor *img_emb, const int *token_ids,
 
 // Backward through the output head + blocks down to a->emb.grad (the gradient of
 // the input embeddings). Shared by the text and multimodal backward paths.
-static void gpt_backward_to_emb(GPT *m, GPTActs *a, Tensor *logits) {
-  gpt_zero_grad(m);
+// zero_params = 0 keeps the parameter gradients, so several micro-batches
+// accumulate into one effective batch (activation grads always reset — they
+// belong to the sequence currently being differentiated).
+static void gpt_backward_to_emb_ex(GPT *m, GPTActs *a, Tensor *logits, int zero_params) {
+  if (zero_params) gpt_zero_grad(m);
   gpt_acts_zero_grad(a);
 
   // logits = ln_f_out @ lm_head
@@ -347,9 +350,19 @@ static void gpt_backward_to_emb(GPT *m, GPTActs *a, Tensor *logits) {
   }
 }
 
+static void gpt_backward_to_emb(GPT *m, GPTActs *a, Tensor *logits) {
+  gpt_backward_to_emb_ex(m, a, logits, 1);
+}
+
 void gpt_backward(GPT *m, const int *token_ids, int seq_len,
                   GPTActs *a, Tensor *logits) {
   gpt_backward_to_emb(m, a, logits);
+  embedding_backward(token_ids, seq_len, &a->emb, &m->wte, &m->wpe);
+}
+
+void gpt_backward_accum(GPT *m, const int *token_ids, int seq_len,
+                        GPTActs *a, Tensor *logits) {
+  gpt_backward_to_emb_ex(m, a, logits, 0);
   embedding_backward(token_ids, seq_len, &a->emb, &m->wte, &m->wpe);
 }
 

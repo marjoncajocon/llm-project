@@ -57,6 +57,12 @@ void adam_free(Adam *o);
 // bad batch cannot poison the weights.
 float clip_grad_norm(Tensor **params, int n_params, float max_norm);
 
+// Scale every parameter's gradient in place. Used after gradient ACCUMULATION:
+// running B micro-batches sums B gradients, so scaling by 1/B turns the sum into
+// the mean — the gradient of an actual batch of B. Do this BEFORE clipping, so
+// the clip threshold means the same thing whatever the batch size.
+void scale_grads(Tensor **params, int n_params, float s);
+
 // ---------------------------------------------------------------------------
 // Learning-rate schedules
 // ---------------------------------------------------------------------------

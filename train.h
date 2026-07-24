@@ -24,6 +24,8 @@ typedef struct {
   float grad_clip;         // global grad-norm clip (0 => off; 1.0 is the usual choice)
   int warmup;              // linear warmup steps (0 => none)
   float lr_min;            // cosine floor LR; < 0 => constant LR (no cosine decay)
+  int batch;               // gradient-accumulation micro-batches per optimizer
+                           // step (1 => the historical one-sequence-per-step)
   // --- LLaMA-family only (llama_train_run); ignored by the GPT trainer ---
   int n_kv;                // KV heads for GQA (0 => n_heads, i.e. plain multi-head)
   float rope_base;         // RoPE frequency base (10000 is standard)

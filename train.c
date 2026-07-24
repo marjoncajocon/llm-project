@@ -39,6 +39,7 @@ TrainConfig train_default_config(void) {
   c.grad_clip = 0.0f;
   c.warmup = 0;
   c.lr_min = -1.0f;
+  c.batch = 1;
   c.n_kv = 0;              // 0 => n_heads (plain multi-head, no GQA sharing)
   c.rope_base = 10000.0f;
   c.lora_r = 0;            // 0 => full fine-tune (no adapters)
@@ -96,8 +97,14 @@ static float sched_lr(const TrainConfig *cfg, int step) {
   return lr_cosine_warmup(cfg->lr, lo, step, cfg->warmup, cfg->steps);
 }
 
+// Micro-batches per optimizer step (>= 1).
+static int batch_of(const TrainConfig *cfg) {
+  return (cfg->batch > 1) ? cfg->batch : 1;
+}
+
 // One-line summary of whichever recipe options are enabled (empty when none are).
 static void print_recipe(const TrainConfig *cfg) {
+  if (cfg->batch > 1) printf("  batch: %d sequences per step (gradient accumulation)\n", cfg->batch);
   if (cfg->weight_decay > 0.0f) printf("  weight decay (AdamW, matrices only): %g\n", cfg->weight_decay);
   if (cfg->grad_clip > 0.0f)    printf("  grad-norm clip: %g\n", cfg->grad_clip);
   if (sched_on(cfg))
@@ -194,13 +201,20 @@ static int train_sft(char *text, const TrainConfig *cfg) {
 
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
+  const int B = batch_of(cfg);
   for (int s = 0; s < steps; s++) {
-    int e = rand() % nex;
-    gpt_forward_train(&model, seq[e], maxL, &acts, &logits);
-    float loss = cross_entropy_forward(&logits, tgt[e], &probs);   // averages over response tokens only
-    tensor_zero_grad(&logits);
-    cross_entropy_backward(&probs, tgt[e], &logits);
-    gpt_backward(&model, seq[e], maxL, &acts, &logits);
+    gpt_zero_grad(&model);
+    float loss = 0.0f;
+    for (int b = 0; b < B; b++) {
+      int e = rand() % nex;
+      gpt_forward_train(&model, seq[e], maxL, &acts, &logits);
+      loss += cross_entropy_forward(&logits, tgt[e], &probs);   // averages over response tokens only
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, tgt[e], &logits);
+      gpt_backward_accum(&model, seq[e], maxL, &acts, &logits);
+    }
+    loss /= (float)B;
+    if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
@@ -322,14 +336,21 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
   const int train_starts = n_train - ctx;    // >= 1 (guaranteed above)
+  const int B = batch_of(cfg);
   for (int s = 0; s < steps; s++) {
-    int start = rand() % train_starts;
-    for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
-    gpt_forward_train(&model, inp, ctx, &acts, &logits);
-    float loss = cross_entropy_forward(&logits, tgt, &probs);
-    tensor_zero_grad(&logits);
-    cross_entropy_backward(&probs, tgt, &logits);
-    gpt_backward(&model, inp, ctx, &acts, &logits);
+    gpt_zero_grad(&model);
+    float loss = 0.0f;
+    for (int b = 0; b < B; b++) {
+      int start = rand() % train_starts;
+      for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
+      gpt_forward_train(&model, inp, ctx, &acts, &logits);
+      loss += cross_entropy_forward(&logits, tgt, &probs);
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, tgt, &logits);
+      gpt_backward_accum(&model, inp, ctx, &acts, &logits);
+    }
+    loss /= (float)B;
+    if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
@@ -603,15 +624,23 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
 
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
+  const int B = batch_of(cfg);
   for (int s = 0; s < steps; s++) {
-    int e = rand() % nex;
-    llama_forward_train_lora(&model, seq[e], maxL, &acts, &logits,
-                             use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
-    float loss = cross_entropy_forward(&logits, tgt[e], &probs);
-    tensor_zero_grad(&logits);
-    cross_entropy_backward(&probs, tgt[e], &logits);
-    llama_backward_lora(&model, seq[e], maxL, &acts, &logits,
-                        use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+    llama_zero_grad(&model);
+    if (use_lora) llama_lora_zero_grad(&lora);
+    float loss = 0.0f;
+    for (int b = 0; b < B; b++) {
+      int e = rand() % nex;
+      llama_forward_train_lora(&model, seq[e], maxL, &acts, &logits,
+                               use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+      loss += cross_entropy_forward(&logits, tgt[e], &probs);
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, tgt[e], &logits);
+      llama_backward_accum(&model, seq[e], maxL, &acts, &logits,
+                           use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+    }
+    loss /= (float)B;
+    if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
@@ -755,16 +784,25 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
   const int train_starts = n_train - ctx;
+  const int B = batch_of(cfg);
   for (int s = 0; s < steps; s++) {
-    int start = rand() % train_starts;
-    for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
-    llama_forward_train_lora(&model, inp, ctx, &acts, &logits,
-                             use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
-    float loss = cross_entropy_forward(&logits, tgt, &probs);
-    tensor_zero_grad(&logits);
-    cross_entropy_backward(&probs, tgt, &logits);
-    llama_backward_lora(&model, inp, ctx, &acts, &logits,
-                        use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+    // Accumulate B micro-batches, then take ONE optimizer step on their mean.
+    llama_zero_grad(&model);
+    if (use_lora) llama_lora_zero_grad(&lora);
+    float loss = 0.0f;
+    for (int b = 0; b < B; b++) {
+      int start = rand() % train_starts;
+      for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
+      llama_forward_train_lora(&model, inp, ctx, &acts, &logits,
+                               use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+      loss += cross_entropy_forward(&logits, tgt, &probs);
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, tgt, &logits);
+      llama_backward_accum(&model, inp, ctx, &acts, &logits,
+                           use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+    }
+    loss /= (float)B;
+    if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);

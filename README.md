@@ -252,6 +252,22 @@ transformer train data/wiki --d-model 256 --layers 6 --heads 8 --ctx 128 --steps
 | `--checkpoint-every N` | save every N steps | | `--resume F` | continue a saved model |
 | `--weight-decay F` | AdamW decay (0 = off) | | `--clip F` | grad-norm clip (0 = off) |
 | `--warmup N` | LR warmup steps (0 = off) | | `--min-lr F` | cosine floor LR (<0 = constant) |
+| `--batch N` | sequences per step (1) | | | |
+
+**Batching (`--batch`).** Training is one sequence per optimizer step by default. `--batch N`
+accumulates N forward+backward passes, scales the summed gradient by 1/N, and then takes a single
+step — the gradient of a real batch of N, at N× the cost per step. Verified against its exact
+definition in the smoke test (part `[25]`): accumulating two sequences and halving equals the mean
+of their separately computed gradients (rel 7.6e-10), and `--batch 1` is **bit-identical** to the
+old path.
+
+> **Scale the learning rate with the batch, or it will look like a regression.** Measured on
+> `data/sft.txt`, all runs processing the same 400 sequences: `--batch 1 --lr 1e-3` → loss
+> **0.0124**; `--batch 8 --lr 1e-3` (only 50 steps) → **1.87**, badly undertrained purely from
+> having 8× fewer updates; `--batch 8 --lr 8e-3` → **0.0265**, back in line while taking an eighth
+> of the optimizer steps. Spending the extra compute — `--batch 8` for the full 400 steps — gives
+> the best result, **0.0093**. A less noisy gradient buys stability and larger usable learning
+> rates, not a free win at fixed compute.
 
 **Training recipe options.** `--weight-decay` switches Adam to **AdamW** (decoupled decay, applied
 to weight matrices only — biases and norm gains are exempt, since decaying a norm gain fights the
