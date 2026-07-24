@@ -234,10 +234,18 @@ static void train_usage(void) {
     "  Training recipe (all OFF by default, so existing runs reproduce exactly):\n"
     "  --weight-decay F  AdamW decoupled decay on weight matrices (biases/norms exempt)\n"
     "  --clip F          global grad-norm clip (1.0 is the usual choice)\n"
-    "  --warmup N        linear LR warmup steps      --min-lr F  cosine floor LR\n");
+    "  --warmup N        linear LR warmup steps      --min-lr F  cosine floor LR\n"
+    "\n"
+    "`llama-train` takes the SAME flags but trains the modern LLaMA-family\n"
+    "architecture (RMSNorm+RoPE+GQA+SwiGLU) and writes an LLMA checkpoint that\n"
+    "`transformer llama` generates from. Two extra flags:\n"
+    "  --kv-heads N      GQA key/value heads (default = --heads, i.e. plain MHA)\n"
+    "  --rope-base F     RoPE frequency base (default 10000)\n");
 }
 
-static int run_train(int argc, char **argv) {
+// Shared by `train` (GPT) and `llama-train` (modern LLaMA-family) — the flags are
+// identical apart from the two GQA/RoPE ones, so only the driver at the end differs.
+static int run_train_arch(int argc, char **argv, int llama) {
   if (argc < 3 || strncmp(argv[2], "--", 2) == 0) { train_usage(); return 2; }
   const char *data = argv[2];
   TrainConfig cfg = train_default_config();
@@ -268,6 +276,8 @@ static int run_train(int argc, char **argv) {
     else if (strcmp(f, "--clip") == 0)    { NEED_VAL(); cfg.grad_clip = (float)atof(argv[++i]); }
     else if (strcmp(f, "--warmup") == 0)  { NEED_VAL(); cfg.warmup = atoi(argv[++i]); }
     else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--kv-heads") == 0 && llama) { NEED_VAL(); cfg.n_kv = atoi(argv[++i]); }
+    else if (strcmp(f, "--rope-base") == 0 && llama) { NEED_VAL(); cfg.rope_base = (float)atof(argv[++i]); }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }
@@ -278,8 +288,11 @@ static int run_train(int argc, char **argv) {
     cfg.out_tok = name_tok;
     printf("model dir: model/%s/\n", name);
   }
-  return train_run(data, &cfg);
+  return llama ? llama_train_run(data, &cfg) : train_run(data, &cfg);
 }
+
+static int run_train(int argc, char **argv) { return run_train_arch(argc, argv, 0); }
+static int run_llama_train(int argc, char **argv) { return run_train_arch(argc, argv, 1); }
 
 // ============================================================================
 // Media generation to a file: quantize the input to tokens, train a small GPT to
@@ -551,14 +564,59 @@ static void llama_print_gen(const int *seq, int n) {
   fflush(stdout);
 }
 
+// Text-in/text-out generation for an LLMA model paired with one of OUR tokenizers
+// (the pairing `llama-train` writes). Mirrors `generate model.bin tok.bin`:
+// encode the line, decode-step through it, sample, and stop on any id at or above
+// the tokenizer's vocab (the SFT EOS slot).
+static int llama_text_chat(LlamaModel *m, const char *tok_path, int n_new,
+                           float temperature, int top_k, float top_p, Rng *rng) {
+  Tokenizer tok;
+  if (tokenizer_load(&tok, tok_path) != 0) {
+    fprintf(stderr, "Error: cannot load tokenizer '%s'\n", tok_path);
+    return 1;
+  }
+  fprintf(stderr, "text mode: tokenizer '%s' (vocab %d)\n", tok_path, tok.vocab_size);
+  LlamaKV kv = llama_kv_create(m);
+  int lv[2] = {1, m->vocab};
+  Tensor logits = tensor_create(lv, 2);
+  int *seq = (int*)malloc((size_t)m->max_seq * sizeof(int));
+  char line[8192];
+  char *out = (char*)malloc((size_t)m->max_seq * 8 + 1);
+
+  while (fgets(line, sizeof(line), stdin)) {
+    size_t ll = strlen(line);
+    while (ll && (line[ll - 1] == '\n' || line[ll - 1] == '\r')) line[--ll] = '\0';
+    if (ll == 0) continue;
+    int n = tokenizer_encode(&tok, line, seq, m->max_seq);
+    if (n <= 0) continue;
+    kv.len = 0;
+    for (int i = 0; i < n; i++) llama_decode_step(m, &kv, seq[i], &logits);
+    int gen0 = n;
+    for (int s = 0; s < n_new && n < m->max_seq; s++) {
+      int nxt = sample_token(&logits, 0, temperature, top_k, top_p, rng);
+      if (nxt >= tok.vocab_size) break;         // EOS slot => stop cleanly
+      seq[n++] = nxt;
+      llama_decode_step(m, &kv, nxt, &logits);
+    }
+    tokenizer_decode(&tok, &seq[gen0], n - gen0, out, (size_t)m->max_seq * 8 + 1);
+    printf("%s\n", out);
+    fflush(stdout);
+  }
+
+  free(out); free(seq); tensor_free(&logits); llama_kv_free(&kv); tokenizer_free(&tok);
+  return 0;
+}
+
 static int run_llama(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: transformer llama <checkpoint.bin> [n_new=40]\n"
+    fprintf(stderr, "usage: transformer llama <checkpoint.bin> [n_new=40] [tok.bin]\n"
                     "  LLMA (f32) or LLMQ (int8, in-memory quantized) checkpoint;\n"
-                    "  reads space-separated token IDs per stdin line; prints 'gen: <ids>'\n");
+                    "  reads space-separated token IDs per stdin line; prints 'gen: <ids>'\n"
+                    "  Pass a tokenizer (as written by `llama-train`) for TEXT in / TEXT out.\n");
     return 2;
   }
   const int n_new = (argc > 3) ? atoi(argv[3]) : 40;
+  const char *tok_path = (argc > 4) ? argv[4] : NULL;
 
   // Peek the magic to pick the f32 (LLMA) vs int8 in-memory (LLMQ) path.
   FILE *pf = fopen(argv[2], "rb");
@@ -602,6 +660,11 @@ static int run_llama(int argc, char **argv) {
     if (llama_model_load(argv[2], &m) != 0) return 1;
     fprintf(stderr, "loaded LLMA (f32): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
             m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+    if (tok_path) {
+      int rc = llama_text_chat(&m, tok_path, n_new, temperature, top_k, top_p, &rng);
+      llama_model_free(&m);
+      return rc;
+    }
     LlamaKV kv = llama_kv_create(&m);
     int lv[2] = {1, m.vocab};
     Tensor logits = tensor_create(lv, 2);
@@ -840,6 +903,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "t2i") == 0) return run_t2i(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-data") == 0) return run_t2i_data(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-recon") == 0) return run_t2i_recon(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "llama-train") == 0) return run_llama_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-train") == 0) return run_t2i_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-gen") == 0) return run_t2i_gen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "vqvae") == 0) return run_vqvae(argc, argv);
@@ -849,7 +913,7 @@ int main(int argc, char **argv) {
   // silently run the demo) — print usage and fail instead.
   if (argc > 1) {
     fprintf(stderr, "unknown command '%s'\n", argv[1]);
-    fprintf(stderr, "usage: transformer [train|generate|agent|imggen|audgen|llama] ...\n");
+    fprintf(stderr, "usage: transformer [train|llama-train|generate|agent|imggen|audgen|llama] ...\n");
     fprintf(stderr, "       transformer            (no args: run the built-in self-test)\n");
     return 1;
   }

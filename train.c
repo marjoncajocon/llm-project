@@ -12,6 +12,8 @@
 #include "optim.h"
 #include "checkpoint.h"
 #include "corpus.h"
+#include "llama.h"
+#include "llamatrain.h"
 
 TrainConfig train_default_config(void) {
   TrainConfig c;
@@ -36,6 +38,8 @@ TrainConfig train_default_config(void) {
   c.grad_clip = 0.0f;
   c.warmup = 0;
   c.lr_min = -1.0f;
+  c.n_kv = 0;              // 0 => n_heads (plain multi-head, no GQA sharing)
+  c.rope_base = 10000.0f;
   return c;
 }
 
@@ -321,6 +325,295 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
   tensor_free(&logits); tensor_free(&probs);
   gpt_acts_free(&acts);
   gpt_free(&model);
+  tokenizer_free(&tok);
+  return rc;
+}
+
+// ===========================================================================
+// LLaMA-family training driver (modern architecture: RMSNorm + RoPE + GQA +
+// SwiGLU). Same corpus/val/checkpoint/resume/SFT/recipe behaviour as the GPT
+// path above; the model type and its forward/backward differ, which C can't
+// abstract over without void* (banned here), so the loop is written out.
+// ===========================================================================
+
+// Geometry shared by every entry point: head_dim = d_model / n_heads, and n_kv
+// defaults to n_heads (plain multi-head). Returns 0 if the config is invalid.
+static int llama_geometry(const TrainConfig *cfg, int *head_dim, int *n_kv, int *d_ff) {
+  if (cfg->n_heads <= 0 || cfg->d_model % cfg->n_heads != 0) {
+    fprintf(stderr, "error: d_model (%d) must be divisible by heads (%d)\n",
+            cfg->d_model, cfg->n_heads);
+    return 0;
+  }
+  *n_kv = (cfg->n_kv > 0) ? cfg->n_kv : cfg->n_heads;
+  if (*n_kv > cfg->n_heads || cfg->n_heads % *n_kv != 0) {
+    fprintf(stderr, "error: heads (%d) must be a multiple of kv heads (%d)\n",
+            cfg->n_heads, *n_kv);
+    return 0;
+  }
+  *head_dim = cfg->d_model / cfg->n_heads;
+  if (*head_dim % 2 != 0) {
+    fprintf(stderr, "error: head_dim (%d) must be even (RoPE rotates feature pairs)\n", *head_dim);
+    return 0;
+  }
+  *d_ff = (cfg->d_ff > 0) ? cfg->d_ff : 4 * cfg->d_model;
+  return 1;
+}
+
+// Forward-only mean loss over `nwin` random windows starting in [lo, hi-ctx).
+static float llama_eval_split(LlamaModel *m, const int *toks, int lo, int hi, int ctx,
+                              LlamaActs *acts, Tensor *logits, Tensor *probs,
+                              int *inp, int *tgt, int nwin) {
+  int count = hi - ctx - lo;
+  if (count < 1) return -1.0f;
+  float sum = 0.0f;
+  for (int w = 0; w < nwin; w++) {
+    int start = lo + (rand() % count);
+    for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
+    llama_forward_train(m, inp, ctx, acts, logits);
+    sum += cross_entropy_forward(logits, tgt, probs);
+  }
+  return sum / nwin;
+}
+
+// Masked instruction tuning for the LLaMA path — same "prompt<TAB>response"
+// format, EOS slot and -1 masking as train_sft() above.
+static int llama_train_sft(char *text, const TrainConfig *cfg) {
+  int head_dim, n_kv, d_ff;
+  if (!llama_geometry(cfg, &head_dim, &n_kv, &d_ff)) return 1;
+  srand(cfg->seed);
+
+  Tokenizer tok = tokenizer_create_bytelevel();
+  tokenizer_train(&tok, text, cfg->num_merges);
+
+  int maxex = 1;
+  for (char *p = text; *p; p++) if (*p == '\n') maxex++;
+  int **P = (int**)malloc(maxex * sizeof(int*)), *PL = (int*)malloc(maxex * sizeof(int));
+  int **R = (int**)malloc(maxex * sizeof(int*)), *RL = (int*)malloc(maxex * sizeof(int));
+  int nex = 0, maxL = 0;
+
+  char *line = strtok(text, "\n");
+  while (line) {
+    char *tab = strchr(line, '\t');
+    if (tab) {
+      *tab = '\0';
+      char *prompt = line, *resp = tab + 1;
+      size_t rl = strlen(resp);
+      if (rl && resp[rl - 1] == '\r') resp[rl - 1] = '\0';
+      if (prompt[0] && resp[0]) {
+        int t[4096], r[4096];
+        int T = tokenizer_encode(&tok, prompt, t, 4096);
+        int Rn = tokenizer_encode(&tok, resp, r, 4096);
+        if (T >= 1 && Rn >= 1 && T + Rn <= 4096) {
+          P[nex] = (int*)malloc(T * sizeof(int));  memcpy(P[nex], t, T * sizeof(int)); PL[nex] = T;
+          R[nex] = (int*)malloc(Rn * sizeof(int)); memcpy(R[nex], r, Rn * sizeof(int)); RL[nex] = Rn;
+          if (T + Rn + 1 > maxL) maxL = T + Rn + 1;
+          nex++;
+        }
+      }
+    }
+    line = strtok(NULL, "\n");
+  }
+
+  if (nex == 0) {
+    fprintf(stderr, "error: SFT file has no 'prompt<TAB>response' lines\n");
+    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok); return 1;
+  }
+
+  const int EOS = tok.vocab_size;
+  int **seq = (int**)malloc(nex * sizeof(int*));
+  int **tgt = (int**)malloc(nex * sizeof(int*));
+  for (int e = 0; e < nex; e++) {
+    seq[e] = (int*)malloc(maxL * sizeof(int));
+    tgt[e] = (int*)malloc(maxL * sizeof(int));
+    int T = PL[e], Rn = RL[e];
+    for (int j = 0; j < T; j++) seq[e][j] = P[e][j];
+    for (int j = 0; j < Rn; j++) seq[e][T + j] = R[e][j];
+    seq[e][T + Rn] = EOS;
+    for (int j = T + Rn + 1; j < maxL; j++) seq[e][j] = 0;
+    for (int j = 0; j < maxL; j++) tgt[e][j] = -1;
+    for (int j = T - 1; j <= T + Rn - 1; j++) tgt[e][j] = seq[e][j + 1];
+  }
+
+  LlamaModel model = llama_model_create_train(tok.vocab_size + 1, cfg->d_model, cfg->n_layers,
+                                              cfg->n_heads, n_kv, head_dim, d_ff, maxL,
+                                              cfg->rope_base, 1e-5f);
+  llama_model_randomize(&model);
+  printf("LLaMA SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
+         nex, tok.vocab_size, maxL, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, cfg->lr);
+
+  LlamaActs acts = llama_acts_create(&model, maxL);
+  int lshape[2] = {maxL, model.vocab};
+  Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
+  Tensor **params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
+  int n_params = llama_collect_params(&model, params);
+  Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  print_recipe(cfg);
+
+  const int steps = cfg->steps;
+  const int report = steps < 10 ? 1 : steps / 10;
+  for (int s = 0; s < steps; s++) {
+    int e = rand() % nex;
+    llama_forward_train(&model, seq[e], maxL, &acts, &logits);
+    float loss = cross_entropy_forward(&logits, tgt[e], &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, tgt[e], &logits);
+    llama_backward(&model, seq[e], maxL, &acts, &logits);
+    if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
+    adam_set_lr(&opt, sched_lr(cfg, s));
+    adam_step(&opt, params, n_params);
+    if (s % report == 0 || s == steps - 1)
+      printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+  }
+
+  int rc = 0;
+  if (llama_model_save(cfg->out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
+  if (tokenizer_save(&tok, cfg->out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
+  if (rc == 0) printf("saved LLMA SFT model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
+
+  for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); free(seq[e]); free(tgt[e]); }
+  free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
+  free(params);
+  adam_free(&opt); tensor_free(&logits); tensor_free(&probs);
+  llama_acts_free(&acts); llama_model_free(&model); tokenizer_free(&tok);
+  return rc;
+}
+
+int llama_train_run(const char *data_path, const TrainConfig *cfg) {
+  const int resuming = (cfg->resume != NULL);
+  int head_dim = 0, n_kv = 0, d_ff = 0;
+  if (!resuming && !llama_geometry(cfg, &head_dim, &n_kv, &d_ff)) return 1;
+
+  long text_len = 0;
+  char *text = corpus_read(data_path, &text_len);
+  if (!text) { fprintf(stderr, "error: cannot read '%s'\n", data_path); return 1; }
+  if (text_len < 8) { fprintf(stderr, "error: '%s' is too small\n", data_path); free(text); return 1; }
+
+  if (cfg->sft) {
+    int rc = llama_train_sft(text, cfg);
+    free(text);
+    return rc;
+  }
+
+  srand(cfg->seed);
+
+  // 1. Tokenizer + model: resume an LLMA checkpoint, or build fresh.
+  Tokenizer tok;
+  LlamaModel model;
+  if (resuming) {
+    if (llama_model_load(cfg->resume, &model) != 0) {
+      fprintf(stderr, "error: cannot load model '%s'\n", cfg->resume); free(text); return 1;
+    }
+    if (tokenizer_load(&tok, cfg->out_tok) != 0) {
+      fprintf(stderr, "error: cannot load tokenizer '%s' (needed to resume)\n", cfg->out_tok);
+      llama_model_free(&model); free(text); return 1;
+    }
+    if (tok.vocab_size != model.vocab) {
+      fprintf(stderr, "error: tokenizer vocab %d != model vocab %d\n", tok.vocab_size, model.vocab);
+      tokenizer_free(&tok); llama_model_free(&model); free(text); return 1;
+    }
+    // A checkpoint loaded for INFERENCE has no gradient arrays, so it cannot be
+    // trained: rebuild a trainable model and copy the weights across.
+    LlamaModel t = llama_model_create_train(model.vocab, model.d_model, model.n_layers,
+                                            model.n_heads, model.n_kv, model.head_dim,
+                                            model.d_ff, model.max_seq, model.rope_base, model.eps);
+    Tensor **src = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
+    Tensor **dst = (Tensor**)malloc((size_t)llama_param_count(&t) * sizeof(Tensor*));
+    int ns = llama_collect_params(&model, src), nd = llama_collect_params(&t, dst);
+    for (int i = 0; i < ns && i < nd; i++)
+      memcpy(dst[i]->data, src[i]->data, src[i]->size * sizeof(float));
+    free(src); free(dst);
+    llama_model_free(&model);
+    model = t;
+    printf("resumed LLMA model %s (vocab %d, d_model %d, layers %d, heads %d, kv %d)\n",
+           cfg->resume, model.vocab, model.d_model, model.n_layers, model.n_heads, model.n_kv);
+  } else {
+    tok = tokenizer_create_bytelevel();
+    tokenizer_train(&tok, text, cfg->num_merges);
+    model = llama_model_create_train(tok.vocab_size, cfg->d_model, cfg->n_layers,
+                                     cfg->n_heads, n_kv, head_dim, d_ff, cfg->ctx,
+                                     cfg->rope_base, 1e-5f);
+    llama_model_randomize(&model);
+    printf("LLaMA model: d_model=%d heads=%d kv=%d head_dim=%d layers=%d d_ff=%d ctx=%d rope_base=%g lr=%g\n",
+           cfg->d_model, cfg->n_heads, n_kv, head_dim, cfg->n_layers, d_ff, cfg->ctx,
+           cfg->rope_base, cfg->lr);
+  }
+
+  // 2. Encode the corpus.
+  int *toks = (int*)malloc((text_len + 1) * sizeof(int));
+  int n_toks = tokenizer_encode(&tok, text, toks, (int)text_len);
+  free(text);
+
+  int ctx = model.max_seq;
+  if (n_toks - 1 < ctx) ctx = n_toks - 1;
+  if (ctx < 2) {
+    fprintf(stderr, "error: corpus too short to train\n");
+    free(toks); tokenizer_free(&tok); llama_model_free(&model); return 1;
+  }
+
+  // 3. Train / validation split (val is the tail of the token stream).
+  int n_val = (int)(n_toks * cfg->val_frac);
+  int n_train = n_toks - n_val;
+  int has_val = (n_val > ctx + 1) && (n_train > ctx + 1);
+  if (!has_val) { n_train = n_toks; n_val = 0; }
+  printf("corpus: %ld bytes -> %d tokens | vocab %d | train %d / val %d | ctx %d\n",
+         text_len, n_toks, tok.vocab_size, n_train, n_val, ctx);
+
+  LlamaActs acts = llama_acts_create(&model, ctx);
+  int lshape[2] = {ctx, model.vocab};
+  Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
+  Tensor **params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
+  int n_params = llama_collect_params(&model, params);
+  Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  print_recipe(cfg);
+
+  int *inp = (int*)malloc(ctx * sizeof(int));
+  int *tgt = (int*)malloc(ctx * sizeof(int));
+
+  // 4. Training loop over random windows from the TRAIN region.
+  const int steps = cfg->steps;
+  const int report = steps < 10 ? 1 : steps / 10;
+  const int train_starts = n_train - ctx;
+  for (int s = 0; s < steps; s++) {
+    int start = rand() % train_starts;
+    for (int j = 0; j < ctx; j++) { inp[j] = toks[start + j]; tgt[j] = toks[start + j + 1]; }
+    llama_forward_train(&model, inp, ctx, &acts, &logits);
+    float loss = cross_entropy_forward(&logits, tgt, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, tgt, &logits);
+    llama_backward(&model, inp, ctx, &acts, &logits);
+    if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
+    adam_set_lr(&opt, sched_lr(cfg, s));
+    adam_step(&opt, params, n_params);
+
+    if (s % report == 0 || s == steps - 1) {
+      if (has_val) {
+        float vl = llama_eval_split(&model, toks, n_train, n_toks, ctx, &acts, &logits, &probs, inp, tgt, 8);
+        printf("  step %5d/%d  train %.4f  val %.4f\n", s, steps, loss, vl);
+      } else {
+        printf("  step %5d/%d  train %.4f  val n/a\n", s, steps, loss);
+      }
+    }
+
+    if (cfg->checkpoint_every > 0 && s > 0 && s % cfg->checkpoint_every == 0) {
+      int cok = (llama_model_save(cfg->out_model, &model) == 0);
+      cok = (tokenizer_save(&tok, cfg->out_tok) == 0) && cok;
+      if (cok) printf("  [checkpoint] saved at step %d -> %s\n", s, cfg->out_model);
+      else fprintf(stderr, "  [checkpoint] FAILED at step %d (previous checkpoint kept)\n", s);
+    }
+  }
+
+  // 5. Final save (LLMA — `transformer llama <out>` can generate from it).
+  int rc = 0;
+  if (llama_model_save(cfg->out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
+  if (tokenizer_save(&tok, cfg->out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
+  if (rc == 0) printf("saved LLMA model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
+
+  free(inp); free(tgt); free(toks);
+  free(params);
+  adam_free(&opt);
+  tensor_free(&logits); tensor_free(&probs);
+  llama_acts_free(&acts);
+  llama_model_free(&model);
   tokenizer_free(&tok);
   return rc;
 }

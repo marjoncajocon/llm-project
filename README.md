@@ -309,6 +309,41 @@ compatible).
 technique work end-to-end on real data via the CLI; generalizing to unseen instructions needs far
 more data + a bigger model.
 
+### `transformer llama-train <path> [flags]` — train the **modern** architecture
+
+Identical flags to `train`, but trains the LLaMA-family architecture (RMSNorm + RoPE + GQA +
+SwiGLU, via `llamatrain.c`) and writes an **LLMA** checkpoint that `transformer llama` generates
+from. Two extra flags: `--kv-heads N` (GQA key/value heads; default = `--heads`, i.e. plain
+multi-head) and `--rope-base F` (default 10000). `head_dim` is `d_model / heads` and must be even,
+since RoPE rotates feature pairs.
+
+```sh
+# Train a small modern model with GQA (4 query heads sharing 2 KV heads):
+transformer llama-train data/sample.txt --steps 600 --d-model 64 --layers 2 \
+  --heads 4 --kv-heads 2 --ctx 32 --merges 60 --lr 1e-3 \
+  --clip 1.0 --warmup 50 --min-lr 1e-4 --weight-decay 0.01 --out lm.bin --tok lm.tok
+
+# Generate from it — TEXT in / TEXT out (pass the tokenizer as the 3rd argument):
+echo "the" | transformer llama lm.bin 30 lm.tok
+# -> the cat likes the mat. the dog likes the log. the quick cat sat. ...
+```
+
+It supports everything the GPT trainer does: train/val split, `--checkpoint-every`, `--resume`
+(rebuilds a trainable model from the inference checkpoint and copies the weights across), the
+recipe flags, and **`--sft`** masked instruction tuning:
+
+```sh
+transformer llama-train data/sft.txt --sft --steps 400 --d-model 64 --layers 2 \
+  --heads 4 --merges 48 --lr 1e-3 --clip 1.0 --out ls.bin --tok ls.tok
+echo "read notes.txt"       | transformer llama ls.bin 40 ls.tok
+#   -> <tool name="read_file" path="notes.txt"></tool>
+echo "the task is finished" | transformer llama ls.bin 40 ls.tok
+#   -> <done>Task complete.</done>
+```
+
+Verified: both routed to the exact tool call and stopped cleanly at EOS. (At this size the model
+memorizes the pairs — the point is the modern-architecture SFT pipeline running end to end.)
+
 ### `transformer generate [model.bin] [tok.bin]`
 
 A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`),

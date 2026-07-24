@@ -24,6 +24,9 @@ typedef struct {
   float grad_clip;         // global grad-norm clip (0 => off; 1.0 is the usual choice)
   int warmup;              // linear warmup steps (0 => none)
   float lr_min;            // cosine floor LR; < 0 => constant LR (no cosine decay)
+  // --- LLaMA-family only (llama_train_run); ignored by the GPT trainer ---
+  int n_kv;                // KV heads for GQA (0 => n_heads, i.e. plain multi-head)
+  float rope_base;         // RoPE frequency base (10000 is standard)
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).
@@ -33,5 +36,13 @@ TrainConfig train_default_config(void);
 // the model to cfg->out_model and tokenizer to cfg->out_tok.
 // Returns 0 on success, nonzero on error.
 int train_run(const char *data_path, const TrainConfig *cfg);
+
+// Same, but trains the MODERN (LLaMA-family) architecture — RMSNorm + RoPE + GQA
+// + SwiGLU, via llamatrain.h — and writes an 'LLMA' checkpoint that
+// `transformer llama` can generate from. Honours the same corpus/val-split,
+// checkpointing, resume, SFT and recipe options, plus cfg->n_kv and
+// cfg->rope_base. head_dim is d_model / n_heads.
+// Returns 0 on success, nonzero on error.
+int llama_train_run(const char *data_path, const TrainConfig *cfg);
 
 #endif // TRAIN_H

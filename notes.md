@@ -1697,3 +1697,45 @@ buy stability on long/fine-tuning runs, not speed on toy memorization. README sa
 **NEXT:** LoRA adapters (freeze base, train rank-r A/B on attention/FFN projections; base can stay
 int8 via `quant.c`) on top of `llamatrain.c` -- then SFT a real SmolLM2-135M so the agent runs on
 our own engine. Then SIMD `matmul`.
+
+## 2026-07-24 (4) -- `llama-train`: the modern architecture is now trainable FROM THE CLI
+
+Third roadmap item. `llamatrain.c` (built earlier today) was **library-only** -- the `llama`
+subcommand is generation-only and `train.c` trains the GPT architecture exclusively, so there was
+no way to reach the new training path from the command line. That gap blocked LoRA and the
+fine-tuned-agent goal. Closed now.
+
+**Added:**
+  - `train.{h,c}`: **`llama_train_run()`** -- the LLaMA-family training driver. Same behaviour as
+    the GPT one: corpus (file or dir), train/val split, `--checkpoint-every`, `--resume`, `--sft`
+    masked instruction tuning, and all the recipe options. Plus `llama_train_sft()`,
+    `llama_eval_split()`, and `llama_geometry()` (validates d_model % heads, heads % kv_heads, and
+    that head_dim is EVEN -- RoPE rotates feature pairs). New TrainConfig fields `n_kv`,
+    `rope_base`. The GPT and LLaMA loops are written out separately: the model types and their
+    forward/backward differ and C cannot abstract over that without `void *` (banned by the rules).
+  - `main.c`: **`llama-train` subcommand**, sharing the whole flag parser with `train` via
+    `run_train_arch(argc, argv, int llama)`; two extra flags `--kv-heads` / `--rope-base`.
+  - `main.c`: **text-in/text-out for `llama`** -- `transformer llama <ckpt> [n_new] [tok.bin]`.
+    Without a tokenizer it stays token-IDs-only (unchanged); with one it encodes stdin, generates,
+    decodes, and stops on any id >= tokenizer vocab (the SFT EOS slot). Without this a locally
+    trained model could only be driven by raw token IDs.
+  - **Resume subtlety:** `llama_model_load` builds an INFERENCE model (grad == NULL), which cannot
+    be trained. Resume therefore rebuilds a trainable model with the loaded config and memcpy's
+    every weight across, via `llama_collect_params` on both.
+
+**Verified end to end (real CLI runs, not just unit tests):**
+  - Corpus training, GQA 4 query heads / 2 KV heads: loss **5.7589 -> 0.0125** (600 steps).
+  - Text generation from the saved LLMA checkpoint reproduces the corpus style coherently
+    ("the cat likes the mat. the dog likes the log. the quick cat sat...").
+  - **Resume** picks up at loss 0.0324 -- NOT back near 5.7 -- proving the weight copy works.
+  - **`--sft`**: loss 5.6875 -> 0.0125, and the trained model answers
+    "read notes.txt" -> `<tool name="read_file" path="notes.txt"></tool>` and
+    "the task is finished" -> `<done>Task complete.</done>`, stopping cleanly at EOS. That is the
+    modern-architecture SFT pipeline working end to end -- the direct precursor to the agent goal.
+  - `Output validation: PASSED`, exit 0; all 8 cross targets `-Wall` clean.
+
+Note: at this scale the models MEMORIZE; the deliverable is the pipeline, not the quality.
+The CLI paths are verified manually (selftest.c has no CLI harness) -- worth automating if CI lands.
+
+**NEXT:** LoRA adapters on top of this (freeze base, rank-r A/B on the attn/FFN projections; base
+can stay int8 via `quant.c`), then SIMD `matmul`, then batching/grad-accumulation (still batch=1).
