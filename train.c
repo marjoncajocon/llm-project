@@ -34,9 +34,15 @@ TrainConfig train_default_config(void) {
   c.val_frac = 0.1f;
   c.sft = 0;
   // Recipe options default to OFF so existing runs reproduce bit-for-bit; opt in
-  // with --weight-decay / --clip / --warmup / --min-lr.
+  // with --weight-decay / --warmup / --min-lr.
   c.weight_decay = 0.0f;
-  c.grad_clip = 0.0f;
+  // grad_clip defaults ON at 1.0: an unclipped run can silently DIVERGE on harder
+  // data (an unclipped gradient spike blew up a real LoRA-SFT run at step ~210 ->
+  // loss 7.7 -> garbage; clip 1.0 fixed it). 1.0 is the standard choice and a no-op
+  // when the grad norm is already <= 1. Pass `--clip 0` to restore the old unclipped
+  // behavior (e.g. to reproduce the pre-2026-07-24 batch/lr perf tables, which were
+  // measured unclipped).
+  c.grad_clip = 1.0f;
   c.warmup = 0;
   c.lr_min = -1.0f;
   c.batch = 1;
