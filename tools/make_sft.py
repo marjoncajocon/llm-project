@@ -25,6 +25,19 @@ def slug(title):
     return s[:24] or "notes"
 
 
+def commands_from_file(path, limit=500):
+    """Real shell commands, one per line (tools/crawl_stackoverflow.py --commands)."""
+    cmds = []
+    if path and os.path.isfile(path):
+        for line in open(path, encoding="utf-8"):
+            c = line.strip()
+            if c and 3 <= len(c) <= 60:
+                cmds.append(c)
+            if len(cmds) >= limit:
+                break
+    return cmds
+
+
 def filenames_from_wiki(wiki_dir, limit=400):
     names = []
     if wiki_dir and os.path.isdir(wiki_dir):
@@ -69,6 +82,9 @@ DONES = [
     ("you can finish", "Task complete."),
 ]
 
+# Instruction phrasings for a literal command the model must copy verbatim.
+RUN_TMPL = ["run {c}", "run the command {c}", "execute {c}", "please run {c}",
+            "run `{c}`", "can you run {c}"]
 READ_TMPL = ["read {f}", "read the file {f}", "open {f}", "show me {f}",
              "display the contents of {f}", "cat {f}", "what's in {f}", "print {f}"]
 WRITE_TMPL = ["write {w} to {f}", "save the word {w} to {f}",
@@ -81,30 +97,36 @@ def esc(s):
     return s  # responses contain no tabs/newlines; loader splits on the first tab
 
 
-def gen(n, files, rng):
+def gen(n, files, rng, run_cmds):
     out = []
     while len(out) < n:
         kind = rng.random()
-        if kind < 0.30:                                   # read_file
+        if kind < 0.28:                                   # read_file
             f = rng.choice(files) + rng.choice(EXTS)
             p = rng.choice(READ_TMPL).format(f=f)
             r = '<tool name="read_file" path="%s"></tool>' % f
-        elif kind < 0.58:                                 # write_file
+        elif kind < 0.52:                                 # write_file
             f = rng.choice(files) + rng.choice(EXTS)
             w = rng.choice(WORDS)
             p = rng.choice(WRITE_TMPL).format(f=f, w=w)
             r = '<tool name="write_file" path="%s">%s</tool>' % (f, w)
-        elif kind < 0.72:                                 # run_command: delete
+        elif kind < 0.64:                                 # run_command: delete
             f = rng.choice(files) + rng.choice(EXTS)
             p = rng.choice(DELETE_TMPL).format(f=f)
             r = '<tool name="run_command" command="rm %s"></tool>' % f
-        elif kind < 0.90:                                 # run_command: fixed
+        elif kind < 0.80 and run_cmds:                    # run_command: real (mined)
+            c = rng.choice(run_cmds)
+            p = rng.choice(RUN_TMPL).format(c=c)
+            r = '<tool name="run_command" command="%s"></tool>' % c
+        elif kind < 0.90:                                 # run_command: fixed intent
             p, cmd = rng.choice(COMMANDS)
             r = '<tool name="run_command" command="%s"></tool>' % cmd
         else:                                             # done
             p, msg = rng.choice(DONES)
             r = '<done>%s</done>' % msg
-        out.append((p, r))
+        # A command in the prompt may contain a backtick from RUN_TMPL; the loader
+        # splits on the first TAB only, so tabs are the sole thing to avoid.
+        out.append((p.replace("\t", " "), r))
     return out
 
 
@@ -113,6 +135,8 @@ def main():
     ap.add_argument("--out", default="data/sft_big.txt")
     ap.add_argument("--n", type=int, default=800)
     ap.add_argument("--wiki", default=None, help="dir of crawled *.txt for filenames")
+    ap.add_argument("--commands", default=None,
+                    help="file of real shell commands (crawl_stackoverflow.py --commands)")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 
@@ -120,13 +144,15 @@ def main():
     files = filenames_from_wiki(args.wiki)
     files = list(dict.fromkeys(files + BUILTIN_FILES))    # dedupe, keep order
     rng.shuffle(files)
-    rows = gen(args.n, files, rng)
+    run_cmds = commands_from_file(args.commands)
+    rows = gen(args.n, files, rng, run_cmds)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8", newline="\n") as f:
         for p, r in rows:
             f.write("%s\t%s\n" % (p, r))
-    print("wrote %d examples -> %s (%d distinct filenames)" % (len(rows), args.out, len(files)))
+    print("wrote %d examples -> %s (%d filenames, %d real commands)"
+          % (len(rows), args.out, len(files), len(run_cmds)))
 
 
 main()

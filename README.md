@@ -91,7 +91,7 @@ defined in the matching `.c`.
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
-| `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py`, `agent_local.py`, `upgrade_llma.py` |
+| `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py`, `crawl_stackoverflow.py`, `make_sft.py`, `agent_local.py`, `upgrade_llma.py` |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -501,9 +501,16 @@ routes to its exact tool call and stops cleanly at EOS:
 
 **Bigger data → generalization, not memorization.** Twelve hand-written examples make the model
 *memorize* pairs. `tools/make_sft.py` templates many phrasings of each intent over a pool of
-filenames (drawn from crawled Wikipedia titles via `tools/crawl_wikipedia.py`, or a built-in list),
-so the same intent recurs with different words and arguments and the model must learn the
-*mapping*. `data/sft_agent.txt` is a committed 200-example sample.
+filenames (drawn from crawled Wikipedia titles via `tools/crawl_wikipedia.py`, or a built-in list)
+**and real shell commands** (mined from Stack Overflow answers via `tools/crawl_stackoverflow.py`,
+`data/so_commands.txt`), so the same intent recurs with different words and arguments and the model
+must learn the *mapping*. `data/sft_agent.txt` is a committed 250-example sample.
+
+```sh
+# mine real git/npm/docker/... commands from Stack Overflow answers (public API, gzip + backoff)
+python tools/crawl_stackoverflow.py git bash docker npm python --pages 1 --commands data/so_commands.txt
+python tools/make_sft.py --out data/sft_big.txt --n 800 --wiki data/wiki --commands data/so_commands.txt
+```
 
 ```sh
 python tools/make_sft.py --out data/sft_big.txt --n 600 --wiki data/wiki
@@ -519,9 +526,13 @@ filenames (`quantum_widget.md`, `snarfblat.json`, `xyzzy.txt` — absent from tr
 | --- | --- | --- |
 | 12 hand-written examples | memorizes | **62%** — right tool, wrong argument (`blat.json` for `snarfblat.json`) |
 | 600 templated examples | **100%** on 60 held-out | **100%** — copies arbitrary filenames + content |
+| 720 templated + real commands | **98%** on 80 held-out, 100% right-tool | **80%** — runs unseen `git rebase -i HEAD~3`, `kubectl get pods`, ... |
 
 The small model still doesn't *plan* multi-step tasks — it routes one instruction to one tool call
-— but it now does so for filenames it has never seen, which the 12-example model could not.
+— but it now does so for filenames and commands it has never seen. The generalization is bounded by
+the training vocabulary: asked to run `cargo build` (a CLI absent from the crawled `git/bash/docker/
+npm/python` tags), it substitutes the familiar `docker build` — it copies commands from the
+distribution it saw, it does not know CLIs it never met.
 
 ### `transformer imggen` / `audgen` (generate media to a file)
 

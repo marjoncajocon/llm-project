@@ -1972,3 +1972,45 @@ README updated with the table; --batch 4 also got its first real use here.
 
 **NEXT:** multi-step planning would need transcript-aware SFT data (observation -> next tool), not
 just single instructions; CI still absent; lm_head dA still starves at small M.
+
+## 2026-07-24 (10) -- Stack Overflow crawl: real shell commands in the agent SFT data
+
+Extended the data-growth work to Stack Overflow, honestly scoped: SO gives a code/Q&A CORPUS, not
+tool-call pairs, so the value is (1) a reusable code corpus and (2) real shell commands mined from
+answers to replace make_sft.py`s tiny hardcoded run_command list.
+
+**`tools/crawl_stackoverflow.py`** (Stack Exchange API, stdlib only). Two API gotchas handled:
+responses are ALWAYS gzip (decompress by magic bytes), and the API returns a `backoff` field you
+MUST honour (tracked as an earliest-next-request time) or you get denied. One `/questions?filter=
+withbody` call + ONE batched `/questions/{id;id;...}/answers` call per page -> quota-friendly (300/
+day; a 5-tag crawl used ~10). Writes each Q&A as text (HTML stripped, code blocks kept) AND, with
+`--commands`, mines shell commands from the answers.
+
+**Command mining** needed several honest filters, each from real noise seen in the data:
+  - drop trailing inline comments ("git add .   # stage" -> "git add .")
+  - reject placeholders (<branch>, {name}, [remote]) -- not literally runnable
+  - reject embedded quotes/backticks -- they would break the command="..." attribute the C tool
+    parser reads (caught `git commit -m "..."` producing command="...""))
+  - reject log/error OUTPUT that merely starts with a CLI name ("npm ERR! ...", "python Traceback")
+  A 5-tag crawl (git/bash/docker/npm/python, 40 Q each) yielded 344 clean distinct commands.
+
+**`make_sft.py`** gained `--commands`: "run <cmd>" / "execute <cmd>" phrasings over the mined
+commands (the same copy-the-argument skill as filenames). `data/sft_agent.txt` (250 ex, committed)
+and `data/so_commands.txt` (344 commands, committed) now reflect this.
+
+**RESULT -- LoRA-SFT SmolLM2-135M on 720 examples incl. real commands** (rank 16, batch 4, 350
+steps), loss -> 0.11:
+  - **80 held-out: 98% exact, 100% right-tool** (34 were real-command run_commands). The 2 misses:
+    a rare-filename copy slip (citleges<-citeseerx) and a long docker command hitting the 40-token
+    gen cap.
+  - **Novel real commands never in any split: 4/5** -- correctly ran `git rebase -i HEAD~3`,
+    `kubectl get pods`, `docker compose up -d`, `npm run test`; MISSED `cargo build --release`
+    -> `docker build --release`. That miss is the honest boundary: `cargo` was absent from the
+    crawled tags, so for a CLI it never saw it substitutes a familiar one. Generalization is
+    bounded by the training vocabulary. README has the table + this caveat.
+
+No C changed; smoke test still PASSED. (The 2h Wikipedia crawl from session 9 was still running in
+the background, ~260 articles, incremental writes.)
+
+**NEXT:** multi-step planning still needs transcript-aware SFT (observation -> next tool); a rust/
+go tag in the crawl would extend command coverage; CI absent; lm_head dA starves at small M.

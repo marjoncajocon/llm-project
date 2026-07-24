@@ -44,6 +44,7 @@ data/*
 !data/instruct.txt
 !data/sft.txt
 !data/sft_agent.txt
+!data/so_commands.txt
 
 # Agent demo artifact
 agent_demo.txt

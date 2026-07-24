@@ -1,0 +1,344 @@
+apt-get install -y iputils-ping
+apt-get install vim
+apt-get update; apt-get install vim
+brew
+brew cleanup;
+brew info node
+brew install gnu-getopt
+brew install node
+brew install util-linux
+brew update
+cat /proc/version
+cd lib/
+cd myproject
+cd ~/project2
+chmod +x /tmp/demo-equals-separated.sh
+chmod +x /tmp/demo-getopts.sh
+chmod +x /tmp/demo-space-separated.sh
+curl
+curl -X GET 123.123.123.123:3000
+curl yahoo.com --silent | wc -l
+docker
+docker attach
+docker build
+docker commit 12345678904b5 mysnapshot
+docker compose
+docker compose exec
+docker container ls
+docker container prune
+docker container prune -f ; \
+docker containers
+docker cp container_id:/src/. target
+docker cp dummy:/path/to/file /dest/to/file
+docker create
+docker exec
+docker export tmp_$$ | tar t
+docker image prune
+docker image prune -a
+docker image prune -f ; \
+docker images
+docker images -f
+docker inspect
+docker inspect name-of-container-or-image
+docker load
+docker network prune
+docker network prune -f ; \
+docker port
+docker ps
+docker ps -a
+docker ps -f
+docker pull
+docker push
+docker rm
+docker rm $(docker ps -aq)
+docker rm --help
+docker rm -f dummy
+docker rm 3e552code34a
+docker rm tmp_$$
+docker rmi
+docker rmi --all --force
+docker rmi node
+docker run
+docker run --net=host
+docker run --rm -i ubuntu bash
+docker run --rm -it ubuntu:trusty bash
+docker run -d
+docker run -e xx=yy
+docker run -i -t ubuntu
+docker run -i -t ubuntu bash
+docker run -p 8050:8050 scrapinghub/splash
+docker run -p 8080:8080
+docker run -t -i mysnapshot /bin/bash
+docker run \
+docker run img /etc/passwd
+docker run redisimg get key
+docker run redisimg redis -H something -u toto get key
+docker start
+docker system prune
+docker system prune --all
+docker tag
+docker volume inspect volume_name
+docker volume ls
+docker volume prune
+docker volume rm
+docker xxx prune
+docker-compose down
+docker-compose exec
+docker-compose ps
+docker-compose run containername ls -la
+docker-compose stop
+docker-compose.yml
+docker-gc
+docker.example.com
+docker.example.com/my-application
+docker.for.mac.host.internal
+docker.for.mac.localhost
+find
+find()
+git
+git add
+git add .
+git add .gitmodules
+git add filename.c
+git branch
+git branch --set-upstream-to=upstream/foo foo
+git branch -a
+git branch -d
+git branch -d origin/bugfix
+git branch -r
+git branch -rd origin/bugfix
+git branch my-saved-work
+git branch new-branch-to-save-current-commits
+git branch newBranch
+git branch newbranch
+git checkout
+git checkout --theirs filename.c
+git checkout -b
+git checkout -b test origin/test
+git checkout 0d1d7fc32
+git checkout 0d1d7fc32 .
+git checkout branchToMoveCommitFrom
+git checkout existingbranch
+git checkout main
+git checkout master
+git checkout newbranch
+git checkout origin/test
+git checkout origin/your_branch
+git checkout test
+git clean
+git clean -f
+git clean -f -X
+git clean -f -d
+git clean -f -x
+git clean -fX
+git clean -fd
+git clean -fx
+git clean -n -d
+git clone
+git clone --branch
+git commit
+git commit -c ORIG_HEAD
+git commit -v
+git config merge.conflictstyle diff3
+git config mergetool.prompt false
+git diff
+git diff --staged
+git fetch
+git fetch --all
+git fetch --all --prune
+git fetch upstream
+git format-patch
+git help log
+git help remote
+git help rm
+git init
+git log
+git log -n4
+git merge
+git merge --squash
+git merge branchToMoveCommitFrom
+git merge some_other_branch
+git merge upstream/main
+git mergetool
+git pull
+git pull origin master
+git push
+git push --follow-tags
+git push --tags
+git push origin :bugfix
+git push origin HEAD:main
+git push origin HEAD:master
+git push origin HEAD:refs/heads/your_branch
+git push origin main
+git push origin master
+git rebase
+git rebase --continue
+git rebase -i
+git rebase -i HEAD~5
+git rebase -i HEAD~n
+git rebase master
+git rebase origin/development
+git rebase upstream/main
+git reflog
+git remote
+git remote -v
+git remote add origin /path/to/origin.git
+git remote set-url origin https://github.com/user/repo2.git
+git remote show
+git rename
+git rerere
+git reset
+git reset --hard
+git reset --hard 0d1d7fc32
+git reset --hard HEAD
+git reset --hard HEAD~2
+git reset --hard HEAD~3
+git reset --hard origin/main
+git reset --hard origin/master
+git reset --soft
+git reset -p
+git reset .
+git reset HEAD
+git reset HEAD^
+git reset HEAD~
+git reset HEAD~1
+git restore
+git revert
+git revert 0d1d7fc..a867b4a
+git revert HEAD~2..HEAD
+git revert a867b4af 25eee4ca 0766c053
+git rm
+git rm --cached FILE
+git rm --cached path_to_submodule
+git show-ref
+git stash
+git stash --keep-index
+git stash drop
+git stash list
+git stash pop
+git status
+git submodule deinit
+git submodule init
+git submodule rm module_name
+git submodule update
+git switch
+git-clean
+git-revert
+git@
+git@gitserv:myrepo.git
+gradle
+grep
+kill
+ls $DIR
+ls $PWD
+ls -d */
+ls -d /home/alice/Documents
+ls -d /home/alice/Documents/*/
+ls -dl */
+ls /container/directory
+ls | pcc
+mkdir
+mkdir -p /path/to/nested/directory
+node
+node --version
+node -v
+node ./script.js server 8080
+node = candidates.pop()
+node module
+node-gyp
+npm
+npm -g install
+npm -g list
+npm 3 Duplication and Deduplication
+npm ci
+npm config set engine-strict true
+npm create-react-app my-app
+npm fund
+npm help package-lock.json
+npm http 200 https://github.com/visionmedia/express.git
+npm i
+npm i npm-check-updates -g
+npm i packagename
+npm info express version
+npm install
+npm install $package
+npm install --dev
+npm install --global generator-h5bp
+npm install --production
+npm install --save
+npm install -S
+npm install -g
+npm install -g pm2
+npm install express
+npm install express@3.0.0
+npm install https://github.com/visionmedia/express
+npm install karma --save-dev
+npm install moment --save
+npm install pm2
+npm link
+npm link ../package-dir
+npm link ../somelocallib
+npm link package-name
+npm list
+npm list --depth=0
+npm list -g
+npm list -g --depth=0
+npm list -g | head -1
+npm list grunt
+npm ls
+npm outdated
+npm outdated -g --depth=0
+npm publish
+npm rebuild node-sass
+npm root
+npm root -g
+npm run
+npm run serve
+npm run test -- --foobar
+npm run test -- -foobar
+npm run test -- foobar
+npm run test --foobar
+npm run test -foobar
+npm run-script
+npm start
+npm start 8080
+npm update
+npm update --save
+npm update -g
+npm view
+npm-check
+npm-check-updates
+npm-check-updates -u
+npm-exec which coffee
+npm-sass
+npm-shrinkwrap.json
+npx
+npx create-react-app my-app
+ps -aux | grep docker
+python foo2.py
+python manage.py migrate
+python manage.py migrate &&
+python manage.py runserver 0.0.0.0:8000
+python manage.py wait_for_db
+python3 --version
+rm -f /usr/local/bin/npm /usr/local/lib/dtrace/node.d;
+rm -rf
+rm -rf .git/modules/path_to_submodule
+rm -rf path_to_submodule
+rm -rf ~/.npm;
+scp
+sed
+ssh
+sudo chmod 666 /var/run/docker.sock
+sudo chmod g+w /lib/systemd/system/docker.socket
+sudo docker run -p 8050:8050 scrapinghub/splash
+sudo docker run -v /data -name DATA2 busybox true
+sudo npm install -g n
+sudo npm install -g npm
+sudo systemctl restart docker
+tar -xf fzfDbDemo.tzst
+tar.gz
+yarn
+yarn global add depcheck
+yarn start
+yarn.lock
