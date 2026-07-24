@@ -481,3 +481,69 @@ and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2
   (crawl_stackoverflow mined commands, make_qa wiki Q&A, make_sft, make_agent_traj) + a
   memorization probe proving generalization. Gaps: two-write "ok" content bug, base-model factual
   errors, no output verification/dedup/difficulty balancing.
+
+## FUTURE WORK -- long-horizon research roadmap (requested 2026-07-24)
+
+Aspirational research directions recorded verbatim from the user's vision. NONE are applied in
+code yet -- all unchecked. These sit far beyond the current pure-C / 135M pipeline and are the
+long-term north star, not the next sprint. (The near-term, actionable items stay in the earlier
+"requested direction" checklist: reasoning-dense [in progress], execution-oriented [x], high-
+quality synthetic data [~].)
+
+### Strengthen core reasoning & reduce hallucination
+- [ ] Integrate Process Reward Models (PRMs) -- reward each reasoning STEP, not just the outcome.
+- [ ] Outcome-supervised RL (RLHF / RLAIF with a twist) -- optimize final-answer correctness.
+
+### Enhance multi-agent & tool-use capabilities
+- [ ] Train a meta-cognition & planning module (plan/monitor/replan over tools).
+- [ ] Simulate multi-agent debate & refinement (proposer/critic rounds before committing).
+
+### Embed self-improvement & data-curation loops
+- [ ] Entropy-based data-quality filtering (keep informative examples, drop low-signal ones).
+- [ ] Constitutional AI + backtranslation for alignment (self-critique against a rule set).
+
+### From single-task execution to autonomous goal pursuit
+- [ ] Train on ambiguous problem decomposition (break a vague goal into sub-goals).
+- [ ] Intrinsic motivation / curiosity-driven exploration (seek novel, learnable states).
+
+### Meta-learning & in-context self-improvement layer
+- [ ] In-context reinforcement learning (adapt within a single context from feedback).
+- [ ] Predictive coding & world-model simulation (predict, compare, correct).
+
+### Cognitive architecture for true general intelligence
+- [ ] Global-workspace architecture with specialized modules.
+- [ ] Scheduler / "consciousness" (the main LLM) routing between modules.
+- [ ] Long-term procedural memory (the fine-tuned execution model -- this project's agent).
+- [ ] Critic module (a separately fine-tuned evaluator).
+- [ ] Open-ended self-improvement.
+
+### Intervention-based training data
+- [ ] Generate counterfactual data ("what if X were different").
+- [ ] Define the supervision signal for interventions.
+- [ ] Ground in key research (causal inference / do-calculus).
+
+### Learning mechanism: online learning & belief updating
+- [ ] Continuous Bayes filtering in latent space.
+- [ ] Training architecture loop: Prediction -> Observation -> Surprise calculation -> Learning
+      trigger (update only when surprise is high).
+
+### Generating probabilistic futures: point predictions -> scenario analysis
+- [ ] Multi-future generation ("cone of plausibility": a distribution of outcomes, not one point).
+
+### The continuous prediction-adaptation loop (operational blueprint)
+- [ ] Ingestion: real-world stream (news, markets, papers, domain data) -> structured causal
+      graph via a causal encoder.
+- [ ] Simulation & prediction: each cycle the causal world-model emits a probability distribution
+      over future states.
+- [ ] Action & intervention (optional): choose an intervention that steers the future toward a
+      more desirable probability cone.
+- [ ] Observation & prediction error: real data arrives; a surprise module measures divergence.
+- [ ] Targeted online learning: on high surprise, an eligibility-trace mechanism isolates the
+      faulty causal chain and rewires it online -- the causal graph improves incrementally
+      without forgetting old links.
+
+Honest note: this is a multi-year research program (causal world-models, online belief updating,
+multi-agent cognition), not incremental engine work. The current repo provides ONE piece of it --
+the "long-term procedural memory / execution model" (the fine-tuned tool-using agent). Everything
+else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
+and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
