@@ -419,3 +419,40 @@ SUCCESS = "above" puts red on TOP / "below" red on BOTTOM (byte-caption model co
 Baseline to beat: byte-caption model `model/t2i_scenes` (commit 4a4d880, loss 0.054, vertical
 conflated). See notes.md "Structured caption tokens" for the full step list.
 
+
+## 2026-07-24 -- Structured caption tokens VALIDATED (relations fixed; VQ color is the new wall)
+
+Commit 160ab66. Finished the run above and validated it **objectively** with a scored harness
+instead of eyeballing a montage. **The structured-token fix WORKED: vertical relations are no
+longer conflated.** Bottleneck moved to color, and color is the **VQ-VAE's** fault, not the GPT's.
+
+Run: VQ 2000 steps (recon_mse 0.0019); GPT 2200 requested but KILLED at ~step 1900 (loss ~0.11),
+so the **step-1800 checkpoint** in `model/t2i_tok/` is what every number below was measured on.
+
+New tooling (use these, don't squint at montages):
+  - `tools/t2i_score.py` -- scores **color fidelity** and **relation accuracy** as SEPARATE axes
+    (nearest-palette-color pixel assignment + per-color centroids). Conflating the two is exactly
+    what made my first read of the montage wrong.
+  - `tools/ppm_montage.py` -- stdlib PPM -> scaled PNG montage.
+
+CALIBRATION (ground-truth `data/t2i_tok/img_*.ppm`, same tool): color 100% (24/24), relation
+**88%** (21/24). So ~88% is the measurement CEILING for relations, not a shortfall.
+
+Measured (step-1800 model, temp 0.4):
+  - ground truth (ceiling) ........ color 100% | relation 88% (21/24)
+  - VQ-VAE RECONSTRUCTION of it ... color **67%** (16/24) | relation 75% (12/16)
+  - GPT gen, all 8 colors ......... color 33% (16/48) | relation **81%** (13/16), above **6/6**
+  - GPT gen, 4 "safe" colors ...... color 30% (17/56) | relation 71% (12/17)
+
+Conclusions:
+  1. **Relations essentially SOLVED, vertical included** -- 81% vs an 88% ceiling. The byte-caption
+     baseline had ZERO vertical sensitivity (always blue-top/red-bottom). Goal achieved.
+  2. **Color fidelity is capped by the VQ-VAE**: reconstructing *training* images (no GPT involved)
+     already loses a color 33% of the time. More GPT steps CANNOT fix this.
+  3. Failure is adjacent-hue collapse (blue->cyan, magenta->purple, orange->yellow); only 14
+     distinct codes of K=256 used per image => smells like codebook COLLAPSE, not K too small.
+
+NEXT: 1) fix VQ-VAE color (dead-code restart / EMA codebook / commitment cost / T2I_LDIM 16->32,
+plus an aggregate codebook-utilization printout to confirm collapse) and re-measure the recon row;
+2) then finish GPT training (~30 min); 3) re-measure relations -- horizontal sample sizes were tiny
+(n=1..4) because color failures ate them.
