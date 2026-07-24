@@ -1344,6 +1344,90 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 23: training-recipe essentials in optim.c — AdamW decoupled weight
+  // decay, global gradient-norm clipping, and the cosine+warmup LR schedule.
+  // Each is checked against its CLOSED-FORM value, not just "it ran".
+  // --------------------------------------------------------------------------
+  {
+    printf("[23] Optimizer: AdamW decay + grad clipping + cosine/warmup LR\n");
+
+    // (a) Decoupled decay with ZERO gradient must scale weights by exactly
+    //     (1 - lr*wd) per step — and must leave 1-D tensors (biases / norm
+    //     gains) untouched.
+    int ms[2] = {2, 2}, vs[1] = {3};
+    Tensor W = tensor_create(ms, 2), B = tensor_create(vs, 1);
+    for (int i = 0; i < 4; i++) W.data[i] = 1.0f;
+    for (int i = 0; i < 3; i++) B.data[i] = 1.0f;
+    tensor_zero_grad(&W); tensor_zero_grad(&B);
+    Tensor *wps[2] = {&W, &B};
+    const float wlr = 0.1f, wwd = 0.5f;
+    Adam wopt = adamw_create(wps, 2, wlr, wwd);
+    adam_step(&wopt, wps, 2);
+    float want = 1.0f * (1.0f - wlr * wwd);            // 0.95
+    float dec_err = fabsf(W.data[0] - want);
+    float bias_err = fabsf(B.data[0] - 1.0f);          // must be exactly untouched
+    int wd_ok = (dec_err < 1e-6f) && (bias_err == 0.0f);
+    printf("    AdamW: matrix %.6f (want %.6f) | 1-D bias %.6f (want 1.000000, undecayed) -> %s\n",
+           W.data[0], want, B.data[0], wd_ok ? "OK" : "FAIL");
+    all_ok &= wd_ok;
+    adam_free(&wopt);
+
+    // Plain adam_create must stay pure Adam: zero grad => zero movement.
+    for (int i = 0; i < 4; i++) W.data[i] = 1.0f;
+    tensor_zero_grad(&W);
+    Adam popt = adam_create(wps, 1, wlr);
+    adam_step(&popt, wps, 1);
+    int plain_ok = (W.data[0] == 1.0f);
+    printf("    plain Adam unchanged by the AdamW addition (wd=0): w = %.6f -> %s\n",
+           W.data[0], plain_ok ? "OK" : "FAIL");
+    all_ok &= plain_ok;
+    adam_free(&popt);
+
+    // (b) Global grad-norm clipping. Grads: four 3.0 => norm = sqrt(4*9) = 6.
+    for (int i = 0; i < 4; i++) W.grad[i] = 3.0f;
+    for (int i = 0; i < 3; i++) B.grad[i] = 0.0f;
+    float n_under = clip_grad_norm(wps, 2, 10.0f);     // above max => untouched
+    int under_ok = (fabsf(n_under - 6.0f) < 1e-5f) && (W.grad[0] == 3.0f);
+    float n_over = clip_grad_norm(wps, 2, 2.0f);       // clip 6 -> 2
+    float post = 0.0f;
+    for (int i = 0; i < 4; i++) post += W.grad[i] * W.grad[i];
+    post = sqrtf(post);
+    int clip_ok = under_ok && (fabsf(n_over - 6.0f) < 1e-5f) && (fabsf(post - 2.0f) < 1e-4f);
+    printf("    clip: norm %.4f (want 6) | no-op under max, grad still %.1f | after clip to 2: %.4f -> %s\n",
+           n_over, 3.0f, post, clip_ok ? "OK" : "FAIL");
+    all_ok &= clip_ok;
+
+    // A NaN gradient must zero every grad (drop the batch) rather than poison weights.
+    W.grad[0] = 0.0f / 0.0f;
+    float n_nan = clip_grad_norm(wps, 2, 1.0f);
+    int nan_ok = !isfinite(n_nan) && (W.grad[0] == 0.0f) && (W.grad[1] == 0.0f);
+    printf("    clip: NaN grad -> norm %s, all grads zeroed -> %s\n",
+           isfinite(n_nan) ? "finite(BAD)" : "non-finite", nan_ok ? "OK" : "FAIL");
+    all_ok &= nan_ok;
+    tensor_free(&W); tensor_free(&B);
+
+    // (c) Cosine schedule with linear warmup: base 1.0, min 0.1, warmup 10, total 110.
+    const float b_lr = 1.0f, m_lr = 0.1f;
+    const int wu = 10, tot = 110;
+    float s0 = lr_cosine_warmup(b_lr, m_lr, 0, wu, tot);      // first warmup step: 0.1
+    float speak = lr_cosine_warmup(b_lr, m_lr, wu - 1, wu, tot);  // end of warmup: 1.0
+    float smid = lr_cosine_warmup(b_lr, m_lr, 60, wu, tot);   // halfway: 0.55
+    float send = lr_cosine_warmup(b_lr, m_lr, tot, wu, tot);  // clamped: 0.1
+    int mono = 1;                                             // non-increasing after warmup
+    float prev = speak;
+    for (int s = wu; s <= tot; s++) {
+      float cur = lr_cosine_warmup(b_lr, m_lr, s, wu, tot);
+      if (cur > prev + 1e-6f) mono = 0;
+      prev = cur;
+    }
+    int sched_ok = fabsf(s0 - 0.1f) < 1e-6f && fabsf(speak - 1.0f) < 1e-6f &&
+                   fabsf(smid - 0.55f) < 1e-4f && fabsf(send - m_lr) < 1e-6f && mono;
+    printf("    LR: warmup[0]=%.4f (0.1) peak=%.4f (1.0) mid=%.4f (0.55) end=%.4f (0.1) monotone=%d -> %s\n\n",
+           s0, speak, smid, send, mono, sched_ok ? "OK" : "FAIL");
+    all_ok &= sched_ok;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

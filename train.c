@@ -30,7 +30,35 @@ TrainConfig train_default_config(void) {
   c.checkpoint_every = 0;
   c.val_frac = 0.1f;
   c.sft = 0;
+  // Recipe options default to OFF so existing runs reproduce bit-for-bit; opt in
+  // with --weight-decay / --clip / --warmup / --min-lr.
+  c.weight_decay = 0.0f;
+  c.grad_clip = 0.0f;
+  c.warmup = 0;
+  c.lr_min = -1.0f;
   return c;
+}
+
+// A schedule is active once warmup or a cosine floor is requested; otherwise the
+// LR stays exactly cfg->lr (the historical behaviour).
+static int sched_on(const TrainConfig *cfg) {
+  return cfg->warmup > 0 || cfg->lr_min >= 0.0f;
+}
+
+// Per-step LR for the configured schedule (constant when none is configured).
+static float sched_lr(const TrainConfig *cfg, int step) {
+  if (!sched_on(cfg)) return cfg->lr;
+  float lo = (cfg->lr_min >= 0.0f) ? cfg->lr_min : 0.0f;
+  return lr_cosine_warmup(cfg->lr, lo, step, cfg->warmup, cfg->steps);
+}
+
+// One-line summary of whichever recipe options are enabled (empty when none are).
+static void print_recipe(const TrainConfig *cfg) {
+  if (cfg->weight_decay > 0.0f) printf("  weight decay (AdamW, matrices only): %g\n", cfg->weight_decay);
+  if (cfg->grad_clip > 0.0f)    printf("  grad-norm clip: %g\n", cfg->grad_clip);
+  if (sched_on(cfg))
+    printf("  LR schedule: warmup %d steps -> cosine %g -> %g\n",
+           cfg->warmup, cfg->lr, (cfg->lr_min >= 0.0f) ? cfg->lr_min : 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +145,8 @@ static int train_sft(char *text, const TrainConfig *cfg) {
   Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
   Tensor **params = (Tensor**)malloc(gpt_param_count(&model) * sizeof(Tensor*));
   int n_params = gpt_collect_params(&model, params);
-  Adam opt = adam_create(params, n_params, cfg->lr);
+  Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  print_recipe(cfg);
 
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
@@ -128,6 +157,8 @@ static int train_sft(char *text, const TrainConfig *cfg) {
     tensor_zero_grad(&logits);
     cross_entropy_backward(&probs, tgt[e], &logits);
     gpt_backward(&model, seq[e], maxL, &acts, &logits);
+    if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
+    adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
     if (s % report == 0 || s == steps - 1)
       printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
@@ -237,7 +268,8 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
   Tensor probs = tensor_create(lshape, 2);
   Tensor **params = (Tensor**)malloc(gpt_param_count(&model) * sizeof(Tensor*));
   int n_params = gpt_collect_params(&model, params);
-  Adam opt = adam_create(params, n_params, cfg->lr);
+  Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  print_recipe(cfg);
 
   int *inp = (int*)malloc(ctx * sizeof(int));
   int *tgt = (int*)malloc(ctx * sizeof(int));
@@ -254,6 +286,8 @@ int train_run(const char *data_path, const TrainConfig *cfg) {
     tensor_zero_grad(&logits);
     cross_entropy_backward(&probs, tgt, &logits);
     gpt_backward(&model, inp, ctx, &acts, &logits);
+    if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
+    adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
 
     if (s % report == 0 || s == steps - 1) {

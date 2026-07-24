@@ -221,6 +221,23 @@ transformer train data/wiki --d-model 256 --layers 6 --heads 8 --ctx 128 --steps
 | `--lr F`    | learning rate (3e-4) | | `--ctx N`    | context window (64) |
 | `--seed N`  | RNG seed (1234) | | `--val-frac F` | held-out fraction (0.1) |
 | `--checkpoint-every N` | save every N steps | | `--resume F` | continue a saved model |
+| `--weight-decay F` | AdamW decay (0 = off) | | `--clip F` | grad-norm clip (0 = off) |
+| `--warmup N` | LR warmup steps (0 = off) | | `--min-lr F` | cosine floor LR (<0 = constant) |
+
+**Training recipe options.** `--weight-decay` switches Adam to **AdamW** (decoupled decay, applied
+to weight matrices only — biases and norm gains are exempt, since decaying a norm gain fights the
+normalization). `--clip` applies one **global** gradient-norm clip across the whole model (the
+direction is preserved, only the length is capped; a NaN/Inf norm zeroes the step so one bad batch
+can't poison the weights). `--warmup`/`--min-lr` enable **linear warmup then cosine decay**. All
+four default to OFF so previously-recorded runs still reproduce exactly. They earn their keep on
+long or fine-tuning runs and against divergence — on a short overfit-a-tiny-corpus run, plain Adam
+at a constant LR will still reach a lower loss, because warmup and cosine decay spend part of the
+budget at a lower LR:
+
+```sh
+transformer train data/wiki --steps 20000 --lr 3e-4 \
+  --weight-decay 0.01 --clip 1.0 --warmup 200 --min-lr 3e-5
+```
 
 `--d-model` must be divisible by `--heads`. Training prints **train + held-out `val`** loss
 (so you can tell learning from memorizing); `--checkpoint-every` saves periodically, and

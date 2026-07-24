@@ -1,4 +1,4 @@
-// optim.h - Adam optimizer
+// optim.h - Adam / AdamW optimizer, gradient clipping, LR schedules
 #ifndef OPTIM_H
 #define OPTIM_H
 
@@ -15,16 +15,60 @@ typedef struct {
   float beta1;     // first-moment decay
   float beta2;     // second-moment decay
   float eps;       // numerical epsilon
+  float weight_decay;  // DECOUPLED weight decay (AdamW); 0 = plain Adam
 } Adam;
 
 // Create optimizer state sized for the given parameter tensors (uses each
-// tensor's `size`). Default hyperparameters: beta1=0.9, beta2=0.999, eps=1e-8.
+// tensor's `size`). Default hyperparameters: beta1=0.9, beta2=0.999, eps=1e-8,
+// weight_decay=0 (i.e. plain Adam — bit-identical to the pre-AdamW behaviour).
 Adam adam_create(Tensor **params, int n_params, float lr);
 
-// One Adam update step using each parameter tensor's accumulated `grad`.
+// Same, with DECOUPLED weight decay (AdamW): the decay is applied straight to the
+// weights (w -= lr * wd * w) instead of being folded into the gradient, so it is
+// not scaled by the adaptive 1/sqrt(v) term. This is the correct way to regularize
+// an Adam-trained transformer, and it matters for fine-tuning.
+//
+// Decay is applied ONLY to tensors with ndim >= 2 (the weight matrices). 1-D
+// tensors — biases and RMSNorm/LayerNorm gains — are left alone, the standard
+// rule: decaying a norm gain toward zero fights the normalization itself.
+Adam adamw_create(Tensor **params, int n_params, float lr, float weight_decay);
+
+// One Adam/AdamW update step using each parameter tensor's accumulated `grad`.
 void adam_step(Adam *o, Tensor **params, int n_params);
+
+// Set the learning rate (call once per step when using a schedule).
+void adam_set_lr(Adam *o, float lr);
 
 // Release optimizer state.
 void adam_free(Adam *o);
+
+// ---------------------------------------------------------------------------
+// Gradient clipping
+// ---------------------------------------------------------------------------
+
+// Global gradient-norm clipping. Computes ONE L2 norm over every parameter's
+// grad (the whole model treated as a single flat vector — not a per-tensor norm),
+// and if it exceeds max_norm scales EVERY gradient by max_norm / total_norm, so
+// the update direction is preserved and only its length is capped.
+//
+// Returns the total norm BEFORE clipping (a useful training diagnostic: a
+// spiking grad norm is the usual first sign of divergence). A non-finite norm
+// (NaN/Inf from an exploded step) zeros all grads and returns that norm, so one
+// bad batch cannot poison the weights.
+float clip_grad_norm(Tensor **params, int n_params, float max_norm);
+
+// ---------------------------------------------------------------------------
+// Learning-rate schedules
+// ---------------------------------------------------------------------------
+
+// Cosine decay with linear warmup — the standard transformer schedule:
+//   step < warmup_steps : linear ramp 0 -> base_lr   (stabilizes the first steps,
+//                                                     when Adam's v is still cold)
+//   otherwise           : cosine from base_lr down to min_lr at total_steps
+//   step >= total_steps : min_lr
+// Pass warmup_steps = 0 for pure cosine. Safe for total_steps <= warmup_steps
+// (returns base_lr rather than dividing by zero).
+float lr_cosine_warmup(float base_lr, float min_lr, int step,
+                       int warmup_steps, int total_steps);
 
 #endif // OPTIM_H

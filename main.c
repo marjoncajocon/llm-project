@@ -230,7 +230,11 @@ static void train_usage(void) {
     "  --seed N      RNG seed (default 1234)             --val-frac F  held-out fraction (default 0.1)\n"
     "  --resume F    continue training a saved model     --checkpoint-every N  save every N steps\n"
     "  --sft         masked instruction tuning: file is 'prompt<TAB>response' lines,\n"
-    "                loss on the response only (true SFT). See data/sft.txt.\n");
+    "                loss on the response only (true SFT). See data/sft.txt.\n"
+    "  Training recipe (all OFF by default, so existing runs reproduce exactly):\n"
+    "  --weight-decay F  AdamW decoupled decay on weight matrices (biases/norms exempt)\n"
+    "  --clip F          global grad-norm clip (1.0 is the usual choice)\n"
+    "  --warmup N        linear LR warmup steps      --min-lr F  cosine floor LR\n");
 }
 
 static int run_train(int argc, char **argv) {
@@ -260,6 +264,10 @@ static int run_train(int argc, char **argv) {
     else if (strcmp(f, "--checkpoint-every") == 0) { NEED_VAL(); cfg.checkpoint_every = atoi(argv[++i]); }
     else if (strcmp(f, "--val-frac") == 0){ NEED_VAL(); cfg.val_frac = (float)atof(argv[++i]); }
     else if (strcmp(f, "--sft") == 0)     { cfg.sft = 1; }
+    else if (strcmp(f, "--weight-decay") == 0) { NEED_VAL(); cfg.weight_decay = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--clip") == 0)    { NEED_VAL(); cfg.grad_clip = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--warmup") == 0)  { NEED_VAL(); cfg.warmup = atoi(argv[++i]); }
+    else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }

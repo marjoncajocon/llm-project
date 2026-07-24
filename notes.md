@@ -1654,3 +1654,46 @@ CPU; 2) AdamW + global grad-norm clipping + cosine-with-warmup LR in `optim.c` (
 no decay/clip/schedule) -- needed for fine-tuning stability; 3) SIMD `matmul` (`matrix.c` is scalar
 + thread pool only) -- guard `__AVX2__`/`__ARM_NEON` with a scalar fallback for WASM, and note it
 won't stay bit-exact once the FMA reduction is reassociated.
+
+## 2026-07-24 (3) -- Training-recipe essentials: AdamW + grad clipping + LR schedule
+
+Second roadmap item (prerequisite for stable LoRA fine-tuning). `optim.c` was plain Adam: no
+weight decay, no clipping, no schedule.
+
+**Added to `optim.{h,c}` (pure C11):**
+  - **AdamW**: `weight_decay` field + `adamw_create()`. Decay is DECOUPLED (applied straight to
+    the weights, NOT divided by sqrt(v_hat)) -- that decoupling is the whole point. Applied only
+    to `ndim >= 2` tensors: biases and RMSNorm/LayerNorm gains are exempt (decaying a norm gain
+    fights the normalization). `adam_create` still sets wd=0, so plain Adam is BIT-IDENTICAL to
+    before -- verified in the selftest.
+  - **`clip_grad_norm(params, n, max_norm)`**: ONE global L2 norm over the whole model (not
+    per-tensor), scaled so direction is preserved and only length is capped. Returns the norm
+    BEFORE clipping (a spiking grad norm is the first sign of divergence). Accumulates in
+    `double` -- summing millions of squared f32 grads loses too much precision otherwise. A
+    non-finite norm ZEROES all grads and returns it, so one exploded batch can't write NaNs into
+    the weights (unrecoverable).
+  - **`lr_cosine_warmup(base, min, step, warmup, total)`**: linear warmup then cosine decay;
+    guards total <= warmup instead of dividing by zero. Plus `adam_set_lr()`.
+
+**Wired into `train.c` + `main.c`** (BOTH loops -- normal and `--sft`): new `TrainConfig` fields
+`weight_decay`, `grad_clip`, `warmup`, `lr_min` and flags `--weight-decay --clip --warmup
+--min-lr`. **All default OFF** so previously-recorded runs reproduce bit-for-bit. Enabled options
+print a one-line recipe summary at startup.
+
+**Verified -- new selftest part [23], all against CLOSED-FORM values (not just "it ran"):**
+  - AdamW, zero grad => weight scales by exactly (1 - lr*wd) = 0.950000; the 1-D bias stays
+    exactly 1.000000 (undecayed). Plain `adam_create` still moves a zero-grad weight by 0.
+  - clip: four grads of 3.0 => norm exactly 6.0; no-op when under max; clipped to 2.0000 exactly;
+    NaN grad => non-finite norm returned AND every grad zeroed.
+  - LR: warmup[0]=0.1, peak=1.0, mid=0.55, end=min=0.1, monotone non-increasing after warmup.
+  Plus a real CLI run of both loops. `Output validation: PASSED`, exit 0, all 8 cross targets
+  `-Wall` clean.
+
+**HONEST result:** on a 300-step overfit of `data/sample.txt`, baseline Adam reached train loss
+0.0907 vs 0.2908 with the recipe on. That is EXPECTED, not a regression -- warmup spends the first
+30 steps at a reduced LR and cosine decays to 1e-4, and weight decay regularizes. These options
+buy stability on long/fine-tuning runs, not speed on toy memorization. README says so explicitly.
+
+**NEXT:** LoRA adapters (freeze base, train rank-r A/B on attention/FFN projections; base can stay
+int8 via `quant.c`) on top of `llamatrain.c` -- then SFT a real SmolLM2-135M so the agent runs on
+our own engine. Then SIMD `matmul`.

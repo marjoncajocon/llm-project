@@ -13,12 +13,17 @@ typedef struct {
   int n_layers;            // transformer blocks
   int d_ff;                // feed-forward hidden dim (<=0 => 4 * d_model)
   int ctx;                 // context window = model max_seq_len
-  float lr;                // Adam learning rate
+  float lr;                // Adam learning rate (peak LR when a schedule is on)
   unsigned seed;           // RNG seed for reproducibility
   const char *resume;      // NULL => fresh model; else path to a checkpoint to continue
   int checkpoint_every;    // save every N steps (0 => only at the end)
   float val_frac;          // fraction of tokens held out for validation loss (e.g. 0.1)
   int sft;                 // 1 => masked instruction-tuning (SFT) mode (prompt<TAB>response lines)
+  // --- Training-recipe options (all default to OFF, so runs stay reproducible) ---
+  float weight_decay;      // AdamW decoupled decay on weight matrices (0 => plain Adam)
+  float grad_clip;         // global grad-norm clip (0 => off; 1.0 is the usual choice)
+  int warmup;              // linear warmup steps (0 => none)
+  float lr_min;            // cosine floor LR; < 0 => constant LR (no cosine decay)
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).
