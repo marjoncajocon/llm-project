@@ -7,7 +7,9 @@
 //   hn  = RMSNorm(h, ffn_norm)
 //   out = h + SwiGLU(hn, Wgate, Wup, Wdown)   (residual)
 //
-// Forward only (inference) — the target use is loading real small modern models.
+// This module is the forward/inference path (loading and running real small
+// modern models). The matching training path — cached-activation forward,
+// backward, and parameter collection — lives in llamatrain.h.
 #ifndef LLAMA_H
 #define LLAMA_H
 
@@ -37,6 +39,11 @@ typedef struct {
 // returned tensors, or use llama_block_randomize for testing).
 LlamaBlock llama_block_create(int d_model, int n_heads, int n_kv, int head_dim,
                               int d_ff, float rope_base, float eps);
+
+// Same, but every weight also gets a gradient array so the block can be TRAINED
+// (see llamatrain.h). Inference-only blocks skip the grads to halve their memory.
+LlamaBlock llama_block_create_train(int d_model, int n_heads, int n_kv, int head_dim,
+                                    int d_ff, float rope_base, float eps);
 void llama_block_free(LlamaBlock *b);
 
 // Fill all weights with small deterministic pseudo-random values (for tests).
@@ -61,6 +68,11 @@ typedef struct {
 LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
                               int n_kv, int head_dim, int d_ff, int max_seq,
                               float rope_base, float eps);
+
+// Same, but with gradient arrays on every weight — a TRAINABLE model (llamatrain.h).
+LlamaModel llama_model_create_train(int vocab, int d_model, int n_layers, int n_heads,
+                                    int n_kv, int head_dim, int d_ff, int max_seq,
+                                    float rope_base, float eps);
 void llama_model_free(LlamaModel *m);
 void llama_model_randomize(LlamaModel *m);
 

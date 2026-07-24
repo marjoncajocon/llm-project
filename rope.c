@@ -70,3 +70,32 @@ void rope_heads_pos(Tensor *x, int n_heads, float base, int pos0) {
 void rope_heads(Tensor *x, int n_heads, float base) {
   rope_heads_pos(x, n_heads, base, 0);
 }
+
+// Mirror of rope_heads_pos on the gradient: the rotation is orthogonal, so the
+// backward is the transposed (inverse) rotation of the same angle. Applied in
+// place, for the same reason the forward is.
+void rope_heads_backward_pos(Tensor *x, int n_heads, float base, int pos0) {
+  const int rows = x->shape[0];
+  const int cols = x->shape[1];
+  const int hd = cols / n_heads;   // per-head dim
+  const int h = hd / 2;
+
+  for (int i = 0; i < rows; i++) {
+    const int pos = pos0 + i;
+    for (int head = 0; head < n_heads; head++) {
+      float *gh = &x->grad[i * cols + head * hd];
+      for (int k = 0; k < h; k++) {
+        float inv_freq = powf(base, -2.0f * (float)k / (float)hd);
+        float ang = (float)pos * inv_freq;
+        float c = cosf(ang), s = sinf(ang);
+        float g1 = gh[k], g2 = gh[k + h];
+        gh[k]     =  g1 * c + g2 * s;
+        gh[k + h] = -g1 * s + g2 * c;
+      }
+    }
+  }
+}
+
+void rope_heads_backward(Tensor *x, int n_heads, float base) {
+  rope_heads_backward_pos(x, n_heads, base, 0);
+}

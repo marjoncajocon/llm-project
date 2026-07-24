@@ -10,6 +10,8 @@
 - **Training** — full backpropagation through attention, feed-forward, LayerNorm and embeddings;
   Adam; cross-entropy; **numerically gradient-checked**. Train on your own text (`transformer
   train`) with configurable model size, train/val split, checkpointing and resume.
+  The **modern LLaMA-family architecture trains too** (`llamatrain.c`): backward through
+  RMSNorm + RoPE + GQA + SwiGLU, gradient-checked end to end — not just inference.
 - **Inference** — temperature / top-k / top-p sampling, a **bit-exact KV cache**, and a
   token/text generation CLI.
 - **Real GPT-2** — loads actual Hugging Face GPT-2 weights (124M–1.5B) and generates coherent
@@ -62,6 +64,7 @@ defined in the matching `.c`.
 | `gqa.h` / `gqa.c`                 | `gqa` (LLaMA-family grouped-query causal attention) + backward |
 | `quant.h` / `quant.c`             | int8 per-channel weight quantize/dequantize (for the LLMQ checkpoint) |
 | `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode |
+| `llamatrain.h` / `llamatrain.c`   | **Training** the LLaMA-family model: cached-activation forward + full backward |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |

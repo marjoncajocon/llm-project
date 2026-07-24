@@ -28,6 +28,7 @@
 #include "swiglu.h"
 #include "gqa.h"
 #include "llama.h"
+#include "llamatrain.h"
 #include "quant.h"
 #include "matrix.h"
 
@@ -48,6 +49,14 @@ static float rope_scalar_loss(const Tensor *x, Tensor *y, const float *w, float 
   float l = 0.0f;
   for (int i = 0; i < n; i++) l += w[i] * y->data[i];
   return l;
+}
+
+// Forward + mean cross-entropy for the LLaMA-family training path — used by the
+// [22] end-to-end gradient check (re-run per perturbed parameter).
+static float llama_ce_loss(LlamaModel *m, LlamaActs *a, const int *ids, int seq_len,
+                           const int *targets, Tensor *logits, Tensor *probs) {
+  llama_forward_train(m, ids, seq_len, a, logits);
+  return cross_entropy_forward(logits, targets, probs);
 }
 
 // Portable "make directory if absent" (ignores already-exists).
@@ -1238,6 +1247,100 @@ int run_selftest(void) {
     all_ok &= qm_ok;
     tensor_free(&Lf); tensor_free(&Ld);
     llama_kv_free(&kv); q_llama_model_free(&qm); llama_model_free(&fm);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 22: TRAINING the modern (LLaMA-family) model — llamatrain.c. Three
+  // gates, in increasing strength:
+  //   (a) the caching training forward must agree BIT-EXACTLY with the plain
+  //       inference forward (otherwise the cached activations describe a
+  //       different function than the one being differentiated),
+  //   (b) an end-to-end numerical gradient check over EVERY parameter tensor —
+  //       the same conditioned rel-err < 1e-2 gate the GPT path uses in [2],
+  //   (c) Adam must actually drive the loss down on a next-token task.
+  // --------------------------------------------------------------------------
+  {
+    const int vocab = 24, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 5;
+    printf("[22] Modern model TRAINING (RMSNorm+RoPE+GQA+SwiGLU backward)\n");
+    srand(23);
+    LlamaModel tm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64,
+                                             10000.0f, 1e-5f);
+    llama_model_randomize(&tm);
+    LlamaActs acts = llama_acts_create(&tm, seq);
+    int ids[5]     = {2, 9, 4, 1, 7};
+    int targets[5] = {9, 4, 1, 7, 3};       // next-token task
+    int ls[2] = {seq, vocab};
+    Tensor logits = tensor_create(ls, 2), probs = tensor_create(ls, 2);
+    Tensor ref = tensor_create(ls, 2);
+
+    // (a) training forward == inference forward, bit for bit.
+    llama_model_forward(&tm, ids, seq, &ref);
+    llama_forward_train(&tm, ids, seq, &acts, &logits);
+    float fwd_diff = 0.0f;
+    for (int i = 0; i < seq * vocab; i++) {
+      float d = fabsf(logits.data[i] - ref.data[i]);
+      if (d > fwd_diff) fwd_diff = d;
+    }
+    int fwd_ok = (fwd_diff == 0.0f);
+    printf("    train forward == inference forward: max |diff| = %.2e -> %s\n",
+           fwd_diff, fwd_ok ? "OK" : "FAIL");
+    all_ok &= fwd_ok;
+
+    // (b) analytic vs central-difference gradients over every parameter.
+    Tensor **lps = (Tensor**)malloc((size_t)llama_param_count(&tm) * sizeof(Tensor*));
+    int n_lp = llama_collect_params(&tm, lps);
+    llama_ce_loss(&tm, &acts, ids, seq, targets, &logits, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward(&tm, ids, seq, &acts, &logits);
+
+    const float leps = 1e-2f;
+    float lmax_rel = 0.0f, lmax_cond = 0.0f;
+    for (int p = 0; p < n_lp; p++) {
+      Tensor *param = lps[p];
+      size_t step = param->size > 2 ? param->size / 2 : 1;
+      for (size_t k = 0; k < param->size; k += step) {
+        float base = param->data[k];
+        param->data[k] = base + leps;
+        float lp = llama_ce_loss(&tm, &acts, ids, seq, targets, &logits, &probs);
+        param->data[k] = base - leps;
+        float lmn = llama_ce_loss(&tm, &acts, ids, seq, targets, &logits, &probs);
+        param->data[k] = base;
+        float numeric = (lp - lmn) / (2.0f * leps);
+        float analytic = param->grad[k];
+        float rel = fabsf(analytic - numeric) / (fabsf(analytic) + fabsf(numeric) + 1e-8f);
+        if (rel > lmax_rel) lmax_rel = rel;
+        // Only entries whose gradient clears the float32 finite-difference noise
+        // floor are judged (same rule as the GPT check in [2]).
+        if (fabsf(analytic) > 1e-2f && rel > lmax_cond) lmax_cond = rel;
+      }
+    }
+    int lgrad_ok = (lmax_cond < 1e-2f);
+    printf("    gradient check (%d param tensors): max rel error %.2e (all) | %.2e (|grad|>1e-2) -> %s\n",
+           n_lp, lmax_rel, lmax_cond, lgrad_ok ? "OK" : "FAIL");
+    all_ok &= lgrad_ok;
+
+    // (c) train: the loss must fall.
+    Adam lopt = adam_create(lps, n_lp, 0.02f);
+    float lfirst = llama_ce_loss(&tm, &acts, ids, seq, targets, &logits, &probs);
+    float llast = lfirst;
+    for (int s = 0; s < 200; s++) {
+      llast = llama_ce_loss(&tm, &acts, ids, seq, targets, &logits, &probs);
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, targets, &logits);
+      llama_backward(&tm, ids, seq, &acts, &logits);
+      adam_step(&lopt, lps, n_lp);
+    }
+    int ltrain_ok = (llast < lfirst * 0.5f) && isfinite(llast);
+    printf("    train 200 steps (Adam): loss %.4f -> %.4f -> %s\n\n",
+           lfirst, llast, ltrain_ok ? "OK" : "FAIL");
+    all_ok &= ltrain_ok;
+
+    adam_free(&lopt);
+    free(lps);
+    tensor_free(&logits); tensor_free(&probs); tensor_free(&ref);
+    llama_acts_free(&acts);
+    llama_model_free(&tm);
   }
 
   // --------------------------------------------------------------------------

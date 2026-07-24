@@ -15,29 +15,48 @@
 #include "swiglu.h"
 #include "quant.h"
 
-// The LLaMA-family path is forward-only (inference), so none of its tensors —
-// weights, KV cache, or decode scratch — ever need a gradient array. Allocating
-// without one halves the memory of a loaded fp32 model.
-static Tensor vec(int n) { int s[1] = {n}; return tensor_create_nograd(s, 1); }
-static Tensor mat(int r, int c) { int s[2] = {r, c}; return tensor_create_nograd(s, 2); }
+// Inference is the common case for the LLaMA-family path, so by default none of
+// its tensors — weights, KV cache, or decode scratch — carry a gradient array;
+// that halves the memory of a loaded fp32 model. The *_create_train variants
+// allocate the same weights WITH grads so the model can be trained (llamatrain.c).
+static Tensor vec_of(int n, int grad) {
+  int s[1] = {n};
+  return grad ? tensor_create(s, 1) : tensor_create_nograd(s, 1);
+}
+static Tensor mat_of(int r, int c, int grad) {
+  int s[2] = {r, c};
+  return grad ? tensor_create(s, 2) : tensor_create_nograd(s, 2);
+}
+static Tensor vec(int n) { return vec_of(n, 0); }
+static Tensor mat(int r, int c) { return mat_of(r, c, 0); }
 
-LlamaBlock llama_block_create(int d_model, int n_heads, int n_kv, int head_dim,
-                              int d_ff, float rope_base, float eps) {
+static LlamaBlock block_create_ex(int d_model, int n_heads, int n_kv, int head_dim,
+                                  int d_ff, float rope_base, float eps, int grad) {
   LlamaBlock b;
   b.d_model = d_model; b.n_heads = n_heads; b.n_kv = n_kv; b.head_dim = head_dim;
   b.d_ff = d_ff; b.rope_base = rope_base; b.eps = eps;
   const int qd = n_heads * head_dim, kvd = n_kv * head_dim;
-  b.attn_norm = vec(d_model);
-  b.Wq = mat(d_model, qd);
-  b.Wk = mat(d_model, kvd);
-  b.Wv = mat(d_model, kvd);
-  b.b_q = vec(qd); b.b_k = vec(kvd); b.b_v = vec(kvd);
-  b.Wo = mat(qd, d_model);
-  b.ffn_norm = vec(d_model);
-  b.Wgate = mat(d_model, d_ff);
-  b.Wup = mat(d_model, d_ff);
-  b.Wdown = mat(d_ff, d_model);
+  b.attn_norm = vec_of(d_model, grad);
+  b.Wq = mat_of(d_model, qd, grad);
+  b.Wk = mat_of(d_model, kvd, grad);
+  b.Wv = mat_of(d_model, kvd, grad);
+  b.b_q = vec_of(qd, grad); b.b_k = vec_of(kvd, grad); b.b_v = vec_of(kvd, grad);
+  b.Wo = mat_of(qd, d_model, grad);
+  b.ffn_norm = vec_of(d_model, grad);
+  b.Wgate = mat_of(d_model, d_ff, grad);
+  b.Wup = mat_of(d_model, d_ff, grad);
+  b.Wdown = mat_of(d_ff, d_model, grad);
   return b;
+}
+
+LlamaBlock llama_block_create(int d_model, int n_heads, int n_kv, int head_dim,
+                              int d_ff, float rope_base, float eps) {
+  return block_create_ex(d_model, n_heads, n_kv, head_dim, d_ff, rope_base, eps, 0);
+}
+
+LlamaBlock llama_block_create_train(int d_model, int n_heads, int n_kv, int head_dim,
+                                    int d_ff, float rope_base, float eps) {
+  return block_create_ex(d_model, n_heads, n_kv, head_dim, d_ff, rope_base, eps, 1);
 }
 
 void llama_block_free(LlamaBlock *b) {
@@ -101,20 +120,34 @@ void llama_block_forward(const LlamaBlock *b, const Tensor *x, Tensor *out) {
 // Full model
 // ---------------------------------------------------------------------------
 
-LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
-                              int n_kv, int head_dim, int d_ff, int max_seq,
-                              float rope_base, float eps) {
+static LlamaModel model_create_ex(int vocab, int d_model, int n_layers, int n_heads,
+                                  int n_kv, int head_dim, int d_ff, int max_seq,
+                                  float rope_base, float eps, int grad) {
   LlamaModel m;
   m.vocab = vocab; m.d_model = d_model; m.n_layers = n_layers;
   m.n_heads = n_heads; m.n_kv = n_kv; m.head_dim = head_dim; m.d_ff = d_ff;
   m.max_seq = max_seq; m.rope_base = rope_base; m.eps = eps;
-  m.wte = mat(vocab, d_model);
+  m.wte = mat_of(vocab, d_model, grad);
   m.blocks = (LlamaBlock*)malloc((size_t)n_layers * sizeof(LlamaBlock));
   for (int l = 0; l < n_layers; l++)
-    m.blocks[l] = llama_block_create(d_model, n_heads, n_kv, head_dim, d_ff, rope_base, eps);
-  m.final_norm = vec(d_model);
-  m.lm_head = mat(d_model, vocab);
+    m.blocks[l] = block_create_ex(d_model, n_heads, n_kv, head_dim, d_ff, rope_base, eps, grad);
+  m.final_norm = vec_of(d_model, grad);
+  m.lm_head = mat_of(d_model, vocab, grad);
   return m;
+}
+
+LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
+                              int n_kv, int head_dim, int d_ff, int max_seq,
+                              float rope_base, float eps) {
+  return model_create_ex(vocab, d_model, n_layers, n_heads, n_kv, head_dim,
+                         d_ff, max_seq, rope_base, eps, 0);
+}
+
+LlamaModel llama_model_create_train(int vocab, int d_model, int n_layers, int n_heads,
+                                    int n_kv, int head_dim, int d_ff, int max_seq,
+                                    float rope_base, float eps) {
+  return model_create_ex(vocab, d_model, n_layers, n_heads, n_kv, head_dim,
+                         d_ff, max_seq, rope_base, eps, 1);
 }
 
 void llama_model_free(LlamaModel *m) {

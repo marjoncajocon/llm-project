@@ -1607,3 +1607,50 @@ KILLED at ~step 1900 (loss ~0.11). The **step-1800 checkpoint** is what is on di
   3. Horizontal-relation sample sizes were tiny (n=1..4) because color failures ate them --
      re-measure relations properly once color fidelity is fixed.
 
+
+## 2026-07-24 (2) -- Training the modern (LLaMA-family) architecture: llamatrain.c
+
+Started the post-t2i roadmap. Goal chosen: make the project able to **train**, not just run, the
+architecture real modern models use -- the prerequisite for LoRA fine-tuning a real small model
+(SmolLM2-135M) so the agent loop can finally be driven by OUR engine instead of an external API.
+
+**The gap:** `llama.c` was inference-only (`llama.h` had no backward/train symbols at all), even
+though `rmsnorm.c`, `rope.c`, `swiglu.c`, `gqa.c` each already had a gradient-checked `_backward`.
+The per-op math existed; the model-level stitching did not.
+
+**Added (pure C11, no deps):**
+  - `llamatrain.h` / `llamatrain.c` -- new module, mirroring the GPT training path in `model.h`:
+    `LlamaActs` (cached activations incl. per-layer `GqaCache`/`SwigluCache`), `llama_acts_create`
+    /`_free`, `llama_forward_train`, `llama_backward`, `llama_param_count`, `llama_collect_params`,
+    `llama_zero_grad`. Params = **3 + 12*n_layers** (27 for the 2-layer test model).
+  - `rope.c/h`: **`rope_heads_backward` / `rope_heads_backward_pos`** -- the multi-head in-place
+    RoPE had no backward. It TRANSFORMS `x->grad` in place (inverse rotation) rather than
+    accumulating, because the in-place forward means pre- and post-rotation grads share a buffer.
+    Documented explicitly in the header since it breaks the usual accumulate convention.
+  - `llama.c/h`: `llama_model_create_train` / `llama_block_create_train` -- same weights but WITH
+    grad arrays. Inference still allocates `nograd` (halves loaded-model memory), via shared
+    `*_create_ex(..., int grad)` helpers so the two paths can't drift.
+
+**Backward order** (reverse of forward; the residual means `h`/`x` receive grad from two paths, so
+the RMSNorm backward must run before the matching `matadd_backward` propagates):
+  out=h+f -> swiglu -> ffn_norm -> h=x+ao -> Wo -> gqa -> RoPE(q,k) -> biases -> Wq/Wk/Wv ->
+  attn_norm -> scatter emb grad into `wte` rows.
+
+**Verified -- new selftest part [22], three gates:**
+  - (a) `llama_forward_train` == `llama_model_forward` **bit-exactly** (max |diff| 0.00e+00). This
+    matters: if the caching forward differed, the backward would be differentiating a different
+    function than the one we ship.
+  - (b) end-to-end numerical gradient check over ALL 27 param tensors: **max rel err 1.04e-03**
+    on conditioned entries (gate < 1e-2), same rule as the GPT check in [2].
+  - (c) Adam, 200 steps, next-token task: loss **3.1764 -> 0.0012**.
+  Also still green: KV-cache bit-exact 0.00e+00, `Output validation: PASSED`, exit 0.
+  **All 8 cross targets build -Wall clean** (incl. wasm32-wasi + both macOS).
+
+Makefile OBJS/deps + README module table updated (contributor rules 7/8).
+
+**NEXT:** 1) LoRA adapters on top of this (freeze base, train rank-r A/B on the attention/FFN
+projections; base can stay int8 via `quant.c`) -- that is what makes fine-tuning 135M feasible on
+CPU; 2) AdamW + global grad-norm clipping + cosine-with-warmup LR in `optim.c` (plain Adam today,
+no decay/clip/schedule) -- needed for fine-tuning stability; 3) SIMD `matmul` (`matrix.c` is scalar
++ thread pool only) -- guard `__AVX2__`/`__ARM_NEON` with a scalar fallback for WASM, and note it
+won't stay bit-exact once the FMA reduction is reassociated.

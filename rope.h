@@ -26,4 +26,15 @@ void rope_backward(const Tensor *input, const Tensor *output, float base);
 void rope_heads_pos(Tensor *x, int n_heads, float base, int pos0);
 void rope_heads(Tensor *x, int n_heads, float base);
 
+// Backward of the in-place multi-head RoPE: replaces x->grad with the INVERSE
+// rotation of itself (dx = R(θ)^T dy), matching the in-place forward above.
+// RoPE is parameter-free, so there is nothing else to accumulate.
+//
+// NOTE: unlike the other *_backward here, this TRANSFORMS x->grad in place rather
+// than accumulating into a separate input — the in-place forward means the
+// pre- and post-rotation gradients live in the same buffer. Call it exactly once,
+// between the consumer's backward (which fills x->grad) and the producer's.
+void rope_heads_backward_pos(Tensor *x, int n_heads, float base, int pos0);
+void rope_heads_backward(Tensor *x, int n_heads, float base);
+
 #endif // ROPE_H
