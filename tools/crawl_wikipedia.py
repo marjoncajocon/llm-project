@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -26,12 +27,41 @@ API = "https://en.wikipedia.org/w/api.php"
 UA = "llm-project-crawler/1.0 (educational; local training corpus)"
 
 
-def api_get(params):
+def api_get(params, tries=6):
+    """GET with exponential backoff on rate limiting / transient server errors.
+
+    Wikipedia answers a too-fast crawler with HTTP 429; treating that as a failed
+    page (the old behaviour) silently drains the queue without fetching anything.
+    Honour Retry-After when present, otherwise back off 2s, 4s, 8s, ... and only
+    give up after `tries` attempts.
+    """
     params = dict(params, format="json", action="query")
     url = API + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+    delay = 2.0
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
+                raise
+            wait = delay
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            if retry_after:
+                try:
+                    wait = max(wait, float(retry_after))
+                except ValueError:
+                    pass
+            print("  [%d] backing off %.0fs" % (e.code, wait), flush=True)
+            time.sleep(wait)
+            delay = min(delay * 2.0, 60.0)
+        except urllib.error.URLError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, 60.0)
+    raise RuntimeError("unreachable")
 
 
 def get_extract(title):

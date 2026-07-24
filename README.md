@@ -495,11 +495,33 @@ routes to its exact tool call and stops cleanly at EOS:
 | `the task is finished` | `<done>Task complete.</done>` |
 | `write hello to notes.txt` | `<tool name="write_file" path="notes.txt">hello</tool>` |
 
-> **Honest scope.** A 135M model SFT'd on 12 examples *routes an instruction to a tool call* — it
-> does not plan a multi-step task, and it memorizes these pairs rather than generalizing.
-> Generation is near-greedy on purpose (`hfgen ... 0.1`); at the default `temp 0.8` it still emits
-> the right call but often rambles past the EOS token. `run_command` is **never** auto-approved
-> regardless of approval mode, so that row always requires an interactive `y`.
+> Generation is near-greedy on purpose (`hfgen ... 0.1`); at the default `temp 0.8` the model still
+> emits the right call but often rambles past the EOS token. `run_command` is **never**
+> auto-approved regardless of approval mode, so that row always requires an interactive `y`.
+
+**Bigger data → generalization, not memorization.** Twelve hand-written examples make the model
+*memorize* pairs. `tools/make_sft.py` templates many phrasings of each intent over a pool of
+filenames (drawn from crawled Wikipedia titles via `tools/crawl_wikipedia.py`, or a built-in list),
+so the same intent recurs with different words and arguments and the model must learn the
+*mapping*. `data/sft_agent.txt` is a committed 200-example sample.
+
+```sh
+python tools/make_sft.py --out data/sft_big.txt --n 600 --wiki data/wiki
+transformer llama-train data/sft_big.txt --sft --resume model/smollm/model.bin \
+  --hf-tok model/smollm/tok.hf --lora-r 16 --lora-alpha 32 --batch 4 \
+  --steps 300 --lr 3e-3 --clip 1.0 --warmup 15 --min-lr 3e-4 --out smol_agent.bin
+```
+
+Measured, holding out examples the model never trained on, and then testing wholly **invented**
+filenames (`quantum_widget.md`, `snarfblat.json`, `xyzzy.txt` — absent from training in any form):
+
+| model | exact match, unseen prompts | novel filenames |
+| --- | --- | --- |
+| 12 hand-written examples | memorizes | **62%** — right tool, wrong argument (`blat.json` for `snarfblat.json`) |
+| 600 templated examples | **100%** on 60 held-out | **100%** — copies arbitrary filenames + content |
+
+The small model still doesn't *plan* multi-step tasks — it routes one instruction to one tool call
+— but it now does so for filenames it has never seen, which the 12-example model could not.
 
 ### `transformer imggen` / `audgen` (generate media to a file)
 

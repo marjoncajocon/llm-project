@@ -1936,3 +1936,39 @@ All 8 cross targets -Wall clean, `Output validation: PASSED`, exit 0.
 **NEXT:** a real/bigger SFT dataset (12 examples means memorization, not generalization) is now the
 main thing holding the agent back; CI is still absent; lm_head`s dA still parallelizes over M and
 starves at small M.
+
+## 2026-07-24 (9) -- Grew the SFT data via crawl -> the agent model now GENERALIZES
+
+The standing bottleneck was data: 12 hand-written SFT pairs => the model memorizes. Fixed it and
+measured genuine generalization.
+
+**Crawler fix (`tools/crawl_wikipedia.py`):** it treated HTTP 429 (rate limited) as a failed page
+and silently drained the queue WITHOUT fetching -- a 0.5s delay got nothing but "skip ... 429".
+Added exponential backoff (honours Retry-After, 2/4/8/...s, 6 tries) on 429/5xx. Verified: it hits
+a 429, waits, and continues instead of skipping. Ran a ~2h crawl at --delay 3.0 (still 429s, so
+Wikipedia is strict); it writes each page as fetched so partial runs are kept (got 130+ articles).
+
+**`tools/make_sft.py`:** templates many phrasings of each intent (read/write/delete/run/done) over
+a filename pool taken from the crawled titles (or a builtin list), so an intent recurs with
+different words + arguments. `data/sft_agent.txt` (200 examples) committed as a reproducible sample
+(forced past the data/* ignore, like data/sft.txt).
+
+**`scratchpad/score_sft.py`:** scores a model on a held-out prompt<TAB>response set -- exact match
+and right-tool -- by running `hfgen` at temp 0.1 and parsing the streamed deltas.
+
+**RESULT -- LoRA-SFT SmolLM2-135M on 540 templated train examples** (rank 16, alpha 32, --batch 4,
+300 steps, lr 3e-3 + warmup/cosine, 16 min): loss -> 0.11.
+  - **60 held-out examples: 100% exact match** (never trained on those pairs).
+  - **8 wholly INVENTED filenames** (quantum_widget, zzblarg, frobnicate, snarfblat, wumpus,
+    xyzzy -- absent from training in any form): **100% exact**.
+  - The OLD 12-example model on those same invented names: **62% exact** -- it picks the right tool
+    every time but GARBLES the argument ("blat.json" for "snarfblat.json", empty write body). That
+    is memorization vs generalization, shown side by side.
+
+So the data growth did exactly what it was for: the model learned the instruction -> tool-call
+MAPPING (copy the filename/word out of the instruction), not a fixed set of pairs. It still does
+not PLAN multi-step tasks -- one instruction -> one tool call -- but now for unseen arguments.
+README updated with the table; --batch 4 also got its first real use here.
+
+**NEXT:** multi-step planning would need transcript-aware SFT data (observation -> next tool), not
+just single instructions; CI still absent; lm_head dA still starves at small M.

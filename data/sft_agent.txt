@@ -1,0 +1,200 @@
+put work in progress in index.json	<tool name="write_file" path="index.json">work in progress</tool>
+read main.txt	<tool name="read_file" path="main.txt"></tool>
+create draft.md with done	<tool name="write_file" path="draft.md">done</tool>
+create results.txt with work in progress	<tool name="write_file" path="results.txt">work in progress</tool>
+display the contents of index.txt	<tool name="read_file" path="index.txt"></tool>
+list files in this folder	<tool name="run_command" command="ls"></tool>
+get rid of results.log	<tool name="run_command" command="rm results.log"></tool>
+print draft.md	<tool name="read_file" path="draft.md"></tool>
+show running processes	<tool name="run_command" command="ps aux"></tool>
+read summary.txt	<tool name="read_file" path="summary.txt"></tool>
+put finished in notes.json	<tool name="write_file" path="notes.json">finished</tool>
+print log.csv	<tool name="read_file" path="log.csv"></tool>
+open summary.md	<tool name="read_file" path="summary.md"></tool>
+open config.txt	<tool name="read_file" path="config.txt"></tool>
+rm results.txt	<tool name="run_command" command="rm results.txt"></tool>
+open readme.txt	<tool name="read_file" path="readme.txt"></tool>
+print scratch.md	<tool name="read_file" path="scratch.md"></tool>
+print report.log	<tool name="read_file" path="report.log"></tool>
+write test to todo.json	<tool name="write_file" path="todo.json">test</tool>
+run the tests	<tool name="run_command" command="make test"></tool>
+build the project	<tool name="run_command" command="make"></tool>
+run the tests	<tool name="run_command" command="make test"></tool>
+run the test suite	<tool name="run_command" command="make test"></tool>
+check the git status	<tool name="run_command" command="git status"></tool>
+what's in readme.md	<tool name="read_file" path="readme.md"></tool>
+put done in log.csv	<tool name="write_file" path="log.csv">done</tool>
+save the word finished to todo.log	<tool name="write_file" path="todo.log">finished</tool>
+create a file notes.md with the text work in progress	<tool name="write_file" path="notes.md">work in progress</tool>
+you can finish	<done>Task complete.</done>
+write done to readme.json	<tool name="write_file" path="readme.json">done</tool>
+save the word hello to output.log	<tool name="write_file" path="output.log">hello</tool>
+put todo in log.log	<tool name="write_file" path="log.log">todo</tool>
+what's in scratch.txt	<tool name="read_file" path="scratch.txt"></tool>
+the task is finished	<done>Task complete.</done>
+save the word the result is 42 to notes.json	<tool name="write_file" path="notes.json">the result is 42</tool>
+print the current directory	<tool name="run_command" command="pwd"></tool>
+that's everything, stop	<done>Stopping as requested.</done>
+make notes.json containing start	<tool name="write_file" path="notes.json">start</tool>
+open output.log	<tool name="read_file" path="output.log"></tool>
+create a file readme.csv with the text test	<tool name="write_file" path="readme.csv">test</tool>
+open output.csv	<tool name="read_file" path="output.csv"></tool>
+nothing more to do	<done>Task complete.</done>
+read config.md	<tool name="read_file" path="config.md"></tool>
+remove output.txt	<tool name="run_command" command="rm output.txt"></tool>
+the task is finished	<done>Task complete.</done>
+create notes.log with ok	<tool name="write_file" path="notes.log">ok</tool>
+create todo.log with the result is 42	<tool name="write_file" path="todo.log">the result is 42</tool>
+we are done here	<done>Task complete.</done>
+write the result is 42 to index.md	<tool name="write_file" path="index.md">the result is 42</tool>
+check the git status	<tool name="run_command" command="git status"></tool>
+make todo.csv containing todo	<tool name="write_file" path="todo.csv">todo</tool>
+show me report.log	<tool name="read_file" path="report.log"></tool>
+what's in todo.csv	<tool name="read_file" path="todo.csv"></tool>
+show me draft.json	<tool name="read_file" path="draft.json"></tool>
+show the directory contents	<tool name="run_command" command="ls -la"></tool>
+put test in output.txt	<tool name="write_file" path="output.txt">test</tool>
+open todo.json	<tool name="read_file" path="todo.json"></tool>
+make results.md containing todo	<tool name="write_file" path="results.md">todo</tool>
+save the word ok to index.log	<tool name="write_file" path="index.log">ok</tool>
+create draft.csv with test	<tool name="write_file" path="draft.csv">test</tool>
+write finished to output.json	<tool name="write_file" path="output.json">finished</tool>
+read the file readme.json	<tool name="read_file" path="readme.json"></tool>
+nothing more to do	<done>Task complete.</done>
+create config.log with todo	<tool name="write_file" path="config.log">todo</tool>
+get rid of config.csv	<tool name="run_command" command="rm config.csv"></tool>
+make summary.log containing done	<tool name="write_file" path="summary.log">done</tool>
+get rid of data.log	<tool name="run_command" command="rm data.log"></tool>
+we are done here	<done>Task complete.</done>
+read the file readme.csv	<tool name="read_file" path="readme.csv"></tool>
+check the git status	<tool name="run_command" command="git status"></tool>
+write first line to todo.txt	<tool name="write_file" path="todo.txt">first line</tool>
+remove output.md	<tool name="run_command" command="rm output.md"></tool>
+nothing more to do	<done>Task complete.</done>
+create a file draft.csv with the text done	<tool name="write_file" path="draft.csv">done</tool>
+show me results.csv	<tool name="read_file" path="results.csv"></tool>
+make log.txt containing finished	<tool name="write_file" path="log.txt">finished</tool>
+put start in index.md	<tool name="write_file" path="index.md">start</tool>
+make temp.md containing the result is 42	<tool name="write_file" path="temp.md">the result is 42</tool>
+remove main.csv	<tool name="run_command" command="rm main.csv"></tool>
+rm draft.csv	<tool name="run_command" command="rm draft.csv"></tool>
+print the current directory	<tool name="run_command" command="pwd"></tool>
+print summary.csv	<tool name="read_file" path="summary.csv"></tool>
+what's in log.log	<tool name="read_file" path="log.log"></tool>
+build the project	<tool name="run_command" command="make"></tool>
+remove config.md	<tool name="run_command" command="rm config.md"></tool>
+put work in progress in summary.json	<tool name="write_file" path="summary.json">work in progress</tool>
+the task is finished	<done>Task complete.</done>
+create a file log.log with the text first line	<tool name="write_file" path="log.log">first line</tool>
+read temp.md	<tool name="read_file" path="temp.md"></tool>
+print the current directory	<tool name="run_command" command="pwd"></tool>
+delete report.md	<tool name="run_command" command="rm report.md"></tool>
+remove data.md	<tool name="run_command" command="rm data.md"></tool>
+create main.log with finished	<tool name="write_file" path="main.log">finished</tool>
+print draft.csv	<tool name="read_file" path="draft.csv"></tool>
+put todo in notes.log	<tool name="write_file" path="notes.log">todo</tool>
+write todo to config.md	<tool name="write_file" path="config.md">todo</tool>
+build the project	<tool name="run_command" command="make"></tool>
+the task is finished	<done>Task complete.</done>
+make output.md containing the result is 42	<tool name="write_file" path="output.md">the result is 42</tool>
+get rid of summary.md	<tool name="run_command" command="rm summary.md"></tool>
+open todo.log	<tool name="read_file" path="todo.log"></tool>
+make draft.md containing hello	<tool name="write_file" path="draft.md">hello</tool>
+rm data.md	<tool name="run_command" command="rm data.md"></tool>
+cat todo.md	<tool name="read_file" path="todo.md"></tool>
+nothing more to do	<done>Task complete.</done>
+show where i am	<tool name="run_command" command="pwd"></tool>
+put work in progress in readme.csv	<tool name="write_file" path="readme.csv">work in progress</tool>
+run the test suite	<tool name="run_command" command="make test"></tool>
+write work in progress to notes.log	<tool name="write_file" path="notes.log">work in progress</tool>
+remove summary.json	<tool name="run_command" command="rm summary.json"></tool>
+read the file results.json	<tool name="read_file" path="results.json"></tool>
+create main.log with ok	<tool name="write_file" path="main.log">ok</tool>
+cat report.log	<tool name="read_file" path="report.log"></tool>
+put work in progress in todo.md	<tool name="write_file" path="todo.md">work in progress</tool>
+get rid of temp.json	<tool name="run_command" command="rm temp.json"></tool>
+nothing more to do	<done>Task complete.</done>
+read the file readme.json	<tool name="read_file" path="readme.json"></tool>
+cat main.csv	<tool name="read_file" path="main.csv"></tool>
+display the contents of scratch.md	<tool name="read_file" path="scratch.md"></tool>
+read the file temp.log	<tool name="read_file" path="temp.log"></tool>
+what's in readme.log	<tool name="read_file" path="readme.log"></tool>
+create scratch.csv with first line	<tool name="write_file" path="scratch.csv">first line</tool>
+put first line in temp.md	<tool name="write_file" path="temp.md">first line</tool>
+display the contents of index.csv	<tool name="read_file" path="index.csv"></tool>
+you can finish	<done>Task complete.</done>
+save the word ok to todo.csv	<tool name="write_file" path="todo.csv">ok</tool>
+print the date	<tool name="run_command" command="date"></tool>
+print results.csv	<tool name="read_file" path="results.csv"></tool>
+create a file todo.log with the text the result is 42	<tool name="write_file" path="todo.log">the result is 42</tool>
+show where i am	<tool name="run_command" command="pwd"></tool>
+create a file temp.csv with the text test	<tool name="write_file" path="temp.csv">test</tool>
+open scratch.md	<tool name="read_file" path="scratch.md"></tool>
+that's everything, stop	<done>Stopping as requested.</done>
+cat index.csv	<tool name="read_file" path="index.csv"></tool>
+rm data.json	<tool name="run_command" command="rm data.json"></tool>
+read the file report.txt	<tool name="read_file" path="report.txt"></tool>
+print data.json	<tool name="read_file" path="data.json"></tool>
+make readme.md containing todo	<tool name="write_file" path="readme.md">todo</tool>
+put the result is 42 in todo.csv	<tool name="write_file" path="todo.csv">the result is 42</tool>
+show running processes	<tool name="run_command" command="ps aux"></tool>
+open readme.txt	<tool name="read_file" path="readme.txt"></tool>
+open report.json	<tool name="read_file" path="report.json"></tool>
+put done in draft.log	<tool name="write_file" path="draft.log">done</tool>
+create a file config.csv with the text start	<tool name="write_file" path="config.csv">start</tool>
+show disk usage	<tool name="run_command" command="df -h"></tool>
+you can finish	<done>Task complete.</done>
+write start to todo.log	<tool name="write_file" path="todo.log">start</tool>
+show the git status	<tool name="run_command" command="git status"></tool>
+save the word todo to readme.txt	<tool name="write_file" path="readme.txt">todo</tool>
+print the date	<tool name="run_command" command="date"></tool>
+stop now	<done>Stopping as requested.</done>
+show me report.md	<tool name="read_file" path="report.md"></tool>
+create main.md with hi there	<tool name="write_file" path="main.md">hi there</tool>
+get rid of report.txt	<tool name="run_command" command="rm report.txt"></tool>
+show running processes	<tool name="run_command" command="ps aux"></tool>
+read summary.txt	<tool name="read_file" path="summary.txt"></tool>
+print the date	<tool name="run_command" command="date"></tool>
+put first line in temp.txt	<tool name="write_file" path="temp.txt">first line</tool>
+save the word the result is 42 to config.csv	<tool name="write_file" path="config.csv">the result is 42</tool>
+show disk usage	<tool name="run_command" command="df -h"></tool>
+create a file notes.csv with the text test	<tool name="write_file" path="notes.csv">test</tool>
+create output.txt with todo	<tool name="write_file" path="output.txt">todo</tool>
+save the word work in progress to draft.json	<tool name="write_file" path="draft.json">work in progress</tool>
+put first line in data.txt	<tool name="write_file" path="data.txt">first line</tool>
+open report.md	<tool name="read_file" path="report.md"></tool>
+remove draft.log	<tool name="run_command" command="rm draft.log"></tool>
+show the git status	<tool name="run_command" command="git status"></tool>
+run the test suite	<tool name="run_command" command="make test"></tool>
+make main.log containing finished	<tool name="write_file" path="main.log">finished</tool>
+display the contents of summary.txt	<tool name="read_file" path="summary.txt"></tool>
+list the files here	<tool name="run_command" command="ls"></tool>
+we are done here	<done>Task complete.</done>
+the task is finished	<done>Task complete.</done>
+remove scratch.md	<tool name="run_command" command="rm scratch.md"></tool>
+run the tests	<tool name="run_command" command="make test"></tool>
+put ok in draft.log	<tool name="write_file" path="draft.log">ok</tool>
+create scratch.md with first line	<tool name="write_file" path="scratch.md">first line</tool>
+run the test suite	<tool name="run_command" command="make test"></tool>
+check the git status	<tool name="run_command" command="git status"></tool>
+print the current directory	<tool name="run_command" command="pwd"></tool>
+nothing more to do	<done>Task complete.</done>
+display the contents of main.txt	<tool name="read_file" path="main.txt"></tool>
+delete index.json	<tool name="run_command" command="rm index.json"></tool>
+create a file report.log with the text work in progress	<tool name="write_file" path="report.log">work in progress</tool>
+list files in this folder	<tool name="run_command" command="ls"></tool>
+what version of python is installed	<tool name="run_command" command="python --version"></tool>
+create draft.log with the result is 42	<tool name="write_file" path="draft.log">the result is 42</tool>
+rm temp.json	<tool name="run_command" command="rm temp.json"></tool>
+make report.txt containing the result is 42	<tool name="write_file" path="report.txt">the result is 42</tool>
+save the word the result is 42 to index.csv	<tool name="write_file" path="index.csv">the result is 42</tool>
+delete log.json	<tool name="run_command" command="rm log.json"></tool>
+write finished to summary.md	<tool name="write_file" path="summary.md">finished</tool>
+rm config.csv	<tool name="run_command" command="rm config.csv"></tool>
+read the file todo.txt	<tool name="read_file" path="todo.txt"></tool>
+we are done here	<done>Task complete.</done>
+list the files here	<tool name="run_command" command="ls"></tool>
+write ok to index.csv	<tool name="write_file" path="index.csv">ok</tool>
+run the tests	<tool name="run_command" command="make test"></tool>
+delete main.csv	<tool name="run_command" command="rm main.csv"></tool>
+what's in todo.csv	<tool name="read_file" path="todo.csv"></tool>
