@@ -111,15 +111,53 @@ def build_tasks(rng, files, cmds):
     return goal, [(tool_run(c), "ok")]
 
 
-def emit_pairs(goal, steps, rng):
-    """Explode a task into (transcript_prefix, next_action) pairs, ending in <done>."""
+# A short, grounded rationale for an action, inferred from the tool call itself.
+# Reasoning-dense SFT trains the model to state WHY before acting; the rationale
+# is ephemeral (emitted then dropped from the transcript), so it need not persist.
+def rationale_for(action, rng):
+    m = re.search(r'name="(\w+)"', action)
+    name = m.group(1) if m else ""
+    path = re.search(r'path="([^"]*)"', action)
+    cmd = re.search(r'command="([^"]*)"', action)
+    if name == "write_file":
+        return rng.choice(["First I'll create %s with the requested content.",
+                           "I need to write the content to %s."]) % (path.group(1) if path else "the file")
+    if name == "read_file":
+        return rng.choice(["Now I'll read %s back to verify it.",
+                           "Read %s to check its contents."]) % (path.group(1) if path else "the file")
+    if name == "run_command":
+        c = cmd.group(1) if cmd else ""
+        if c.startswith("rm "):
+            return "Delete %s as asked." % c[3:]
+        if c == "ls" or c.startswith("ls "):
+            return "List the files to see the result."
+        return "Run %s to do this." % c
+    return ""
+
+
+def emit_pairs(goal, steps, rng, reason):
+    """Explode a task into (transcript_prefix, next_action) pairs, ending in <done>.
+
+    With reason=True the RESPONSE is "<think>rationale</think>action" (the model
+    plans out loud, then acts), but the transcript MODEL turns stay bare actions,
+    so prior reasoning is not fed back — matching agent_local.py at inference.
+    """
     pairs = []
     turns = ["GOAL: " + goal]
     for action, obs in steps:
-        pairs.append((SEP.join(turns), action))
-        turns.append("MODEL: " + action)
+        resp = action
+        if reason:
+            r = rationale_for(action, rng)
+            if r:
+                resp = "<think>%s</think>%s" % (r, action)
+        pairs.append((SEP.join(turns), resp))
+        turns.append("MODEL: " + action)          # bare action in history
         turns.append("OBSERVATION: " + obs.replace("\n", " ").replace("\t", " "))
-    pairs.append((SEP.join(turns), "<done>%s</done>" % rng.choice(DONE)))
+    done = "<done>%s</done>" % rng.choice(DONE)
+    if reason:
+        done = "<think>%s</think>%s" % (rng.choice(
+            ["Every step is finished, so I'm done.", "The goal is complete."]), done)
+    pairs.append((SEP.join(turns), done))
     return pairs
 
 
@@ -129,6 +167,8 @@ def main():
     ap.add_argument("--n", type=int, default=260, help="number of tasks (each -> several pairs)")
     ap.add_argument("--wiki", default=None)
     ap.add_argument("--commands", default=None)
+    ap.add_argument("--reason", action="store_true",
+                    help="reasoning-dense: prefix each action with <think>rationale</think>")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
 
@@ -141,7 +181,7 @@ def main():
     for _ in range(args.n):
         goal, steps = build_tasks(rng, files, cmds)
         steps_hist[len(steps)] = steps_hist.get(len(steps), 0) + 1
-        for prompt, resp in emit_pairs(goal, steps, rng):
+        for prompt, resp in emit_pairs(goal, steps, rng, args.reason):
             rows.append("%s\t%s" % (prompt.replace("\t", " "), resp))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

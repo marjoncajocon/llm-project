@@ -47,10 +47,15 @@ def decode_deltas(stdout):
     return "".join(text)
 
 
-def first_action(text):
-    """Return just the first <tool .../> or <done>...</done> the model emitted."""
+def split_reason_action(text):
+    """Return (reasoning, action). The model may emit "<think>why</think><tool .../>";
+    the reasoning is shown to the user but NOT recorded in the transcript, so the
+    history stays bare tool calls (matching the trajectory SFT prefixes)."""
+    think = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+    reason = think.group(1).strip() if think else ""
     m = re.search(r'<tool\b[^>]*>.*?</tool>|<done>.*?</done>', text, re.DOTALL)
-    return m.group(0) if m else text.strip()
+    action = m.group(0) if m else text.strip()
+    return reason, action
 
 
 def main():
@@ -67,10 +72,17 @@ def main():
         print("<done>Nothing to do.</done>")
         return
 
-    proc = subprocess.run([ENGINE, "hfgen", model, tok, "40", "0.1"],
+    # 64 new tokens: reasoning-dense output is "<think>...</think><tool .../>",
+    # longer than a bare tool call.
+    proc = subprocess.run([ENGINE, "hfgen", model, tok, "64", "0.1"],
                           input=prompt.encode("utf-8"),
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    action = first_action(decode_deltas(proc.stdout))
+    reason, action = split_reason_action(decode_deltas(proc.stdout))
+    if reason:
+        # stderr is shown to the user by the agent but not captured as the model's
+        # response, so the recorded transcript turn stays a bare tool call.
+        sys.stderr.write("  thought: %s\n" % reason)
+        sys.stderr.flush()
     print(action or "<done>No response.</done>")
 
 
