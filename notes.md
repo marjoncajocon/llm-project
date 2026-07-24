@@ -2191,3 +2191,22 @@ multi-agent cognition), not incremental engine work. The current repo provides O
 the "long-term procedural memory / execution model" (the fine-tuned tool-using agent). Everything
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
+
+## 2026-07-24 (14) -- REASONING-DENSE planning WORKS (top future-work item done)
+
+The model now states a short rationale BEFORE each action. `make_agent_traj.py --reason` wraps each
+step response as "<think>rationale</think><tool .../>" (rationale inferred from the tool call);
+the transcript MODEL turns stay BARE, and `agent_local.py` writes the reasoning to stderr (shown
+to the user) while returning only the clean tool call to stdout (recorded), so history matches
+training. `toolcall_parse` already scans for <tool> anywhere, so no C change. Trained SmolLM2-135M
+(LoRA r16, batch 4, 350 steps) on 500 reasoning-trajectory + 378 Q&A pairs, loss -> 0.88 (higher/
+noisier than 0.46 without reasoning -- EXPECTED, the think spans add token variety).
+
+**VERIFIED end to end** on "create hello.txt containing world and read it back":
+  step1  thought "First I'll create hello.txt with the requested content." -> write_file "world"
+  step2  thought "Read hello.txt to check its contents."                    -> read_file
+  step3  thought "The goal is complete."                                     -> <done>
+  File held "world". The rationales are grounded in the actual task/files and the correct 2nd
+  action + stop were chosen from the transcript. Reasoning-dense + multi-step + execution, together.
+
+So the near-term checklist item flips: reasoning-dense is now [x] APPLIED (was [ ]).

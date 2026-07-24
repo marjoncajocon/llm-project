@@ -470,10 +470,11 @@ and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2
 
 ### FUTURE WORK (requested) -- [x] applied in code, [~] partial, [ ] not yet
 
-- [ ] Reasoning-dense data/training -- NOT applied. All SFT pairs are direct
-  instruction/transcript -> action, no chain-of-thought spans. To apply: add short reasoning
-  between OBSERVATION and the next action in trajectory data and train the model to emit rationale
-  then tool call. Biggest lever for harder planning.
+- [x] Reasoning-dense data/training -- APPLIED 2026-07-24. make_agent_traj.py --reason wraps each
+  step as "<think>rationale</think><tool>"; agent_local.py shows reasoning on stderr, records the
+  bare tool call. Verified end to end: the agent states a grounded thought before each action
+  ("First I'll create hello.txt...", "Read hello.txt to check...", "The goal is complete") and
+  completes the multi-step task. Reasoning-dense + multi-step + execution together.
 - [x] Execution-oriented -- APPLIED. agent.c/toolcall.c/toolexec.c parse -> approve -> execute ->
   observe real tool calls over multiple steps; SFT labels are executable tool calls; observations
   come from real execution.
