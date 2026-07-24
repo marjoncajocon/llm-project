@@ -1840,3 +1840,55 @@ All 8 cross targets -Wall clean, `Output validation: PASSED`, exit 0.
 data -- the payoff this and the last four sessions were building toward. Then batching /
 grad-accumulation (still batch=1). Also worth doing: lm_head's dA parallelizes over M rows, which
 starves at small M -- parallelizing that kernel over K instead would fix the 1.9x outlier.
+
+## 2026-07-24 (7) -- THE PAYOFF: the agent now runs on our OWN engine (LoRA-SFT SmolLM2-135M)
+
+Sixth roadmap item, and the goal the last five sessions were building toward. The README's
+long-standing caveat -- "the built-in transformer is far too small to emit valid tool calls; point
+--cmd at an instruction-tuned model or an LLM API" -- is now RETIRED.
+
+**Avoided a 270 MB re-download.** `model/smollm/model.bin` was already on disk but is **LLMA v1**,
+and the loader requires v2 (v2 added the per-layer q/k/v biases). Instead of re-running
+`convert_llama.py` (needs a HF download; no local HF cache exists), wrote **`tools/upgrade_llma.py`**
+-- v1 and v2 differ ONLY by three zero bias vectors per layer for LLaMA/SmolLM, so the upgrade is
+mechanical. Verified the layout arithmetically first: predicted v1 size matched the actual file
+byte-for-byte once I corrected the header to 48 bytes (4 magic + 4 version + 32 cfg + 8 floats),
+and the converter consumed the input with no trailing bytes.
+
+**`--hf-tok`: fine-tune with a REAL model's own vocabulary.** SFT previously always trained our
+byte-level BPE, which is useless for a pretrained model (different ids => meaningless embeddings).
+Added an `AnyTok` tagged union (Tokenizer | HFTok) with `anytok_encode/vocab/eos/model_vocab`, so
+ONE SFT loop serves both and the project's no-`void *` rule is respected. With an HF vocab the
+model's REAL EOS is used (id 2 for SmolLM2), so no vocab slot is grown.
+
+**Also:** `hfgen` had temperature hardcoded at 0.8; now `hfgen <model> <tok> [n_new] [temp]`.
+Deterministic tool-call generation needs near-greedy sampling.
+
+**RESULTS -- LoRA-SFT of the real SmolLM2-135M** (vocab 49152, d_model 576, 30 layers, GQA 9/3),
+base FROZEN, rank 16 alpha 32, 400 steps, **292 s**:
+  - loss **8.6459 -> 0.1041**
+  - at temp 0.1, ALL five prompts route to the exact tool call AND stop cleanly at EOS:
+    read_file / run_command ls / run_command git status / <done> / write_file with body.
+  - a 60-step run (72 s) already reached 0.20 and got 2 of 3 right -- it picked `run_command` for
+    "read notes.txt". 400 steps fixed the tool choice.
+
+**This is the direct contrast that validates the earlier honest finding:** the SAME LoRA code on a
+TOY base (440-byte corpus, d_model 64) plateaued at loss ~2.5 and emitted garbage; on a genuinely
+pretrained base it reaches 0.10 and is exactly right. LoRA needs real pretrained representations --
+now demonstrated both ways.
+
+**Agent end to end** (`tools/agent_local.py`, new): goal "write hello to notes.txt" -> our engine
+emitted `<tool name="write_file" path="notes.txt">hello</tool>` -> agent parsed, auto-approved,
+executed, and notes.txt contained "hello". No API, no network.
+Note `run_command` is NEVER auto-approved (deliberate hardening in agent.c), so a `git status` goal
+correctly stops at an interactive y/N and is denied on non-interactive stdin.
+
+**Honest scope:** 135M SFT'd on 12 examples ROUTES an instruction to a tool call; it does not plan
+multi-step tasks and it memorizes rather than generalizes. At the default temp 0.8 it still emits
+the right call but rambles past EOS. README states all of this.
+
+All 8 cross targets -Wall clean, `Output validation: PASSED`, exit 0.
+
+**NEXT:** batching / grad-accumulation (still batch=1) would make longer fine-tunes meaningfully
+better; a bigger/real SFT dataset would move it from memorization toward generalization; CI still
+absent; lm_head dA still parallelizes over M (starves at small M).

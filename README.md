@@ -91,7 +91,7 @@ defined in the matching `.c`.
 | `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
-| `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py` |
+| `tools/`                          | Non-C helpers: GPT-2 setup/tokenizer, converters, `crawl_wikipedia.py`, `agent_local.py`, `upgrade_llma.py` |
 | `Makefile`                        | Build rules                                                   |
 | `tools/`                          | Helper scripts in **other** languages (Python/Go/…) — not C   |
 
@@ -451,9 +451,39 @@ real LLM with a small script (see `tools/agent_mock.py`, which shows the Anthrop
 to drop in). The pieces: `toolcall.c` (parse) · `toolexec.c` (write/read/run) · `approval.c`
 (gate) · `agent.c` (loop + scripted/command backends).
 
-> The built-in transformer is far too small to emit valid tool calls, and `model/gpt2` is base
-> (not instruction-tuned) — for a genuinely acting agent, point `--cmd` at an instruction-tuned
-> model or an LLM API.
+**The agent now runs on this project's own engine** — no API, no network. LoRA-fine-tune a real
+model to emit tool calls, then point `--cmd` at it via `tools/agent_local.py`:
+
+```sh
+# 1. LoRA-SFT SmolLM2-135M on the tool-call data (~5 min, base frozen)
+transformer llama-train data/sft.txt --sft --resume model/smollm/model.bin \
+  --hf-tok model/smollm/tok.hf --lora-r 16 --lora-alpha 32 \
+  --steps 400 --lr 2e-3 --clip 1.0 --warmup 20 --min-lr 2e-4 --out smol_sft.bin
+
+# 2. drive the agent with it
+transformer agent --cmd "python tools/agent_local.py smol_sft.bin model/smollm/tok.hf" \
+  --goal "write hello to notes.txt"
+#   tool requested: write_file 'notes.txt' (5 bytes)
+#   [auto-approved] write_file 'notes.txt' (5 bytes)
+#   observation: wrote 5 bytes to notes.txt
+```
+
+Measured after 400 LoRA steps (loss 8.65 → 0.10), generating at `temp 0.1`, every instruction
+routes to its exact tool call and stops cleanly at EOS:
+
+| prompt | output |
+| --- | --- |
+| `read notes.txt` | `<tool name="read_file" path="notes.txt"></tool>` |
+| `list the files here` | `<tool name="run_command" command="ls"></tool>` |
+| `show the git status` | `<tool name="run_command" command="git status"></tool>` |
+| `the task is finished` | `<done>Task complete.</done>` |
+| `write hello to notes.txt` | `<tool name="write_file" path="notes.txt">hello</tool>` |
+
+> **Honest scope.** A 135M model SFT'd on 12 examples *routes an instruction to a tool call* — it
+> does not plan a multi-step task, and it memorizes these pairs rather than generalizing.
+> Generation is near-greedy on purpose (`hfgen ... 0.1`); at the default `temp 0.8` it still emits
+> the right call but often rambles past the EOS token. `run_command` is **never** auto-approved
+> regardless of approval mode, so that row always requires an interactive `y`.
 
 ### `transformer imggen` / `audgen` (generate media to a file)
 

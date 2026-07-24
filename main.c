@@ -244,7 +244,10 @@ static void train_usage(void) {
     "  --lora-r N        LoRA rank: FREEZE the base and train only low-rank adapters\n"
     "                    on Wq/Wk/Wv/Wo (merged into the weights before saving).\n"
     "                    Pair with --resume to fine-tune a pretrained checkpoint.\n"
-    "  --lora-alpha F    LoRA scaling (scale = alpha / r; default alpha = r)\n");
+    "  --lora-alpha F    LoRA scaling (scale = alpha / r; default alpha = r)\n"
+    "  --hf-tok F        fine-tune with a REAL model's own vocabulary (.hf, see\n"
+    "                    tools/export_tokenizer.py) instead of training a byte BPE.\n"
+    "                    Its real EOS token is used, so no vocab slot is added.\n");
 }
 
 // Shared by `train` (GPT) and `llama-train` (modern LLaMA-family) — the flags are
@@ -284,6 +287,7 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--rope-base") == 0 && llama) { NEED_VAL(); cfg.rope_base = (float)atof(argv[++i]); }
     else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--hf-tok") == 0 && llama) { NEED_VAL(); cfg.hf_tok = argv[++i]; }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }
@@ -752,14 +756,14 @@ static int hf_stop(char *dec) {
 // Stops on the model's real end-of-generation token (hftok_is_eog) — no string
 // heuristic needed once a chat template is used; hf_stop stays as a safety net
 // for base models that emit role labels as plain text.
-static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_new) {
+static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_new, float temp) {
   unsigned int magic = 0;
   FILE *pf = fopen(mpath, "rb");
   if (!pf) { fprintf(stderr, "cannot open '%s'\n", mpath); return 1; }
   if (fread(&magic, 4, 1, pf) != 1) magic = 0;
   fclose(pf);
 
-  const float temp = 0.8f, top_p = 0.95f;
+  const float top_p = 0.95f;
   const int top_k = 40;
   Rng rng = rng_create(1234);
   char *dec = (char*)malloc(1 << 20);
@@ -834,10 +838,13 @@ done:
 
 static int run_hfgen(int argc, char **argv) {
   if (argc < 4) {
-    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new]\n");
+    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp]\n"
+                    "  temp defaults to 0.8; use a low value (e.g. 0.1) for an\n"
+                    "  instruction-tuned model that should answer deterministically\n");
     return 2;
   }
   int n_new = (argc > 4) ? atoi(argv[4]) : 128;
+  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.8f;
   HFTok tok;
   if (hftok_load(&tok, argv[3]) != 0) return 1;
 
@@ -848,7 +855,7 @@ static int run_hfgen(int argc, char **argv) {
   int cap = plen + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, prompt, pids, cap);
-  int rc = hf_generate(&tok, argv[2], pids, np, n_new);
+  int rc = hf_generate(&tok, argv[2], pids, np, n_new, temp);
   free(pids); hftok_free(&tok);
   return rc;
 }
@@ -890,7 +897,7 @@ static int run_hfchat(int argc, char **argv) {
   int cap = (int)strlen(rendered) + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, rendered, pids, cap);
-  int rc = hf_generate(&tok, argv[2], pids, np, n_new);
+  int rc = hf_generate(&tok, argv[2], pids, np, n_new, 0.8f);
   free(pids); hftok_free(&tok);
   return rc;
 }

@@ -29,6 +29,8 @@ typedef struct {
   float rope_base;         // RoPE frequency base (10000 is standard)
   int lora_r;              // LoRA rank; > 0 => freeze the base, train adapters only
   float lora_alpha;        // LoRA scaling (scale = alpha / r); 0 => use r (scale 1)
+  const char *hf_tok;      // .hf/.tok vocab of a REAL model (hftok.h): fine-tune with
+                           // the model's OWN tokenizer instead of training a byte BPE
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).

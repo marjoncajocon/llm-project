@@ -14,6 +14,7 @@
 #include "corpus.h"
 #include "llama.h"
 #include "llamatrain.h"
+#include "hftok.h"
 
 TrainConfig train_default_config(void) {
   TrainConfig c;
@@ -42,7 +43,44 @@ TrainConfig train_default_config(void) {
   c.rope_base = 10000.0f;
   c.lora_r = 0;            // 0 => full fine-tune (no adapters)
   c.lora_alpha = 0.0f;     // 0 => alpha = r, i.e. scale 1
+  c.hf_tok = NULL;         // NULL => train/load our own byte-level BPE
   return c;
+}
+
+// ---------------------------------------------------------------------------
+// Fine-tuning a REAL model has to use that model's OWN tokenizer, so the SFT
+// path accepts either. A tagged union keeps one training loop with concrete
+// types (the project bans untyped void* in APIs) instead of duplicating it.
+// ---------------------------------------------------------------------------
+typedef struct {
+  int is_hf;
+  Tokenizer bpe;   // valid when !is_hf
+  HFTok hf;        // valid when  is_hf
+} AnyTok;
+
+static int anytok_encode(const AnyTok *t, const char *s, int *ids, int max_ids) {
+  return t->is_hf ? hftok_encode(&t->hf, s, ids, max_ids)
+                  : tokenizer_encode(&t->bpe, s, ids, max_ids);
+}
+
+static int anytok_vocab(const AnyTok *t) {
+  return t->is_hf ? t->hf.n_vocab : t->bpe.vocab_size;
+}
+
+// End-of-response id. A real model already HAS an EOS token in its vocabulary;
+// our byte-level BPE does not, so one extra slot is appended past its vocab.
+static int anytok_eos(const AnyTok *t) {
+  if (!t->is_hf) return t->bpe.vocab_size;
+  return (t->hf.eos >= 0) ? t->hf.eos : t->hf.n_vocab - 1;
+}
+
+// Model vocabulary needed to host that EOS id.
+static int anytok_model_vocab(const AnyTok *t) {
+  return t->is_hf ? t->hf.n_vocab : t->bpe.vocab_size + 1;
+}
+
+static void anytok_free(AnyTok *t) {
+  if (t->is_hf) hftok_free(&t->hf); else tokenizer_free(&t->bpe);
 }
 
 // A schedule is active once warmup or a cosine floor is requested; otherwise the
@@ -421,28 +459,39 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   // Fine-tuning MUST reuse the base model's tokenizer — a freshly trained one
   // would assign different ids to the same text, making the pretrained
   // embeddings meaningless. Fresh runs train a tokenizer on the SFT text.
-  Tokenizer tok;
+  AnyTok tok;
+  tok.is_hf = 0;
   LlamaModel loaded;
+  if (cfg->hf_tok) {                        // a real model's own vocabulary
+    if (hftok_load(&tok.hf, cfg->hf_tok) != 0) {
+      fprintf(stderr, "error: cannot load HF tokenizer '%s'\n", cfg->hf_tok);
+      return 1;
+    }
+    tok.is_hf = 1;
+    printf("tokenizer: %s (%d tokens, eos %d)\n", cfg->hf_tok, tok.hf.n_vocab, tok.hf.eos);
+  }
   if (resuming) {
     if (llama_model_load(cfg->resume, &loaded) != 0) {
       fprintf(stderr, "error: cannot load model '%s'\n", cfg->resume);
+      if (tok.is_hf) anytok_free(&tok);
       return 1;
     }
-    if (tokenizer_load(&tok, cfg->out_tok) != 0) {
+    if (!tok.is_hf && tokenizer_load(&tok.bpe, cfg->out_tok) != 0) {
       fprintf(stderr, "error: cannot load tokenizer '%s' (needed to resume)\n", cfg->out_tok);
       llama_model_free(&loaded);
       return 1;
     }
-    if (loaded.vocab < tok.vocab_size) {
-      fprintf(stderr, "error: model vocab %d < tokenizer vocab %d\n", loaded.vocab, tok.vocab_size);
-      tokenizer_free(&tok); llama_model_free(&loaded);
+    if (loaded.vocab < anytok_vocab(&tok)) {
+      fprintf(stderr, "error: model vocab %d < tokenizer vocab %d\n",
+              loaded.vocab, anytok_vocab(&tok));
+      anytok_free(&tok); llama_model_free(&loaded);
       return 1;
     }
     printf("resumed LLMA model %s (vocab %d, d_model %d, layers %d, heads %d, kv %d)\n",
            cfg->resume, loaded.vocab, loaded.d_model, loaded.n_layers, loaded.n_heads, loaded.n_kv);
-  } else {
-    tok = tokenizer_create_bytelevel();
-    tokenizer_train(&tok, text, cfg->num_merges);
+  } else if (!tok.is_hf) {
+    tok.bpe = tokenizer_create_bytelevel();
+    tokenizer_train(&tok.bpe, text, cfg->num_merges);
   }
 
   int maxex = 1;
@@ -461,8 +510,8 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
       if (rl && resp[rl - 1] == '\r') resp[rl - 1] = '\0';
       if (prompt[0] && resp[0]) {
         int t[4096], r[4096];
-        int T = tokenizer_encode(&tok, prompt, t, 4096);
-        int Rn = tokenizer_encode(&tok, resp, r, 4096);
+        int T = anytok_encode(&tok, prompt, t, 4096);
+        int Rn = anytok_encode(&tok, resp, r, 4096);
         if (T >= 1 && Rn >= 1 && T + Rn <= 4096) {
           P[nex] = (int*)malloc(T * sizeof(int));  memcpy(P[nex], t, T * sizeof(int)); PL[nex] = T;
           R[nex] = (int*)malloc(Rn * sizeof(int)); memcpy(R[nex], r, Rn * sizeof(int)); RL[nex] = Rn;
@@ -476,7 +525,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
 
   if (nex == 0) {
     fprintf(stderr, "error: SFT file has no 'prompt<TAB>response' lines\n");
-    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok);
+    free(P); free(PL); free(R); free(RL); anytok_free(&tok);
     if (resuming) llama_model_free(&loaded);
     return 1;
   }
@@ -484,11 +533,11 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     fprintf(stderr, "error: SFT sequences need %d positions but the base model's ctx is %d\n",
             maxL, loaded.max_seq);
     for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); }
-    free(P); free(PL); free(R); free(RL); tokenizer_free(&tok); llama_model_free(&loaded);
+    free(P); free(PL); free(R); free(RL); anytok_free(&tok); llama_model_free(&loaded);
     return 1;
   }
 
-  const int EOS = tok.vocab_size;
+  const int EOS = anytok_eos(&tok);
   int **seq = (int**)malloc(nex * sizeof(int*));
   int **tgt = (int**)malloc(nex * sizeof(int*));
   for (int e = 0; e < nex; e++) {
@@ -507,22 +556,26 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   if (resuming) {
     // Grow the vocab by one for the EOS slot if the base doesn't already have it,
     // keeping every other dimension (and max_seq, so the KV geometry still fits).
-    const int vocab = (loaded.vocab > tok.vocab_size) ? loaded.vocab : tok.vocab_size + 1;
+    // A real model already has an EOS in its vocabulary; our byte BPE does not,
+    // so the vocab grows by one slot in that case (and only that case).
+    const int want = anytok_model_vocab(&tok);
+    const int vocab = (loaded.vocab > want) ? loaded.vocab : want;
     model = llama_model_create_train(vocab, loaded.d_model, loaded.n_layers, loaded.n_heads,
                                      loaded.n_kv, loaded.head_dim, loaded.d_ff,
                                      loaded.max_seq, loaded.rope_base, loaded.eps);
-    llama_model_randomize(&model);          // the new EOS row/column starts random
+    llama_model_randomize(&model);          // any new row/column starts random
     copy_weights_grow(&model, &loaded);     // ...then every pretrained weight lands on top
     llama_model_free(&loaded);
-    printf("LLaMA SFT (fine-tune): %d examples | vocab %d (+EOS -> %d) | seq len %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
-           nex, tok.vocab_size, vocab, maxL, model.d_model, model.n_layers, model.n_heads, model.n_kv, cfg->lr);
+    printf("LLaMA SFT (fine-tune): %d examples | vocab %d -> %d | seq len %d | d_model=%d layers=%d heads=%d kv=%d eos=%d lr=%g\n",
+           nex, anytok_vocab(&tok), vocab, maxL, model.d_model, model.n_layers,
+           model.n_heads, model.n_kv, EOS, cfg->lr);
   } else {
-    model = llama_model_create_train(tok.vocab_size + 1, cfg->d_model, cfg->n_layers,
+    model = llama_model_create_train(anytok_model_vocab(&tok), cfg->d_model, cfg->n_layers,
                                      cfg->n_heads, n_kv, head_dim, d_ff, maxL,
                                      cfg->rope_base, 1e-5f);
     llama_model_randomize(&model);
     printf("LLaMA SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
-           nex, tok.vocab_size, maxL, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, cfg->lr);
+           nex, anytok_vocab(&tok), maxL, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, cfg->lr);
   }
 
   LlamaActs acts = llama_acts_create(&model, maxL);
@@ -575,15 +628,23 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
 
   int rc = 0;
   if (llama_model_save(cfg->out_model, &model) != 0) { fprintf(stderr, "error saving model\n"); rc = 1; }
-  if (tokenizer_save(&tok, cfg->out_tok) != 0) { fprintf(stderr, "error saving tokenizer\n"); rc = 1; }
-  if (rc == 0) printf("saved LLMA SFT model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
+  // An HF vocabulary is the model's own file and is not rewritten — only our
+  // byte-level BPE is owned by the run and needs saving alongside the weights.
+  if (!tok.is_hf && tokenizer_save(&tok.bpe, cfg->out_tok) != 0) {
+    fprintf(stderr, "error saving tokenizer\n"); rc = 1;
+  }
+  if (rc == 0) {
+    if (tok.is_hf) printf("saved LLMA SFT model -> %s (tokenizer: %s, unchanged)\n",
+                          cfg->out_model, cfg->hf_tok);
+    else printf("saved LLMA SFT model -> %s, tokenizer -> %s\n", cfg->out_model, cfg->out_tok);
+  }
 
   for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); free(seq[e]); free(tgt[e]); }
   free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
   free(params);
   if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
   adam_free(&opt); tensor_free(&logits); tensor_free(&probs);
-  llama_acts_free(&acts); llama_model_free(&model); tokenizer_free(&tok);
+  llama_acts_free(&acts); llama_model_free(&model); anytok_free(&tok);
   return rc;
 }
 

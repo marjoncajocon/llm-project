@@ -55,7 +55,7 @@ toolexec.o:   toolexec.h toolcall.h
 approval.o:   approval.h
 agent.o:      agent.h approval.h toolcall.h toolexec.h
 corpus.o:     corpus.h
-train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h llama.h llamatrain.h
+train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h llama.h llamatrain.h hftok.h
 image.o:      image.h
 patch.o:      patch.h tensor.h image.h matrix.h
 video.o:      video.h tensor.h image.h patch.h
