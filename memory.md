@@ -478,10 +478,16 @@ and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2
 - [x] Execution-oriented -- APPLIED. agent.c/toolcall.c/toolexec.c parse -> approve -> execute ->
   observe real tool calls over multiple steps; SFT labels are executable tool calls; observations
   come from real execution.
-- [~] High-quality synthetic data -- PARTIAL. Generators grounded in real data exist
-  (crawl_stackoverflow mined commands, make_qa wiki Q&A, make_sft, make_agent_traj) + a
-  memorization probe proving generalization. Gaps: two-write "ok" content bug, base-model factual
-  errors, no output verification/dedup/difficulty balancing.
+- [~] High-quality synthetic data -- GATE BUILT (2026-07-24), retrain re-measure pending.
+  `tools/clean_sft.py` VERIFIES each pair (reject a tool call whose path/write-content/command-file
+  arg is not grounded in the prompt; whole-token match so "ok" != inside "cook"; empty write body
+  rejected), DEDUPES exact+near-dup lines (conservative -- variety kept), and BALANCES action-type x
+  task-length with full logging (no silent truncation). Validated on an adversarial probe: 4/4
+  correct rejects + 4/4 correct keeps. Fixed the two_writes "ok" bug at source in make_agent_traj.py
+  (2nd content now a varied word copied from the goal). Clean corpus data/clean_reason.txt = 1545
+  pairs (62 dups removed). A 350-step LoRA-SFT retrain on it is running -> model/smollm/reason_clean.bin;
+  flip to [x] once sft_memtest / eval_mixed / a live agent run confirm the cleaned data holds or
+  improves the numbers. Remaining gaps: base-model factual errors; optional entropy/solvability filter.
 
 ## FUTURE WORK -- long-horizon research roadmap (requested 2026-07-24)
 
@@ -549,12 +555,18 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (next session, user 2026-07-24 eve) -- highest-value next step
+## >>> RESUME HERE (next session) -- re-measure the cleaned-data retrain
 
-Continuing at home. NEXT = the remaining [~] item: make synthetic data HIGH-QUALITY (verified +
-deduplicated). It is the main wall for the 135M agent now (reasoning-dense/multi-step/execution
-all work). Plan: (1) VERIFY each pair -- every tool arg in the response must be copyable from the
-prompt (fixes the two_writes hardcoded-"ok" bug in make_agent_traj.py); (2) DEDUPE across
-generators; (3) balance difficulty, log drops; (4) optional entropy-style filter by what the model
-already solves. Then retrain reasoning-dense multi-step + re-measure with sft_memtest.py,
-eval_mixed.py, and a live agent run.
+Data-quality GATE is DONE (tools/clean_sft.py: verify + dedupe + balance; commit 113db78) and the
+two_writes generator bug is fixed. A 350-step LoRA-SFT retrain of SmolLM2-135M on the cleaned
+1545-pair corpus (data/clean_reason.txt) was launched in the background ->
+`model/smollm/reason_clean.bin` (r16/alpha32, batch 4, lr 3e-3 warmup 30; ~2-3 h at seq-len 160).
+NEXT when it finishes: (1) loss curve in scratchpad/train_reason.log (prior ~0.88); (2)
+`python tools/sft_memtest.py .\transformer.exe model/smollm/reason_clean.bin model/smollm/tok.hf
+data/clean_reason.txt` (generalization); (3) `python tools/eval_mixed.py ...` (tool-vs-prose +
+off-topic probe); (4) a live tools/agent_local.py multi-step run. If numbers hold/improve, flip
+high-quality synthetic data [~] -> [x]. Rebuild the clean corpus any time with:
+`python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki
+--commands data/so_commands.txt --reason` then `python tools/clean_sft.py --shuffle --balance
+--report data/clean_report.txt --out data/clean_reason.txt data/traj_reason.txt data/qa.txt
+data/toolcalls.txt`.

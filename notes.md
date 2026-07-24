@@ -2211,27 +2211,70 @@ noisier than 0.46 without reasoning -- EXPECTED, the think spans add token varie
 
 So the near-term checklist item flips: reasoning-dense is now [x] APPLIED (was [ ]).
 
-## >>> RESUME HERE (next session) -- highest-value next step (user, 2026-07-24 eve)
+## 2026-07-24 (15) -- HIGH-QUALITY synthetic data: verify + dedupe + balance GATE (built + applied)
 
-Continuing at home. The agreed NEXT task is the one remaining [~] item:
-**make the synthetic data HIGH-QUALITY -- verified + deduplicated.** This is now the main thing
-gating the 135M agent (reasoning-dense, multi-step, execution all work; data quality is the wall).
+The remaining [~] near-term item. Built `tools/clean_sft.py`, the quality gate that sits between
+the generators (make_sft / make_qa / make_agent_traj / mixes) and training. Three stages, all
+logged (no silent truncation), deterministic given --seed, emitting the same prompt<TAB>response
+format the `--sft` loader reads:
 
-Concrete plan:
-  1. VERIFY each synthetic example is self-consistent -- every argument in the response must be
-     copyable from the prompt. This directly fixes the known two_writes bug in make_agent_traj.py
-     (the 2nd file's content is hardcoded "ok" instead of taken from the goal), and would catch
-     any future arg/goal mismatch. Add a checker that rejects a pair whose tool args are not
-     present in the prompt text.
-  2. DEDUPE across generators (make_sft / make_qa / make_agent_traj / mixes) -- exact and near-dup
-     prompt<TAB>response lines waste training and inflate held-out scores.
-  3. BALANCE difficulty / task-length distribution; log what was dropped (no silent truncation).
-  4. Optional: filter by whether the current model already solves held-out variants (keep the
-     informative examples) -- a cheap step toward the "entropy-based data filtering" roadmap item.
+  1. VERIFY each pair is self-consistent -- reject any tool call whose ARGS are not grounded in the
+     prompt text: an ungrounded `path="F"`, an ungrounded OR EMPTY write_file body, or a
+     filename-like token (name.ext) inside a run_command that never appears in the prompt.
+     Canonical command verbs (ls/git/rm/make ...) need NOT appear -- only the DATA they act on.
+     Prose (QA) and <done> have no args and always pass. Grounding uses a WHOLE-TOKEN regex match
+     (boundaries on [0-9a-z_]) so "ok" does not spuriously match inside "cook", while "a.txt" still
+     matches (the dot is inside the escaped literal). Multi-step trajectory prompts are the full
+     transcript, so a read/delete arg introduced by an earlier step is correctly counted grounded.
+  2. DEDUPE exact + case/whitespace-normalized duplicate lines (keep first). Deliberately
+     CONSERVATIVE: filenames/words are NOT masked to a template signature, so the template variety
+     that is the whole point of the data survives; only true repeats are dropped.
+  3. BALANCE -- classify each survivor by action type x task length, print the distribution, and
+     with `--balance` cap any over-represented type to factor x median (default 2.0), logging every
+     drop.
 
-Then retrain the reasoning-dense multi-step model on the cleaned data and re-measure with
-sft_memtest.py (generalization) + eval_mixed.py (tool vs prose) + a live multi-step agent run.
+**Verifier VALIDATED against an adversarial probe** (8 hand-built lines): 4/4 correct REJECTIONS
+(empty write body, write to an ungrounded path, read an ungrounded path, run `rm secret.log` when
+the goal names a different file) and 4/4 correct KEEPS (valid grounded write, bare `ls` with no
+filename, prose QA answer, `<done>`). So the checker catches the real hallucinated-arg failure
+modes without false-positiving canonical verbs or prose.
+
+**Also fixed the two_writes bug at the SOURCE (make_agent_traj.py):** the 2nd write's content was
+hardcoded "ok" -- self-consistent (it was in the goal) but ZERO variety, so the model learned "2nd
+write is always ok" (the observed empty-b.txt symptom). Now draws a separate word w2 != w and puts
+it in the goal, so the 2nd content must be copied like every other argument. Regenerated
+`data/traj_reason.txt` (--reason, 829 pairs); the 2nd content now varies (done / build passed / ...).
+
+**Clean corpus built:** `clean_sft.py --shuffle --balance data/traj_reason.txt data/qa.txt
+data/toolcalls.txt` -> `data/clean_reason.txt` = **1545 pairs** (from 1607: verify 0 rejected on the
+now-grounded generators, dedupe removed 62 exact/near-dups; distribution already within 2x median so
+nothing capped). Report -> data/clean_report.txt. clean_sft.py SUPERSEDES the mix_sft step (it
+merges + cleans in one pass). Only the two tools are tracked (commit 113db78); the data/*.txt are
+git-ignored + regenerable.
+
+**Retrain LAUNCHED (background, in progress):** `transformer llama-train data/clean_reason.txt --sft
+--hf-tok model/smollm/tok.hf --resume model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4
+--steps 350 --lr 3e-3 --warmup 30 --min-lr 1e-4 --out model/smollm/reason_clean.bin`. TIMING REALITY:
+~30 s/step at seq-len 160 (global-maxL padding, driven by the long QA prose) => ~2-3 h for 350 steps,
+NOT the "~55 min" older note (that predated adding toolcalls.txt / the longer padded set). A 3-step
+dry run confirmed the cleaned data loads + trains (1545 ex, 240 LoRA adapter tensors, base frozen).
+
+## >>> RESUME HERE (next session) -- re-measure the cleaned-data retrain
+
+The data-quality GATE is built + applied (verify + dedupe + balance, commit 113db78) and the
+generator bug is fixed. A 350-step LoRA-SFT retrain on the cleaned 1545-pair corpus was launched in
+the background (-> `model/smollm/reason_clean.bin`). NEXT when it finishes:
+  1. Check the loss curve in scratchpad/train_reason.log (prior reasoning run reached ~0.88).
+  2. Re-measure GENERALIZATION: `python tools/sft_memtest.py .\transformer.exe
+     model/smollm/reason_clean.bin model/smollm/tok.hf data/clean_reason.txt` (random-gibberish
+     args -> copy rate; the decisive not-memorized signal, needs no held-out split).
+  3. Re-measure tool-vs-prose routing + off-topic probe: `python tools/eval_mixed.py .\transformer.exe
+     model/smollm/reason_clean.bin model/smollm/tok.hf <tool.tsv> data/qa.txt`.
+  4. Live multi-step agent run via tools/agent_local.py on "create hello.txt containing world and
+     read it back" -> expect write -> read -> <done> with grounded <think> rationales.
+If the cleaned data holds or improves the numbers, flip high-quality synthetic data [~] -> [x].
 
 Status recap: near-term checklist = reasoning-dense [x], execution-oriented [x], high-quality
-synthetic data [~]  <-- this is the resume target. Long-horizon research roadmap recorded above.
-Keep 2-space, C-only-flat-root rules; training is slow (~55 min) due to global-maxL padding.
+synthetic data [~ -> pending the retrain re-measure above]. Long-horizon research roadmap recorded
+above. Keep 2-space, C-only-flat-root rules; training is slow (~2-3 h) due to global-maxL padding
+(a real future lever: length-bucketed batches instead of one global max would cut most of it).
