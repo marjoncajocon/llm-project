@@ -559,15 +559,33 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (next session) -- near-term checklist DONE; pick the next lever
+## >>> RESUME HERE (2026-07-25, AGREED) -- lever #3: GROW / DIVERSIFY the data
 
-All three near-term items are [x]: reasoning-dense, execution-oriented, and (now) high-quality
-synthetic data. The data-quality gate (clean_sft.py verify+dedupe+balance, commit 113db78) + the
-two_writes/content-vocab fixes (6e0b15e) + a STABLE retrain (`--clip 1.0`) produced
-`model/smollm/reason_clean.bin`: routes, plans multi-step with <think> reasoning, answers prose, and
-generalizes (100% novel filenames / 70% novel commands) incl. the previously-empty 2nd-write copy.
+All three near-term items are [x] (reasoning-dense, execution-oriented, high-quality synthetic data),
+plus hardening levers grad_clip-default (4a61ffb) and variable-length batching (6f68ca6, ~4.7x faster,
+bit-exact). `model/smollm/reason_clean.bin` routes, plans multi-step with <think> reasoning, answers
+prose, generalizes 100%/70%. **User agreed (before sleeping 2026-07-24) that the NEXT task is lever
+#3: grow/diversify the training data, then re-clean + retrain + re-measure.** Cheap now: a full
+retrain is ~30 min (was ~2-3 h).
 
-Candidate NEXT levers (ask the user which):
+TOMORROW'S PLAN (details + exact commands in notes.md ">>> RESUME HERE (2026-07-25...)"):
+  1. Add richer templates to make_agent_traj.py build_tasks: 3-step chains (write->run->read,
+     write->read->delete), a verify chain, and an ERROR-RECOVERY step (obs shows error -> next action
+     retries/fixes). Keep every arg grounded so clean_sft.py's verifier still passes.
+  2. (opt) crawl_stackoverflow.py --commands with rust/go tags -> extend data/so_commands.txt.
+  3. Regenerate traj_reason.txt -> clean_sft.py (--shuffle --balance); check the report (verifier
+     rejects any ungrounded new template BEFORE training; confirm 3-step chains show in the dist).
+  4. Retrain ~30 min: llama-train ... --lora-r 16 --lora-alpha 32 --batch 4 --steps 350 --lr 3e-3
+     --warmup 30 --min-lr 1e-4 (--clip 1.0 is now the default). -> model/smollm/reason_clean.bin.
+  5. Re-measure: hand-probe a 3-step transcript prefix (expect correct next action); sft_memtest.py
+     (>=90% A / >=70% B, no regression); a live agent_local.py 3-step run. Record + pick next lever.
+NO C changes expected for #3 (data/tools only). Env: zig D:\env\zig\zig.exe, python
+D:\env\python\python-3.9.10.amd64\python.exe. Keep 2-space, C-only-flat-root rules.
+
+Other levers still open (later): #4 long-horizon roadmap (PRMs, multi-agent debate); #5 (opt) apply
+variable-length batching to the GPT train_sft path.
+
+Candidate NEXT levers (reference):
   1. [x] DONE (commit 4a61ffb) -- grad_clip defaults to 1.0 in train.c (stability hardening).
   2. [x] DONE (commit 6f68ca6) -- variable-length SFT batching (LLaMA path): each example trains at
      its OWN length instead of global-maxL padding. BIT-EXACT (full 350-step curve matched retrain #3

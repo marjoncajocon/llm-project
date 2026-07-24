@@ -2330,22 +2330,44 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
-## >>> RESUME HERE (next session) -- near-term checklist DONE + 2 hardening levers; pick next
+## >>> RESUME HERE (2026-07-25, agreed) -- lever #3: GROW / DIVERSIFY the data
 
-Done this session: high-quality synthetic data [x] (clean_sft.py gate 113db78 + generator fixes
-6e0b15e + stable retrain), grad_clip defaults to 1.0 (4a61ffb), and variable-length SFT batching
+Done 2026-07-24: high-quality synthetic data [x] (clean_sft.py gate 113db78 + generator fixes
+6e0b15e + stable retrain), grad_clip defaults to 1.0 (4a61ffb), variable-length SFT batching
 (6f68ca6, ~4.7x faster fine-tunes, bit-exact). `model/smollm/reason_clean.bin` routes, plans
-multi-step with reasoning, answers prose, generalizes 100%/70%. Near-term checklist all [x].
+multi-step with reasoning, answers prose, generalizes 100%/70%. Near-term checklist all [x];
+hardening levers #1/#2 done. **Agreed next task (user, before sleeping 2026-07-24): lever #3 --
+grow/diversify the training data, then re-clean + retrain + re-measure.** Now cheap: a full retrain
+is ~30 min (was ~2-3 h) thanks to variable-length batching.
 
-Candidate NEXT levers (pick per user):
-  1. [x] DONE (4a61ffb) -- grad_clip defaults to 1.0.
-  2. [x] DONE (6f68ca6) -- variable-length SFT batching, ~4.7x faster LLaMA fine-tunes.
-  3. **Grow/vary the data further** -- more task templates (3+ step chains, mixed read/run/write),
-     more real commands (rust/go SO tags), harder Q&A; then re-clean + retrain (now only ~30 min).
-     Cheaper to iterate now that training is ~4.7x faster.
-  4. **Start a long-horizon roadmap item** (PRMs, multi-agent debate, etc. -- see roadmap above).
-  5. **(optional) Apply variable-length batching to the GPT `train_sft` path too** -- needs the
-     attention-weights tensor re-strided (shape (n_heads*seq_len, seq_len)); smaller payoff since the
-     agent uses the LLaMA path.
-Rebuild the clean corpus + retrain commands: see the memory.md RESUME block. Keep 2-space,
-C-only-flat-root rules; LLaMA fine-tune is now ~30 min (was ~2-3 h) thanks to variable-length batching.
+CONCRETE PLAN for tomorrow:
+  1. Add richer trajectory templates to `tools/make_agent_traj.py` (currently 1-2 step tasks; see
+     build_tasks). Add: 3-step chains (e.g. write -> run -> read; write -> read -> delete), a
+     write->run->read verify chain, and an ERROR-RECOVERY step (a tool obs shows an error/"not found"
+     -> the next action retries or fixes). Keep every arg grounded in the goal/transcript so the
+     clean_sft.py verifier still passes (that's the quality guarantee).
+  2. Optionally widen real commands: run tools/crawl_stackoverflow.py --commands with rust/go tags to
+     extend run_command coverage (see 2026-07-24 (10)); append to data/so_commands.txt.
+  3. Regenerate + CLEAN (the validated recipe):
+       python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki \
+         --commands data/so_commands.txt --reason
+       python tools/clean_sft.py --shuffle --balance --report data/clean_report.txt \
+         --out data/clean_reason.txt data/traj_reason.txt data/qa.txt data/toolcalls.txt
+     (Confirm the report: verify rejects any ungrounded new template BEFORE training -- fix the
+     template if so. Check the action-type x task-length distribution now includes the 3-step chains.)
+  4. Retrain (~30 min) with the SAME validated flags (note --clip 1.0 is now the default, harmless):
+       .\transformer.exe llama-train data/clean_reason.txt --sft --hf-tok model/smollm/tok.hf \
+         --resume model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4 --steps 350 \
+         --lr 3e-3 --warmup 30 --min-lr 1e-4 --out model/smollm/reason_clean.bin
+  5. RE-MEASURE: probe the new multi-step chains by hand (hfgen on a 3-step transcript prefix ->
+     expect the correct next action); python tools/sft_memtest.py (expect >=90% A / >=70% B, no
+     regression); a live tools/agent_local.py run on a 3-step goal. If a longer chain works end to
+     end and nothing regressed, record it and pick the next lever.
+
+Build + smoke test after any C change (there should be NONE for lever #3 -- it's data/tools only):
+see the "CONTINUATION GUIDE" section above for the zig glob build. Env: zig D:\env\zig\zig.exe,
+python D:\env\python\python-3.9.10.amd64\python.exe. Keep 2-space, C-only-flat-root rules.
+
+Other levers still open (after #3, or instead): #4 long-horizon roadmap item (PRMs, multi-agent
+debate); #5 (optional) apply variable-length batching to the GPT `train_sft` path (its attn-weights
+tensor strides by seq_len, so it needs re-striding -- smaller payoff, agent uses the LLaMA path).
