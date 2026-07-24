@@ -2078,3 +2078,50 @@ unaffected.
 **NEXT:** multi-step planning (transcript-aware SFT: observation -> next tool) is the remaining
 frontier; the mixed run's slowness argues for per-example (not global-maxL) padding or length
 bucketing; CI still absent.
+
+## 2026-07-24 (13) -- MULTI-STEP PLANNING works + future-work direction
+
+The agent now PLANS multi-step tasks, not just routes one instruction. New data + a rewritten
+bridge; no C changed (agent.c already fed the full transcript to the backend).
+
+**How:** `tools/make_agent_traj.py` synthesizes small multi-step tasks (write-then-read,
+two-writes, read-then-delete, run-then-list, single-step), plays each into a transcript, and
+explodes it into one SFT pair per step ending in <done>. Transcript turns are flattened with " | "
+so each pair stays one line; `tools/agent_local.py` applies the identical flatten at inference, so
+train and run formats match. Trained SmolLM2-135M (LoRA r16, batch 4, 350 steps) on 500 trajectory
++ 378 Q&A pairs, loss -> 0.46. (Slow: ~55 min, long transcripts push maxL high.)
+
+**VERIFIED end to end with the real agent:**
+  goal "create hello.txt containing world and read it back" ->
+    step1 write_file hello.txt "world" | step2 read_file hello.txt | step3 <done>. File held
+    "world". The model picked the correct SECOND action from the transcript and STOPPED at the
+    goal -- genuine planning, not one-shot routing.
+
+**Honest bug:** "create a.txt with foo, then create b.txt with bar" got sequencing/stopping/
+filenames right but wrote b.txt EMPTY -- the two_writes template hardcodes "ok" as the second
+content, so the model never learned to copy the 2nd argument from the goal. Data-generation
+artifact, not a planning failure. Fix: template should copy real content.
+
+## FUTURE WORK -- requested direction (check = applied in code, ~ = partial, blank = not yet)
+
+- [ ] **Reasoning-dense data/training.** NOT applied. Every SFT pair is direct
+  instruction/transcript -> action; there are no reasoning ("thought") spans before the tool call.
+  To apply: add explicit chain-of-thought between OBSERVATION and the next MODEL action in the
+  trajectory data, and train the model to emit a short rationale then the tool call. This is the
+  biggest lever for harder tasks a 135M model currently can't plan.
+
+- [x] **Execution-oriented.** APPLIED. The agent parses -> approves -> executes -> observes real
+  tool calls (agent.c / toolcall.c / toolexec.c), now over MULTIPLE steps, and the SFT labels are
+  executable tool calls (not chat). Observations come from real execution (write/read/run), and
+  the trajectory data mirrors toolexec.c's real observation strings.
+
+- [~] **High-quality synthetic data.** PARTIALLY applied. Built generators grounded in real data:
+  mined real shell commands from Stack Overflow (crawl_stackoverflow.py), wiki-grounded Q&A
+  (make_qa.py), templated tool calls (make_sft.py), multi-step trajectories (make_agent_traj.py),
+  and a memorization probe (sft_memtest.py) that proved generalization. Quality GAPS remain: the
+  two-write "ok" content bug, factual errors from the 135M base, no output VERIFICATION, no dedup
+  across generators, no difficulty balancing. To fully apply: verify each synthetic example is
+  self-consistent (e.g. content actually copyable from the goal), dedupe, and balance task
+  difficulty; consider filtering by whether the trained model can solve held-out variants.
+
+See [[planned-next-step]] in agent memory. Reasoning-dense is the top unchecked item.

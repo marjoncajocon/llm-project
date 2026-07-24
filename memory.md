@@ -456,3 +456,28 @@ NEXT: 1) fix VQ-VAE color (dead-code restart / EMA codebook / commitment cost / 
 plus an aggregate codebook-utilization printout to confirm collapse) and re-measure the recon row;
 2) then finish GPT training (~30 min); 3) re-measure relations -- horizontal sample sizes were tiny
 (n=1..4) because color failures ate them.
+
+## 2026-07-24 -- MULTI-STEP PLANNING + requested future-work checklist
+
+The agent now PLANS multi-step tasks (not just one-shot routing). `tools/make_agent_traj.py`
+synthesizes multi-step tasks and explodes each into (transcript-prefix -> next-action) SFT pairs
+ending in <done>; transcript turns flattened with " | " and `tools/agent_local.py` applies the
+same flatten at inference so formats match. SmolLM2-135M LoRA-SFT on 500 trajectory + 378 Q&A
+pairs. VERIFIED end to end: goal "create hello.txt containing world and read it back" -> write ->
+read -> <done>, file held "world". The model chose the correct SECOND action from the transcript
+and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2nd content, so the
+2nd write's content isn't copied from the goal (data artifact, not a planning failure). No C changed.
+
+### FUTURE WORK (requested) -- [x] applied in code, [~] partial, [ ] not yet
+
+- [ ] Reasoning-dense data/training -- NOT applied. All SFT pairs are direct
+  instruction/transcript -> action, no chain-of-thought spans. To apply: add short reasoning
+  between OBSERVATION and the next action in trajectory data and train the model to emit rationale
+  then tool call. Biggest lever for harder planning.
+- [x] Execution-oriented -- APPLIED. agent.c/toolcall.c/toolexec.c parse -> approve -> execute ->
+  observe real tool calls over multiple steps; SFT labels are executable tool calls; observations
+  come from real execution.
+- [~] High-quality synthetic data -- PARTIAL. Generators grounded in real data exist
+  (crawl_stackoverflow mined commands, make_qa wiki Q&A, make_sft, make_agent_traj) + a
+  memorization probe proving generalization. Gaps: two-write "ok" content bug, base-model factual
+  errors, no output verification/dedup/difficulty balancing.
