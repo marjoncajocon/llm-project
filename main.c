@@ -760,7 +760,8 @@ static int hf_stop(char *dec) {
 // Stops on the model's real end-of-generation token (hftok_is_eog) — no string
 // heuristic needed once a chat template is used; hf_stop stays as a safety net
 // for base models that emit role labels as plain text.
-static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_new, float temp) {
+static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_new,
+                       float temp, unsigned long long seed) {
   unsigned int magic = 0;
   FILE *pf = fopen(mpath, "rb");
   if (!pf) { fprintf(stderr, "cannot open '%s'\n", mpath); return 1; }
@@ -769,7 +770,7 @@ static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_n
 
   const float top_p = 0.95f;
   const int top_k = 40;
-  Rng rng = rng_create(1234);
+  Rng rng = rng_create(seed);
   char *dec = (char*)malloc(1 << 20);
   int prevlen = 0;
   int *gen = (int*)malloc((size_t)(np + n_new) * sizeof(int));
@@ -842,13 +843,15 @@ done:
 
 static int run_hfgen(int argc, char **argv) {
   if (argc < 4) {
-    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp]\n"
+    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]\n"
                     "  temp defaults to 0.8; use a low value (e.g. 0.1) for an\n"
-                    "  instruction-tuned model that should answer deterministically\n");
+                    "  instruction-tuned model that should answer deterministically.\n"
+                    "  seed defaults to 1234; vary it for different samples at temp>0.\n");
     return 2;
   }
   int n_new = (argc > 4) ? atoi(argv[4]) : 128;
   float temp = (argc > 5) ? (float)atof(argv[5]) : 0.8f;
+  unsigned long long seed = (argc > 6) ? strtoull(argv[6], NULL, 10) : 1234ull;
   HFTok tok;
   if (hftok_load(&tok, argv[3]) != 0) return 1;
 
@@ -859,7 +862,7 @@ static int run_hfgen(int argc, char **argv) {
   int cap = plen + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, prompt, pids, cap);
-  int rc = hf_generate(&tok, argv[2], pids, np, n_new, temp);
+  int rc = hf_generate(&tok, argv[2], pids, np, n_new, temp, seed);
   free(pids); hftok_free(&tok);
   return rc;
 }
@@ -901,7 +904,7 @@ static int run_hfchat(int argc, char **argv) {
   int cap = (int)strlen(rendered) + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, rendered, pids, cap);
-  int rc = hf_generate(&tok, argv[2], pids, np, n_new, 0.8f);
+  int rc = hf_generate(&tok, argv[2], pids, np, n_new, 0.8f, 1234ull);
   free(pids); hftok_free(&tok);
   return rc;
 }
