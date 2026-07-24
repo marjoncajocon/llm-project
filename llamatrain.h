@@ -51,6 +51,13 @@ typedef struct {
 LlamaActs llama_acts_create(const LlamaModel *m, int seq_len);
 void llama_acts_free(LlamaActs *a);
 
+// Re-target the activation buffers at a SHORTER sequence length (<= the length
+// passed to llama_acts_create). Only the logical row count shrinks — no realloc —
+// so an SFT loop can run each example at its TRUE length instead of padding every
+// one to the global max. Bit-exact vs padding (causal attention never reads padded
+// rows; padded targets are -1 = zero loss/grad), just far less wasted compute.
+void llama_acts_set_len(LlamaActs *a, int seq_len);
+
 // Training-mode forward: fills the activation cache and logits (seq_len, vocab).
 // Causal, and identical in value to llama_model_forward.
 void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
@@ -109,6 +116,10 @@ typedef struct {
 
 LlamaLoraActs llama_lora_acts_create(const LlamaModel *m, const LlamaLora *lo, int seq_len);
 void llama_lora_acts_free(LlamaLoraActs *la);
+
+// Re-target the LoRA activation caches at a shorter sequence length (see
+// llama_acts_set_len). Call alongside it before a shorter forward.
+void llama_lora_acts_set_len(LlamaLoraActs *la, int seq_len);
 
 // Trainable adapter tensors (== 8 * n_layers: an A and a B per projection).
 int llama_lora_param_count(const LlamaLora *lo);

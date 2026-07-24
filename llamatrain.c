@@ -51,6 +51,47 @@ LlamaActs llama_acts_create(const LlamaModel *m, int seq_len) {
   return a;
 }
 
+// Reduce a tensor's logical shape to `rows` (<= its allocated rows). Row-major
+// stride is shape[1] (cols), independent of the row count, so shrinking shape[0]
+// and size just makes every shape-driven op process fewer rows — the underlying
+// buffer (sized for the create-time max) is untouched.
+static void set_rows(Tensor *t, int rows) {
+  t->shape[0] = rows;
+  t->size = (size_t)rows * (size_t)t->shape[1];
+}
+
+void llama_acts_set_len(LlamaActs *a, int seq_len) {
+  a->seq_len = seq_len;
+  set_rows(&a->emb, seq_len);
+  set_rows(&a->final_hn, seq_len);
+  for (int l = 0; l < a->n_layers; l++) {
+    set_rows(&a->xn[l], seq_len);
+    set_rows(&a->q[l], seq_len);
+    set_rows(&a->k[l], seq_len);
+    set_rows(&a->v[l], seq_len);
+    set_rows(&a->o[l], seq_len);
+    set_rows(&a->ao[l], seq_len);
+    set_rows(&a->h[l], seq_len);
+    set_rows(&a->hn[l], seq_len);
+    set_rows(&a->f[l], seq_len);
+    set_rows(&a->block_out[l], seq_len);
+    a->gc[l].n = seq_len;                 // GqaCache strides its att buffer by n
+    set_rows(&a->sc[l].g, seq_len);       // SwigluCache tensors stride by shape[0]
+    set_rows(&a->sc[l].u, seq_len);
+    set_rows(&a->sc[l].a, seq_len);
+    set_rows(&a->sc[l].h, seq_len);
+  }
+}
+
+void llama_lora_acts_set_len(LlamaLoraActs *la, int seq_len) {
+  for (int l = 0; l < la->n_layers; l++) {
+    set_rows(&la->q[l].xa, seq_len); set_rows(&la->q[l].y, seq_len);
+    set_rows(&la->k[l].xa, seq_len); set_rows(&la->k[l].y, seq_len);
+    set_rows(&la->v[l].xa, seq_len); set_rows(&la->v[l].y, seq_len);
+    set_rows(&la->o[l].xa, seq_len); set_rows(&la->o[l].y, seq_len);
+  }
+}
+
 void llama_acts_free(LlamaActs *a) {
   tensor_free(&a->emb);
   tensor_free(&a->final_hn);

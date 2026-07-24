@@ -103,6 +103,14 @@ static float sched_lr(const TrainConfig *cfg, int step) {
   return lr_cosine_warmup(cfg->lr, lo, step, cfg->warmup, cfg->steps);
 }
 
+// Re-target a [rows, cols] output tensor (logits/probs) at a shorter row count
+// without reallocating — the buffer is sized for the max; we only shrink the
+// logical extent so cross_entropy (which loops over shape[0]) sees the right rows.
+static void set_logits_len(Tensor *t, int rows, int cols) {
+  t->shape[0] = rows;
+  t->size = (size_t)rows * (size_t)cols;
+}
+
 // Micro-batches per optimizer step (>= 1).
 static int batch_of(const TrainConfig *cfg) {
   return (cfg->batch > 1) ? cfg->batch : 1;
@@ -628,6 +636,16 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
   print_recipe(cfg);
 
+  // Variable-length training: run each example at its OWN length instead of padding
+  // every one to the global max. Bit-exact (causal attention never reads padding;
+  // padded targets are -1 => zero loss/grad) but skips the wasted padded compute --
+  // decode is O(seq^2), so a mostly-short set trains far faster.
+  double sumL = 0.0;
+  for (int e = 0; e < nex; e++) sumL += PL[e] + RL[e] + 1;
+  const double meanL = sumL / nex;
+  printf("  variable-length batching: mean seq %.1f / max %d -> ~%.1fx less padded work\n",
+         meanL, maxL, maxL / (meanL > 0 ? meanL : 1));
+
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
   const int B = batch_of(cfg);
@@ -637,12 +655,17 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     float loss = 0.0f;
     for (int b = 0; b < B; b++) {
       int e = rand() % nex;
-      llama_forward_train_lora(&model, seq[e], maxL, &acts, &logits,
+      const int L = PL[e] + RL[e] + 1;          // prompt ++ response ++ EOS (no padding)
+      llama_acts_set_len(&acts, L);
+      if (use_lora) llama_lora_acts_set_len(&lacts, L);
+      set_logits_len(&logits, L, model.vocab);
+      set_logits_len(&probs, L, model.vocab);
+      llama_forward_train_lora(&model, seq[e], L, &acts, &logits,
                                use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
       loss += cross_entropy_forward(&logits, tgt[e], &probs);
       tensor_zero_grad(&logits);
       cross_entropy_backward(&probs, tgt[e], &logits);
-      llama_backward_accum(&model, seq[e], maxL, &acts, &logits,
+      llama_backward_accum(&model, seq[e], L, &acts, &logits,
                            use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     }
     loss /= (float)B;
