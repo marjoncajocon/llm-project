@@ -490,7 +490,8 @@ and stopped at the goal. Known bug: a two-write template hardcodes "ok" as the 2
   (was empty); routing/prose-vs-tool intact; live agent_local.py multi-step run (write "world"->read->
   <done>, hello.txt held "world"); generalization 100% novel filenames / 70% novel commands (misses =
   char copy-slips, still right tool). => model/smollm/reason_clean.bin. Commits: gate 113db78,
-  content-widen 6e0b15e. RULE: LoRA-SFT MUST pass --clip 1.0.
+  content-widen 6e0b15e. STABILITY: grad_clip now DEFAULTS to 1.0 in train.c (commit 4a61ffb; was
+  0.0=off, which let retrain #2 diverge); pass --clip 0 to disable / reproduce old unclipped perf tables.
 
 ## FUTURE WORK -- long-horizon research roadmap (requested 2026-07-24)
 
@@ -567,8 +568,7 @@ two_writes/content-vocab fixes (6e0b15e) + a STABLE retrain (`--clip 1.0`) produ
 generalizes (100% novel filenames / 70% novel commands) incl. the previously-empty 2nd-write copy.
 
 Candidate NEXT levers (ask the user which):
-  1. Make `--clip 1.0` the train.c DEFAULT (small stability hardening; rebuild + smoke test; note the
-     prior batch/lr perf tables were measured unclipped).
+  1. [x] DONE (commit 4a61ffb) -- grad_clip defaults to 1.0 in train.c (stability hardening).
   2. Cut training time: length-bucketed batches instead of global-maxL padding (seq-len 164 pads every
      short tool-call to the longest QA prose; ~2-3 h -> much less).
   3. Grow/vary data (3+ step chains, more real commands, harder Q&A) -> re-clean -> retrain.

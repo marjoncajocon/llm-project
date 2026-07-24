@@ -2301,10 +2301,11 @@ was 7.7). Re-measured `reason_clean.bin`:
 
 => **high-quality synthetic data flips [~] -> [x].** The near-term checklist is now all done:
 reasoning-dense [x], execution-oriented [x], high-quality synthetic data [x] (verified + deduped +
-balanced, retrained + validated). **Required recipe note: LoRA-SFT must pass `--clip 1.0`** -- without
-it a harder dataset can diverge (train.c default grad_clip=0). Follow-up worth doing: make grad_clip
-default to 1.0 in train.c (behavior change to all 4 train loops + a rebuild/smoke test; the prior
-batch/lr measurement tables were taken unclipped, so note that if changed).
+balanced, retrained + validated). **DONE (commit 4a61ffb): grad_clip now DEFAULTS to 1.0** in
+train.c (was 0.0 = off) so a harder dataset can't silently diverge a multi-hour run; 1.0 is a no-op
+when the grad norm is already <=1, and `--clip 0` restores the old unclipped behavior (needed to
+reproduce the pre-2026-07-24 batch/lr perf tables, which were measured unclipped). Build -Wall clean,
+self-test PASSED (clip acts only in the train loops, not the gradient checks).
 
 ## >>> RESUME HERE (next session) -- near-term checklist DONE; pick the next lever
 
@@ -2315,8 +2316,7 @@ routes, plans multi-step with reasoning, answers prose, and generalizes (100%/70
 args) incl. the previously-failing 2nd-write copy. All three near-term items are done.
 
 Candidate NEXT levers (pick per user):
-  1. **Make `--clip 1.0` the train.c default** (small, high-value stability hardening; rebuild + smoke
-     test; note the unclipped prior perf tables).
+  1. [x] DONE (commit 4a61ffb) -- `grad_clip` now defaults to 1.0 in train.c (stability hardening).
   2. **Cut training time** -- length-bucketed batches instead of global-maxL padding (seq-len 164 now
      pads every short tool-call sequence to the longest QA prose); ~2-3 h -> much less.
   3. **Grow/vary the data further** -- more task templates (3+ step chains, mixed read/run/write),
