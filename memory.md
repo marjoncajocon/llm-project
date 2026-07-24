@@ -569,9 +569,13 @@ generalizes (100% novel filenames / 70% novel commands) incl. the previously-emp
 
 Candidate NEXT levers (ask the user which):
   1. [x] DONE (commit 4a61ffb) -- grad_clip defaults to 1.0 in train.c (stability hardening).
-  2. Cut training time: length-bucketed batches instead of global-maxL padding (seq-len 164 pads every
-     short tool-call to the longest QA prose; ~2-3 h -> much less).
-  3. Grow/vary data (3+ step chains, more real commands, harder Q&A) -> re-clean -> retrain.
+  2. [x] DONE (commit 6f68ca6) -- variable-length SFT batching (LLaMA path): each example trains at
+     its OWN length instead of global-maxL padding. BIT-EXACT (full 350-step curve matched retrain #3
+     to 4 decimals; self-test PASSED) and ~4.7x faster (32 min vs ~150 min; llama_acts_set_len /
+     llama_lora_acts_set_len reshape acts with no realloc). GPT train_sft path left as-is (its attn
+     weights stride by seq_len -- deeper change, smaller payoff).
+  3. Grow/vary data (3+ step chains, more real commands, harder Q&A) -> re-clean -> retrain
+     (now only ~30 min, so cheap to iterate).
   4. Start a long-horizon roadmap item (PRMs, multi-agent debate, ...).
 
 Rebuild clean corpus + retrain (the validated recipe, note --clip 1.0):

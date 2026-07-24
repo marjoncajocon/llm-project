@@ -2307,20 +2307,45 @@ when the grad norm is already <=1, and `--clip 0` restores the old unclipped beh
 reproduce the pre-2026-07-24 batch/lr perf tables, which were measured unclipped). Build -Wall clean,
 self-test PASSED (clip acts only in the train loops, not the gradient checks).
 
-## >>> RESUME HERE (next session) -- near-term checklist DONE; pick the next lever
+## 2026-07-24 (16) -- Variable-length SFT batching: LLaMA fine-tune ~4.7x faster (BIT-EXACT)
 
-The remaining [~] item (high-quality synthetic data) is now [x]: `tools/clean_sft.py` verify+dedupe+
-balance gate (commit 113db78), two_writes + content-vocab fixes in make_agent_traj.py (6e0b15e), and
-a stable retrain (`--clip 1.0`) on the clean 1547-pair corpus -> `model/smollm/reason_clean.bin` that
-routes, plans multi-step with reasoning, answers prose, and generalizes (100%/70% on unmemorizable
-args) incl. the previously-failing 2nd-write copy. All three near-term items are done.
+Lever #2 (cut training time). The LLaMA SFT loop padded every example to the global max seq-len
+(164, set by the longest QA prose) and ran the full padded forward+backward even for a 20-token
+tool call -- and attention is O(seq^2), so most of that was pure padding. Now each example trains at
+its OWN length. New `llama_acts_set_len` / `llama_lora_acts_set_len` (llamatrain.c) retarget the
+activation buffers at a shorter row count with NO realloc -- tensors stride by columns so shrinking
+shape[0]+size just processes fewer rows; the GQA cache already strides its att buffer by its runtime
+`n`; SwiGLU/LoRA caches stride by their own shape[0]. train.c sets each example's length before its
+forward/backward. Commit 6f68ca6.
+
+**BIT-EXACT, not an approximation** (causal attention never reads padded rows; padded targets are -1
+=> zero loss AND zero grad there). PROVEN: a full 350-step retrain matches the padded retrain #3
+loss curve to 4 decimals at EVERY logged step (0:3.0016, 70:1.4372, 210:1.0507, 315:0.1219,
+349:1.2194 -- all identical), so forward AND backward are numerically identical. Self-test still
+PASSED. **Wall clock: 32.1 min vs ~150 min padded = ~4.7x** (mean seq 65.2 / max 164; super-linear
+vs the ~2.5x row-count estimate because attention is O(seq^2)). The saved model is bit-identical to
+retrain #3, so every earlier probe result still holds.
+
+Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path is LEFT AS-IS -- its
+attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
+in-place reshape is unsafe without a deeper change (documented follow-up).
+
+## >>> RESUME HERE (next session) -- near-term checklist DONE + 2 hardening levers; pick next
+
+Done this session: high-quality synthetic data [x] (clean_sft.py gate 113db78 + generator fixes
+6e0b15e + stable retrain), grad_clip defaults to 1.0 (4a61ffb), and variable-length SFT batching
+(6f68ca6, ~4.7x faster fine-tunes, bit-exact). `model/smollm/reason_clean.bin` routes, plans
+multi-step with reasoning, answers prose, generalizes 100%/70%. Near-term checklist all [x].
 
 Candidate NEXT levers (pick per user):
-  1. [x] DONE (commit 4a61ffb) -- `grad_clip` now defaults to 1.0 in train.c (stability hardening).
-  2. **Cut training time** -- length-bucketed batches instead of global-maxL padding (seq-len 164 now
-     pads every short tool-call sequence to the longest QA prose); ~2-3 h -> much less.
+  1. [x] DONE (4a61ffb) -- grad_clip defaults to 1.0.
+  2. [x] DONE (6f68ca6) -- variable-length SFT batching, ~4.7x faster LLaMA fine-tunes.
   3. **Grow/vary the data further** -- more task templates (3+ step chains, mixed read/run/write),
-     more real commands (rust/go SO tags), harder Q&A; then re-clean + retrain.
+     more real commands (rust/go SO tags), harder Q&A; then re-clean + retrain (now only ~30 min).
+     Cheaper to iterate now that training is ~4.7x faster.
   4. **Start a long-horizon roadmap item** (PRMs, multi-agent debate, etc. -- see roadmap above).
+  5. **(optional) Apply variable-length batching to the GPT `train_sft` path too** -- needs the
+     attention-weights tensor re-strided (shape (n_heads*seq_len, seq_len)); smaller payoff since the
+     agent uses the LLaMA path.
 Rebuild the clean corpus + retrain commands: see the memory.md RESUME block. Keep 2-space,
-C-only-flat-root rules; training ~2-3 h due to global-maxL padding.
+C-only-flat-root rules; LLaMA fine-tune is now ~30 min (was ~2-3 h) thanks to variable-length batching.
