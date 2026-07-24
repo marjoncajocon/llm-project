@@ -2014,3 +2014,27 @@ the background, ~260 articles, incremental writes.)
 
 **NEXT:** multi-step planning still needs transcript-aware SFT (observation -> next tool); a rust/
 go tag in the crawl would extend command coverage; CI absent; lm_head dA starves at small M.
+
+## 2026-07-24 (11) -- Memorization probe: the agent model GENERALIZED (not memorized)
+
+Direct test of "did the AI memorize the output". Method (`tools/sft_memtest.py`): feed arguments
+made of RANDOM GIBBERISH generated at test time, so they appear nowhere in the training data or any
+crawled corpus. A memorizing model cannot reproduce a string it never saw -- it would emit a
+training string instead; a generalizing model copies the novel argument verbatim.
+
+Model: the crawl-grown run (720 templated examples incl. real commands, `smol_cmd.bin`).
+  - A. random-gibberish filenames ("ctngh4.log", ...): **19/20 = 95%** copied correctly.
+  - B. random-gibberish commands ("ldcz s9n4h --zn9", ...): **17/20 = 85%** copied correctly.
+  - C. exact training prompts (baseline): 25/25 = 100% (expected; informative only as a floor).
+
+**VERDICT: not memorized.** The model copies random strings that could not have been memorized.
+The misses REINFORCE this: they are off-by-one-character copies (cogngh4<-ctngh4, hssxk<-hsxk) --
+a small model imperfectly COPYING an out-of-distribution byte string, the opposite of
+memorization (which would snap to a training filename, not near-copy a novel one). The character
+slips come from the tokenizer splitting random consonant runs into rare tokens.
+
+Contrast with the 12-example model (session 9): 62% on novel args, GARBLING them (blat<-snarfblat)
+-- that one memorized. Growing + varying the data (sessions 9-10) is what moved it to the
+copy-the-argument mapping. `tools/sft_memtest.py` committed as the reusable probe.
+
+(Also stopped the session-9 Wikipedia crawl at 383 articles on request; incremental writes kept.)
