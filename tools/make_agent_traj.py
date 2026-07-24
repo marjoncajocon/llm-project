@@ -87,9 +87,15 @@ def build_tasks(rng, files, cmds):
                       (tool_read(f1), w)]
 
     if kind < 0.46:                                   # two writes
-        goal = "create %s with %s, then create %s with %s" % (f1, w, f2, "ok")
+        # Draw a SEPARATE second word (was hardcoded "ok") so the model must copy
+        # the 2nd content from the goal, not memorize a constant. Guaranteeing
+        # w2 != w keeps the two steps distinguishable.
+        w2 = w
+        while w2 == w:
+            w2 = rng.choice(WORDS)
+        goal = "create %s with %s, then create %s with %s" % (f1, w, f2, w2)
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
-                      (tool_write(f2, "ok"), "wrote 2 bytes to %s" % f2)]
+                      (tool_write(f2, w2), "wrote %d bytes to %s" % (len(w2), f2))]
 
     if kind < 0.62:                                   # read then delete
         goal = rng.choice(["read %s then delete it", "open %s and then remove it"]) % f1
