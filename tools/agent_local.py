@@ -3,19 +3,23 @@
 
     transformer agent --cmd "python tools/agent_local.py <model.bin> <tok.hf>"
 
-The C agent writes the running transcript to a temp file and passes its path as
-the last argument; this program's STDOUT becomes the model's next response. Here
-that response comes from `transformer hfgen`, i.e. a LLaMA-family checkpoint
-fine-tuned by `llama-train --sft` to emit tool calls.
+The C agent (agent.c) writes the running transcript to a temp file and passes its
+path as the last argument; this program's STDOUT becomes the model's next action.
+The transcript looks like:
 
-Sampling is near-greedy (temp 0.1): the model should route an instruction to its
-tool call deterministically, not sample creatively.
+    GOAL: <goal>
+    MODEL: <action>
+    OBSERVATION: <obs>
+    ...
 
-Note the honest limitation — a 135M model SFT'd on a handful of examples answers
-the LAST instruction; it does not plan a multi-step task. The loop below feeds it
-just the newest instruction line and stops once the model says <done>.
+For MULTI-STEP planning the model must see the WHOLE transcript, not just the last
+line. We flatten it to the SAME " | "-joined single line that the trajectory SFT
+data uses (tools/make_agent_traj.py), so training and inference formats match, then
+generate the next action near-greedily (temp 0.1). The model itself emits <done>
+when the goal is met; the agent loop stops there.
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -24,15 +28,29 @@ ENGINE = os.path.join(os.path.dirname(HERE), "transformer.exe")
 if not os.path.exists(ENGINE):
     ENGINE = os.path.join(os.path.dirname(HERE), "transformer")
 
+SEP = " | "   # must match make_agent_traj.py
 
-def last_instruction(transcript):
-    """The most recent line the agent wants acted on (GOAL, or newest OBSERVATION)."""
-    goal = ""
-    for line in transcript.splitlines():
-        s = line.strip()
-        if s.startswith("GOAL:"):
-            goal = s[len("GOAL:"):].strip()
-    return goal
+
+def flatten(transcript):
+    """Real-newline transcript -> single line joined by SEP (matches training)."""
+    lines = [ln.rstrip() for ln in transcript.splitlines() if ln.strip()]
+    return SEP.join(lines)
+
+
+def decode_deltas(stdout):
+    text = []
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith('{"d":"'):
+            body = line[len('{"d":"'):-2]
+            text.append(body.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\"))
+    return "".join(text)
+
+
+def first_action(text):
+    """Return just the first <tool .../> or <done>...</done> the model emitted."""
+    m = re.search(r'<tool\b[^>]*>.*?</tool>|<done>.*?</done>', text, re.DOTALL)
+    return m.group(0) if m else text.strip()
 
 
 def main():
@@ -44,28 +62,16 @@ def main():
         with open(sys.argv[3], encoding="utf-8", errors="replace") as f:
             transcript = f.read()
 
-    # One tool call per turn: once a tool has run, the task is done.
-    if "OBSERVATION:" in transcript:
-        print("<done>Done.</done>")
-        return
-
-    prompt = last_instruction(transcript)
+    prompt = flatten(transcript)
     if not prompt:
         print("<done>Nothing to do.</done>")
         return
 
-    proc = subprocess.run([ENGINE, "hfgen", model, tok, "32", "0.1"],
+    proc = subprocess.run([ENGINE, "hfgen", model, tok, "40", "0.1"],
                           input=prompt.encode("utf-8"),
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    # hfgen streams {"d":"piece"} JSON deltas; concatenate them back into text.
-    text = []
-    for line in proc.stdout.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if line.startswith('{"d":"'):
-            body = line[len('{"d":"'):-2]
-            text.append(body.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\"))
-    print("".join(text).strip() or "<done>No response.</done>")
+    action = first_action(decode_deltas(proc.stdout))
+    print(action or "<done>No response.</done>")
 
 
 main()
