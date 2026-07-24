@@ -230,6 +230,21 @@ void bias_add(const Tensor *x, const Tensor *bias, Tensor *out) {
 // ---------------------------------------------------------------------------
 // Backward passes
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The backward kernels were ~10x slower than the forward (measured: ~20 GF/s vs
+// 113-216 GF/s) for one reason — the forward's inner loop is an AXPY over
+// contiguous j, which the compiler auto-vectorizes, whereas both backward loops
+// were floating-point REDUCTIONS, which it may not reassociate at -O2 and so
+// cannot vectorize. Both are rewritten below to expose the same parallelism in
+// plain portable C (no intrinsics, no target guards, works on WebAssembly too):
+//   dB: restructured into an AXPY over j, accumulating i in the SAME order as
+//       before -> auto-vectorizes AND stays bit-exact.
+//   dA: an unavoidable dot product, given ACC_LANES independent accumulators so
+//       the compiler can use one vector FMA chain. This reassociates the sum, so
+//       dA is NOT bit-identical to the old scalar order (see matrix.h).
+// ---------------------------------------------------------------------------
+#define ACC_LANES 8
+
 typedef struct { const Tensor *A, *B, *C; int M, K, N; } MMBwd;
 
 // dA[i,k] += sum_j dC[i,j] * B[k,j]   (parallel over rows i)
@@ -237,25 +252,52 @@ static void mm_bwd_dA(int i0, int i1, void *ctx) {
   const MMBwd *t = (const MMBwd*)ctx;
   const int K = t->K, N = t->N;
   for (int i = i0; i < i1; i++) {
+    const float *dCi = &t->C->grad[(size_t)i * N];
+    float *dAi = &t->A->grad[(size_t)i * K];
     for (int k = 0; k < K; k++) {
+      const float *Bk = &t->B->data[(size_t)k * N];
+      float acc[ACC_LANES];
+      for (int u = 0; u < ACC_LANES; u++) acc[u] = 0.0f;
+      int j = 0;
+      for (; j + ACC_LANES <= N; j += ACC_LANES)
+        for (int u = 0; u < ACC_LANES; u++) acc[u] += dCi[j + u] * Bk[j + u];
       float sum = 0.0f;
-      for (int j = 0; j < N; j++) sum += t->C->grad[(size_t)i * N + j] * t->B->data[(size_t)k * N + j];
-      t->A->grad[(size_t)i * K + k] += sum;
+      for (int u = 0; u < ACC_LANES; u++) sum += acc[u];
+      for (; j < N; j++) sum += dCi[j] * Bk[j];
+      dAi[k] += sum;
     }
   }
 }
 
-// dB[k,j] += sum_i A[i,k] * dC[i,j]   (parallel over rows k)
+// dB[k,j] += sum_i A[i,k] * dC[i,j]   (parallel over rows k).
+// Accumulates a whole row of dB at once so the inner loop is a contiguous AXPY.
+// `i` is still summed in ascending order into a zeroed row, exactly as the
+// previous per-element `sum` did, so the result is bit-identical to it.
 static void mm_bwd_dB(int k0, int k1, void *ctx) {
   const MMBwd *t = (const MMBwd*)ctx;
   const int M = t->M, K = t->K, N = t->N;
-  for (int k = k0; k < k1; k++) {
-    for (int j = 0; j < N; j++) {
-      float sum = 0.0f;
-      for (int i = 0; i < M; i++) sum += t->A->data[(size_t)i * K + k] * t->C->grad[(size_t)i * N + j];
-      t->B->grad[(size_t)k * N + j] += sum;
-    }
+  float *acc = (float*)malloc((size_t)N * sizeof(float));
+  if (!acc) {                       // fall back to the in-place form if OOM
+    for (int k = k0; k < k1; k++)
+      for (int i = 0; i < M; i++) {
+        const float a = t->A->data[(size_t)i * K + k];
+        const float *dCi = &t->C->grad[(size_t)i * N];
+        float *dBk = &t->B->grad[(size_t)k * N];
+        for (int j = 0; j < N; j++) dBk[j] += a * dCi[j];
+      }
+    return;
   }
+  for (int k = k0; k < k1; k++) {
+    for (int j = 0; j < N; j++) acc[j] = 0.0f;
+    for (int i = 0; i < M; i++) {
+      const float a = t->A->data[(size_t)i * K + k];
+      const float *dCi = &t->C->grad[(size_t)i * N];
+      for (int j = 0; j < N; j++) acc[j] += a * dCi[j];
+    }
+    float *dBk = &t->B->grad[(size_t)k * N];
+    for (int j = 0; j < N; j++) dBk[j] += acc[j];
+  }
+  free(acc);
 }
 
 // Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC
@@ -270,6 +312,17 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
   }
   parallel_for(M, mm_bwd_dA, &t);
   parallel_for(K, mm_bwd_dB, &t);
+}
+
+// Input-gradient half only: dA += dC @ B^T, leaving B->grad untouched. For a
+// FROZEN weight (LoRA fine-tuning) dB is computed and then discarded, which is
+// half the backward's work — and B->grad need not even exist.
+void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C) {
+  tf_check_matmul(A, B, C);
+  const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
+  MMBwd t = { A, B, C, M, K, N };
+  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_bwd_dA(0, M, &t); return; }
+  parallel_for(M, mm_bwd_dA, &t);
 }
 
 // Backward of C = A + B: dA += dC, dB += dC

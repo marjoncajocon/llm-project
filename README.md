@@ -135,6 +135,34 @@ matrices; small ones stay single-threaded and bit-exact). It uses all CPU cores 
 override with the `TF_THREADS` env var (e.g. `TF_THREADS=4`). Measured ~2.7× on 8 threads for
 a d_model-256 / 4-layer model. WebAssembly runs single-threaded (no thread model).
 
+### Vectorization (portable C, no intrinsics)
+
+The forward `matmul` was already auto-vectorized at `-O2` — its inner loop is an AXPY over
+contiguous columns. The **backward** was not: both of its loops were floating-point *reductions*,
+which the compiler may not reassociate, and it measured **~10× slower than the forward**. Both were
+restructured in plain portable C (no `<immintrin.h>`, no target guards, so WebAssembly benefits
+too):
+
+| kernel (M=128) | before | after | |
+| --- | --- | --- | --- |
+| backward, 576×576 | 19.9 GF/s | **141.6 GF/s** | 7.1× |
+| backward, 576×1536 | 20.0 GF/s | **181.2 GF/s** | 9.1× |
+| backward, 1536×576 | 20.1 GF/s | **174.2 GF/s** | 8.7× |
+| backward, lm_head 576×49152 | 21.3 GF/s | **39.4 GF/s** | 1.9× (M=16 limits row parallelism) |
+
+**Numerics:** `dB` accumulates in the same order as before and is **bit-exact**; `dA` is a
+dot-product reduction given several independent accumulators so it can vectorize, which
+reassociates the sum — it is *not* bit-identical to a naive left-to-right scalar sum (typically
+slightly more accurate). Threading stays bit-exact either way, since each output row is produced
+entirely by one thread. The forward is untouched, so the **KV-cache bit-exactness gate is still
+`0.00e+00`** and every gradient check is numerically unchanged.
+
+**Frozen-weight backward.** `matmul_backward_dx` / `swiglu_backward_dx` compute only the input
+gradient, skipping `dW` for weights that will never be updated. LoRA fine-tuning uses them
+throughout (and skips the embedding scatter): measured **61.2 → 42.4 ms/step, 1.44×**, on a
+d_model-256 / 4-layer model. Not a full halving — the forward pass and the adapters' own work
+don't shrink.
+
 ### Cross-compiling
 
 Build **all** targets at once into `build/` (needs `zig` + a POSIX shell):

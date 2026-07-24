@@ -28,4 +28,10 @@ void swiglu_forward(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
 void swiglu_backward(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
                      const Tensor *W_down, SwigluCache *c, const Tensor *y);
 
+// Same, but only x->grad is produced — the three weight gradients are neither
+// read nor written. For a FROZEN FFN (LoRA fine-tuning) that skips roughly half
+// the sub-layer's matmul work, and the FFN dominates a layer's FLOPs.
+void swiglu_backward_dx(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
+                        const Tensor *W_down, SwigluCache *c, const Tensor *y);
+
 #endif // SWIGLU_H

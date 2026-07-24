@@ -1791,3 +1791,52 @@ of this explicitly.
 **NEXT:** the missing ingredient is a real pretrained base -- convert SmolLM2-135M to LLMA
 (`tools/convert_llama.py` exists) and LoRA-SFT that. Before that is practical: SIMD `matmul`
 (matrix.c is still scalar + thread pool), then batching/grad-accumulation (still batch=1).
+
+## 2026-07-24 (6) -- Vectorized the BACKWARD (7-9x) + frozen-weight dx-only backward
+
+Fifth roadmap item. Went in planning to write AVX2 intrinsics; **measured first, and the
+measurement changed the plan** -- for the better, and it kept everything in pure portable C.
+
+**Measurement (scratchpad bench, sizes mimicking SmolLM2-135M, M=128):**
+  - forward matmul was ALREADY 113-216 GF/s -- clang auto-vectorizes it at -O2, because its inner
+    loop is an AXPY over contiguous j. Explicit SIMD there would have bought ~nothing.
+  - **backward was ~20 GF/s, 6-10x slower.** Both its loops are floating-point REDUCTIONS, which
+    the compiler may not reassociate at -O2 and therefore cannot vectorize. THAT was the bottleneck.
+
+So the fix is not "add SIMD everywhere", it is "stop writing the backward as an unvectorizable
+reduction". Done in plain C11 -- **no `<immintrin.h>`, no `__AVX2__`/`__ARM_NEON` guards, no
+-march flags** -- so every target including wasm32-wasi benefits and the build command is unchanged.
+
+  - `mm_bwd_dB`: restructured into a contiguous AXPY over j, accumulating i into a zeroed scratch
+    row in the SAME order as before -> auto-vectorizes AND is **bit-exact** vs the old kernel.
+  - `mm_bwd_dA`: an unavoidable dot product; given ACC_LANES=8 independent accumulators so the
+    compiler emits one vector FMA chain. This REASSOCIATES the sum -> **not** bit-identical to the
+    old scalar order (typically slightly more accurate). Documented in matrix.h + README.
+
+| backward kernel (M=128) | before | after | |
+|---|---|---|---|
+| 576x576   | 19.9 GF/s | **141.6** | 7.1x |
+| 576x1536  | 20.0 GF/s | **181.2** | 9.1x |
+| 1536x576  | 20.1 GF/s | **174.2** | 8.7x |
+| lm_head 576x49152 | 21.3 GF/s | **39.4** | 1.9x (M=16 starves the row-parallel dA) |
+
+**Frozen-weight backward (the second half of the task):** `matmul_backward_dx` and
+`swiglu_backward_dx` compute ONLY the input gradient. `llama_backward_lora` uses them for lm_head,
+Wo, Wq/Wk/Wv and the whole SwiGLU FFN when adapters are active, and skips the wte scatter. This
+also retires the caveat from the LoRA commit (base grads were being computed and thrown away).
+
+**HONEST numbers:** per-step LoRA training went **61.2 -> 42.4 ms/step (1.44x)** on a d_model-256 /
+4-layer model, NOT the "halved backward" I predicted -- the forward pass and the adapters' own
+work don't shrink, and dW is only part of the backward. Measured with setup time subtracted
+(2.21 s of tokenizer/model setup, over 198 steps).
+
+**Correctness unchanged:** every gradient check reports the SAME value as before (GPT 9.28e-04,
+LLaMA 1.04e-03, LoRA adapters 5.51e-04, RMSNorm/SwiGLU/GQA identical), and because the FORWARD was
+not touched the **KV-cache gate is still bit-exact 0.00e+00**. LoRA part [24] reproduces exactly
+(10.8467 -> 2.1921), which is itself evidence the dx-only path yields identical adapter gradients.
+All 8 cross targets -Wall clean, `Output validation: PASSED`, exit 0.
+
+**NEXT:** convert SmolLM2-135M to LLMA (`tools/convert_llama.py`) and LoRA-SFT it on the tool-call
+data -- the payoff this and the last four sessions were building toward. Then batching /
+grad-accumulation (still batch=1). Also worth doing: lm_head's dA parallelizes over M rows, which
+starves at small M -- parallelizing that kernel over K instead would fix the 1.9x outlier.

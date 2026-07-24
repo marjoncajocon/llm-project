@@ -159,8 +159,14 @@ void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
     }
   }
 
+  // Under LoRA the base is frozen, so every base weight gradient is dead work:
+  // take the input-gradient-only path for each big projection (roughly halves
+  // the backward) and skip the embedding scatter entirely.
+  const int frozen = (lo != NULL);
+
   // logits = final_hn @ lm_head
-  matmul_backward(&a->final_hn, &m->lm_head, logits);
+  if (frozen) matmul_backward_dx(&a->final_hn, &m->lm_head, logits);
+  else        matmul_backward(&a->final_hn, &m->lm_head, logits);
   // final_hn = RMSNorm(block_out[L-1], final_norm)
   rmsnorm_backward(&a->block_out[m->n_layers - 1], &m->final_norm, &a->final_hn,
                    &m->final_norm, m->eps);
@@ -171,13 +177,15 @@ void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
 
     // --- Feed-forward sub-layer (reverse) ---
     matadd_backward(&a->block_out[l], &a->h[l], &a->f[l]);
-    swiglu_backward(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l]);
+    if (frozen) swiglu_backward_dx(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l]);
+    else        swiglu_backward(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l]);
     // Completes h->grad: the FFN branch adds to the residual term already there.
     rmsnorm_backward(&a->h[l], &b->ffn_norm, &a->hn[l], &b->ffn_norm, b->eps);
 
     // --- Attention sub-layer (reverse) ---
     matadd_backward(&a->h[l], x, &a->ao[l]);          // dx += dh (residual), dao += dh
-    matmul_backward(&a->o[l], &b->Wo, &a->ao[l]);
+    if (frozen) matmul_backward_dx(&a->o[l], &b->Wo, &a->ao[l]);
+    else        matmul_backward(&a->o[l], &b->Wo, &a->ao[l]);
     if (lo) lora_backward(&lo->o[l], &a->o[l], &a->ao[l], &la->o[l]);
     gqa_backward(&a->q[l], &a->k[l], &a->v[l], &a->gc[l], &a->o[l]);
     // RoPE is in place, so this REPLACES q/k grads with their pre-rotation form.
@@ -186,9 +194,15 @@ void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
     bias_add_backward(&a->q[l], &b->b_q);
     bias_add_backward(&a->k[l], &b->b_k);
     bias_add_backward(&a->v[l], &b->b_v);
-    matmul_backward(&a->xn[l], &b->Wq, &a->q[l]);
-    matmul_backward(&a->xn[l], &b->Wk, &a->k[l]);
-    matmul_backward(&a->xn[l], &b->Wv, &a->v[l]);
+    if (frozen) {
+      matmul_backward_dx(&a->xn[l], &b->Wq, &a->q[l]);
+      matmul_backward_dx(&a->xn[l], &b->Wk, &a->k[l]);
+      matmul_backward_dx(&a->xn[l], &b->Wv, &a->v[l]);
+    } else {
+      matmul_backward(&a->xn[l], &b->Wq, &a->q[l]);
+      matmul_backward(&a->xn[l], &b->Wk, &a->k[l]);
+      matmul_backward(&a->xn[l], &b->Wv, &a->v[l]);
+    }
     if (lo) {   // q/k/v adapters saw the SAME xn, and add into its gradient too
       lora_backward(&lo->q[l], &a->xn[l], &a->q[l], &la->q[l]);
       lora_backward(&lo->k[l], &a->xn[l], &a->k[l], &la->k[l]);
@@ -198,9 +212,11 @@ void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
   }
 
   // Embedding: scatter each position's gradient into its token's row of wte.
-  for (int i = 0; i < seq_len; i++)
-    for (int j = 0; j < dm; j++)
-      m->wte.grad[ids[i] * dm + j] += a->emb.grad[i * dm + j];
+  // Skipped when the base is frozen — nothing consumes wte's gradient.
+  if (!frozen)
+    for (int i = 0; i < seq_len; i++)
+      for (int j = 0; j < dm; j++)
+        m->wte.grad[ids[i] * dm + j] += a->emb.grad[i * dm + j];
 }
 
 void llama_backward(LlamaModel *m, const int *ids, int seq_len,

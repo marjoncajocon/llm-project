@@ -25,7 +25,19 @@ void bias_add(const Tensor *x, const Tensor *bias, Tensor *out);
 // ---------------------------------------------------------------------------
 
 // Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC (reads C->grad).
+//
+// NUMERICS: dB accumulates in the same order as the naive scalar loop and is
+// bit-exact. dA is a dot-product reduction computed with several independent
+// accumulators so it can vectorize, which REASSOCIATES the sum — it is not
+// bit-identical to a naive left-to-right scalar sum (it is typically slightly
+// more accurate). Threading remains bit-exact: each output row is produced
+// entirely by one thread, so results do not depend on the thread count.
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C);
+
+// Just the input-gradient half of matmul_backward: dA += dC @ B^T, and B->grad
+// is neither read nor written. Use when B is FROZEN (e.g. the base weights under
+// LoRA fine-tuning) — it skips half the backward's work.
+void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C);
 
 // Backward of C = A + B: dA += dC, dB += dC (reads C->grad).
 void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B);
