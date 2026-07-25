@@ -2330,7 +2330,54 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
-## >>> RESUME HERE (2026-07-25, agreed) -- lever #3: GROW / DIVERSIFY the data
+## 2026-07-25 -- lever #3 GROW / DIVERSIFY the data -- ✅ DONE (3-step chains + error recovery)
+
+Grew the trajectory generator to 3-step chains incl. ERROR RECOVERY, re-cleaned, retrained, and
+re-measured. **New capability proven end to end: the agent now reacts to a failed observation and
+recovers, and completes 3-action chains.** No C changes (data/tools only).
+
+WHAT CHANGED (`tools/make_agent_traj.py` `build_tasks`, the only tracked edit): rebalanced the mix
+and added three 3-step templates, every arg drawn from the goal so clean_sft.py's verifier keeps
+them all:
+  - write -> run -> read (verify chain)
+  - write -> read -> delete
+  - read (obs = "error: <f>: not found") -> write -> read  (ERROR RECOVERY -- react to the error,
+    don't stop). The failed-read observation is context in the next prompt; the write's path+content
+    are still grounded in the GOAL, so verify passes.
+
+REGENERATE + CLEAN (the validated recipe, unchanged):
+  `make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki --commands
+   data/so_commands.txt --reason` -> 968 pairs / 300 tasks (task lengths 1:32, 2:168, **3:100**).
+  `clean_sft.py --shuffle --balance --report data/clean_report.txt --out data/clean_reason.txt
+   data/traj_reason.txt data/qa.txt data/toolcalls.txt` -> **VERIFY kept 1746/1746 (0 rejected)** =>
+   every new template grounded; DEDUPE -> **1685 clean** (was 1547). Distribution now has real depth:
+   `done` 1-step:6 2-step:32 **3-step:168 4-step:100**; read_file/run_command reach 3-step.
+
+RETRAIN (~44 min, variable-length batching mean seq 75.2 -> ~2.6x less padded work; --clip 1.0
+default): `llama-train data/clean_reason.txt --sft --hf-tok model/smollm/tok.hf --resume
+model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4 --steps 350 --lr 3e-3 --warmup 30
+--min-lr 1e-4 --out model/smollm/reason_clean.bin`. sft-loss 3.90 -> ~0.08-0.13 (noisy tail =
+batch variance, recovered each spike). LoRA merged into base -> `model/smollm/reason_clean.bin`.
+
+RE-MEASURED (all green):
+  - **3-step next-action probe (NOVEL args, scratchpad probe3.py): 4/4.** Failed read -> writes file
+    with goal content "quantum meadow"; verify-chain 3rd step reads back; write-read-delete 3rd step
+    `rm <file>`; completed chain -> `<done>`. Novel filenames it never saw => generalization, not recall.
+  - **sft_memtest.py: A novel filenames 95% (19/20, >=90 ok), B novel commands 75% (15/20, >=70 ok)** --
+    no regression (was 100%/70%; A's 1 miss + B's misses are char copy-slips, ALWAYS the right tool).
+    C (exact-training reproduction) 20% is a HARNESS ARTIFACT for reasoning data -- memtest compares a
+    `first_tag`-stripped `<tool>` against the full `<think>...</think><tool>` expected string, so they
+    can't match; high-A/B + low-C is the generalization signature, not memorization.
+  - **LIVE agent (agent_local.py, error-recovery goal): full chain executed** -- read greeting.txt ->
+    "error: cannot read" -> WROTE greeting.txt "hello world" (content from goal) -> read back
+    "hello world" -> `<done>`. File on disk held "hello world". Real recovery, end to end.
+
+NEXT LEVER (pick one): #4 long-horizon roadmap item (PRMs, multi-agent debate); #5 (opt) apply
+variable-length batching to the GPT `train_sft` path (attn-weights stride by seq_len -> needs
+re-striding, smaller payoff since the agent uses the LLaMA path). Could also grow data further
+(4-step chains, more real rust/go commands via crawl_stackoverflow.py, harder Q&A).
+
+## >>> lever #3 ORIGINAL PLAN (2026-07-25, agreed) -- DONE above
 
 Done 2026-07-24: high-quality synthetic data [x] (clean_sft.py gate 113db78 + generator fixes
 6e0b15e + stable retrain), grad_clip defaults to 1.0 (4a61ffb), variable-length SFT batching
