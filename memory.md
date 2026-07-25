@@ -561,6 +561,15 @@ and model scale. Recorded so the direction is not lost. See [[planned-next-step]
 
 ## >>> RESUME HERE (2026-07-26) -- verbose-observation training DONE (fixed premature-<done>)
 
+> **⏸ PAUSED -- user is asleep, will continue the MORNING of 2026-07-26.** Tree is CLEAN, all work
+> committed on `agent-1` (local only, NOT pushed; master merged by user). Last 4 commits this session:
+> 25d1113 (verbose obs), 8207921 (lever #4 proposer-critic), 6895f6f (lever #3-further 4-step +
+> rust/go), 59b4252 (lever #3 3-step + error recovery). **RECOMMENDED next step (my rec, user has NOT
+> yet chosen):** option (a) below -- more steps (~500) / 2nd epoch, ~45 min, cheap; tail loss ~0.5 =>
+> longer chains undertrained, and it likely firms up BOTH the char-slip and the longer chains at once.
+> Wait for the user to confirm which lever before retraining. First actions on resume: `git status`
+> (expect clean) + `git log --oneline -6`; the exe is cleaned, rebuild with the zig glob if needed.
+
 **Verbose/multi-line observation training DONE (2026-07-26) -- the real capability win.** Problem: the
 generator trained every run_command obs as bare "ok", so a VERBOSE real obs (multi-line `git status`)
 was OOD and the model stopped early with <done> (lever #3-b live; lever #4 case B4). Fix (one tracked
