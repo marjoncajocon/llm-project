@@ -92,52 +92,56 @@ def tool_run(c):
 def build_tasks(rng, files, cmds, contents):
     """Return (goal, [(action, observation), ...]) for one random task.
 
-    Mix of 1-, 2- and 3-step chains. Every tool ARG (path, write content, and any
-    filename inside a run_command) is drawn from the goal string, so clean_sft.py's
-    grounding verifier keeps them all. The 3-step chains (verify / write-read-delete
-    / error-recovery) teach the model to keep going past the second action and to
-    react to an OBSERVATION (incl. an error) instead of stopping early."""
+    Mix of 1-, 2-, 3- and 4-step chains. Every tool ARG (path, write content, and
+    any filename inside a run_command) is drawn from the goal string, so clean_sft.py's
+    grounding verifier keeps them all. The 3- and 4-step chains (verify / write-read-
+    delete / error-recovery) teach the model to keep going past the second action and
+    to react to an OBSERVATION (incl. an error) instead of stopping early."""
     f1 = rng.choice(files) + rng.choice(EXTS)
     f2 = rng.choice(files) + rng.choice(EXTS)
     w = rng.choice(contents)
     c = rng.choice(cmds)
+
+    def w2_of(w):
+        """A DIFFERENT content word, so a 2nd write must be copied from the goal
+        (not memorized as a constant) and the two steps stay distinguishable."""
+        x = w
+        while x == w:
+            x = rng.choice(contents)
+        return x
+
     kind = rng.random()
 
-    if kind < 0.14:                                   # write then read (verify)
+    if kind < 0.12:                                   # write then read (verify)
         g = rng.choice(["create %s containing %s and read it back",
                         "write %s to %s, then read it to confirm"])
         goal = (g % (f1, w)) if "containing" in g else (g % (w, f1))
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_read(f1), w)]
 
-    if kind < 0.28:                                   # two writes
-        # Draw a SEPARATE second word (was hardcoded "ok") so the model must copy
-        # the 2nd content from the goal, not memorize a constant. Guaranteeing
-        # w2 != w keeps the two steps distinguishable.
-        w2 = w
-        while w2 == w:
-            w2 = rng.choice(contents)
+    if kind < 0.24:                                   # two writes
+        w2 = w2_of(w)
         goal = "create %s with %s, then create %s with %s" % (f1, w, f2, w2)
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_write(f2, w2), "wrote %d bytes to %s" % (len(w2), f2))]
 
-    if kind < 0.40:                                   # read then delete
+    if kind < 0.35:                                   # read then delete
         goal = rng.choice(["read %s then delete it", "open %s and then remove it"]) % f1
         return goal, [(tool_read(f1), w),
                       (tool_run("rm %s" % f1), "")]
 
-    if kind < 0.52:                                   # run a command then list files
+    if kind < 0.46:                                   # run a command then list files
         goal = "run %s and then list the files" % c
         return goal, [(tool_run(c), "ok"),
                       (tool_run("ls"), "%s  %s" % (f1, f2))]
 
-    if kind < 0.64:                                   # 3-step: write -> run -> read (verify chain)
+    if kind < 0.57:                                   # 3-step: write -> run -> read (verify chain)
         goal = "create %s containing %s, run %s, then read it back to verify" % (f1, w, c)
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_run(c), "ok"),
                       (tool_read(f1), w)]
 
-    if kind < 0.76:                                   # 3-step: write -> read -> delete
+    if kind < 0.67:                                   # 3-step: write -> read -> delete
         goal = rng.choice(
             ["create %s with %s, read it back, then delete it",
              "write %s to %s, confirm it by reading, then remove it"])
@@ -146,7 +150,7 @@ def build_tasks(rng, files, cmds, contents):
                       (tool_read(f1), w),
                       (tool_run("rm %s" % f1), "")]
 
-    if kind < 0.88:                                   # 3-step: error recovery (missing file)
+    if kind < 0.77:                                   # 3-step: error recovery (missing file)
         # The first read FAILS (obs = "not found"); the model must react to the
         # error by CREATING the file, then read it. Teaches recovery, not just
         # happy-path chaining.
@@ -157,7 +161,32 @@ def build_tasks(rng, files, cmds, contents):
                       (tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_read(f1), w)]
 
-    if kind < 0.94:                                   # single write step
+    if kind < 0.83:                                   # 4-step: two writes -> run -> read first
+        w2 = w2_of(w)
+        goal = ("create %s with %s and %s with %s, run %s, then read %s"
+                % (f1, w, f2, w2, c, f1))
+        return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
+                      (tool_write(f2, w2), "wrote %d bytes to %s" % (len(w2), f2)),
+                      (tool_run(c), "ok"),
+                      (tool_read(f1), w)]
+
+    if kind < 0.89:                                   # 4-step: error recovery + run + verify
+        goal = ("read %s; if it is missing create it with %s, then run %s and read it again"
+                % (f1, w, c))
+        return goal, [(tool_read(f1), "error: %s: not found" % f1),
+                      (tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
+                      (tool_run(c), "ok"),
+                      (tool_read(f1), w)]
+
+    if kind < 0.94:                                   # 4-step: write -> read -> run -> delete
+        goal = ("create %s with %s, read it back, run %s, then delete it"
+                % (f1, w, c))
+        return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
+                      (tool_read(f1), w),
+                      (tool_run(c), "ok"),
+                      (tool_run("rm %s" % f1), "")]
+
+    if kind < 0.97:                                   # single write step
         goal = rng.choice(["create %s with %s", "save %s to %s"])
         goal = (goal % (f1, w)) if goal.startswith("create") else (goal % (w, f1))
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1))]

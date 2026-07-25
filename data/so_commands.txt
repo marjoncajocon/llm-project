@@ -8,6 +8,74 @@ brew install gnu-getopt
 brew install node
 brew install util-linux
 brew update
+cargo +nightly build
+cargo +nightly install racer
+cargo --features
+cargo --list
+cargo --version
+cargo -V
+cargo -Z help
+cargo add
+cargo add curl
+cargo asm
+cargo build
+cargo build --bin other
+cargo build --features customfeature
+cargo build --help
+cargo build --release
+cargo build --target wasm32-wasi
+cargo cache -a
+cargo check
+cargo clean
+cargo clippy
+cargo clippy --fix
+cargo doc
+cargo doc --no-deps
+cargo fix
+cargo fix --clippy
+cargo fmt
+cargo help
+cargo install
+cargo install --git repository_url
+cargo install --path /path/to/crate
+cargo install --path ~/my_rustfmt
+cargo install cargo-asm
+cargo install crate_name
+cargo install list
+cargo install racer
+cargo install rustfmt
+cargo install stopwatch
+cargo install xargo
+cargo install-update
+cargo new
+cargo new --bin test1
+cargo new playground
+cargo new projectname --bin
+cargo remove
+cargo rm
+cargo rm curl
+cargo run
+cargo run --bin force-build
+cargo run --bin other
+cargo run --package xray_cli
+cargo run -p foo
+cargo rustc
+cargo test
+cargo test -- --ignored
+cargo test -- --nocapture
+cargo test --all-features
+cargo test --doc
+cargo test --features filesystem
+cargo test --features network
+cargo test --package school_info
+cargo test --release
+cargo test test-name
+cargo test test_extract_failure
+cargo uberwar
+cargo uninstall
+cargo uninstall rustfmt
+cargo update
+cargo watch
 cat /proc/version
 cd lib/
 cd myproject
@@ -226,6 +294,29 @@ git-clean
 git-revert
 git@
 git@gitserv:myrepo.git
+go build
+go build -cover
+go build -race
+go clean -testcache
+go env
+go get
+go get -u
+go get -u all
+go get github.com/private/repo
+go get package
+go help gopath
+go install
+go install myapp
+go install mypack
+go mod init
+go mod init github.com/my-org/my-package
+go mod init test3
+go run
+go run .
+go test
+go test mypack
+go tool cover
+go tool cover -help
 gradle
 grep
 kill

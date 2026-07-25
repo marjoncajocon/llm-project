@@ -2330,6 +2330,59 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-07-25 (b) -- lever #3-further: 4-step chains + real rust/go commands -- ✅ DONE (probe 7/7)
+
+Went DEEPER on the data lever: added 4-action chains and folded 91 REAL rust/go commands into the
+run_command pool. Same recipe, no C changes. Two tracked edits: `tools/make_agent_traj.py` +
+`data/so_commands.txt`.
+
+WHAT CHANGED:
+  - `make_agent_traj.py` build_tasks: three new 4-step templates (all args grounded) --
+    (a) write f1 -> write f2 -> run c -> read f1;
+    (b) read f1 (fails "not found") -> write f1 -> run c -> read f1  (error recovery + run + verify);
+    (c) write f1 -> read f1 -> run c -> delete f1.
+    Rebalanced thresholds: ~5% 1-step, ~46% 2-step, ~31% 3-step, ~18% 4-step. Factored the "2nd
+    content must differ" logic into a w2_of() helper (was inline in the two-writes case).
+  - `data/so_commands.txt` (TRACKED): 344 -> 435 commands (+91). Crawled SO tags
+    go/cargo/rust-cargo/golang/rust-tokio (`crawl_stackoverflow.py --commands`, 240 mined), then
+    FILTERED to genuinely-runnable cargo/go/rustc/rustup commands (scratchpad merge_cmds.py dropped
+    miner false-positives: maven `cargo.datasource.*=`, version strings, `make(Point)` code, urls,
+    comments) and merged the union in sorted. Adds cargo build/test/run/fmt/clippy/check/clean/doc/
+    update/new/add/install, go build/test/run/mod init/get/install/env/tool cover, etc.
+
+REGEN + CLEAN: traj 1040 pairs / 300 tasks (lengths 1:17, 2:163, 3:83, **4:37**). clean_sft VERIFY
+kept **1818/1818 (0 rejected)** => all 4-step templates grounded; DEDUPE -> **1754 clean** (was
+1685). Distribution now reaches depth 5: `done` 3-step:163 **4-step:83 5-step:37**; read_file/
+run_command have 4-step rows.
+
+RETRAIN (~45 min, variable-length batching mean seq 81.5 -> ~3.0x less padded work): same flags ->
+`model/smollm/reason_clean.bin`. sft-loss 3.54 -> ~0.58 (HIGHER + noisier than the 3-step run's ~0.1
+-- expected: harder/longer data, seq up to 243, 350 steps is <1 epoch over 1754 ex; loss is averaged
+over longer response spans). Loss is not the verdict -- the probes are.
+
+RE-MEASURED:
+  - **Next-action probe 7/7 (NOVEL args + new commands)**: the 3 original 3-step cases PLUS the 3 new
+    4-step chains all correct -- after 2 writes it runs `cargo test`; after failed-read+write it runs
+    `go build`; after write+read+run it emits `rm <file>`; completed chains -> `<done>`. The new rust/go
+    commands emit correctly at the right step.
+  - **sft_memtest: A novel-filenames 95% (19/20), B novel-commands 100% (20/20)** -- NO regression;
+    **B rose 75% -> 100%** (the richer/more-varied command pool improved command copying). C 20%
+    (same reasoning-data harness artifact as before).
+  - **LIVE agent, 4-step error-recovery+run** (piped `y` approvals; run_command is never
+    auto-approved by design): executed read demo_note.txt -> "cannot read" -> WROTE "hello agent" ->
+    ran `git status` (real multi-line output consumed) -> then STOPPED with `<done>`. TWO honest
+    limits surfaced live: (1) a filename char-slip (demo_note -> demonstra_note; self-consistent
+    across the chain, right tools -- the known copy-slip); (2) it emitted `<done>` ONE STEP EARLY,
+    skipping the final re-read, because `git status`'s long real output differs from the clean "ok"
+    it trained on. So 4-step LOGIC is solid on clean observations (probe 7/7) but robustness to
+    verbose real-world observations is a gap.
+
+FOLLOW-UPS (recorded, not done): (a) more steps (~500) / a 2nd epoch to firm up the longer chains
+(final loss 0.58 suggests undertraining); (b) train on VERBOSE/multi-line observations (real command
+output, not just "ok") so live long observations don't trigger early `<done>`; (c) reduce char-slips
+(the persistent 5% A miss) -- maybe a copy-focused auxiliary or longer training. NEXT LEVER otherwise:
+#4 long-horizon roadmap (PRMs / multi-agent debate).
+
 ## 2026-07-25 -- lever #3 GROW / DIVERSIFY the data -- ✅ DONE (3-step chains + error recovery)
 
 Grew the trajectory generator to 3-step chains incl. ERROR RECOVERY, re-cleaned, retrained, and

@@ -559,38 +559,38 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-07-25) -- lever #3 GROW/DIVERSIFY DATA ✅ DONE; pick next lever
+## >>> RESUME HERE (2026-07-25) -- lever #3 (+deeper) DONE; NEXT = train on verbose obs / more steps
 
-Lever #3 is DONE (this session, 2026-07-25). Grew `tools/make_agent_traj.py` `build_tasks` with
-three 3-step templates -- write->run->read (verify), write->read->delete, and **read(fails
-"not found")->write->read (ERROR RECOVERY)** -- all args grounded so clean_sft.py's verifier keeps
-them (VERIFY kept 1746/1746, 0 rejected; clean corpus 1547->**1685**, dist now `done` 3-step:168
-4-step:100). Retrained (~44 min, variable-length batching) -> `model/smollm/reason_clean.bin`,
-sft-loss 3.90->~0.1. RE-MEASURED green: **3-step next-action probe 4/4 (novel args)**; sft_memtest
-**A 95% / B 75%** (>=90/>=70, no regression; C 20% is a harness artifact for reasoning data --
-first_tag strips `<think>` so it can't match the full expected string); **live agent ran the full
-error-recovery chain** (read greeting.txt->"cannot read"->wrote "hello world"->read back->`<done>`,
-file held "hello world"). Only tracked edit = `make_agent_traj.py`; data/* git-ignored. Full detail
-+ exact commands: notes.md "2026-07-25 -- lever #3 GROW / DIVERSIFY the data -- DONE".
+Lever #3 done TWICE this session. **Pass 1 (3-step + error recovery):** three 3-step templates in
+`make_agent_traj.py` build_tasks; retrain -> probe 4/4, sft_memtest A95/B75, live 3-step error-recovery
+ran end to end (commit 59b4252). **Pass 2 (4-step + real rust/go commands):** three 4-step templates
+(write-write-run-read; read-fail->write->run->read; write-read-run-delete) + folded 91 REAL rust/go
+commands into `data/so_commands.txt` (344->435, TRACKED; crawled SO go/cargo/rust tags, filtered miner
+junk, merged). clean_sft VERIFY 1818/1818 (0 rejected); clean corpus 1685->**1754**, depth to 5-step.
+Retrain (~45 min) -> `model/smollm/reason_clean.bin`, sft-loss 3.54->~0.58 (higher: harder/longer data,
+<1 epoch). RE-MEASURED: **next-action probe 7/7** (3- AND 4-step, novel args + new cmds emit right);
+**sft_memtest A 95% / B 100%** (B rose 75->100 from the richer cmd pool; no regression; C 20% = the
+`<think>`-strip harness artifact). LIVE 4-step error-recovery+run: read-fail->write->ran git status
+(real output)->`<done>` -- but TWO honest limits: a filename char-slip (demo_note->demonstra_note) and
+it stopped ONE STEP EARLY (verbose git output != clean "ok" it trained on). Full detail + commands:
+notes.md "2026-07-25 (b) -- lever #3-further". Tracked edits: make_agent_traj.py, so_commands.txt (data/*
+else git-ignored).
 
-**PICK NEXT LEVER (ask the user which):**
-  4. Long-horizon roadmap item (PRMs = per-step reward; multi-agent debate proposer/critic). Big,
-     research-y -- mostly beyond 135M/CPU/pure-C, but a toy proposer/critic loop is feasible.
-  5. (opt) Variable-length batching for the GPT `train_sft` path (attn-weights stride by seq_len ->
-     needs re-striding; smaller payoff, the agent uses the LLaMA path already batched in #2).
-  6. Grow data FURTHER: 4-step chains, more real rust/go commands (crawl_stackoverflow.py --commands),
-     harder Q&A. Cheap now (~44 min/retrain). Same recipe as #3.
+**BIGGEST NEXT LEVER (from what the live run exposed):** train on VERBOSE / multi-line OBSERVATIONS
+(real command output, not just "ok") so long live observations don't trigger an early `<done>`. Also:
+more steps (~500) / 2nd epoch to firm up the longer chains (loss 0.58 => undertrained), and reduce the
+persistent 5% char-slip. THEN consider #4 (long-horizon: PRMs / multi-agent debate proposer-critic --
+research-y, mostly beyond 135M/CPU but a toy loop is feasible). Ask the user which to take.
 
 Env: zig D:\env\zig\zig.exe, python D:\env\python\python-3.9.10.amd64\python.exe. Keep 2-space,
 C-only-flat-root rules. Rebuild+smoke before any commit (Output validation: PASSED).
 
 Candidate levers ledger (reference):
   1. [x] DONE (4a61ffb) -- grad_clip defaults to 1.0 in train.c (stability hardening).
-  2. [x] DONE (6f68ca6) -- variable-length SFT batching (LLaMA path): each example trains at its OWN
-     length instead of global-maxL padding. BIT-EXACT + ~4.7x faster. GPT train_sft left as-is.
-  3. [x] DONE (2026-07-25) -- grow/vary data (3-step chains incl. error recovery) -> re-clean ->
-     retrain -> re-measure. All green (see above).
-  4. Long-horizon roadmap item (PRMs, multi-agent debate, ...) -- next candidate.
+  2. [x] DONE (6f68ca6) -- variable-length SFT batching (LLaMA path): BIT-EXACT + ~4.7x faster.
+  3. [x] DONE (2026-07-25, commit 59b4252 + this pass) -- grow/vary data: 3-step chains + error
+     recovery, THEN 4-step chains + 91 real rust/go commands. All green (probe 7/7, no regression).
+  4. Long-horizon roadmap item (PRMs, multi-agent debate, ...) -- candidate after the obs-robustness fix.
 
 Rebuild clean corpus + retrain (the validated recipe, note --clip 1.0):
 `python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki --commands
