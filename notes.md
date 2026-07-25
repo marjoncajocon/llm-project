@@ -2330,6 +2330,62 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-07-25 (c) -- lever #4: proposer-critic loop -- ✅ BUILT (correct + honest: no accuracy win at 135M)
+
+Built an inference-time PROPOSER-CRITIC loop (the roadmap's "multi-agent debate & refinement" /
+"critic module"). The proposer (the SFT model, sampled BEST_OF times at temp 0.7 with a DIFFERENT
+seed per call) offers candidate next-actions; a critic filters + ranks them. No C changes -- hfgen
+already takes `[n_new] [temp] [seed]`, so diverse candidates come from varying the seed.
+
+NEW/CHANGED FILES (all tools/, no C):
+  - `agent_critic.py` (new) -- the critic. Checks, in order: (1) GROUNDING (reuses clean_sft.verify --
+    the SAME gate as the training data -- so a char-slipped path/content, absent from the prompt, is
+    dropped); (2) ANTI-REPEAT of SUCCESSFUL actions only (failed actions exempt so an error-recovery
+    re-read isn't filtered); (3) RETRY-GUARD -- right after a FAILED action, drop a candidate that
+    re-attempts it (the fix must come first); (4) DONE-GUARD + SELF-CONSISTENCY -- never <done> right
+    after an error, stop only on consensus, else commit the MAJORITY grounded action. If every
+    candidate is rejected -> None -> caller falls back to greedy (so the critic can only help/deadlock-
+    break, never strand).
+  - `agent_local.py` (mod) -- `AGENT_BEST_OF>1` (env) turns on the loop (default 1 == old greedy
+    behaviour); `AGENT_TEMP` (0.7) the proposal temp. Added a seedable `gen()`; parse_history() derives
+    taken/last_obs/last_action. Guarded `main()` under `__main__`.
+  - `clean_sft.py` (mod) -- guarded `main()` under `__main__` so agent_critic can import the CANONICAL
+    verify()/norm() (no logic change; CLI unchanged).
+  - `eval_critic.py` (new) -- greedy@0.1 vs single@0.7 vs best-of@0.7 on (A) novel-filename copy
+    (grounding) and (B) 3-/4-step next-action probes.
+
+UNIT TESTS (scratchpad critic_unit.py, all pass): char-slip rejected -> correct write committed;
+genuine completion -> <done>; all-ungrounded -> None (fallback); error-recovery re-read KEPT when a
+write intervened; RETRY-LOOP GUARD -> after a failed read, re-reads rejected, write forced.
+
+MEASURED (eval_critic, M=24, best_of=5, model reason_clean.bin):
+  - A novel-filename copy: greedy@0.1 96% | single@0.7 96% | best-of@0.7 96%.
+  - B multi-step: 3/4 for ALL THREE (the miss = case 4, a re-read after a VERBOSE git-status obs).
+  => **best-of-N gives NO accuracy gain over a single sample on this 135M model.** WHY (honest, and
+  diagnosed with a candidate dump): the model's residual errors here are SYSTEMATIC / LOW-VARIANCE,
+  not the random-and-recoverable kind best-of-N exploits. For case B4 the proposer NEVER emits the
+  correct re-read in any of 6 samples (it proposes <done>, a re-write, or a re-run -- all filtered);
+  the one A miss slips the same way across samples. Self-consistency can only recover what the
+  proposer sometimes gets right.
+
+LIVE RUNS -- the critic's real value is DEADLOCK/LOOP SAFETY, and finding that took a live run:
+  - FIRST live best-of-5 (error-recovery goal) REGRESSED: it re-read the missing file 8x then gave up
+    (greedy does read->write->read->done fine). Root cause: anti-repeat exempts FAILED actions (needed
+    for legit re-reads), which also let it retry the SAME failing read forever. => added the RETRY-GUARD
+    (check 3). SECOND live run is CORRECT: step-2 log "5 candidates -> 1 grounded-tool, 4 rejected"
+    (4 re-read retries blocked -> forces the write) -> read(fail) -> write "hello world" -> read ->
+    <done>; greeting.txt held "hello world".
+
+COST: best-of-N reloads the 651 MB fp32 model PER candidate (N model loads/step) -> ~5x slower/step;
+practical best-of-N would need a persistent-process server or an int8 fine-tune (both future work).
+
+HONEST VERDICT: the proposer-critic scaffold is CORRECT and adds real guarantees (never commit
+ungrounded / a successful-repeat / a just-failed retry / a post-error <done>; self-consistency
+majority; greedy fallback) -- and the retry-guard genuinely prevents a loop. But it yields NO accuracy
+WIN on this small low-variance model; the win needs a noisier/stronger proposer, harder tasks, or the
+deferred "train on verbose observations" lever (which would also fix case B4 at the source). Recorded
+as a validated harness, not a quality jump. See [[planned-next-step]].
+
 ## 2026-07-25 (b) -- lever #3-further: 4-step chains + real rust/go commands -- ✅ DONE (probe 7/7)
 
 Went DEEPER on the data lever: added 4-action chains and folded 91 REAL rust/go commands into the

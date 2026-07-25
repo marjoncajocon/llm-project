@@ -215,4 +215,7 @@ def main():
         print("report -> %s" % args.report)
 
 
-main()
+# Guarded so other tools (tools/agent_critic.py) can import verify()/grounded()/norm()
+# as the CANONICAL grounding check without running the CLI.
+if __name__ == "__main__":
+    main()

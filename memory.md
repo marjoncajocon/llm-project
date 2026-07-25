@@ -559,7 +559,30 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-07-25) -- lever #3 (+deeper) DONE; NEXT = train on verbose obs / more steps
+## >>> RESUME HERE (2026-07-25) -- lever #4 proposer-critic BUILT; NEXT = train on verbose obs
+
+**Lever #4 (proposer-critic loop) BUILT this session -- correct + honest, but NO accuracy win at
+135M.** New tools (no C): `agent_critic.py` (critic: grounding via clean_sft.verify + anti-repeat of
+SUCCESSFUL actions + retry-guard for just-FAILED actions + done-guard/self-consistency + greedy
+fallback), best-of-N in `agent_local.py` (env `AGENT_BEST_OF>1`, `AGENT_TEMP`; hfgen already takes a
+seed so varied seeds give diverse candidates), `eval_critic.py`, and guarded `clean_sft.main()` so
+verify() imports. Unit tests all pass. MEASURED (eval_critic M=24): best-of@0.7 == single@0.7 ==
+greedy@0.1 (A 96%, B 3/4) -- NO gain, because this small model's errors are SYSTEMATIC/low-variance
+(diagnosed: for the premature-done case the proposer never emits the correct action in any sample),
+which best-of-N can't fix. KEY LIVE FINDING: the first best-of-5 live run REGRESSED into an 8x
+re-read LOOP (failed actions were exempt from anti-repeat) -> fixed with the retry-guard; second live
+run correct (read-fail->write "hello world"->read->done). COST: best-of-N reloads the 651MB model per
+candidate (~5x slower/step). Verdict: validated harness with real safety guarantees, not a quality
+jump. Full detail: notes.md "2026-07-25 (c) -- lever #4". Commit pending. Files: agent_critic.py,
+eval_critic.py (new), agent_local.py, clean_sft.py (mod).
+
+**BIGGEST NEXT LEVER (unchanged, now doubly motivated):** train on VERBOSE / multi-line OBSERVATIONS
+(real command output, not just "ok") -- fixes BOTH the lever-#3 early-<done> AND lever-#4 case B4 at
+the source (the proposer would then know to continue after a verbose obs). Also: more steps
+(~500)/2nd epoch; reduce the ~5% char-slip; (optional) a persistent-process inference server or an
+int8 fine-tune so best-of-N is fast enough to be practical. Ask the user which.
+
+--- earlier this session (lever #3, both passes) ---
 
 Lever #3 done TWICE this session. **Pass 1 (3-step + error recovery):** three 3-step templates in
 `make_agent_traj.py` build_tasks; retrain -> probe 4/4, sft_memtest A95/B75, live 3-step error-recovery

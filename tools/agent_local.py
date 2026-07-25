@@ -30,6 +30,14 @@ if not os.path.exists(ENGINE):
 
 SEP = " | "   # must match make_agent_traj.py
 
+# --- proposer-critic (lever #4) -----------------------------------------------
+# Off by default (BEST_OF=1 == the original greedy behaviour). Set AGENT_BEST_OF>1
+# to sample several candidates at AGENT_TEMP (varied seeds) and let agent_critic
+# pick a grounded, non-repeating action -- see tools/agent_critic.py.
+BEST_OF = int(os.environ.get("AGENT_BEST_OF", "1"))
+PROPOSE_TEMP = float(os.environ.get("AGENT_TEMP", "0.7"))
+GREEDY_TEMP = float(os.environ.get("AGENT_GREEDY_TEMP", "0.1"))
+
 
 def flatten(transcript):
     """Real-newline transcript -> single line joined by SEP (matches training)."""
@@ -58,6 +66,16 @@ def split_reason_action(text):
     return reason, action
 
 
+def gen(model, tok, prompt, temp, seed, n_new=64):
+    """One raw model completion. 64 new tokens: reasoning-dense output is
+    "<think>...</think><tool .../>", longer than a bare tool call."""
+    proc = subprocess.run(
+        [ENGINE, "hfgen", model, tok, str(n_new), str(temp), str(seed)],
+        input=prompt.encode("utf-8"),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return decode_deltas(proc.stdout)
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit("usage: agent_local.py <model.bin> <tok.hf> [transcript]")
@@ -72,12 +90,24 @@ def main():
         print("<done>Nothing to do.</done>")
         return
 
-    # 64 new tokens: reasoning-dense output is "<think>...</think><tool .../>",
-    # longer than a bare tool call.
-    proc = subprocess.run([ENGINE, "hfgen", model, tok, "64", "0.1"],
-                          input=prompt.encode("utf-8"),
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    reason, action = split_reason_action(decode_deltas(proc.stdout))
+    if BEST_OF > 1:
+        # PROPOSER-CRITIC: sample BEST_OF candidates (varied seeds so they differ),
+        # let the critic pick a grounded, non-repeating, non-premature action.
+        from agent_critic import critique, parse_history
+        taken, last_obs, last_action = parse_history(transcript.splitlines())
+        cands = [gen(model, tok, prompt, PROPOSE_TEMP, seed) for seed in range(1, BEST_OF + 1)]
+        choice, log = critique(cands, prompt, taken, last_obs, last_action)
+        for line in log:
+            sys.stderr.write("  " + line + "\n")
+        if choice is None:                       # every candidate rejected
+            sys.stderr.write("  critic: falling back to greedy\n")
+            _, choice = split_reason_action(gen(model, tok, prompt, GREEDY_TEMP, 1234))
+        sys.stderr.flush()
+        print(choice or "<done>No response.</done>")
+        return
+
+    # Default: a single near-greedy sample (original behaviour).
+    reason, action = split_reason_action(gen(model, tok, prompt, GREEDY_TEMP, 1234))
     if reason:
         # stderr is shown to the user by the agent but not captured as the model's
         # response, so the recorded transcript turn stays a bare tool call.
@@ -86,4 +116,5 @@ def main():
     print(action or "<done>No response.</done>")
 
 
-main()
+if __name__ == "__main__":
+    main()
