@@ -559,7 +559,27 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-07-25) -- lever #4 proposer-critic BUILT; NEXT = train on verbose obs
+## >>> RESUME HERE (2026-07-26) -- verbose-observation training DONE (fixed premature-<done>)
+
+**Verbose/multi-line observation training DONE (2026-07-26) -- the real capability win.** Problem: the
+generator trained every run_command obs as bare "ok", so a VERBOSE real obs (multi-line `git status`)
+was OOD and the model stopped early with <done> (lever #3-b live; lever #4 case B4). Fix (one tracked
+edit, `tools/make_agent_traj.py`): new `run_obs()` + `_RUN_OUT` table emit realistic per-command-family
+output (git/cargo/go/make/npm/..., 25% terse), avoiding the critic's error hints so success != failure.
+VERIFY 1856/1856 (0 rejected); clean corpus 1754->1798; retrain -> reason_clean.bin. CONFIRMED: eval_critic
+B4 (read after verbose git status) MISS-for-all -> OK-for-all; and the EXACT lever-#3-b live scenario that
+stopped early now COMPLETES (read-fail->write->git status[verbose]->read->done, no char-slip). No regression
+(sft_memtest A 95% / B 80%, both above bar; B down from 100% peak but within the 75-100% retrain band).
+Full detail: notes.md "2026-07-26 -- verbose/multi-line observations".
+
+**NEXT LEVER (ask the user):** (a) more steps (~500) / 2nd epoch -- tail loss still ~0.5, longer chains
+undertrained; (b) reduce the persistent ~5% filename char-slip (copy-focused aux or longer training);
+(c) a persistent-process inference server or an int8 fine-tune so best-of-N (lever #4) is fast enough to
+be practical (~5x model-reload cost now); (d) a long-horizon roadmap item (#4-style PRM / multi-agent
+debate). Env: zig D:\env\zig\zig.exe, python D:\env\python\python-3.9.10.amd64\python.exe. 2-space,
+C-only-flat-root. Rebuild+smoke before any commit (Output validation: PASSED).
+
+--- earlier this session (lever #4 proposer-critic) ---
 
 **Lever #4 (proposer-critic loop) BUILT this session -- correct + honest, but NO accuracy win at
 135M.** New tools (no C): `agent_critic.py` (critic: grounding via clean_sft.verify + anti-repeat of

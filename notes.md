@@ -2330,6 +2330,48 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-07-26 -- verbose/multi-line observations -- ✅ DONE (fixes premature-<done>, the real win)
+
+The lever the lever-#4 measurements pointed at, and it WORKED. The trajectory generator trained EVERY
+run_command step's observation as a bare "ok", so at inference a VERBOSE real observation (e.g. a
+multi-line `git status`) was out-of-distribution and the model stopped early with <done> (lever #3-b
+live run; lever #4 case B4). Fix = train on realistic, often multi-line tool output. Data/tools only,
+no C changes. One tracked edit: `tools/make_agent_traj.py`.
+
+WHAT CHANGED: new `run_obs(command, rng)` + `_RUN_OUT` table -- per-command-family output (git ->
+"On branch ... nothing to commit"; cargo -> "Compiling ... Finished ..."/"running 3 tests ... test
+result: ok. 3 passed"; go/make/npm/pip/docker/ls/pwd/...), 25% of the time terse ("", "ok", "done").
+Every `(tool_run(c), "ok")` in build_tasks (6 sites) now uses `run_obs(c, rng)`. SUCCESS outputs
+avoid the critic's error hints (error/failed/cannot/not found/no such/denied/traceback/exception) so a
+good step is never misread as a failure. The transcript flattens \n->space (emit_pairs), matching how
+real output arrives; observations are PROMPT context, so grounding of the RESPONSE is unaffected.
+
+REGEN + CLEAN: VERIFY kept **1856/1856 (0 rejected)** (verbose obs don't touch grounding); clean
+corpus 1754 -> **1798**. Confirmed the key pattern is now in the data: a multi-line "On branch agent-1
+nothing to commit ..." observation FOLLOWED BY a continuation action (ls), not a premature <done>.
+
+RETRAIN (~45 min, variable-length batching mean seq 86.0 -> ~3.0x less padded work): same flags ->
+`model/smollm/reason_clean.bin`, sft-loss 3.11 -> ~0.1-0.67 (noisy; harder/longer data, <1 epoch).
+
+RE-MEASURED -- the fix is CONFIRMED both in a probe and live:
+  - eval_critic B case 4 (read_file AFTER a VERBOSE git-status obs): was MISS-for-all before this
+    lever, now **OK for greedy, single@0.7, AND best-of@0.7**. (The 4-case probe is n=1/case and noisy,
+    so a different case flipped and net B stays 3/4 -- but the targeted verbose-obs failure is fixed.)
+  - **LIVE (greedy): the EXACT lever-#3-b scenario that stopped one step early now COMPLETES.** Goal
+    "read demo_note.txt; if missing create it with hello agent, then run git status and read it again"
+    -> read(fail) -> write "hello agent" -> run git status (real multi-line output) -> **read
+    demo_note.txt -> "hello agent"** (the final re-read that used to be skipped) -> <done>. Also NO
+    filename char-slip this run (demo_note stayed demo_note; the old run slipped to demonstra_note).
+  - No regression (sft_memtest): A novel filenames **95%** (>=90), B novel commands **80%** (>=70;
+    down from the 100% peak but inside the 75-100% band seen across retrains -- misses are char-slips,
+    always the right tool). C 32% (reasoning-data harness artifact).
+
+VERDICT: a real, demonstrable capability gain -- the agent now keeps going after noisy real-world tool
+output instead of stopping early, and best-of-N (lever #4) plus this share the same model so both
+improve. Remaining, still open: the ~5% filename char-slip; more steps (~500)/2nd epoch to firm up the
+longer chains (loss still ~0.5 at the tail); and a persistent-process / int8 path so best-of-N is fast
+enough to be practical. See [[planned-next-step]].
+
 ## 2026-07-25 (c) -- lever #4: proposer-critic loop -- ✅ BUILT (correct + honest: no accuracy win at 135M)
 
 Built an inference-time PROPOSER-CRITIC loop (the roadmap's "multi-agent debate & refinement" /

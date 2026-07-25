@@ -89,6 +89,51 @@ def tool_run(c):
     return '<tool name="run_command" command="%s"></tool>' % c
 
 
+# Realistic, often MULTI-LINE output for a run_command step. Training every run
+# observation as a bare "ok" left the model brittle: at inference a VERBOSE real
+# observation (e.g. `git status`) is out-of-distribution, so it stopped early with
+# <done> (lever #4 case B4). Varying the observation -- silent, terse, or multi-line
+# per command family -- teaches it to CONTINUE the chain regardless of tool verbosity.
+# The transcript flattens \n to spaces (emit_pairs), matching how real output arrives.
+# SUCCESS outputs deliberately avoid the critic's error hints (error / failed / cannot
+# / not found / no such / denied / traceback / exception) so a good step is never
+# misread as a failure (see tools/agent_critic.py obs_is_error).
+_RUN_OUT = {
+    "git": ["On branch agent-1\nnothing to commit, working tree clean",
+            "On branch agent-1\nYour branch is up to date with 'origin/agent-1'.",
+            "Already up to date."],
+    "cargo": ["   Compiling app v0.1.0\n    Finished dev target(s) in 1.20s",
+              "running 3 tests\ntest tests::ok ... ok\ntest result: ok. 3 passed",
+              "    Finished release [optimized] target(s) in 4.51s"],
+    "go": ["ok   example/app   0.184s",
+           "PASS\nok   example/pkg   0.012s",
+           "go: downloading dependencies\nok"],
+    "make": ["cc -c main.c\ncc -o app main.o\nbuild complete",
+             "make: Nothing to be done for 'all'."],
+    "npm": ["added 42 packages in 3s", "up to date in 512ms"],
+    "npx": ["added 42 packages in 3s"],
+    "pip": ["Successfully installed app-1.0", "Requirement already satisfied: app"],
+    "pip3": ["Successfully installed app-1.0"],
+    "docker": ["Successfully built 3f2a1b\nSuccessfully tagged app:latest",
+               "app   latest   3f2a1b   2 minutes ago   128MB"],
+    "python": ["hello world", "3.9.10"],
+    "python3": ["hello world"],
+    "node": ["hello world", "v18.17.0"],
+    "ls": ["src  README.md  Cargo.toml  target"],
+    "pwd": ["/home/work/project"],
+    "curl": ["  % Total    % Received\n100  1256  100  1256  0 --:--:-- 12560"],
+}
+
+
+def run_obs(command, rng):
+    verb = (command.split() or [""])[0]
+    if rng.random() < 0.25:                       # some tools are silent / terse
+        return rng.choice(["", "ok", "done"])
+    opts = _RUN_OUT.get(verb)
+    return rng.choice(opts) if opts else rng.choice(
+        ["ok", "done", "completed", "output written"])
+
+
 def build_tasks(rng, files, cmds, contents):
     """Return (goal, [(action, observation), ...]) for one random task.
 
@@ -132,13 +177,13 @@ def build_tasks(rng, files, cmds, contents):
 
     if kind < 0.46:                                   # run a command then list files
         goal = "run %s and then list the files" % c
-        return goal, [(tool_run(c), "ok"),
+        return goal, [(tool_run(c), run_obs(c, rng)),
                       (tool_run("ls"), "%s  %s" % (f1, f2))]
 
     if kind < 0.57:                                   # 3-step: write -> run -> read (verify chain)
         goal = "create %s containing %s, run %s, then read it back to verify" % (f1, w, c)
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
-                      (tool_run(c), "ok"),
+                      (tool_run(c), run_obs(c, rng)),
                       (tool_read(f1), w)]
 
     if kind < 0.67:                                   # 3-step: write -> read -> delete
@@ -167,7 +212,7 @@ def build_tasks(rng, files, cmds, contents):
                 % (f1, w, f2, w2, c, f1))
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_write(f2, w2), "wrote %d bytes to %s" % (len(w2), f2)),
-                      (tool_run(c), "ok"),
+                      (tool_run(c), run_obs(c, rng)),
                       (tool_read(f1), w)]
 
     if kind < 0.89:                                   # 4-step: error recovery + run + verify
@@ -175,7 +220,7 @@ def build_tasks(rng, files, cmds, contents):
                 % (f1, w, c))
         return goal, [(tool_read(f1), "error: %s: not found" % f1),
                       (tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
-                      (tool_run(c), "ok"),
+                      (tool_run(c), run_obs(c, rng)),
                       (tool_read(f1), w)]
 
     if kind < 0.94:                                   # 4-step: write -> read -> run -> delete
@@ -183,7 +228,7 @@ def build_tasks(rng, files, cmds, contents):
                 % (f1, w, c))
         return goal, [(tool_write(f1, w), "wrote %d bytes to %s" % (len(w), f1)),
                       (tool_read(f1), w),
-                      (tool_run(c), "ok"),
+                      (tool_run(c), run_obs(c, rng)),
                       (tool_run("rm %s" % f1), "")]
 
     if kind < 0.97:                                   # single write step
@@ -193,7 +238,7 @@ def build_tasks(rng, files, cmds, contents):
 
     # single run step
     goal = rng.choice(["run %s", "execute %s", "please run %s"]) % c
-    return goal, [(tool_run(c), "ok")]
+    return goal, [(tool_run(c), run_obs(c, rng))]
 
 
 # A short, grounded rationale for an action, inferred from the tool call itself.
