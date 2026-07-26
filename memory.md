@@ -569,6 +569,51 @@ and model scale. Recorded so the direction is not lost. See [[planned-next-step]
 > tools/remeasure.py (new, tracked), .gitignore run-log patterns, notes.md + memory.md. Tree CLEAN.
 > Model .bin files are git-ignored, so the promoted checkpoint lives only on this machine.
 
+## STaR SELF-TRAINING LOOP -- ✅ BUILT + VERIFIED (2026-07-26 c). Harness only; NO retrain yet.
+
+User's ask: *"support this AI to learn from itself -- when I prompt, he learns."* Built as
+**rejection-sampling self-training**: the agent's own VERIFIED-successful runs become SFT data.
+Tools only, no C. `tools/self_train.py` (NEW) + `AGENT_TRACE` hook in `tools/agent_local.py`.
+
+```
+$env:AGENT_TRACE = "data/self_trace.jsonl"      # off by default => normal runs unchanged
+.\transformer.exe agent --cmd "... tools/agent_local.py model/smollm/reason_e2.bin model/smollm/tok.hf" --goal "..."
+python tools/self_train.py --trace data/self_trace.jsonl --out data/self_traj.txt   # --dry-run to inspect
+```
+
+**THE MODEL NEVER GRADES ITSELF** -- that is what keeps this from amplifying its own errors. Every
+accept/reject keys off TOOL OBSERVATIONS or `clean_sft.verify()` grounding: terminal `<done>`
+required (else `no-terminal-done`); final observation must not be an error (earlier errors are KEPT
+-- error-recovery is GOOD data); every row must pass grounding (**this is what rejects the ~5%
+char-slip** -- verified on the historical `demo_note`->`demonstra_note`); loop guard `--max-repeat 2`
+(lever #4 saw a live 8x re-read loop); at least one tool call. **All 5 reject paths tested and
+correct.** Runs are rebuilt by PREFIX-CHAINING (step k's prompt contains step k-1's) -- no run id.
+
+VERIFIED END-TO-END on real runs: 2 traced live runs on reason_e2.bin -> both accepted -> 9 rows ->
+merged via clean_sft at 1798+9 = **1807 pairs, 100% kept**. (Bug found+fixed in the process: `load()`
+used plain utf-8, so a BOM silently DROPPED record #1; now `utf-8-sig` like `clean_sft.read_rows`.)
+
+**HONEST LIMITS -- do not oversell:** (1) it AMPLIFIES what the model sometimes already gets right,
+it does not create new capability -- lever #4 measured that at 135M the residual errors are
+SYSTEMATIC/low-variance (the proposer never emitted the right action in 6 samples). (2) NEVER train
+on self-data alone -- always fold in the original corpus or the distribution narrows. (3) NOTHING is
+promoted without `tools/remeasure.py` green. (4) **"learns the instant you prompt it" needs the
+resident-model lever (c) FIRST** -- every generation reloads 651MB now; a single-sample LoRA step is
+only ~3s of compute, so per-prompt online updates are viable ONLY with the model in memory. Batch
+STaR (collect -> verify -> periodic retrain) works TODAY without it.
+
+**NEXT for STaR:** accumulate traces over real use (tens of runs), then the standard 2-stage retrain
+on `clean_sft`-merged self+original data, then remeasure, then promote only if non-regressive.
+
+Full detail: notes.md "2026-07-26 (c) -- STaR self-training loop".
+
+**ALSO ASKED: "can it predict the future like a human?"** Two different things. Next-token prediction
+it already does. Predicting real-world FUTURE EVENTS needs a causal world-model (state, intervention,
+counterfactuals, surprise-triggered belief update) -- that program is recorded at the END of this file
+and is honestly OUT OF REACH at 135M/CPU/pure-C. Keep it recorded; do not spend cycles on it.
+
+---
+
 **RESULT -- non-regressive everywhere, better in three places:**
 
 ```
@@ -745,6 +790,10 @@ Candidate levers ledger (reference):
   5. [x] DONE (2026-07-26, commit 4bea3b9) -- lever (a) 2 EPOCHS (2x450 staged): probe 6/8 -> 8/8,
      memtest B 80% -> 90%, critic B 3/4 -> 4/4, no memorization, live 5-step run green.
      => `model/smollm/reason_e2.bin` PROMOTED as the current model.
+  6. [~] BUILT, NOT YET EXERCISED (2026-07-26 c) -- STaR self-training harness (`self_train.py` +
+     `AGENT_TRACE`). All 5 reject paths verified; 9 rows harvested from 2 real runs. Needs volume
+     (tens of runs) before a retrain is worth it. Prereq for the "learns as you prompt" version is
+     lever (c) resident model.
 
 Rebuild clean corpus + retrain (the validated recipe, note --clip 1.0):
 `python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki --commands

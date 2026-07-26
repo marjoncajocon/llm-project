@@ -2330,6 +2330,75 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-07-26 (c) -- STaR self-training loop -- ✅ BUILT + VERIFIED (harness only, no retrain yet)
+
+User asked: "can the AI learn from itself, like when I prompt it, then it learns?" Answer built:
+**rejection-sampling self-training (STaR)** -- the agent's OWN successful runs become SFT data.
+Tools only, no C changes. Two files: `tools/agent_local.py` (trace hook), `tools/self_train.py` (new).
+
+### What was built
+
+1. **Trace hook** (`agent_local.py`): if `AGENT_TRACE=<file.jsonl>` is set, every step appends the
+   EXACT `(prompt, response)` pair the model produced. That pair IS the SFT row format already, so
+   nothing is reconstructed from the human-readable console log (which is lossy -- it renders
+   `write_file ... (11 bytes)` instead of the content). **Off by default => normal runs unchanged.**
+   Tracing is wrapped in try/except: it must never break a live run.
+2. **Harvester** (`self_train.py`): rebuilds whole runs, judges them, emits SFT rows.
+   Runs are reassembled by **PREFIX-CHAINING** -- step k's prompt contains step k-1's verbatim, so a
+   run is a maximal chain. No run id needed; interleaved or abandoned runs sort themselves out.
+
+### The verifier is EXTERNAL -- the model never grades its own work
+
+This is the part that makes self-training safe rather than a feedback loop of its own errors. Every
+accept/reject keys off the TOOL OBSERVATIONS or `clean_sft.verify()` grounding, never the model's
+opinion:
+
+| criterion | rejects |
+|---|---|
+| terminal `<done>` required | runs that hit the step limit (`no-terminal-done`) |
+| final observation not an error | `final-observation-failed:...` (earlier errors are KEPT -- error-recovery is good data) |
+| `clean_sft.verify()` per row | `ungrounded-path/content/cmd-file` -- **this is what catches the ~5% char-slip** |
+| loop guard (`--max-repeat`, default 2) | `looped-action:...` (lever #4 saw a live 8x re-read loop) |
+| at least one tool call | `no-tool-calls` (a bare `<done>` teaches nothing) |
+
+ALL FIVE PATHS TESTED against a synthetic bad trace, all rejected correctly -- including the exact
+historical char-slip `demo_note.txt -> demonstra_note.txt`, caught as `ungrounded-path`.
+
+### End-to-end verified on REAL runs
+
+Two live traced runs on `reason_e2.bin` (5-step error-recovery+git-status, and write-read-delete):
+both ACCEPTED, 9 rows harvested -> `data/self_traj.txt`. Merged with the corpus through the normal
+pipeline: `clean_sft` took 1798+9 = **1807 pairs, 100% kept** (expected -- self_train already applied
+the same verifier).
+
+BUG FOUND AND FIXED DURING THE TEST: `load()` read plain `utf-8`, so a BOM on line 1 (any Windows
+tool that wrote the trace) made `json.loads` fail and **silently drop that record**. Now reads
+`utf-8-sig`, matching `clean_sft.read_rows`. Found because a 5-record test showed "4 unique steps"
+-- worth chasing the off-by-one rather than assuming.
+
+### HONEST LIMITS (do not oversell this)
+
+- **It amplifies, it does not create.** Measured in lever #4: at 135M the residual errors are
+  SYSTEMATIC and low-variance -- for the failing case the proposer never emitted the right action in
+  6 samples. Self-training sharpens what the model sometimes already gets right. Expect no NEW skill.
+- **Never train on self-data alone** -- that narrows the distribution. Always fold in the original
+  corpus (the printed NEXT step does this).
+- **Not yet a retrain.** The harness is built and verified; NO self-trained model exists yet. Nothing
+  is promoted without `tools/remeasure.py` staying green -- the same gate lever (a) had to pass.
+- **"Learns the instant you prompt it" needs the resident-model lever first.** Every generation
+  currently reloads 651MB; a single-sample LoRA step is only ~3s of compute, so per-prompt online
+  updates are viable ONLY once the model stays in memory. Batch STaR (collect -> verify -> periodic
+  retrain) works TODAY without it.
+
+### Usage
+
+```
+$env:AGENT_TRACE = "data/self_trace.jsonl"
+.\transformer.exe agent --cmd "python tools/agent_local.py model/smollm/reason_e2.bin model/smollm/tok.hf" --goal "..."
+python tools/self_train.py --trace data/self_trace.jsonl --out data/self_traj.txt --report data/self_report.txt
+  (add --dry-run to inspect accept/reject with nothing written)
+```
+
 ## 2026-07-26 (b) -- lever (a) 2-epoch retrain -- ✅ DONE, ALL GREEN (probe 6/8 -> 8/8)
 
 ### RESULT (measured after both stages; supersedes the "IN FLIGHT" text below)

@@ -38,6 +38,25 @@ BEST_OF = int(os.environ.get("AGENT_BEST_OF", "1"))
 PROPOSE_TEMP = float(os.environ.get("AGENT_TEMP", "0.7"))
 GREEDY_TEMP = float(os.environ.get("AGENT_GREEDY_TEMP", "0.1"))
 
+# --- self-training trace (STaR) ------------------------------------------------
+# Off unless AGENT_TRACE names a .jsonl. Each step appends the EXACT (prompt,
+# response) pair the model produced -- already the SFT row format, so no lossy
+# reconstruction from the console log. tools/self_train.py rebuilds whole runs by
+# PREFIX-CHAINING (step k's prompt contains step k-1's verbatim), which needs no
+# run id and survives interleaved/aborted runs.
+TRACE = os.environ.get("AGENT_TRACE", "")
+
+
+def trace(prompt, response):
+  if not TRACE:
+    return
+  import json
+  try:
+    with open(TRACE, "a", encoding="utf-8") as f:
+      f.write(json.dumps({"prompt": prompt, "response": response}) + "\n")
+  except OSError:
+    pass                                  # tracing must never break a live run
+
 
 def flatten(transcript):
     """Real-newline transcript -> single line joined by SEP (matches training)."""
@@ -103,6 +122,7 @@ def main():
             sys.stderr.write("  critic: falling back to greedy\n")
             _, choice = split_reason_action(gen(model, tok, prompt, GREEDY_TEMP, 1234))
         sys.stderr.flush()
+        trace(prompt, choice or "<done>No response.</done>")
         print(choice or "<done>No response.</done>")
         return
 
@@ -113,6 +133,7 @@ def main():
         # response, so the recorded transcript turn stays a bare tool call.
         sys.stderr.write("  thought: %s\n" % reason)
         sys.stderr.flush()
+    trace(prompt, action or "<done>No response.</done>")
     print(action or "<done>No response.</done>")
 
 
