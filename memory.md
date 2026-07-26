@@ -564,6 +564,10 @@ and model scale. Recorded so the direction is not lost. See [[planned-next-step]
 > **CURRENT MODEL = `model/smollm/reason_e2.bin`** (2 epochs). `reason_clean.bin` KEPT as the A/B
 > baseline; `reason_e2_s1.bin` is the stage-1 midpoint (651MB, delete if disk is tight -- it is
 > reproducible). Use reason_e2.bin in every probe/live command from now on.
+>
+> **COMMITTED: 4bea3b9** on `agent-1` (local only, NOT pushed) -- train.c fflush, tools/probe3.py +
+> tools/remeasure.py (new, tracked), .gitignore run-log patterns, notes.md + memory.md. Tree CLEAN.
+> Model .bin files are git-ignored, so the promoted checkpoint lives only on this machine.
 
 **RESULT -- non-regressive everywhere, better in three places:**
 
@@ -608,7 +612,8 @@ server / int8 so best-of-N is practical (~5x model-reload cost now). (d) periodi
 `llama_train_sft` -- STILL MISSING, cost us 90 min today (see FINDING 2). (e) long-horizon PRM /
 multi-agent debate.
 
-**FINDING 1 -- the recorded "probe 7/7" IS STALE; the current model measures 6/8.** Re-ran the 7-case
+**FINDING 1 -- the recorded "probe 7/7" WAS STALE; `reason_clean.bin` measured 6/8** (the current
+model is now reason_e2.bin at 8/8 -- this finding is about the BASELINE). Re-ran the 7-case
 next-action probe (+1 new verbose case) on `reason_clean.bin`: **6/8**. Both failures are premature
 `<done>` after a TERSE `OBSERVATION: ok` from run_command. The verbose case PASSES, so 25d1113's fix
 is real and holds. It went unnoticed because 25d1113 was validated on `sft_memtest` + `eval_critic`
@@ -648,20 +653,21 @@ STILL OPEN -- periodic LoRA checkpointing is a real design call: merge into a CO
 the ~651MB working set) vs merge-save-unmerge (float drift every checkpoint, kills bit-exactness).
 Do it before any future long run. Operational lesson: run long jobs DETACHED, not as tool children.
 
-**PREDICTION -- MADE, THEN CONFIDENCE WITHDRAWN (score it honestly either way).** Original call while
-stage 1 ran: "2 epochs will lower the loss but will NOT fix probe cases 2 and 7". It rested on the
-mechanism FINDING 1b refuted. Under the CORRECTED mechanism the corpus DOES contain 41
-terse-word -> CONTINUE examples, just outnumbered 74-to-41 by unanimous EMPTY -> `<done>`; if the
-failure is "41 is too few to separate `ok` from `""`", more epochs COULD fix cases 2 and 7 -- the
-opposite of the original call. Not asserting the reverse (no evidence for that either). Honest
-position: lever (a) is a MORE informative experiment than I first credited; the probe decides, and
-the original prediction was made on a wrong premise no matter how it lands.
+**PREDICTION -- RESOLVED: I WAS WRONG.** Original call while stage 1 ran: "2 epochs will lower the
+loss but will NOT fix probe cases 2 and 7". Both cases PASS on reason_e2.bin. It rested on the
+mechanism FINDING 1b refuted; I withdrew confidence once the measurement landed, which was right,
+but the call itself was wrong. Why it was wrong: the corpus DID contain 41 terse-word -> CONTINUE
+examples, merely outnumbered 74-to-41 by unanimous EMPTY -> `<done>`, and a 2nd epoch was enough to
+separate `ok` from `""`. **Transferable lesson: "the data doesn't cover it" and "the data covers it
+but is outvoted" look identical from the failure alone -- COUNT THE CORPUS before predicting which,
+and prefer the cheap experiment over the confident diagnosis.**
 
-**RE-MEASURE AFTER STAGE 2 -- all of it, no shortcuts (this is exactly what FINDING 1 punishes):**
-`probe3.py <model>` 8 cases (the 2 terse-ok cases are the tell) | `sft_memtest` (A >=90%, B 75-100%)
-| `eval_critic` (A, B1-B4) | LIVE multi-step agent run. Promote `reason_e2.bin` over
-`reason_clean.bin` ONLY if non-regressive. NOTE: `probe3.py` lives in the session scratchpad and is
-UNTRACKED -- commit it to `tools/` so it stops getting lost between sessions.
+**RE-MEASURE -- ✅ DONE for reason_e2.bin (all four, no shortcuts), and now AUTOMATED.** The probe
+set is `probe3.py` (8 cases) | `sft_memtest` (A >=90%, B 75-100%) | `eval_critic` (A, B1-B4) | LIVE
+agent run. Both probes are now TRACKED (`tools/probe3.py`, `tools/remeasure.py` -- probe3 was rescued
+from a session scratchpad where it had nearly been lost). `remeasure.py` runs all three in one
+command and prints `?` for anything unparsed, so FINDING 1 (a skipped probe reading as a pass)
+cannot recur silently.
 
 **Verbose/multi-line observation training DONE (2026-07-26) -- the real capability win.** Problem: the
 generator trained every run_command obs as bare "ok", so a VERBOSE real obs (multi-line `git status`)
@@ -674,12 +680,12 @@ stopped early now COMPLETES (read-fail->write->git status[verbose]->read->done, 
 (sft_memtest A 95% / B 80%, both above bar; B down from 100% peak but within the 75-100% retrain band).
 Full detail: notes.md "2026-07-26 -- verbose/multi-line observations".
 
-**NEXT LEVER (ask the user):** (a) more steps (~500) / 2nd epoch -- tail loss still ~0.5, longer chains
-undertrained; (b) reduce the persistent ~5% filename char-slip (copy-focused aux or longer training);
-(c) a persistent-process inference server or an int8 fine-tune so best-of-N (lever #4) is fast enough to
-be practical (~5x model-reload cost now); (d) a long-horizon roadmap item (#4-style PRM / multi-agent
-debate). Env: zig D:\env\zig\zig.exe, python D:\env\python\python-3.9.10.amd64\python.exe. 2-space,
-C-only-flat-root. Rebuild+smoke before any commit (Output validation: PASSED).
+~~**NEXT LEVER:** (a) more steps / 2nd epoch ...~~ **SUPERSEDED -- (a) is DONE (commit 4bea3b9, probe
+6/8 -> 8/8). The live list is the "NEXT LEVER" block at the top of the 2026-07-26 (b) section.**
+Env (unchanged, still current): zig `D:\env\zig\zig.exe`, python
+`D:\env\python\python-3.9.10.amd64\python.exe`. 2-space, C-only-flat-root. Rebuild+smoke before any
+commit (Output validation: PASSED). Build:
+`$c=(Get-ChildItem *.c|%{$_.Name}); D:\env\zig\zig.exe cc -std=c11 -O2 -Wall -o transformer.exe @c -lm`
 
 --- earlier this session (lever #4 proposer-critic) ---
 
@@ -736,13 +742,33 @@ Candidate levers ledger (reference):
   3. [x] DONE (2026-07-25, commit 59b4252 + this pass) -- grow/vary data: 3-step chains + error
      recovery, THEN 4-step chains + 91 real rust/go commands. All green (probe 7/7, no regression).
   4. Long-horizon roadmap item (PRMs, multi-agent debate, ...) -- candidate after the obs-robustness fix.
+  5. [x] DONE (2026-07-26, commit 4bea3b9) -- lever (a) 2 EPOCHS (2x450 staged): probe 6/8 -> 8/8,
+     memtest B 80% -> 90%, critic B 3/4 -> 4/4, no memorization, live 5-step run green.
+     => `model/smollm/reason_e2.bin` PROMOTED as the current model.
 
 Rebuild clean corpus + retrain (the validated recipe, note --clip 1.0):
 `python tools/make_agent_traj.py --out data/traj_reason.txt --n 300 --wiki data/wiki --commands
 data/so_commands.txt --reason` then `python tools/clean_sft.py --shuffle --balance --report
 data/clean_report.txt --out data/clean_reason.txt data/traj_reason.txt data/qa.txt data/toolcalls.txt`
-then `.\transformer.exe llama-train data/clean_reason.txt --sft --hf-tok model/smollm/tok.hf --resume
-model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4 --steps 350 --lr 3e-3 --warmup 30
---min-lr 1e-4 --clip 1.0 --out model/smollm/reason_clean.bin`. Live agent (space-free paths, from repo
-root): `.\transformer.exe agent --cmd "D:\env\python\python-3.9.10.amd64\python.exe tools/agent_local.py
-model/smollm/reason_clean.bin model/smollm/tok.hf" --goal "..."`.
+then TWO 450-step stages (2 epochs -- **NOT the old single `--steps 350`, which is only 0.78 epoch
+and measurably undertrained; see 2026-07-26 (b)**), each DETACHED via `Start-Process`:
+`.\transformer.exe llama-train data/clean_reason.txt --sft --hf-tok model/smollm/tok.hf --resume
+model/smollm/model_v2.bin --lora-r 16 --lora-alpha 32 --batch 4 --steps 450 --lr 3e-3 --warmup 30
+--min-lr 1e-4 --clip 1.0 --out model/smollm/reason_e2_s1.bin` then the same with
+`--resume model/smollm/reason_e2_s1.bin --steps 450 --lr 1e-3 --warmup 10 --out
+model/smollm/reason_e2.bin`. Budget ~2.8 h total at ~5.2 steps/min.
+
+VALIDATE (one command, runs the FULL set -- built precisely so a probe cannot be skipped again):
+`python tools/remeasure.py model/smollm/reason_e2.bin` (add `--best-of 1 --m 8` for a quick pass).
+It prints probe3 + sft_memtest + eval_critic vs the recorded baseline and shows `?` for anything it
+could not parse, so a missing number never reads as a pass. GOTCHA baked in: `sft_memtest` execs the
+engine argv VERBATIM, so it needs an ABSOLUTE path (probe3/eval_critic abspath internally and hid
+this for one run). Individual probe: `python tools/probe3.py model/smollm/reason_e2.bin`.
+
+Live agent (space-free paths, from repo root):
+`.\transformer.exe agent --cmd "D:\env\python\python-3.9.10.amd64\python.exe tools/agent_local.py
+model/smollm/reason_e2.bin model/smollm/tok.hf" --goal "..."`.
+**STDIN TRAP:** `run_command` needs interactive approval (`approval.c:11`); with no stdin `fgets`
+returns EOF => DENIED, so a detached/piped live run silently skips every command step. Pipe
+approvals: `"y`ny`ny`ny`n" | .\transformer.exe agent ...`. (The model handles a denial correctly --
+it treats "denied by user" as an observation and continues -- but the verbose-obs path goes untested.)
