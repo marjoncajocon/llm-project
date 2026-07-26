@@ -559,15 +559,21 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-07-26 b) -- lever (a) 2-epoch retrain ✅ DONE, ALL GREEN, PROMOTED
+## >>> RESUME HERE (2026-07-26) -- lever (a) 2-epoch retrain ✅ DONE+PROMOTED; STaR harness ✅ BUILT
 
-> **CURRENT MODEL = `model/smollm/reason_e2.bin`** (2 epochs). `reason_clean.bin` KEPT as the A/B
-> baseline; `reason_e2_s1.bin` is the stage-1 midpoint (651MB, delete if disk is tight -- it is
-> reproducible). Use reason_e2.bin in every probe/live command from now on.
+> **SESSION COMPLETE, TREE CLEAN, nothing left half-done.** Three commits on `agent-1`
+> (local only, NOT pushed): **4bea3b9** lever (a) retrain + train.c fflush + tools/probe3.py +
+> tools/remeasure.py | **90488e1** memory.md stale-recipe fix | **8c9f405** STaR self-training loop
+> (tools/self_train.py + AGENT_TRACE hook). Rebuild+smoke green (Output validation: PASSED).
 >
-> **COMMITTED: 4bea3b9** on `agent-1` (local only, NOT pushed) -- train.c fflush, tools/probe3.py +
-> tools/remeasure.py (new, tracked), .gitignore run-log patterns, notes.md + memory.md. Tree CLEAN.
-> Model .bin files are git-ignored, so the promoted checkpoint lives only on this machine.
+> **CURRENT MODEL = `model/smollm/reason_e2.bin`** (2 epochs, probe 8/8). `reason_clean.bin` KEPT as
+> the A/B baseline; `reason_e2_s1.bin` is the stage-1 midpoint (651MB, delete if disk is tight -- it
+> is reproducible). Use reason_e2.bin in every probe/live command from now on. Model .bin files are
+> git-ignored, so the promoted checkpoint lives ONLY on this machine -- the commits carry the recipe,
+> not the weights.
+>
+> **FIRST ACTIONS ON RESUME:** `git status` (expect clean) + `git log --oneline -5`. The exe may be
+> stale/cleaned -- rebuild with the zig glob (see the env block further down).
 
 ## STaR SELF-TRAINING LOOP -- ✅ BUILT + VERIFIED (2026-07-26 c). Harness only; NO retrain yet.
 
@@ -649,7 +655,10 @@ case it resurfaces, but do not spend a retrain on it now.
 > got fresh adapters, fresh Adam state, restarted LR schedule. RUN LONG JOBS DETACHED via
 > `Start-Process` -- a harness-child run was killed at 90 min and lost everything.
 
-**NEXT LEVER (ask the user):** (b) the ~5% char-slip -- now the TOP remaining defect and it has a
+**NEXT LEVER (ask the user):** (STaR-volume) accumulate traces over real use -- the harness is built
+and verified but only 9 rows exist; it needs TENS of runs before a retrain is worth the 2.8 h. This
+is the cheapest way to keep improving and it now runs itself as a by-product of normal use (just set
+AGENT_TRACE). (b) the ~5% char-slip -- the TOP remaining accuracy defect and it has a
 diagnosed SHAPE: it does not corrupt randomly, it SNAPS a novel token toward a real command it knows
 (`ldcz`->`ls`, `r4n4`->`rm4n4`, `ctngh4`->`cngh4`). That is prior-over-copy, so a copy-focused aux
 objective or contrastive novel-token data is the aimed fix, not more steps. (c) persistent inference
