@@ -49,6 +49,19 @@ data/*
 # Agent demo artifact
 agent_demo.txt
 
+# Training / evaluation run logs (detached Start-Process stdout+stderr)
+train_*.log
+train_*.err
+remeasure_*.log
+remeasure_*.err
+memtest_*.log
+memtest_*.err
+live_*.log
+live_*.err
+
+# Python bytecode cache (tools/ probes)
+__pycache__/
+
 # webchat Go server binary (POSIX build; the Windows .exe is caught by *.exe)
 tools/webchat/webchat
 

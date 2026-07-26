@@ -232,8 +232,12 @@ static int train_sft(char *text, const TrainConfig *cfg) {
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
-    if (s % report == 0 || s == steps - 1)
+    // flush: a long run redirected to a file is block-buffered otherwise, so the
+    // loss curve only lands on disk at exit -- useless if the run is interrupted.
+    if (s % report == 0 || s == steps - 1) {
       printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+      fflush(stdout);
+    }
   }
 
   int rc = 0;
@@ -673,8 +677,11 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     adam_set_lr(&opt, sched_lr(cfg, s));
     adam_step(&opt, params, n_params);
-    if (s % report == 0 || s == steps - 1)
+    // flush: see train_sft -- a redirected long run must not buffer its loss curve.
+    if (s % report == 0 || s == steps - 1) {
       printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+      fflush(stdout);
+    }
   }
 
   // Fold the adapters into the weights so the result saves as an ordinary LLMA

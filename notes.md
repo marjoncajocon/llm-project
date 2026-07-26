@@ -2330,6 +2330,183 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-07-26 (b) -- lever (a) 2-epoch retrain -- ✅ DONE, ALL GREEN (probe 6/8 -> 8/8)
+
+### RESULT (measured after both stages; supersedes the "IN FLIGHT" text below)
+
+`model/smollm/reason_e2.bin` is NON-REGRESSIVE on every probe and better on three. PROMOTED.
+
+```
+  probe                    reason_clean.bin   reason_e2.bin
+  probe3 (8 cases)              6/8              8/8    <- both terse-"ok" cases FIXED
+  sft_memtest A (bar >=90)      95%              95%
+  sft_memtest B (bar 75-100)    80%              90%
+  sft_memtest C (artifact)      20%              32%
+  eval_critic A grounding       96%              96%
+  eval_critic B multi-step      3/4              4/4    <- B4 now passes greedy+single+best-of
+```
+
+NO MEMORIZATION: A/B high with C low is the generalizing signature -- 2 epochs on 1798 examples did
+NOT tip it into reproducing training pairs (the main risk of this lever).
+
+LIVE RUN (the real parse->approve->execute loop, with REAL 23-line `git status` output):
+`read demo_note.txt -> error | write demo_note.txt "hello world" | run git status -> 23 real lines |
+read demo_note.txt -> "hello world" | <done>` -- 5 steps, COMPLETE. This is the exact scenario that
+last session stopped ONE STEP EARLY on **and** char-slipped (demo_note -> demonstra_note). Both gone.
+(First live attempt ran detached with no stdin, so `approval.c` fgets hit EOF -> `run_command` was
+DENIED. Not a model failure -- and the model correctly treated "denied by user" as an observation and
+CONTINUED to the read. Re-ran with approvals piped to stdin to exercise the verbose obs for real.)
+
+STILL UNFIXED (untouched by this lever, as expected): the ~5% char-slip. eval_critic A flat at 96%,
+memtest misses are `ctngh4.log`->`cngh4.log`, `r4n4`->`rm4n4`, `ldcz`->`ls`. NOTE THE SHAPE: it is
+not random corruption, it SNAPS a novel token toward a REAL command it knows (rm, ls). That is a
+prior-over-copy problem and wants its own lever.
+
+SCORING MY OWN PREDICTION: **WRONG.** I predicted more steps would NOT fix probe cases 2 and 7. It
+did. The corrected mechanism (FINDING 1b) explains why: the 41 terse-word -> CONTINUE examples were
+already in the corpus, merely outnumbered 74-to-41 by the unanimous EMPTY -> `<done>` pattern, and a
+second epoch was enough to separate `ok` from `""`. Withdrawing confidence once the measurement
+refuted the premise was right; the original call was not. **LEVER B IS NOT NEEDED for this defect**
+-- keep the empty<->terminal decorrelation design on file in case it resurfaces, but do not spend a
+retrain on it now.
+
+COST: stage 1 86 min + stage 2 81 min = ~2.8 h, plus ~50 min validation. Rate ~5.2 steps/min.
+
+--- what follows is the IN-FLIGHT writeup from earlier the same day (kept for the findings) ---
+
+## 2026-07-26 (b, cont.) -- lever (a): the two findings that came out of it
+
+Resumed the paused session. User picked lever **(a) more steps / 2nd epoch**. Two findings landed
+before the retrain even produced a checkpoint; both matter more than the retrain itself.
+
+### FINDING 1 (important): the recorded "probe 7/7" DOES NOT hold on the current checkpoint
+
+Recovered the 7-case next-action probe from an earlier session's scratchpad, parameterized it by
+model path, and added an 8th case for the verbose-observation fix (25d1113). Re-measured the CURRENT
+`reason_clean.bin`:
+
+```
+[PASS] write_file            (failed read -> write)
+[FAIL] read_file             write -> run(cargo build) -> "ok"  => got <done>All steps done.</done>
+[PASS] rm vault_ledger.log
+[PASS] <done
+[PASS] cargo test
+[PASS] go build
+[FAIL] rm quartz_notes.csv   write -> read -> run(cargo fmt) -> "ok"  => got <done>All steps done.</done>
+[PASS] read_file             VERBOSE multi-line git status -> correctly CONTINUES
+6/8 next-action probes correct
+```
+
+Both failures are **premature `<done>` after a TERSE `OBSERVATION: ok` following run_command** --
+the mirror image of the bug 25d1113 fixed. Case 8 (verbose) passes, so the verbose fix is real and
+holds.
+
+~~DIAGNOSIS: `run_obs()` emits verbose ~75% / terse "ok" ~25%, so a bare "ok" became rare and now
+reads as end-of-chain.~~ **THAT DIAGNOSIS WAS WRONG -- measured and refuted the same day, see
+below. Left struck-through rather than deleted because acting on it (rebalancing terse/verbose)
+would have been the wrong fix.**
+
+### DIAGNOSIS, MEASURED (supersedes the guess above)
+
+Counted the ACTUAL corpus (`data/clean_reason.txt`, scratchpad obs_stats). For every SFT line whose
+PROMPT ends on a run_command observation, what does the RESPONSE do?
+
+```
+  EMPTY/rm         n= 74   next-TOOL   0 (  0.0%)   <done>  74 (100.0%)
+  EMPTY/other      n=  9   next-TOOL   8 ( 88.9%)   <done>   1 ( 11.1%)
+  terse-word/other n= 41   next-TOOL  39 ( 95.1%)   <done>   2 (  4.9%)
+  verbose/other    n=119   next-TOOL  75 ( 63.0%)   <done>  44 ( 37.0%)
+```
+
+Both halves of the old guess are false: terse is **46.8%** of run_command observations (not 25% --
+the `_RUN_OUT` fallback ALSO returns terse strings for any verb absent from the table), and the data
+does NOT teach "terse => done" -- after a terse WORD the corpus continues **95.1%** of the time.
+
+THE REAL STRUCTURE: the **EMPTY** observation is the culprit, and it comes from the generator, not
+from `run_obs()`. Three templates hardcode `""` as the observation of a TERMINAL `rm`
+(`make_agent_traj.py:176`, `:196`, `:232`), so `EMPTY/rm` is 74 examples that are **100% followed by
+`<done>`** -- a perfect predictor -- while mid-chain empties are rare (9). The model plausibly
+learned "short/empty observation => finish" from 74 unanimous examples and over-generalized it onto
+`ok`, against only 41 counterexamples. Verbosity is CONFOUNDED WITH POSITION in the data.
+
+CONSEQUENCE FOR LEVER B (the fix is now specific, and it is NOT a global rebalance): break the
+empty<->terminal correlation. Route the terminal `rm` through `run_obs` so it sometimes emits
+`removed 'f1'`, and add mid-chain terse-word steps so the 41 grows. Then verbosity is independent of
+position and the model must decide "done" from the GOAL, not from output length.
+
+WHY IT WAS MISSED: 25d1113 was validated on `sft_memtest` A/B + `eval_critic` B4 only -- the 7-case
+probe was NOT re-run after that retrain. The "7/7" in the notes is a true measurement of the
+*6895f6f* model, NOT of `reason_clean.bin`. **Rule going forward: re-run the FULL probe set after
+every retrain; a targeted fix validated only on the case it targets hides the trade it made.**
+
+### FINDING 2: a 90-minute run was killed and produced NOTHING (robustness gap)
+
+First attempt (single continuous 900 steps, launched as a harness-managed background child) was
+terminated externally at ~10:15 after ~90 min. Result: no `reason_e2.bin`, and `train_e2.log` still
+0 bytes. Cause of the kill: unknown. Cause of the TOTAL loss: two gaps in `llama_train_sft`
+(`train.c`) --
+  1. progress `printf` had no `fflush`, so a redirected long run block-buffers its whole loss curve
+     and only lands it at exit;
+  2. unlike the GPT path (`train.c:386` `[checkpoint] saved at step`), the LLaMA SFT path has NO
+     periodic checkpointing at all -- the save happens only after the loop.
+
+FIXED NOW (tracked, 1 edit): `fflush(stdout)` after the progress printf in BOTH `train_sft` and
+`llama_train_sft`, with a comment. No numerics touched; rebuild clean, full selftest
+`Output validation: PASSED`. Deliberately did NOT change the `steps/10` report cadence (4 call
+sites, all training paths) for a monitoring convenience.
+
+STILL OPEN (design decision, not a quick patch): periodic checkpointing in `llama_train_sft`. LoRA
+makes it awkward -- either merge into a COPY of the model to save (doubles the ~651MB working set)
+or merge-save-unmerge (float drift on every checkpoint, kills the bit-exactness property). Left
+undone deliberately; worth doing before any future long run.
+
+### THE RUN (in flight)
+
+Corpus is 1798 examples at `--batch 4` => ~450 steps/epoch, so the previous 350-step run was only
+**0.78 epoch** -- that is the real explanation for the ~0.5 tail loss, not a stubborn optimum.
+Relaunched as TWO 450-step stages, DETACHED via `Start-Process` (not a harness child), each writing
+a real checkpoint:
+  - stage 1: resume `model_v2.bin`, 450 steps, lr 3e-3, warmup 30, min-lr 1e-4, clip 1.0
+             -> `model/smollm/reason_e2_s1.bin`
+  - stage 2: resume stage 1, 450 steps, **lr 1e-3, warmup 10** (NOT a re-warm to 3e-3 -- re-applying
+             peak LR to already-fine-tuned weights is the likely way to damage them)
+             -> `model/smollm/reason_e2.bin`
+`reason_clean.bin` is NOT overwritten -- it stays as the A/B baseline.
+
+HONEST CAVEAT: staged != one continuous 900-step run. Each stage merges its adapters and saves an
+ordinary checkpoint; stage 2 starts with FRESH adapters, FRESH Adam state, and a restarted LR
+schedule. It is a legitimate 2-epoch schedule and matches the project idiom (the validated recipe
+itself resumes from `model_v2.bin`), but it is a different optimization path.
+
+MEASURED THROUGHPUT (corrects the old note): ~4.5 steps/min, NOT the ~7.8 the "350 steps ~ 45 min"
+line implies. Stage ~100 min, both stages ~3.3 h.
+
+### EXPECTATION (recorded BEFORE the result, so it can be scored honestly)
+
+ORIGINAL (recorded while stage 1 ran): "more steps fixes UNDERtraining, not a distribution the data
+no longer covers -- 2 epochs will drop the loss but cases 2 and 7 will STAY broken."
+
+**CONFIDENCE WITHDRAWN (same day, after the measurement above).** That prediction rested on the
+refuted mechanism. Under the CORRECTED mechanism the data does contain 41 examples of
+terse-word -> CONTINUE, they are simply outnumbered 74-to-41 by the unanimous EMPTY -> `<done>`
+pattern. If the failure is "41 counterexamples are too few to separate `ok` from `""`", then more
+epochs on those same 41 COULD fix cases 2 and 7 -- the opposite of the original call. Not asserting
+the reverse either (no evidence for it); the honest position is that lever (a) is a MORE
+informative experiment than I first credited, and the probe decides. Score the original as made on
+a wrong premise regardless of how it lands.
+
+**QUEUED NEXT (lever B, the targeted fix):** rebalance the terse/verbose mix in `run_obs()` and add
+chains where a terse "ok" is followed by a FURTHER step, regenerate + `clean_sft` verify, retrain.
+That attacks the measured defect; (a) does not.
+
+### RE-MEASURE CHECKLIST (after stage 2)
+
+Full set, no shortcuts -- this is exactly what FINDING 1 punishes:
+`probe3.py <model>` (8 cases, expect the 2 terse-ok cases to be the tell) | `sft_memtest.py` (A/B
+bands, A >=90% / B 75-100%) | `eval_critic.py` (A, B1-B4) | LIVE agent multi-step run. Promote
+`reason_e2.bin` over `reason_clean.bin` ONLY if non-regressive. Probe scripts live in the session
+scratchpad (probe3.py is NOT tracked -- consider committing it to tools/ so this stops happening).
+
 ## 2026-07-26 -- verbose/multi-line observations -- ✅ DONE (fixes premature-<done>, the real win)
 
 The lever the lever-#4 measurements pointed at, and it WORKED. The trajectory generator trained EVERY
