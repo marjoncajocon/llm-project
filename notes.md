@@ -2815,3 +2815,13 @@ python D:\env\python\python-3.9.10.amd64\python.exe. Keep 2-space, C-only-flat-r
 Other levers still open (after #3, or instead): #4 long-horizon roadmap item (PRMs, multi-agent
 debate); #5 (optional) apply variable-length batching to the GPT `train_sft` path (its attn-weights
 tensor strides by seq_len, so it needs re-striding -- smaller payoff, agent uses the LLaMA path).
+
+
+#-------------------------------#
+#for checking#
+Raw Coding (HumanEval+)
+SWE-bench Verified
+Math & Logic Reasoning
+Multi-File Code Tracking
+Hallucination Rate
+#-------------------------------#
