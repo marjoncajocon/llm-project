@@ -2330,6 +2330,100 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-09-02 (c) -- DPO: learning from preferences -- ✅ BUILT + VERIFIED (no gated run yet)
+
+User asked to implement DPO after agreeing it is the better next lever than more GRPO. Reason,
+from our own measurements: **GRPO must SAMPLE to learn** (G rollouts x max-new decode steps per
+task, 12-40 s/step here) **and then discards most of those steps** -- on `reason_e2.bin` the mean
+reward is already ~0.94, so a group's rollouts all score alike, the advantage is zero, and the
+group is skipped. DPO collects preferences offline once and never wastes a step.
+
+New subcommand `transformer dpo`. Paper: Rafailov et al., *Direct Preference Optimization*.
+
+### The objective and why it cost almost no new code
+
+```
+s_w = log pi(y_w|x) - log pi_ref(y_w|x)      implicit reward, chosen
+s_l = log pi(y_l|x) - log pi_ref(y_l|x)      implicit reward, rejected
+h   = beta * (s_w - s_l)
+L   = -log sigmoid(h) = softplus(-h)
+```
+
+d/d logits of log pi(y_t) is (onehot - p) -- the SAME score function GRPO uses -- so the whole
+backward is `pg_backward` again, with one scalar shared by every token of the pair:
+
+```
+g = beta * sigmoid(-h)
+coeff = +g on every scored CHOSEN token,  -g on every scored REJECTED token
+```
+
+`sigmoid(-h)` is near beta while the model still prefers the WRONG answer and near 0 once the
+preference is learned -- **the update anneals itself away pair by pair**. No reward model, no
+value network, no rollouts.
+
+**The reference is free**, same trick as GRPO's KL term: with LoRA the base is frozen, so pi_ref
+is the model with adapters OFF. Hence `--lora-r > 0` is REQUIRED and the trainer errors clearly
+without it -- there is no reference otherwise short of a second 621 MB copy.
+
+Two implementation notes worth keeping: the reference log-probs are **precomputed once for every
+pair** (pi_ref never changes; recomputing it per step would be two wasted forwards per pair), and
+the rejected side is backpropagated FIRST because the activation cache already holds it after its
+forward -- that saves one forward per pair.
+
+### Files
+
+- **NEW `dpo.h`/`dpo.c`** -- `dpo_pair_loss()` (pure arithmetic, stable softplus/sigmoid both
+  ways) + `dpo_run()`.
+- **NEW `tools/dpo_pairs.py`** -- builds `prompt<TAB>chosen<TAB>rejected`. Synthetic negatives
+  corrupt a verified response in the ways this model actually fails: hallucinated path, the
+  measured ~5% char-slip, empty write body, premature `<done>`, trailing ramble, unterminated
+  block, wrong tool. `--traces` mines REAL on-policy failures from an AGENT_TRACE JSONL.
+- `main.c` (run_dpo + usage), `Makefile`, `selftest.c` part `[31]`.
+
+### A data bug caught by reading the generated pairs, not by any test
+
+First version corrupted `strip_reasoning(good)` while writing the untouched `good` as the chosen
+side. So every pair differed in TWO ways: the defect, and the presence of `<think>...</think>`.
+**DPO learns whatever separates the two sides**, so that corpus would have quietly taught
+"prefer responses containing `<think>`" instead of "do not ramble". Fixed: corruptions now apply
+to the FULL chosen response, and `premature_done` carries the reasoning prefix over deliberately.
+Nothing would have caught this except looking at the rows.
+
+### Verified
+
+Smoke test part `[31]`, all green, `Output validation: PASSED`:
+- **Indifferent pair**: loss 0.69315 = ln2 exactly, g = beta/2 exactly. Catches a flipped
+  softplus or sigmoid immediately.
+- **Self-annealing**: g(already correct) 0.0354 < g(indifferent) 0.0500 < g(backwards) 0.0646.
+- **Numerical stability** at +/-1000 margin: finite, no NaN (a naive log(1+exp(-h)) would blow up).
+- **NUMERICAL GRADIENT CHECK of the whole objective through the model**: 2.56e-03 on
+  well-conditioned entries. This is the gate that matters -- a sign error here would train the
+  model BACKWARDS while the loss curve still looked entirely plausible.
+- **Closed loop** (60 steps): loss 0.6636 -> 0.5319, margin +0.2998 -> +1.7685.
+
+Real run on `model/smollm/reason_e2.bin` with 40 pairs: **step 0 reports loss 0.6931 and margin
+0.0000 exactly** -- because LoRA's B starts at zero the policy IS the reference at init. That is
+the theory confirming itself, and a useful sanity check: if a run does not start at ln2, the
+reference wiring is wrong before any training has happened. Margin then rose and pref-acc went
+0% -> 100%.
+
+### Measured cost (SmolLM2-135M, this CPU)
+
+- reference pass ~**1.2 s/pair**, one time: ~29 min for the full 1420-pair corpus, then cached.
+- training ~**18 s/step at --batch 4**.
+
+Honest comparison: that is *comparable to GRPO per step*, not dramatically faster. **The win is
+that no step is discarded** -- GRPO skipped 2-3 of every 4 groups in testing -- plus determinism
+and no decode loop.
+
+### Not done
+
+No long gated run. 1420 pairs sit in `data/dpo_pairs.txt`. Next: run a few hundred steps, then
+`tools/remeasure.py` + `tools/probe3.py`, promote only if non-regressive. **A rising margin means
+the PREFERENCE was learned, not that the model got better at the task** -- the run prints that
+warning itself. If the margin rises but remeasure does not improve, the likely cause is the
+synthetic negatives; switch to `--traces` and real on-policy failures.
+
 ## 2026-09-02 (b) -- GPU build flag (OpenCL) + Colab cross-build -- ✅ BUILT + VERIFIED
 
 User asked for a GPU build flag ("we can build both cpu and for gpu support"), then clarified:

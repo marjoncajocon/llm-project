@@ -18,6 +18,7 @@
 #include "tokenizer.h"
 #include "train.h"
 #include "grpo.h"
+#include "dpo.h"
 #include "agent.h"
 #include "caption.h"
 #include "text2media.h"
@@ -1014,6 +1015,96 @@ static int run_hfchat(int argc, char **argv) {
   return rc;
 }
 
+static void dpo_usage(void) {
+  printf(
+    "Usage: transformer dpo <pairs.txt> --model M.bin --hf-tok V.hf [options]\n"
+    "\n"
+    "Direct Preference Optimization (Rafailov et al.). Where `grpo` must SAMPLE to\n"
+    "learn -- G rollouts per task, 12-40s per step on a CPU -- DPO learns from\n"
+    "preference pairs collected offline. No sampling, no reward model, no rollouts:\n"
+    "every step is a few forward passes over text that already exists. On a CPU that\n"
+    "difference is the whole point.\n"
+    "\n"
+    "<pairs.txt> is `prompt<TAB>chosen<TAB>rejected` -- the SFT format with one extra\n"
+    "column. Build one with: python tools/dpo_pairs.py --out data/dpo_pairs.txt ...\n"
+    "\n"
+    "Required:\n"
+    "  --model F         LLMA checkpoint to start from (the policy)\n"
+    "  --hf-tok F        that model's own .hf vocabulary\n"
+    "Output:\n"
+    "  --out F           where to save (default model/dpo.bin)\n"
+    "  --name X          shorthand for --out model/X/model.bin\n"
+    "Objective:\n"
+    "  --beta F          KL strength (default 0.1) -- the one knob unique to DPO. It\n"
+    "                    sets how far the policy may move from the reference. Lower\n"
+    "                    drifts further and can degrade; higher stays cautious and\n"
+    "                    learns less.\n"
+    "  --len-norm        divide each completion's log-prob by its token count.\n"
+    "                    Standard DPO sums, which has a known LENGTH BIAS: summing\n"
+    "                    more negative terms makes long completions look worse\n"
+    "                    regardless of quality. Turn this on when chosen and rejected\n"
+    "                    differ a lot in length.\n"
+    "Optimization:\n"
+    "  --steps N         optimizer steps (default 200)\n"
+    "  --batch N         preference pairs per step (default 4)\n"
+    "  --lr F            learning rate (default 5e-6). DPO is a sharp objective --\n"
+    "                    SFT learning rates diverge here.\n"
+    "  --clip F          grad-norm clip (default 1.0)\n"
+    "  --weight-decay F  AdamW decoupled decay (default 0)\n"
+    "  --warmup N / --min-lr F   cosine schedule (default: constant LR)\n"
+    "  --lora-r N        LoRA rank (default 8). REQUIRED > 0: the frozen reference\n"
+    "                    policy IS the model with adapters off, so without adapters\n"
+    "                    there is no reference without a second full copy in memory.\n"
+    "  --lora-alpha F    LoRA scaling (default 16)\n"
+    "Run control:\n"
+    "  --seed N          RNG seed (default 1)\n"
+    "  --verbose         extra per-step detail\n"
+    "\n"
+    "Watch the MARGIN: it starts near 0 and should climb. Loss falling and margin\n"
+    "rising means the PREFERENCE was learned -- not that the model got better at the\n"
+    "task. Only tools/remeasure.py can tell you that; gate promotion on it.\n");
+}
+
+static int run_dpo(int argc, char **argv) {
+  if (argc < 3 || strncmp(argv[2], "--", 2) == 0) { dpo_usage(); return 2; }
+  const char *pairs = argv[2];
+  DpoConfig cfg = dpo_default_config();
+  const char *name = NULL;
+  static char name_model[512], name_tok[512];
+
+  for (int i = 3; i < argc; i++) {
+    const char *f = argv[i];
+    int has_val = (i + 1 < argc);
+#define NEED_VAL() do { if (!has_val) { fprintf(stderr, "missing value for %s\n", f); return 2; } } while (0)
+    if      (strcmp(f, "--model") == 0)   { NEED_VAL(); cfg.model = argv[++i]; }
+    else if (strcmp(f, "--hf-tok") == 0)  { NEED_VAL(); cfg.hf_tok = argv[++i]; }
+    else if (strcmp(f, "--out") == 0)     { NEED_VAL(); cfg.out_model = argv[++i]; }
+    else if (strcmp(f, "--name") == 0)    { NEED_VAL(); name = argv[++i]; }
+    else if (strcmp(f, "--beta") == 0)    { NEED_VAL(); cfg.beta = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--len-norm") == 0){ cfg.len_norm = 1; }
+    else if (strcmp(f, "--steps") == 0)   { NEED_VAL(); cfg.steps = atoi(argv[++i]); }
+    else if (strcmp(f, "--batch") == 0)   { NEED_VAL(); cfg.batch = atoi(argv[++i]); }
+    else if (strcmp(f, "--lr") == 0)      { NEED_VAL(); cfg.lr = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--clip") == 0)    { NEED_VAL(); cfg.grad_clip = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--weight-decay") == 0) { NEED_VAL(); cfg.weight_decay = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--warmup") == 0)  { NEED_VAL(); cfg.warmup = atoi(argv[++i]); }
+    else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--lora-r") == 0)  { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
+    else if (strcmp(f, "--lora-alpha") == 0) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
+    else if (strcmp(f, "--verbose") == 0) { cfg.verbose = 1; }
+    else { fprintf(stderr, "unknown flag: %s\n", f); dpo_usage(); return 2; }
+#undef NEED_VAL
+  }
+  if (name) {
+    model_paths(name, name_model, name_tok, sizeof(name_model), 1);
+    cfg.out_model = name_model;
+    printf("model dir: model/%s/\n", name);
+  }
+  if (cfg.batch < 1) cfg.batch = 1;
+  return dpo_run(pairs, &cfg);
+}
+
 // ============================================================================
 // GPU: report what the backend found, and benchmark it against the CPU.
 // ============================================================================
@@ -1191,6 +1282,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "t2i-data") == 0) return run_t2i_data(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-recon") == 0) return run_t2i_recon(argc, argv);
   if (argc > 1 && strcmp(argv[1], "grpo") == 0) return run_grpo(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "dpo") == 0) return run_dpo(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama-train") == 0) return run_llama_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-train") == 0) return run_t2i_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-gen") == 0) return run_t2i_gen(argc, argv);

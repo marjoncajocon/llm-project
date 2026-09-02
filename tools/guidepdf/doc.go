@@ -412,8 +412,8 @@ func (d *doc) titlePage(version, date string) {
 	d.pdf.CellFormat(bodyW, 6, "Read this first", "", 1, "L", false, 0, "")
 	d.pdf.SetFont("Helvetica", "", 10)
 	d.pdf.MultiCell(bodyW, 5.2,
-		"Section 3 gets you a working binary. Section 6 trains a model. Section 10 links it into "+
-			"your own program. If you only have ten minutes, read 3.1, 6.2 and 10.4.", "", "L", false)
+		"Section 3 gets you a working binary. Section 6 trains a model. Section 11 links it into "+
+			"your own program. If you only have ten minutes, read 3.1, 6.2 and 11.3.", "", "L", false)
 
 	d.pdf.SetY(252)
 	d.pdf.SetDrawColor(200, 208, 220)
