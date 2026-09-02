@@ -380,6 +380,16 @@ int dpo_run(const char *pairs_path, const DpoConfig *cfg) {
       step_margin += margin;
       step_acc += acc;
 
+      // The four log-probs behind the margin. Worth seeing when a run misbehaves:
+      // if the POLICY numbers barely move from the reference ones the learning
+      // rate is too low, and if they run away from them beta is too low and the
+      // model is drifting off the reference rather than learning the preference.
+      if (cfg->verbose && b == 0 && (s % report == 0 || s == cfg->steps - 1))
+        printf("      pair: pi(w) %8.3f  pi(l) %8.3f | ref(w) %8.3f  ref(l) %8.3f"
+               " | margin %+.4f  g %.4f\n",
+               (double)pi_c, (double)pi_r, (double)pr->ref_c, (double)pr->ref_r,
+               (double)margin, (double)g);
+
       // 4. Rejected: push DOWN (coefficient -g). The cache already holds it.
       for (int j = 0; j < Lr; j++) coeff[j] = 0.0f;
       for (int j = T - 1; j <= Lr - 2; j++) coeff[j] = -g;
