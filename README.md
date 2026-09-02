@@ -115,6 +115,17 @@ gcc -std=c11 -O3 -march=native -o transformer *.c -lm
 `clang` works as a drop-in replacement for `gcc`. On a machine without gcc/clang, the
 project also builds with `zig cc -std=c11 -O2 -Wall -o transformer *.c -lm`.
 
+### The complete guide (PDF)
+
+`build/guide.pdf` is a 32-page end-to-end manual — compiling, data preparation, pre-training,
+SFT, LoRA, GRPO, GPU acceleration, the Colab workflow, and embedding the engine in your own C
+program, with every CLI parameter documented alongside its default and its use case. It is
+committed, so you can just open it. Regenerate after changing the engine:
+
+```sh
+cd tools/guidepdf && go run .     # -> build/guide.pdf
+```
+
 ### Optional GPU build (`GPU=1`)
 
 ```sh
