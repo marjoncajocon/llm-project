@@ -68,7 +68,6 @@ func writeAll(d *doc, version, date string) {
 	secCommands(d)
 	secData(d)
 	secTraining(d)
-	secDPO(d)
 	secGRPO(d)
 	secGPU(d)
 	secColab(d)
@@ -277,7 +276,6 @@ func secCommands(d *doc) {
 		{"(no args)", "Run the built-in 30-part self-test"},
 		{"train", "Train a GPT-2 style model on text"},
 		{"llama-train", "Train the modern LLaMA-family architecture; also does SFT and LoRA"},
-		{"dpo", "Preference learning: shown two answers and told which is better"},
 		{"grpo", "Reinforcement learning from verifiable rewards"},
 		{"generate", "Text generation from a GPTC checkpoint"},
 		{"llama", "Generation from an LLMA or LLMQ checkpoint"},
@@ -503,108 +501,6 @@ func secTraining(d *doc) {
 		{"train falls, validation rises", "Memorization. Fewer steps, more data, or add --weight-decay."},
 		{"0 examples", "The prompt/response separator is not a real tab."},
 	})
-}
-
-// ===========================================================================
-func secDPO(d *doc) {
-	d.h1("DPO: learning from preferences")
-	d.p("Direct Preference Optimization (Rafailov et al.) is the third way this engine learns. " +
-		"Supervised fine-tuning is shown the right answer. GRPO acts and scores what it did. DPO " +
-		"is shown two answers and told which one is better.")
-
-	d.h2("Why it exists alongside GRPO")
-	d.lead("GRPO must SAMPLE to learn. DPO does not.")
-	d.p("A GRPO step samples G rollouts per task, each a full KV-cache decode - 12 to 40 seconds " +
-		"on this CPU. Worse, most of those steps are then discarded: when every rollout in a group " +
-		"scores the same there is no advantage and no gradient, and on a model that already scores " +
-		"~0.94 that is most groups.")
-	d.p("DPO collects its preferences offline, once. Every training step is then a handful of " +
-		"forward passes over text that already exists, and no step is ever wasted.")
-
-	d.h2("The objective")
-	d.code(
-		"s_w = log pi(y_w|x) - log pi_ref(y_w|x)     implicit reward, chosen",
-		"s_l = log pi(y_l|x) - log pi_ref(y_l|x)     implicit reward, rejected",
-		"h   = beta * (s_w - s_l)                    the preference margin",
-		"L   = -log sigmoid(h)",
-	)
-	d.p("The paper's insight is that this IS the RLHF objective with the reward model solved for " +
-		"in closed form. That is why there is no reward model and no rollouts here - only a " +
-		"classification loss over pairs.")
-
-	d.h3("How it reaches the weights")
-	d.p("The derivative of log pi(y_t) with respect to the logits is (onehot - p) - the same score " +
-		"function GRPO uses - so the entire backward is pg_backward again, with one scalar shared " +
-		"by every token of the pair:")
-	d.code(
-		"g = beta * sigmoid(-h)",
-		"coeff = +g   on every scored token of the CHOSEN completion   (push up)",
-		"coeff = -g   on every scored token of the REJECTED completion (push down)",
-	)
-	d.p("Notice what sigmoid(-h) does: it is near beta while the model still prefers the wrong " +
-		"answer, and near zero once the preference has been learned. The update anneals itself " +
-		"away, pair by pair.")
-
-	d.h3("The reference policy is free")
-	d.p("With LoRA the base weights are frozen, so pi_ref is simply the same model with the " +
-		"adapters switched off - no second copy of a 621 MB checkpoint. That is why --lora-r must " +
-		"be greater than zero; without adapters there is no reference to be had without doubling " +
-		"memory, and the trainer refuses to start rather than silently doing something else.")
-	d.tip("A correct run starts at loss 0.6931 (= ln 2) and margin 0.0000 exactly, because LoRA's " +
-		"B begins at zero, so at step 0 the policy IS the reference. If your run does not start " +
-		"there, the reference wiring is wrong before any training has happened.")
-
-	d.h2("Walkthrough")
-	d.step(1, "Build preference pairs from a corpus you have already verified.")
-	d.code("python tools/dpo_pairs.py --out data/dpo_pairs.txt --max-chars 900 data/clean_reason.txt")
-	d.step(2, "Train. Watch the MARGIN - it starts near zero and should climb.")
-	d.code("transformer dpo data/dpo_pairs.txt \\",
-		"  --model model/smollm/reason_e2.bin --hf-tok model/smollm/tok.hf \\",
-		"  --out model/smollm/dpo.bin --beta 0.1 --steps 400 --batch 4")
-	d.step(3, "Gate it. Re-measure with tools/remeasure.py and tools/probe3.py, and promote only if non-regressive.")
-
-	d.h2("Every DPO parameter")
-	d.table([]string{"Flag", "Default", "Meaning"}, []float64{34, 18, 122}, [][]string{
-		{"--model / --hf-tok", "-", "Required: the starting checkpoint and its own vocabulary."},
-		{"--beta", "0.1", "KL strength - the one knob unique to DPO. It sets how far the policy may move from the reference. Lower drifts further and can degrade; higher stays cautious and learns less."},
-		{"--len-norm", "off", "Divide each completion's log-prob by its token count. Standard DPO sums, which carries a known LENGTH BIAS: summing more negative terms makes long completions look worse regardless of quality. Turn on when chosen and rejected differ a lot in length."},
-		{"--steps / --batch", "200 / 4", "Optimizer steps, and preference pairs accumulated per step."},
-		{"--lr", "5e-6", "DPO is a sharp objective; SFT learning rates diverge here."},
-		{"--clip", "1.0", "Gradient-norm clip. Leave it on."},
-		{"--lora-r / --lora-alpha", "8 / 16", "Required (rank > 0). See the free-reference note above."},
-		{"--beta, --warmup, --min-lr, --weight-decay, --seed", "-", "As in the other trainers."},
-	})
-
-	d.h2("Where the rejected side comes from")
-	d.p("This is the whole game. The chosen side is easy - it is a response you have already " +
-		"verified. tools/dpo_pairs.py offers two sources for the rejected side:")
-	d.table([]string{"Source", "How", "Trade-off"}, []float64{30, 76, 68}, [][]string{
-		{"Synthetic (default)", "Corrupt a verified response in the ways this model is known to fail: hallucinated filename, the measured ~5% character slip, empty write body, premature <done>, rambling past </tool>, wrong tool.", "Cheap, deterministic, needs no sampling. But it can only teach the model to avoid defects somebody thought to encode."},
-		{"Real (--traces)", "Mine an AGENT_TRACE JSONL for responses that actually FAIL clean_sft.verify(), and pair each with the correct response for the same prompt.", "Strictly better data - on-policy mistakes rather than imagined ones. But you only get as many as the model has actually made."},
-	})
-	d.warn("DPO learns WHATEVER separates the two sides. An early version of the generator " +
-		"corrupted a reasoning-stripped copy while writing the untouched response as the chosen " +
-		"side, so every pair differed in two ways - the defect, and the presence of a <think> " +
-		"span. That corpus would have quietly taught the model to prefer responses containing " +
-		"<think> rather than to stop rambling. Corruptions are now applied to the FULL chosen " +
-		"response. Read your generated pairs; no test catches this.")
-
-	d.h2("Measured cost, and the honest comparison")
-	d.table([]string{"Phase", "Cost on SmolLM2-135M"}, []float64{50, 124}, [][]string{
-		{"Reference pass", "~1.2 s per pair, ONE time (~29 min for 1,420 pairs), then cached - pi_ref never changes."},
-		{"Training", "~18 s per step at --batch 4."},
-	})
-	d.p("Per step that is comparable to GRPO, not dramatically faster. The win is that no step is " +
-		"discarded - in testing GRPO skipped two or three of every four groups - plus determinism " +
-		"and no decode loop to wait on.")
-
-	d.h2("Honest expectations")
-	d.lead("A falling loss and a rising margin mean the PREFERENCE was learned. They do not mean " +
-		"the model got better at the task.")
-	d.p("Only tools/remeasure.py can tell you that, which is why promotion is gated on it. If the " +
-		"margin rises but re-measurement does not improve, the most likely cause is the synthetic " +
-		"negatives: the model has learned to avoid corruptions it was never going to make. Collect " +
-		"a real trace and re-run tools/dpo_pairs.py with --traces.")
 }
 
 // ===========================================================================
@@ -1072,7 +968,6 @@ func secCookbook(d *doc) {
 	d.p("Two mechanisms, in increasing order of power.")
 	d.table([]string{"Approach", "How it works", "Limitation"}, []float64{30, 78, 66}, [][]string{
 		{"STaR (tools/self_train.py)", "Trace real agent runs, keep the verified-successful ones, fold them back in as new supervised rows.", "Discards failures, so a failed rollout teaches nothing."},
-		{"DPO (transformer dpo)", "Show it two answers and say which is better. No sampling at training time - the preferences are collected offline.", "You must supply the pairs, and it learns whatever separates them - including differences you did not intend."},
 		{"GRPO (transformer grpo)", "Sample a group of rollouts, score them, and push toward the better-than-average while suppressing the worse.", "Needs variance within a group; a uniformly right or wrong model gives no signal."},
 	})
 	d.warn("Never train on self-generated data alone - always mix in the original corpus, or the " +

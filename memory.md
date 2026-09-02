@@ -559,55 +559,7 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-09-02 c) -- DPO (preference learning) ✅ BUILT + VERIFIED
-
-> User works **only from open-source papers** ("to avoid behind them"). DPO = Rafailov et al.,
-> *Direct Preference Optimization*. New subcommand **`transformer dpo`**. Smoke test PASSED,
-> `-Wall` clean, new part `[31]`.
->
-> **WHY DPO OVER MORE GRPO** (from our own numbers): GRPO must SAMPLE -- G rollouts per task,
-> 12-40 s/step -- and then **throws most steps away**, because `reason_e2.bin` already scores
-> ~0.94 so groups have no spread and get skipped. DPO collects preferences offline once and
-> never wastes a step.
->
-> **THE MATH, and why it was nearly free:** `d/d logits log pi(y_t) = onehot - p` -- the same
-> score function GRPO uses -- so the backward is `pg_backward` again with ONE scalar per pair:
-> `g = beta*sigmoid(-h)`, applied **+g on chosen tokens, -g on rejected**. `sigmoid(-h)` is near
-> beta while the model prefers the WRONG answer and near 0 once learned, so the update
-> **anneals itself away**. The reference policy is FREE (LoRA adapters off) -- hence
-> `--lora-r > 0` is REQUIRED.
->
-> **SANITY CHECK WORTH REMEMBERING:** a correct run starts at **loss 0.6931 (= ln2) and margin
-> 0.0000 exactly**, because LoRA's B=0 means the policy IS the reference at init. If a run does
-> not start there, the reference wiring is broken before any training happened.
->
-> **NEW FILES:** `dpo.c/.h`, `tools/dpo_pairs.py`. **MODIFIED:** `main.c`, `Makefile`,
-> `selftest.c`, `README.md`.
->
-> **RUN IT:**
-> ```
-> python tools/dpo_pairs.py --out data/dpo_pairs.txt --max-chars 900 data/clean_reason.txt
-> .\transformer.exe dpo data/dpo_pairs.txt --model model/smollm/reason_e2.bin \
->     --hf-tok model/smollm/tok.hf --out model/smollm/dpo.bin --beta 0.1 --steps 400 --batch 4
-> ```
-> Cost measured: reference pass **~1.2 s/pair one-time** (~29 min for 1420 pairs, then cached),
-> training **~18 s/step at batch 4**. Comparable to GRPO PER STEP -- the win is that no step is
-> discarded.
->
-> **A DATA BUG WORTH NOT REPEATING:** the first pair generator corrupted a `<think>`-stripped
-> copy while writing the untouched response as "chosen", so every pair differed in TWO ways.
-> **DPO learns whatever separates the two sides**, so it would have taught "prefer responses
-> containing `<think>`" instead of the actual defect. Only reading the generated rows caught it.
->
-> **NOT DONE:** no gated run. 1420 pairs are in `data/dpo_pairs.txt`. Next: a few hundred steps,
-> then `remeasure.py` + `probe3.py`, promote only if non-regressive. **A rising margin means the
-> PREFERENCE was learned, NOT that the model got better at the task.** If margin rises but
-> remeasure does not improve, the synthetic negatives are the likely cause -- switch to
-> `tools/dpo_pairs.py --traces` for real on-policy failures.
->
-> Full detail: notes.md "2026-09-02 (c) -- DPO: learning from preferences".
-
-## >>> PREVIOUS (2026-09-02 b) -- GPU build flag (OpenCL) + Colab cross-build ✅ BUILT + VERIFIED
+## >>> RESUME HERE (2026-09-02 b) -- GPU build flag (OpenCL) + Colab cross-build ✅ BUILT + VERIFIED
 
 > User asked for a GPU build flag, then clarified: *"my device has no support gpu, so prepare it
 > to support and cross compile, so that i can test it in google colab."* Delivered: `make GPU=1`,

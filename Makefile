@@ -1,4 +1,4 @@
-﻿# Makefile - Minimal GPT-2 Style Transformer
+# Makefile - Minimal GPT-2 Style Transformer
 # All source files live flat in the project root (Lua-style layout).
 
 CC      = gcc
@@ -12,7 +12,7 @@ LDLIBS  = -lm -pthread
 #                  dlopen/LoadLibrary at runtime and its entry points resolved
 #                  by name (see gpu.h). All that is needed is -ldl on POSIX.
 # A GPU build on a machine with no GPU still links, runs, and falls back to the
-# CPU â€” that fallback is a tested property, not a hope.
+# CPU — that fallback is a tested property, not a hope.
 GPU ?= 0
 ifeq ($(GPU),1)
   CFLAGS += -DTF_GPU
@@ -25,7 +25,7 @@ endif
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o rmsnorm.o rope.o swiglu.o gqa.o quant.o llama.o lora.o llamatrain.o \
-          toolcall.o toolexec.o approval.o agent.o corpus.o train.o reward.o grpo.o dpo.o gpu.o \
+          toolcall.o toolexec.o approval.o agent.o corpus.o train.o reward.o grpo.o gpu.o \
           image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o selftest.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
@@ -76,7 +76,6 @@ corpus.o:     corpus.h
 train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h llama.h llamatrain.h hftok.h
 reward.o:     reward.h toolcall.h
 grpo.o:       grpo.h reward.h tensor.h llama.h llamatrain.h lora.h loss.h optim.h sampler.h hftok.h activation.h
-dpo.o:        dpo.h tensor.h llama.h llamatrain.h lora.h loss.h optim.h sampler.h hftok.h activation.h
 image.o:      image.h
 patch.o:      patch.h tensor.h image.h matrix.h
 video.o:      video.h tensor.h image.h patch.h
@@ -88,8 +87,8 @@ text2media.o: text2media.h tensor.h image.h imagegen.h audio.h audiogen.h model.
 t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h checkpoint.h
 vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 hftok.o:      hftok.h
-selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h dpo.h
-main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h dpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h
+selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h
+main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.
 # Requires `zig` and a POSIX shell (Linux/macOS/WSL). No per-OS toolchain needed.
@@ -108,7 +107,7 @@ cross:
 	done
 	@echo "cross builds written to $(BUILDDIR)/"
 
-# Cross-compile the GPU-enabled Linux binary â€” the artifact to upload to Google
+# Cross-compile the GPU-enabled Linux binary — the artifact to upload to Google
 # Colab (or any Linux box with a GPU). Because the OpenCL driver is opened at
 # RUNTIME, this needs no OpenCL SDK and no CUDA toolkit: `zig cc` alone is enough,
 # even from Windows.
@@ -128,7 +127,7 @@ cross-gpu:
 # On Windows without make, use: powershell -File tools\webchat\build.ps1
 webchat: $(TARGET)
 	cd tools/webchat && go build -o webchat .
-	@echo "built ./$(TARGET) and tools/webchat/webchat â€” run: ./tools/webchat/webchat"
+	@echo "built ./$(TARGET) and tools/webchat/webchat — run: ./tools/webchat/webchat"
 
 clean:
 	rm -f $(OBJS) $(TARGET)
@@ -136,5 +135,3 @@ clean:
 	rm -f tools/webchat/webchat tools/webchat/webchat.exe
 
 .PHONY: all clean cross cross-gpu webchat
-
-
