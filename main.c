@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 
 #include "tensor.h"
 #include "loss.h"
@@ -30,6 +31,8 @@
 #include "imagegen.h"
 #include "audiogen.h"
 #include "llama.h"
+#include "matrix.h"
+#include "gpu.h"
 #include "selftest.h"
 
 // Portable "make directory if absent" (ignores already-exists).
@@ -1011,7 +1014,169 @@ static int run_hfchat(int argc, char **argv) {
   return rc;
 }
 
+// ============================================================================
+// GPU: report what the backend found, and benchmark it against the CPU.
+// ============================================================================
+
+static int run_gpu_info(int argc, char **argv) {
+  (void)argc; (void)argv;
+  if (!gpu_compiled_in()) {
+    printf("GPU backend: NOT COMPILED IN (this is a CPU-only build)\n");
+    printf("  Rebuild with:  make GPU=1        (native)\n");
+    printf("                 make cross-gpu    (Linux x86_64 binary for Colab)\n");
+    return 0;
+  }
+  printf("GPU backend: compiled in (OpenCL, loaded at runtime)\n");
+  const int ok = gpu_available();
+  printf("  device: %s\n", gpu_device_name());
+  if (!ok) {
+    printf("  status: NO USABLE DEVICE -- every matmul will run on the CPU.\n");
+    printf("          This is a correct, supported state, not a failure.\n");
+    printf("          On Linux/Colab, an OpenCL ICD loader is usually all that is missing:\n");
+    printf("            apt-get install -y ocl-icd-libopencl1\n");
+    printf("            mkdir -p /etc/OpenCL/vendors\n");
+    printf("            echo libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd\n");
+    return 0;
+  }
+  printf("  compute units: %d\n", gpu_compute_units());
+  printf("  global memory: %.1f GB\n", (double)gpu_global_mem() / (1024.0 * 1024.0 * 1024.0));
+  printf("  status: READY (enabled=%d)\n", gpu_is_enabled());
+  printf("  thresholds: TF_GPU_MIN_M (default 8), TF_GPU_MIN_MACS (default 4194304)\n");
+  printf("              Below either one a matmul stays on the CPU on purpose --\n");
+  printf("              single-token decode (M=1) is bandwidth-bound and loses on a GPU.\n");
+  return 0;
+}
+
+// Monotonic wall time in seconds. clock() measures CPU time, which undercounts a
+// blocking wait on a device queue -- exactly the thing being measured here.
+static double wall_now(void) {
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// Summarized as the GEOMETRIC MEAN of the per-shape speedups, not as
+// sum(cpu)/sum(gpu). Summing absolute times lets one huge shape decide the
+// verdict: the lm_head GEMM alone is ~100x the work of a layer projection, so an
+// arithmetic summary reported "1.24x, use the GPU" while the GPU was actually
+// losing 0.25-0.45x on the three shapes a transformer layer really runs -- and a
+// layer's projections execute n_layers times per forward against lm_head's once.
+static double g_bench_log_ratio = 0.0;
+static int    g_bench_shapes = 0;
+static double g_bench_worst_err = 0.0;
+static double g_bench_best_ratio = 0.0;
+
+static void bench_one(int M, int K, int N, int reps) {
+  int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
+  Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
+  for (size_t i = 0; i < A.size; i++) A.data[i] = (float)((i * 37) % 19) * 0.01f - 0.09f;
+  for (size_t i = 0; i < B.size; i++) B.data[i] = (float)((i * 53) % 23) * 0.01f - 0.11f;
+
+  const double flops = 2.0 * (double)M * (double)N * (double)K * (double)reps;
+
+  gpu_set_enabled(0);
+  double t0 = wall_now();
+  for (int r = 0; r < reps; r++) matmul(&A, &B, &C);
+  const double cpu_s = wall_now() - t0;
+  // Keep one CPU result to compare against, so the benchmark also proves the two
+  // paths agree -- a fast wrong answer is not a speedup.
+  float *ref = (float*)malloc(C.size * sizeof(float));
+  memcpy(ref, C.data, C.size * sizeof(float));
+
+  gpu_set_enabled(1);
+  const int have = gpu_available();
+  double gpu_s = 0.0, maxrel = 0.0;
+  if (have) {
+    matmul(&A, &B, &C);                     // warm up: first call builds/uploads
+    t0 = wall_now();
+    for (int r = 0; r < reps; r++) matmul(&A, &B, &C);
+    gpu_s = wall_now() - t0;
+    for (size_t i = 0; i < C.size; i++) {
+      double d = fabs((double)C.data[i] - (double)ref[i]);
+      double m = fabs((double)ref[i]);
+      double rel = d / (m > 1e-6 ? m : 1e-6);
+      if (rel > maxrel) maxrel = rel;
+    }
+  }
+
+  printf("  %5d x %5d x %5d | CPU %7.1f ms (%6.1f GFLOP/s)", M, K, N,
+         cpu_s * 1000.0, flops / cpu_s / 1e9);
+  if (have) {
+    printf(" | GPU %7.1f ms (%6.1f GFLOP/s) | %5.2fx | max rel err %.1e\n",
+           gpu_s * 1000.0, flops / gpu_s / 1e9, cpu_s / gpu_s, maxrel);
+    const double ratio = cpu_s / gpu_s;
+    g_bench_log_ratio += log(ratio);
+    g_bench_shapes++;
+    if (ratio > g_bench_best_ratio) g_bench_best_ratio = ratio;
+    if (maxrel > g_bench_worst_err) g_bench_worst_err = maxrel;
+  } else {
+    printf(" | GPU: no device\n");
+  }
+
+  free(ref);
+  tensor_free(&A); tensor_free(&B); tensor_free(&C);
+}
+
+static int run_gpu_bench(int argc, char **argv) {
+  int reps = (argc > 2) ? atoi(argv[2]) : 5;
+  if (reps < 1) reps = 1;
+  printf("matmul benchmark, %d reps per shape (shapes taken from SmolLM2-135M)\n", reps);
+  if (!gpu_compiled_in())
+    printf("  NOTE: CPU-only build -- this measures the CPU path only.\n");
+  else if (!gpu_available())
+    printf("  NOTE: no GPU device found (%s) -- CPU path only.\n", gpu_device_name());
+  printf("      M x     K x     N |\n");
+  bench_one(256, 576, 1536, reps);      // SwiGLU up/gate projection
+  bench_one(256, 1536, 576, reps);      // SwiGLU down projection
+  bench_one(512, 576, 576, reps);       // attention projections, longer sequence
+  bench_one(256, 576, 49152, reps);     // lm_head -- the big one
+  printf("\nDecode (M=1) is deliberately NOT benchmarked on the GPU: it is memory-\n"
+         "bandwidth-bound, so it stays on the CPU by design (TF_GPU_MIN_M).\n");
+
+  // A benchmark that makes you infer the conclusion is only half a benchmark.
+  // "GPU present" does not mean "GPU worth using" -- an integrated GPU sharing
+  // the CPU's memory bus routinely loses to a well-threaded CPU.
+  if (gpu_compiled_in() && gpu_available() && g_bench_shapes > 0) {
+    const double geo = exp(g_bench_log_ratio / g_bench_shapes);
+    printf("\nVERDICT: %.2fx typical (geometric mean over %d shapes; best single shape "
+           "%.2fx)\n         worst rel err vs CPU: %.1e\n",
+           geo, g_bench_shapes, g_bench_best_ratio, g_bench_worst_err);
+    if (g_bench_worst_err > 1e-4)
+      printf("  !! The GPU results DISAGREE with the CPU beyond tolerance. Do not\n"
+             "     train with this device; report the shape that failed.\n");
+    else if (geo >= 1.15)
+      printf("  Use the GPU on this machine: run training/rollouts as-is.\n");
+    else
+      printf("  This GPU is SLOWER than this CPU on the shapes a transformer layer\n"
+             "  actually runs. Prefer --no-gpu here (or build without GPU=1).\n"
+             "  That is the normal result for an INTEGRATED GPU: it shares the CPU's\n"
+             "  memory bus and has a fraction of the FLOPs. The GPU build is still\n"
+             "  worth having -- run this same command on a discrete GPU (a Colab T4,\n"
+             "  say) to see what it is for.\n");
+    if (geo < 1.15 && g_bench_best_ratio >= 1.15)
+      printf("  (One shape DID win -- the big lm_head GEMM, where this CPU does worst.\n"
+             "   It does not carry the verdict: a layer's projections run n_layers\n"
+             "   times per forward, lm_head once.)\n");
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  // Global --gpu / --no-gpu, honoured by every subcommand. They are stripped from
+  // argv before dispatch so the per-subcommand parsers never see them (they
+  // reject unknown flags). --no-gpu on a GPU build is how you get an honest A/B.
+  static char *fargv[256];
+  int fargc = 0;
+  for (int i = 0; i < argc && fargc < 256; i++) {
+    if (i > 0 && strcmp(argv[i], "--no-gpu") == 0) { gpu_set_enabled(0); continue; }
+    if (i > 0 && strcmp(argv[i], "--gpu") == 0)    { gpu_set_enabled(1); continue; }
+    fargv[fargc++] = argv[i];
+  }
+  argv = fargv;
+  argc = fargc;
+
+  if (argc > 1 && strcmp(argv[1], "gpu-info") == 0) return run_gpu_info(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "gpu-bench") == 0) return run_gpu_bench(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfgen") == 0) return run_hfgen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfchat") == 0) return run_hfchat(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
@@ -1037,6 +1202,7 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     fprintf(stderr, "unknown command '%s'\n", argv[1]);
     fprintf(stderr, "usage: transformer [train|llama-train|grpo|generate|agent|imggen|audgen|llama] ...\n");
+    fprintf(stderr, "       transformer [gpu-info|gpu-bench]   (GPU backend status / CPU-vs-GPU timing)\n");
     fprintf(stderr, "       transformer            (no args: run the built-in self-test)\n");
     return 1;
   }

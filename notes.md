@@ -2330,6 +2330,90 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-09-02 (b) -- GPU build flag (OpenCL) + Colab cross-build -- ✅ BUILT + VERIFIED
+
+User asked for a GPU build flag ("we can build both cpu and for gpu support"), then clarified:
+*"my device has no support gpu, so prepare it to support and cross compile, so that i can test it
+in google colab."* So the deliverable is a CROSS-COMPILED Linux GPU binary produced on this
+Windows box, plus a notebook that validates it on a Colab T4.
+
+### Why OpenCL, loaded at runtime
+
+CUDA needs nvcc + .cu files (breaks C-only-flat-root, can't cross-compile from Windows). Vulkan
+compute needs a SPIR-V toolchain at build time. OpenCL's kernels are STRINGS compiled by the
+driver, so the kernel source is a C string literal in `gpu.c` and the tree stays C-only and flat.
+
+The driver is opened with `dlopen`/`LoadLibrary` and its ~20 entry points resolved by name; the
+OpenCL types are declared in `gpu.c`, NOT pulled from `<CL/cl.h>`. Consequence, and the whole
+point: **no OpenCL SDK/header/import lib and no CUDA toolkit is needed to build or CROSS-build.**
+`zig cc -target x86_64-linux-gnu.2.31 -DTF_GPU` on Windows produces a working Colab binary
+(verified: 1.09 MB, valid 64-bit x86-64 ELF). glibc pinned to 2.31 for Ubuntu 22.04.
+
+### Design
+
+ONE dispatch point. `matmul` (matrix.c) was already a 6-line dispatcher and is the chokepoint for
+all 49 call sites, so the hook is `if (gpu_matmul(...)) return;` and **no call site changed**.
+Same for `matmul_backward` / `matmul_backward_dx`. Without `-DTF_GPU`, `gpu.c` is stubs returning
+0 -- no `#ifdef` anywhere outside `gpu.c`, CPU build byte-identical.
+
+Three tiled kernels. The forward one also has **register tiling** (WPT=4 outputs per work-item,
+strided by TS to keep global reads coalesced) -- that alone took the iGPU from 36 -> 62 GFLOP/s.
+
+**Caching: allocations only, NEVER contents.** A weight content-cache is worth ~2x but cannot be
+done safely here: activations are rewritten between matmuls by rmsnorm/rope/swiglu, and
+**`attention.c` passes ACTIVATIONS as the B operand for Q@K^T**, so "B is a weight" is false.
+Guessing wrong would not crash -- it would silently train on stale weights. Left as documented
+follow-up needing an explicit immutability hint from the model code.
+
+Two gates keep the GPU off work it loses at, both env-tunable without a rebuild:
+`TF_GPU_MIN_M` (default 8) and `TF_GPU_MIN_MACS` (default 1<<22). **M=1 decode stays on the CPU
+by design** -- it is bandwidth-bound, and uploading a 113 MB lm_head to multiply one row by it
+loses badly.
+
+### SURPRISE: this box DOES have a working OpenCL device
+
+I checked the registry first and concluded there was none (`HKLM\SOFTWARE\Khronos\...` absent,
+`igdrcl64.dll` only in the DriverStore) -- **that conclusion was wrong**. `gpu-info` enumerates
+the Intel UHD 730 with 24 compute units. So the GPU path is fully testable HERE, not just on
+Colab, which is how part [30] got exercised for real.
+
+### MEASURED (i5-14400, 10c/16t, vs Intel UHD 730 iGPU)
+
+```
+   M  x   K  x   N   |  CPU GFLOP/s | GPU GFLOP/s | ratio
+  256 x  576 x  1536 |     167      |     62      | 0.37x
+  256 x 1536 x   576 |     197      |     58      | 0.30x
+  512 x  576 x   576 |     242      |     65      | 0.27x
+  256 x  576 x 49152 |      31      |     54      | 1.77x   <- lm_head, CPU does worst here
+```
+**The iGPU is SLOWER than the CPU on everything but the huge lm_head GEMM.** Expected: it shares
+the CPU's memory bus and has a fraction of the FLOPs. `gpu-bench` now prints an explicit VERDICT
+telling the user to prefer `--no-gpu` when the GPU loses -- a benchmark that makes you infer the
+conclusion is only half a benchmark. The build exists for DISCRETE GPUs; Colab is where it pays.
+
+### Verified
+
+- Both flavours `-Wall` clean; CPU smoke test PASSED (part [30] self-skips), GPU smoke test PASSED.
+- **Part [30]**: fwd/dA/dB/dx vs CPU on 3 RAGGED shapes (40x33x47, 130x129x131, 96x257x320 --
+  none a multiple of the 16-wide tile, 320 not a multiple of the forward kernel's 64-col block:
+  the boundary tile is where a tiled GEMM classically breaks). Result: **fwd 0.0e+00, dB 0.0e+00
+  (bit-identical), dA/dx 2.0e-07**. Also asserts the backward kernels ACCUMULATE into pre-seeded
+  grads rather than overwrite -- a store-instead-of-accumulate kernel passes a zero-initialized
+  test and silently discards every accumulated gradient in real training.
+- Cross-build verified as a 64-bit x86-64 ELF by inspecting the header (cannot be run here).
+
+**A test-methodology note worth keeping:** part [30] first FAILED with dA 1.7e-02. Not a kernel
+bug -- a bad metric. `matrix.h` documents that the CPU's dA reassociates its dot product to
+vectorize, so entries near zero show huge PER-ELEMENT relative error while the absolute error is
+negligible. Switched to max|diff| / max|value| over the whole tensor (the metric parts [24]/[25]
+already use) -> 2.0e-07.
+
+### Still open
+
+Weight content-cache (~2x). cuBLAS could be dynamically loaded behind this same dispatch layer
+for far more T4 throughput, but it is NVIDIA-only -- recorded, not built. Nothing has been run on
+an actual discrete GPU yet: `tools/colab_gpu_test.ipynb` is the next action.
+
 ## 2026-09-02 -- GRPO: RL from verifiable rewards -- ✅ BUILT + VERIFIED (no promoted retrain yet)
 
 User asked to "support the latest algorithm". Chose **GRPO** (Group Relative Policy Optimization --

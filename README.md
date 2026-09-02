@@ -87,10 +87,11 @@ defined in the matching `.c`.
 | `audiogen.h` / `audiogen.c`       | Audio ↔ tokens (µ-law) for autoregressive audio **generation** (Phase G) |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
+| `gpu.h` / `gpu.c`                 | Optional OpenCL matmul offload (`-DTF_GPU`); driver loaded at runtime, no SDK |
 | `reward.h` / `reward.c`           | Verifiable reward for a sampled agent response: format + grounding + action match |
 | `grpo.h` / `grpo.c`               | **GRPO**: RL from verifiable rewards — group-relative advantage, clipped policy gradient |
 | `selftest.h` / `selftest.c`       | Built-in smoke test (`run_selftest`): the default `transformer` run           |
-| `main.c`                          | Entry point + subcommands (`train`, `llama-train`, `grpo`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
+| `main.c`                          | Entry point + subcommands (`train`, `llama-train`, `grpo`, `generate`, `agent`, `imggen`, `audgen`, `llama`, `gpu-info`, `gpu-bench`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
 | `tools/`                          | Non-C helpers: crawlers (`crawl_wikipedia.py`, `crawl_stackoverflow.py`), SFT data (`make_sft.py`, `make_qa.py`, `mix_sft.py`, `sft_memtest.py`), `agent_local.py`, `upgrade_llma.py`, GPT-2/LLaMA converters |
@@ -113,6 +114,51 @@ gcc -std=c11 -O3 -march=native -o transformer *.c -lm
 
 `clang` works as a drop-in replacement for `gcc`. On a machine without gcc/clang, the
 project also builds with `zig cc -std=c11 -O2 -Wall -o transformer *.c -lm`.
+
+### Optional GPU build (`GPU=1`)
+
+```sh
+make                # CPU only — the default, unchanged
+make GPU=1          # + the OpenCL backend (gpu.c)
+make cross-gpu      # a Linux x86_64 GPU binary, for Colab or any Linux GPU box
+powershell -File tools/build_gpu.ps1     # all three, from Windows (no make here)
+
+./transformer gpu-info      # what the backend found
+./transformer gpu-bench     # CPU vs GPU on this engine's real GEMM shapes
+```
+
+**The GPU build needs no OpenCL SDK, header, import library or CUDA toolkit.** The driver is
+opened with `dlopen`/`LoadLibrary` at runtime and its ~20 entry points resolved by name; the
+handful of OpenCL types are declared in `gpu.c` rather than pulled from `<CL/cl.h>`. That is
+what lets a Windows machine with no NVIDIA GPU **cross-compile a working GPU binary for
+Colab** with nothing but `zig cc`.
+
+`--gpu` / `--no-gpu` work on every subcommand and are stripped before the subcommand parses
+its own flags, so one binary can be A/B'd against itself.
+
+Only `matmul` and its two backward forms are offloaded — that is essentially all the FLOPs in
+both inference and training, and it needs no change at any of the 49 call sites. Two gates
+(`TF_GPU_MIN_M`, default 8, and `TF_GPU_MIN_MACS`, default 4194304 — both env vars, tunable
+without a rebuild) keep small work on the CPU. **Single-token decode is `M=1` and
+memory-bandwidth-bound, so it stays on the CPU on purpose**: uploading a 113 MB `lm_head` to
+multiply one row by it loses badly.
+
+> **A GPU being present does not mean it is worth using.** Measured here on an Intel UHD 730
+> (24 EUs, sharing the CPU's memory bus) against a 10-core i5-14400: the GPU reaches ~62
+> GFLOP/s versus the CPU's ~170–240, i.e. **0.27–0.37× — slower** — on the mid-size shapes,
+> winning only on the huge `lm_head` GEMM (1.77×) where the CPU does worst. `gpu-bench` prints
+> an explicit verdict and tells you to use `--no-gpu` when that is the right call. An
+> integrated GPU losing to a good CPU is the normal result; the build exists for discrete
+> GPUs, which is what `make cross-gpu` + `tools/colab_gpu_test.ipynb` are for.
+>
+> Numerically the two paths agree: the forward matmul and `dB` are **bit-identical**, and `dA`
+> differs by 2.0e-07 only because `matrix.h` documents that the CPU reassociates that
+> reduction to vectorize. Smoke-test part `[30]` gates this on ragged shapes.
+>
+> Known headroom (~2×): every operand is uploaded on every call. Caching weight *contents*
+> cannot be done safely without an explicit immutability hint from the model code, because
+> `attention.c` passes **activations** as the `B` operand for Q·Kᵀ — so "B is a weight" is not
+> a safe assumption, and guessing wrong would silently train on stale data rather than crash.
 
 ## Supported platforms
 

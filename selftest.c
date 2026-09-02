@@ -34,6 +34,7 @@
 #include "activation.h"
 #include "reward.h"
 #include "grpo.h"
+#include "gpu.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -2107,6 +2108,127 @@ int run_selftest(void) {
       tensor_free(&glog); tensor_free(&gprob);
       tensor_free(&dlog); tensor_free(&dprob);
       llama_acts_free(&ga); llama_model_free(&gm);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 30: the optional GPU backend (gpu.h). Self-skipping — on a CPU-only
+  // build, or a GPU build with no device, it reports that and leaves all_ok
+  // alone, so the same binary is a valid test everywhere.
+  //
+  // The GPU must produce the SAME NUMBERS as the CPU, not merely produce them
+  // faster. Shapes are deliberately RAGGED (not multiples of the 16-wide tile or
+  // of the forward kernel's 64-column block) because a tiled GEMM's classic bug
+  // is exactly the boundary tile — and it hides completely on tidy dimensions.
+  // --------------------------------------------------------------------------
+  {
+    printf("[30] GPU backend: results must match the CPU\n");
+    if (!gpu_compiled_in()) {
+      printf("    skipped (CPU-only build; rebuild with GPU=1 to exercise this)\n\n");
+    } else if (!gpu_available()) {
+      printf("    skipped (no GPU device: %s)\n", gpu_device_name());
+      printf("    the CPU fallback carried every matmul in this run -- that IS the\n"
+             "    contract being checked here\n\n");
+      // Reaching this line at all proves the fallback works: every part above
+      // ran through matrix.c with the GPU backend compiled in and inactive.
+    } else {
+      printf("    device: %s\n", gpu_device_name());
+      // Ragged on purpose: none of these is a multiple of the 16-wide tile, and
+      // 320 is not a multiple of the forward kernel's 64-column (TS*WPT) block.
+      const int SH[3][3] = { {40, 33, 47}, {130, 129, 131}, {96, 257, 320} };
+      float worst_fwd = 0.0f, worst_da = 0.0f, worst_db = 0.0f, worst_dx = 0.0f;
+      int acc_ok = 1;
+      // Compared as max|diff| / max|value| over the whole tensor, the same metric
+      // parts [24]/[25] use. A PER-ELEMENT relative error is the wrong tool here:
+      // matrix.h documents that the CPU's dA reassociates its dot product to
+      // vectorize, so CPU and GPU legitimately differ in the last bits, and an
+      // entry that happens to land near zero then shows a huge relative error
+      // while its absolute error is negligible.
+      #define CMP(nhost, host, ref, worst) do {                       \
+        float _md = 0.0f, _mv = 0.0f;                                 \
+        for (size_t _i = 0; _i < (nhost); _i++) {                     \
+          float _d = fabsf((host)[_i] - (ref)[_i]);                   \
+          if (_d > _md) _md = _d;                                     \
+          if (fabsf((ref)[_i]) > _mv) _mv = fabsf((ref)[_i]);          \
+        }                                                             \
+        float _r = _md / (_mv + 1e-9f);                               \
+        if (_r > (worst)) (worst) = _r;                               \
+      } while (0)
+
+      for (int s = 0; s < 3; s++) {
+        const int M = SH[s][0], K = SH[s][1], N = SH[s][2];
+        int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
+        Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
+        for (size_t i = 0; i < A.size; i++) A.data[i] = 0.02f * (float)((i * 31) % 17) - 0.16f;
+        for (size_t i = 0; i < B.size; i++) B.data[i] = 0.02f * (float)((i * 41) % 19) - 0.18f;
+        for (size_t i = 0; i < C.size; i++) C.grad[i] = 0.01f * (float)((i * 23) % 13) - 0.06f;
+
+        // --- forward ---
+        gpu_set_enabled(0);
+        matmul(&A, &B, &C);
+        float *ref = (float*)malloc(C.size * sizeof(float));
+        memcpy(ref, C.data, C.size * sizeof(float));
+        gpu_set_enabled(1);
+        memset(C.data, 0, C.size * sizeof(float));
+        matmul(&A, &B, &C);
+        CMP(C.size, C.data, ref, worst_fwd);
+
+        // --- backward, INCLUDING that it accumulates rather than overwrites ---
+        // Both grads are pre-filled with a nonzero pattern: a kernel that stores
+        // instead of accumulating passes a zero-initialized test and silently
+        // discards every previously accumulated gradient in real training.
+        float *gA0 = (float*)malloc(A.size * sizeof(float));
+        float *gB0 = (float*)malloc(B.size * sizeof(float));
+        for (size_t i = 0; i < A.size; i++) gA0[i] = 0.03f * (float)((i * 7) % 11) - 0.15f;
+        for (size_t i = 0; i < B.size; i++) gB0[i] = 0.03f * (float)((i * 5) % 9) - 0.12f;
+
+        memcpy(A.grad, gA0, A.size * sizeof(float));
+        memcpy(B.grad, gB0, B.size * sizeof(float));
+        gpu_set_enabled(0);
+        matmul_backward(&A, &B, &C);
+        float *rA = (float*)malloc(A.size * sizeof(float));
+        float *rB = (float*)malloc(B.size * sizeof(float));
+        memcpy(rA, A.grad, A.size * sizeof(float));
+        memcpy(rB, B.grad, B.size * sizeof(float));
+
+        memcpy(A.grad, gA0, A.size * sizeof(float));
+        memcpy(B.grad, gB0, B.size * sizeof(float));
+        gpu_set_enabled(1);
+        matmul_backward(&A, &B, &C);
+        CMP(A.size, A.grad, rA, worst_da);
+        CMP(B.size, B.grad, rB, worst_db);
+        // If the kernel had overwritten instead of accumulated, the GPU result
+        // would equal the CPU's only when gA0 was zero -- so also assert the
+        // result actually moved away from the seed.
+        int moved = 0;
+        for (size_t i = 0; i < A.size && !moved; i++)
+          if (fabsf(A.grad[i] - gA0[i]) > 1e-6f) moved = 1;
+        if (!moved) acc_ok = 0;
+
+        // --- dx-only (the frozen-B / LoRA path) ---
+        memcpy(A.grad, gA0, A.size * sizeof(float));
+        gpu_set_enabled(0);
+        matmul_backward_dx(&A, &B, &C);
+        memcpy(rA, A.grad, A.size * sizeof(float));
+        memcpy(A.grad, gA0, A.size * sizeof(float));
+        gpu_set_enabled(1);
+        matmul_backward_dx(&A, &B, &C);
+        CMP(A.size, A.grad, rA, worst_dx);
+
+        free(ref); free(gA0); free(gB0); free(rA); free(rB);
+        tensor_free(&A); tensor_free(&B); tensor_free(&C);
+      }
+
+      #undef CMP
+      const float tol = 1e-4f;
+      int g_ok = (worst_fwd < tol) && (worst_da < tol) && (worst_db < tol) &&
+                 (worst_dx < tol) && acc_ok;
+      printf("    3 ragged shapes | fwd %.1e | dA %.1e | dB %.1e | dx %.1e (tol %.0e) -> %s\n",
+             worst_fwd, worst_da, worst_db, worst_dx, tol, g_ok ? "OK" : "FAIL");
+      printf("    backward ACCUMULATES into pre-seeded grads (not overwrite) -> %s\n\n",
+             acc_ok ? "OK" : "FAIL");
+      all_ok &= g_ok;
+      gpu_set_enabled(1);
     }
   }
 

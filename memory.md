@@ -559,7 +559,54 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-09-02) -- GRPO (RL from verifiable rewards) ✅ BUILT + VERIFIED
+## >>> RESUME HERE (2026-09-02 b) -- GPU build flag (OpenCL) + Colab cross-build ✅ BUILT + VERIFIED
+
+> User asked for a GPU build flag, then clarified: *"my device has no support gpu, so prepare it
+> to support and cross compile, so that i can test it in google colab."* Delivered: `make GPU=1`,
+> `make cross-gpu`, `tools/build_gpu.ps1`, `tools/colab_gpu_test.ipynb`, and new subcommands
+> `gpu-info` / `gpu-bench`. Both flavours `-Wall` clean, both smoke tests PASSED.
+>
+> **THE KEY PROPERTY:** OpenCL is opened with `dlopen`/`LoadLibrary` at RUNTIME and its entry
+> points resolved by name; the OpenCL types are declared in `gpu.c`, not from `<CL/cl.h>`. So
+> **no OpenCL SDK and no CUDA toolkit is needed to build OR cross-build.** `zig cc -target
+> x86_64-linux-gnu.2.31 -DTF_GPU` on this Windows box yields a working Colab binary (verified:
+> 1.09 MB, valid x86-64 ELF at `build/transformer-linux-x86_64-gpu`).
+>
+> **ONE dispatch point:** `matmul` in matrix.c was already a 6-line dispatcher covering all 49
+> call sites -> the hook is `if (gpu_matmul(...)) return;` and NO call site changed. Same for the
+> two backward forms. Without `-DTF_GPU`, `gpu.c` is stubs; no `#ifdef` outside `gpu.c`.
+>
+> **I WAS WRONG ABOUT THE HARDWARE.** I checked the registry and concluded this box had no OpenCL
+> device -- it does. `gpu-info` finds the Intel UHD 730 (24 compute units). So the GPU path is
+> testable HERE, not only on Colab.
+>
+> **BUT THE iGPU IS SLOWER THAN THE CPU** (i5-14400, 10c/16t). Measured GFLOP/s CPU vs GPU:
+> 167/62, 197/58, 242/65 -- i.e. **0.27-0.37x** -- winning only on the huge lm_head GEMM
+> (31/54 = 1.77x). Expected: an iGPU shares the CPU's memory bus. `gpu-bench` prints a VERDICT
+> line telling you to use `--no-gpu` when the GPU loses. **On this machine, prefer the CPU
+> build.** The GPU build is for discrete GPUs -> that is what Colab is for.
+>
+> **CORRECTNESS (part [30]):** fwd and dB **bit-identical** to the CPU, dA/dx 2.0e-07, on 3
+> deliberately RAGGED shapes. Also asserts the backward kernels ACCUMULATE rather than overwrite.
+> Note: [30] first failed at 1.7e-02 -- that was a BAD METRIC, not a bug (matrix.h documents that
+> the CPU's dA reassociates to vectorize, so near-zero entries blow up per-element relative
+> error). Fixed by comparing max|diff|/max|value| like parts [24]/[25] do.
+>
+> **DELIBERATE:** decode (M=1) stays on the CPU -- bandwidth-bound, and uploading a 113MB lm_head
+> to multiply one row by it loses. Gates `TF_GPU_MIN_M` (8) / `TF_GPU_MIN_MACS` (1<<22) are env
+> vars, tunable without a rebuild.
+>
+> **KNOWN HEADROOM (~2x):** every operand is uploaded every call. A weight content-cache is NOT
+> safe without an explicit immutability hint, because **`attention.c` passes ACTIVATIONS as the B
+> operand** for Q@K^T -- "B is a weight" is false, and guessing wrong would silently train on
+> stale weights instead of crashing. cuBLAS behind the same dispatch layer is the other follow-up
+> (NVIDIA-only).
+>
+> **NEXT:** run `tools/colab_gpu_test.ipynb` on a T4. Nothing has touched a discrete GPU yet.
+>
+> Full detail: notes.md "2026-09-02 (b) -- GPU build flag (OpenCL) + Colab cross-build".
+
+## >>> PREVIOUS (2026-09-02) -- GRPO (RL from verifiable rewards) ✅ BUILT + VERIFIED
 
 > User asked to "support the latest algorithm" -> chose **GRPO** (Group Relative Policy Optimization,
 > the DeepSeek-R1 algorithm) as the direct successor to the STaR loop, with the **static verifiable**

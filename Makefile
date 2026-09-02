@@ -5,10 +5,27 @@ CC      = gcc
 CFLAGS  = -std=c11 -O3 -march=native -Wall -pthread
 LDLIBS  = -lm -pthread
 
+# --- Optional GPU backend (OpenCL) ---------------------------------------
+# `make`        -> CPU only, exactly as before.
+# `make GPU=1`  -> adds the OpenCL backend (gpu.c). NO OpenCL SDK, header or
+#                  import library is required: the driver is opened with
+#                  dlopen/LoadLibrary at runtime and its entry points resolved
+#                  by name (see gpu.h). All that is needed is -ldl on POSIX.
+# A GPU build on a machine with no GPU still links, runs, and falls back to the
+# CPU — that fallback is a tested property, not a hope.
+GPU ?= 0
+ifeq ($(GPU),1)
+  CFLAGS += -DTF_GPU
+  ifeq ($(OS),Windows_NT)
+  else
+    LDLIBS += -ldl
+  endif
+endif
+
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o rmsnorm.o rope.o swiglu.o gqa.o quant.o llama.o lora.o llamatrain.o \
-          toolcall.o toolexec.o approval.o agent.o corpus.o train.o reward.o grpo.o \
+          toolcall.o toolexec.o approval.o agent.o corpus.o train.o reward.o grpo.o gpu.o \
           image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o selftest.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
@@ -30,7 +47,8 @@ $(TARGET): $(OBJS)
 
 # Header dependencies (rebuild dependents when a header changes).
 tensor.o:     tensor.h
-matrix.o:     matrix.h tensor.h check.h
+matrix.o:     matrix.h tensor.h check.h gpu.h
+gpu.o:        gpu.h
 activation.o: activation.h tensor.h
 layernorm.o:  layernorm.h tensor.h
 rmsnorm.o:    rmsnorm.h tensor.h
@@ -89,6 +107,21 @@ cross:
 	done
 	@echo "cross builds written to $(BUILDDIR)/"
 
+# Cross-compile the GPU-enabled Linux binary — the artifact to upload to Google
+# Colab (or any Linux box with a GPU). Because the OpenCL driver is opened at
+# RUNTIME, this needs no OpenCL SDK and no CUDA toolkit: `zig cc` alone is enough,
+# even from Windows.
+#
+# glibc is pinned low (2.31) so the binary runs on Colab's Ubuntu 22.04 and
+# anything newer. wasm32-wasi is deliberately excluded from GPU builds: it has no
+# dlopen.
+COLAB_TARGET = x86_64-linux-gnu.2.31
+cross-gpu:
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(COLAB_TARGET) -std=c11 -O2 -Wall -DTF_GPU \
+	  -o "$(BUILDDIR)/transformer-linux-x86_64-gpu" $(SRCS) -lm
+	@echo "GPU build -> $(BUILDDIR)/transformer-linux-x86_64-gpu (upload this to Colab)"
+
 # Build the Go web testing frontend (tools/webchat). Depends on the engine so
 # `make webchat` produces BOTH exes: ./transformer and tools/webchat/webchat.
 # On Windows without make, use: powershell -File tools\webchat\build.ps1
@@ -101,4 +134,4 @@ clean:
 	rm -f $(BUILDDIR)/transformer-*
 	rm -f tools/webchat/webchat tools/webchat/webchat.exe
 
-.PHONY: all clean cross webchat
+.PHONY: all clean cross cross-gpu webchat

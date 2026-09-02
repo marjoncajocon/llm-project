@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "check.h"
+#include "gpu.h"
 
 // ===========================================================================
 // Persistent thread pool (internal to matrix.c).
@@ -193,6 +194,10 @@ static void mm_fwd_rows(int i0, int i1, void *ctx) {
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
+  // Optional GPU offload (gpu.h). Returns 0 — "not mine" — for a CPU-only build,
+  // when no device was found, when --no-gpu is in force, or when the problem is
+  // too small to be worth the dispatch; the CPU path below is then unchanged.
+  if (gpu_matmul(A->data, B->data, C->data, M, K, N)) return;
   MMFwd t = { A->data, B->data, C->data, K, N };
   if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_fwd_rows(0, M, &t); return; }
   parallel_for(M, mm_fwd_rows, &t);
@@ -304,6 +309,7 @@ static void mm_bwd_dB(int k0, int k1, void *ctx) {
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
+  if (gpu_matmul_backward(A->data, B->data, C->grad, A->grad, B->grad, M, K, N)) return;
   MMBwd t = { A, B, C, M, K, N };
   if ((size_t)M * N * K < MM_THREAD_THRESHOLD) {
     mm_bwd_dA(0, M, &t);
@@ -320,6 +326,7 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
 void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
+  if (gpu_matmul_backward_dx(B->data, C->grad, A->grad, M, K, N)) return;
   MMBwd t = { A, B, C, M, K, N };
   if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_bwd_dA(0, M, &t); return; }
   parallel_for(M, mm_bwd_dA, &t);
