@@ -18,6 +18,13 @@ xbuild_*
 build/*
 !build/*.md
 !build/*.txt
+# Two deliberate exceptions to "never commit compiled output":
+#   - the Colab GPU binary, so it can be downloaded and uploaded to a notebook
+#     without needing zig and this tree on hand
+#   - the generated guide, which is a document rather than a build artifact
+#     (regenerate with: cd tools/guidepdf && go run .)
+!build/transformer-linux-x86_64-gpu
+!build/guide.pdf
 
 # Debug / linker artifacts
 *.pdb
