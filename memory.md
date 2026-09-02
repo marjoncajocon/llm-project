@@ -559,7 +559,55 @@ the "long-term procedural memory / execution model" (the fine-tuned tool-using a
 else here is unbuilt and, at 135M / CPU / pure-C, mostly out of reach without a different compute
 and model scale. Recorded so the direction is not lost. See [[planned-next-step]].
 
-## >>> RESUME HERE (2026-07-26) -- lever (a) 2-epoch retrain ✅ DONE+PROMOTED; STaR harness ✅ BUILT
+## >>> RESUME HERE (2026-09-02) -- GRPO (RL from verifiable rewards) ✅ BUILT + VERIFIED
+
+> User asked to "support the latest algorithm" -> chose **GRPO** (Group Relative Policy Optimization,
+> the DeepSeek-R1 algorithm) as the direct successor to the STaR loop, with the **static verifiable**
+> reward (no tool execution during training). New subcommand: **`transformer grpo`**. Smoke test
+> green (`Output validation: PASSED`), `-Wall` clean, new parts `[26]`-`[29]`.
+>
+> **WHY IT BEATS STaR:** STaR keeps the winning rollouts and throws the losers away, so a failure
+> teaches nothing. GRPO normalizes rewards WITHIN a group of G rollouts, so a below-average rollout
+> gets a NEGATIVE advantage and is actively suppressed. No value net, no reward model -- the group's
+> own mean is the baseline, which is why it fits 135M on a CPU.
+>
+> **THE TRICK THAT MADE IT SMALL:** `∇_logits log π = onehot − p`, so the entire new backward is
+> `pg_backward` = `cross_entropy_backward` with `1/N` swapped for a per-token `coeff[t]` (~15 lines
+> in loss.c). Everything downstream is reused untouched. And **the KL reference policy is free**:
+> with LoRA the base is frozen, so the same model with adapters OFF *is* the reference -- no second
+> copy of 621MB.
+>
+> **NEW FILES:** `reward.c/.h` (format 0.2 + grounding 0.3 + action-match 0.5; grounding is a C port
+> of `clean_sft.py verify()`), `grpo.c/.h`, `tools/grpo_tasks.py`. **MODIFIED:** `loss.c/.h`
+> (`pg_backward`, `logprob_of`), `llama.c/.h` (`llama_decode_step_lora` -- adapters after the q/k/v
+> bias and BEFORE RoPE, mirroring the training forward), `llamatrain.c/.h`
+> (`llama_lora_decode_view`), `main.c`, `Makefile`, `selftest.c`, `README.md`.
+>
+> **RUN IT:**
+> ```
+> python tools/grpo_tasks.py --out data/grpo_tasks.txt --actions-only data/clean_reason.txt
+> .\transformer.exe grpo data/grpo_tasks.txt --model model/smollm/reason_e2.bin \
+>     --hf-tok model/smollm/tok.hf --out model/smollm/grpo.bin --group 8 --steps 200 --verbose
+> ```
+> ~12-40s/step at G=6, max-new 96, on the 135M. 1420 tasks built from `clean_reason.txt`.
+>
+> **TWO GOTCHAS THE FIRST RUNS FOUND (both fixed, do not re-learn them):**
+> (1) a small `--max-new` truncates every tool call -> every rollout scores identically -> zero
+> variance -> zero gradient. The run now WARNS when >25% of rollouts hit the cap.
+> (2) the model emits a CORRECT tool call then rambles into SmolLM2 pretraining artifacts
+> (`<jupyter_text>`, `<file_sep>`) instead of EOS. Rollouts now **stop at `</tool>`/`</done>`** --
+> which is what the real agent does anyway (`toolcall_parse` takes the first block only) -- and that
+> also cut rollout length 96 -> 28-40 tokens.
+>
+> **NOTHING PROMOTED.** No long run yet. **GRPO learns from VARIANCE**, and on `reason_e2.bin` the
+> mean reward is already ~0.94 so most groups are FLAT and get skipped. Next: build a task file
+> weighted toward cases the model gets right only SOMETIMES, run long, then `tools/remeasure.py` +
+> `tools/probe3.py`, and promote only if non-regressive. Watch `--verbose` for reward hacking (total
+> rising while the `match` term stays flat).
+>
+> Full detail: notes.md "2026-09-02 -- GRPO: RL from verifiable rewards".
+
+## >>> PREVIOUS (2026-07-26) -- lever (a) 2-epoch retrain ✅ DONE+PROMOTED; STaR harness ✅ BUILT
 
 > **SESSION COMPLETE, TREE CLEAN, nothing left half-done.** Three commits on `agent-1`
 > (local only, NOT pushed): **4bea3b9** lever (a) retrain + train.c fflush + tools/probe3.py +

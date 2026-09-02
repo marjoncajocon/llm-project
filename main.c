@@ -16,6 +16,7 @@
 #include "checkpoint.h"
 #include "tokenizer.h"
 #include "train.h"
+#include "grpo.h"
 #include "agent.h"
 #include "caption.h"
 #include "text2media.h"
@@ -307,6 +308,107 @@ static int run_train_arch(int argc, char **argv, int llama) {
 
 static int run_train(int argc, char **argv) { return run_train_arch(argc, argv, 0); }
 static int run_llama_train(int argc, char **argv) { return run_train_arch(argc, argv, 1); }
+
+static void grpo_usage(void) {
+  printf(
+    "Usage: transformer grpo <tasks.txt> --model M.bin --hf-tok V.hf [options]\n"
+    "\n"
+    "Reinforcement learning from VERIFIABLE rewards (GRPO). Where `llama-train\n"
+    "--sft` is shown the right answer and pushed toward it, this lets the model\n"
+    "ACT, scores what it did, and pushes it toward its own better-than-average\n"
+    "attempts and away from its worse-than-average ones.\n"
+    "\n"
+    "<tasks.txt> is the SAME prompt<TAB>response format the SFT trainer reads --\n"
+    "the response column becomes the REFERENCE ACTION the reward scores against,\n"
+    "so a corpus from tools/clean_sft.py drops straight in. Build one that is\n"
+    "known-grounded with: python tools/grpo_tasks.py --out data/grpo_tasks.txt ...\n"
+    "\n"
+    "Required:\n"
+    "  --model F         LLMA checkpoint to start from (the policy)\n"
+    "  --hf-tok F        that model's own .hf vocabulary\n"
+    "Output:\n"
+    "  --out F           where to save (default model/grpo.bin)\n"
+    "  --name X          shorthand for --out model/X/model.bin\n"
+    "Rollouts:\n"
+    "  --group N         G rollouts per task, >= 2 (default 8). The group's own\n"
+    "                    mean is the baseline -- that is what replaces a value net.\n"
+    "  --max-new N       cap on sampled tokens per rollout (default 96)\n"
+    "  --temp F          sampling temperature (default 1.0). This is the EXPLORATION\n"
+    "                    knob: too low and every rollout in a group is identical,\n"
+    "                    the advantage is zero, and the group teaches nothing.\n"
+    "  --top-k N / --top-p F   nucleus sampling (defaults 0 / 0.95)\n"
+    "Optimization:\n"
+    "  --steps N         optimizer steps (default 100)\n"
+    "  --groups N        task groups accumulated per step (default 1)\n"
+    "  --inner-epochs N  updates taken per set of rollouts (default 1 = on-policy).\n"
+    "                    > 1 reuses the expensive rollouts; the ratio clip is what\n"
+    "                    keeps that honest.\n"
+    "  --lr F            learning rate (default 1e-5 -- RL wants far less than SFT)\n"
+    "  --clip F          grad-norm clip (default 1.0; 0 disables -- not advised)\n"
+    "  --weight-decay F  AdamW decoupled decay (default 0)\n"
+    "  --warmup N / --min-lr F   cosine schedule (default: constant LR)\n"
+    "  --lora-r N        LoRA rank, base frozen (default 8; 0 = full fine-tune)\n"
+    "  --lora-alpha F    LoRA scaling (default 16)\n"
+    "Objective:\n"
+    "  --clip-eps F      PPO-style ratio clip, 1 +/- eps (default 0.2; 0 = off)\n"
+    "  --kl F            KL penalty toward the reference policy (default 0 = off).\n"
+    "                    The reference is the FROZEN BASE -- the same weights with\n"
+    "                    the adapters off -- so it costs one extra forward per\n"
+    "                    rollout and no extra memory.\n"
+    "Run control:\n"
+    "  --seed N          RNG seed (default 1)\n"
+    "  --verbose         print a scored sample rollout per group\n"
+    "\n"
+    "The run saves ONCE, at the end: mid-run saving would mean merging the\n"
+    "adapters, which resets B to zero and stalls training.\n");
+}
+
+static int run_grpo(int argc, char **argv) {
+  if (argc < 3 || strncmp(argv[2], "--", 2) == 0) { grpo_usage(); return 2; }
+  const char *tasks = argv[2];
+  GrpoConfig cfg = grpo_default_config();
+  const char *name = NULL;
+  static char name_model[512], name_tok[512];
+
+  for (int i = 3; i < argc; i++) {
+    const char *f = argv[i];
+    int has_val = (i + 1 < argc);
+#define NEED_VAL() do { if (!has_val) { fprintf(stderr, "missing value for %s\n", f); return 2; } } while (0)
+    if      (strcmp(f, "--model") == 0)   { NEED_VAL(); cfg.model = argv[++i]; }
+    else if (strcmp(f, "--hf-tok") == 0)  { NEED_VAL(); cfg.hf_tok = argv[++i]; }
+    else if (strcmp(f, "--out") == 0)     { NEED_VAL(); cfg.out_model = argv[++i]; }
+    else if (strcmp(f, "--name") == 0)    { NEED_VAL(); name = argv[++i]; }
+    else if (strcmp(f, "--group") == 0)   { NEED_VAL(); cfg.group = atoi(argv[++i]); }
+    else if (strcmp(f, "--max-new") == 0) { NEED_VAL(); cfg.max_new = atoi(argv[++i]); }
+    else if (strcmp(f, "--temp") == 0)    { NEED_VAL(); cfg.temperature = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--top-k") == 0)   { NEED_VAL(); cfg.top_k = atoi(argv[++i]); }
+    else if (strcmp(f, "--top-p") == 0)   { NEED_VAL(); cfg.top_p = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--steps") == 0)   { NEED_VAL(); cfg.steps = atoi(argv[++i]); }
+    else if (strcmp(f, "--groups") == 0)  { NEED_VAL(); cfg.groups_per_step = atoi(argv[++i]); }
+    else if (strcmp(f, "--inner-epochs") == 0) { NEED_VAL(); cfg.inner_epochs = atoi(argv[++i]); }
+    else if (strcmp(f, "--lr") == 0)      { NEED_VAL(); cfg.lr = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--clip") == 0)    { NEED_VAL(); cfg.grad_clip = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--weight-decay") == 0) { NEED_VAL(); cfg.weight_decay = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--warmup") == 0)  { NEED_VAL(); cfg.warmup = atoi(argv[++i]); }
+    else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--lora-r") == 0)  { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
+    else if (strcmp(f, "--lora-alpha") == 0) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--clip-eps") == 0){ NEED_VAL(); cfg.clip_eps = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--kl") == 0)      { NEED_VAL(); cfg.kl_beta = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
+    else if (strcmp(f, "--verbose") == 0) { cfg.verbose = 1; }
+    else { fprintf(stderr, "unknown flag: %s\n", f); grpo_usage(); return 2; }
+#undef NEED_VAL
+  }
+  if (name) {
+    model_paths(name, name_model, name_tok, sizeof(name_model), 1);
+    cfg.out_model = name_model;
+    printf("model dir: model/%s/\n", name);
+  }
+  if (cfg.groups_per_step < 1) cfg.groups_per_step = 1;
+  if (cfg.inner_epochs < 1) cfg.inner_epochs = 1;
+  return grpo_run(tasks, &cfg);
+}
 
 // ============================================================================
 // Media generation to a file: quantize the input to tokens, train a small GPT to
@@ -923,6 +1025,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "t2i") == 0) return run_t2i(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-data") == 0) return run_t2i_data(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-recon") == 0) return run_t2i_recon(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "grpo") == 0) return run_grpo(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama-train") == 0) return run_llama_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-train") == 0) return run_t2i_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "t2i-gen") == 0) return run_t2i_gen(argc, argv);
@@ -933,7 +1036,7 @@ int main(int argc, char **argv) {
   // silently run the demo) — print usage and fail instead.
   if (argc > 1) {
     fprintf(stderr, "unknown command '%s'\n", argv[1]);
-    fprintf(stderr, "usage: transformer [train|llama-train|generate|agent|imggen|audgen|llama] ...\n");
+    fprintf(stderr, "usage: transformer [train|llama-train|grpo|generate|agent|imggen|audgen|llama] ...\n");
     fprintf(stderr, "       transformer            (no args: run the built-in self-test)\n");
     return 1;
   }

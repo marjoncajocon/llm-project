@@ -294,6 +294,11 @@ void llama_kv_free(LlamaKV *kv) {
 }
 
 void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits) {
+  llama_decode_step_lora(m, kv, token, logits, NULL);
+}
+
+void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
+                            Tensor *logits, const LlamaDecodeLora *lo) {
   const int dm = m->d_model, hd = m->head_dim;
   const int qd = m->n_heads * hd, kvd = m->n_kv * hd;
   const int pos = kv->len;                 // this token's position
@@ -308,6 +313,16 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
   float *sc = (float*)malloc((size_t)(pos + 1) * sizeof(float));
   SwigluCache sc_ff = swiglu_cache_create(1, m->d_ff);
 
+  // One-row adapter scratch, reused across layers (decode never backpropagates,
+  // so the cache is pure scratch). Only allocated when adapters are in play.
+  LoraCache lcq, lck, lcv, lco;
+  if (lo) {
+    lcq = lora_cache_create(1, lo->q[0].r, qd);
+    lck = lora_cache_create(1, lo->k[0].r, kvd);
+    lcv = lora_cache_create(1, lo->v[0].r, kvd);
+    lco = lora_cache_create(1, lo->o[0].r, dm);
+  }
+
   for (int l = 0; l < m->n_layers; l++) {
     const LlamaBlock *b = &m->blocks[l];
     // Attention
@@ -315,6 +330,13 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
     matmul(&xn, &b->Wq, &q); bias_add(&q, &b->b_q, &q);
     matmul(&xn, &b->Wk, &k); bias_add(&k, &b->b_k, &k);
     matmul(&xn, &b->Wv, &v); bias_add(&v, &b->b_v, &v);
+    // Adapters land here — after the bias, BEFORE RoPE — matching
+    // llama_forward_train_lora exactly.
+    if (lo) {
+      lora_forward(&lo->q[l], &xn, &q, &lcq);
+      lora_forward(&lo->k[l], &xn, &k, &lck);
+      lora_forward(&lo->v[l], &xn, &v, &lcv);
+    }
     rope_heads_pos(&q, m->n_heads, m->rope_base, pos);
     rope_heads_pos(&k, m->n_kv, m->rope_base, pos);
     memcpy(&kv->k[l][pos * kvd], k.data, (size_t)kvd * sizeof(float));   // append to cache
@@ -344,6 +366,7 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
       }
     }
     matmul(&o, &b->Wo, &ao);
+    if (lo) lora_forward(&lo->o[l], &o, &ao, &lco);
     for (int j = 0; j < dm; j++) x.data[j] += ao.data[j];       // residual
 
     // Feed-forward
@@ -357,6 +380,10 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
   kv->len = pos + 1;
 
   free(sc); swiglu_cache_free(&sc_ff);
+  if (lo) {
+    lora_cache_free(&lcq); lora_cache_free(&lck);
+    lora_cache_free(&lcv); lora_cache_free(&lco);
+  }
   tensor_free(&x); tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
   tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
 }

@@ -49,3 +49,31 @@ void cross_entropy_backward(const Tensor *probs, const int *targets, Tensor *log
     }
   }
 }
+
+// Per-row-weighted version of the above: the row weight comes from coeff[i]
+// instead of being the uniform 1/nvalid. See loss.h for why every log-likelihood
+// objective collapses to this one loop.
+void pg_backward(const Tensor *probs, const int *targets, const float *coeff,
+                 Tensor *logits_grad) {
+  const int N = probs->shape[0];
+  const int V = probs->shape[1];
+
+  for (int i = 0; i < N; i++) {
+    if (targets[i] < 0) continue;          // masked position (e.g. the prompt)
+    if (coeff[i] == 0.0f) continue;        // clipped token: contributes nothing
+    tf_check_target_id(targets[i], V);
+    const float c = coeff[i];
+    for (int j = 0; j < V; j++) {
+      float g = probs->data[i * V + j];
+      if (j == targets[i]) g -= 1.0f;
+      logits_grad->grad[i * V + j] += g * c;
+    }
+  }
+}
+
+float logprob_of(const Tensor *probs, int row, int id) {
+  const int V = probs->shape[1];
+  tf_check_target_id(id, V);
+  float p = probs->data[(size_t)row * V + id];
+  return logf(p > 1e-12f ? p : 1e-12f);
+}

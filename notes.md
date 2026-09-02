@@ -2330,6 +2330,92 @@ Scope: LLaMA SFT path only (the SmolLM2 agent's path). The GPT `train_sft` path 
 attention-weights tensor is shaped (n_heads*seq_len, seq_len) and strides by seq_len, so the same
 in-place reshape is unsafe without a deeper change (documented follow-up).
 
+## 2026-09-02 -- GRPO: RL from verifiable rewards -- ✅ BUILT + VERIFIED (no promoted retrain yet)
+
+User asked to "support the latest algorithm". Chose **GRPO** (Group Relative Policy Optimization --
+the algorithm behind DeepSeek-R1) as the direct successor to the STaR loop below, and the reward as
+the **static verifiable** kind (no tool execution during training). New subcommand `transformer grpo`.
+
+### Why GRPO is the successor to STaR
+
+STaR is rejection sampling: keep the winners as SFT rows, throw the losers away, so a failed rollout
+teaches NOTHING. GRPO scores a whole GROUP of rollouts and normalizes the rewards within it, so a
+below-average rollout gets a **negative** advantage and is actively suppressed. **That suppression
+is the capability rejection sampling does not have.** No value network and no reward model is needed
+-- the group's own mean IS the baseline -- which is exactly why it fits 135M on a CPU.
+
+### The insight that made it small
+
+`∇_logits log π(o_t) = onehot − p`, so ANY objective of the form `Σ w_t · log π(o_t)` is just the
+cross-entropy gradient with a per-token weight. New `pg_backward` (loss.c) is
+`cross_entropy_backward` with `1/N` replaced by `coeff[t]` -- ~15 lines. Everything downstream
+(`llama_backward_accum`, `clip_grad_norm`, `adam_step`, `llama_lora_merge`) is reused untouched, and
+the prompt is masked with `targets[t] = -1` exactly as SFT already does.
+
+Second piece of leverage: **the reference policy for the KL term is free.** With LoRA the base is
+frozen, so the same model with adapters OFF *is* the reference -- no second copy of 621MB.
+
+### Files
+
+- **NEW `reward.h`/`reward.c`** -- format (0.2, exactly one properly-closed block, nothing trailing)
+  + grounding (0.3, a C port of `clean_sft.py verify()`: every path / write body / command filename
+  must occur in the prompt as a whole token) + action match vs the reference (0.5, partial credit for
+  right tool / wrong arg). Pure: opens no files, executes nothing, writes nothing.
+- **NEW `grpo.h`/`grpo.c`** -- `grpo_advantages` (z-score within the group; returns 0 = no spread),
+  `grpo_token_coeffs` (ratio, one-sided clip, k3 KL), `grpo_group_coeffs` (both, for the test), and
+  `grpo_run` (the driver).
+- **NEW `llama_decode_step_lora`** (llama.c) -- the KV-cache decode with adapters applied, so
+  rollouts are sampled from the policy being updated. `llama_decode_step` is now a NULL-lo wrapper.
+  Adapters land after the q/k/v bias and **BEFORE RoPE**, mirroring `llama_forward_train_lora`.
+- **NEW `tools/grpo_tasks.py`** -- builds a task file from the SFT corpus, dropping any row
+  `clean_sft.verify()` rejects. **A bad row in SFT data teaches one wrong answer; a bad row in an RL
+  task file teaches the REWARD to lie.**
+
+### Two things the first real runs taught (both fixed)
+
+1. **`--max-new 24` made every group flat.** Rollouts were truncated mid-tool-call, so every one
+   scored `malformed-action` identically -> zero variance -> zero gradient. The run now reports the
+   cap rate and WARNS when >25% of rollouts end at the cap instead of stopping themselves.
+2. **The model emits a correct tool call and then rambles** into SmolLM2 pretraining artifacts
+   (`<jupyter_text>`, `<file_sep>`, `<issue_comment>`) instead of EOS -- so the format term was 0 on
+   nearly every rollout. Fixed by **stopping the rollout at `</tool>`/`</done>`**: `toolcall_parse`
+   takes the first block and `agent.c` executes only that, so text after it is discarded at runtime,
+   and scoring tokens the harness throws away optimizes something that does not exist in deployment.
+   Also cut rollout length 96 -> 28-40 tokens (2-3x faster).
+
+### Verified
+
+Smoke test parts `[26]`-`[29]`, all green, `Output validation: PASSED`, `-Wall` clean:
+- `[26]` LoRA decode == LoRA training forward, max |logit diff| **0.00e+00** (a wrong adapter/RoPE
+  order would silently make every importance ratio compare two different policies); NULL view ==
+  plain decode, 0.00e+00.
+- `[27]` reward on a 10-case adversarial probe: 4 perfect + 6 penalized, incl. hallucinated path,
+  empty write body, the char-slip (`demo_note` -> `demonstra_note`), unterminated block, trailing
+  rambling, wrong tool. Plus the whole-token rule ("ok" must not match inside "cooking").
+- `[28]` all-equal rewards -> skipped with zero advantages; advantages are z-scores (mean 0);
+  one-sided clipping (adv>0 drops rho=1.5, adv<0 drops rho=0.5); and
+  **`pg_backward(coeff=1/N) == cross_entropy_backward` to 0.00e+00** -- the identity it all rests on.
+- `[29]` numerical gradient check of the surrogate (`J = Σ coeff·(-log p)`) at eps=1e-2: 9.91e-04 on
+  well-conditioned entries. Then a CLOSED GRPO loop (tiny model, G=6, 40 steps, reward = fraction of
+  tokens == GOAL): mean reward **0.083 -> 1.000** from exactly chance (1/12).
+
+Real run on `model/smollm/reason_e2.bin` + `data/grpo_tasks.txt` (1420 tasks): pipeline works end to
+end, rewards 0.75-1.00, ~12-40s/step at G=6 max-new 96. **Nothing promoted** -- no long run yet.
+
+### Honest limits
+
+GRPO learns from **variance**. On `reason_e2.bin` the mean reward is already ~0.94, so MOST GROUPS
+ARE FLAT and get skipped before any forward pass. Lever #4 measured that the residual errors at 135M
+are systematic/low-variance, which is exactly the regime where a group has no spread. The realistic
+win is sharpening what the model gets right only sometimes and suppressing the confidently-wrong,
+not a new skill. Watch `--verbose` for **reward hacking**: a rising total with a flat `match` term
+means it found a cheap way to satisfy format + grounding. Gate any promotion on `tools/remeasure.py`
++ `tools/probe3.py`, as `4bea3b9` was gated.
+
+**NEXT for GRPO:** build a task file weighted toward cases the model currently gets right only
+SOMETIMES (that is where the gradient lives), then a long run, then remeasure, then promote only if
+non-regressive.
+
 ## 2026-07-26 (c) -- STaR self-training loop -- ✅ BUILT + VERIFIED (harness only, no retrain yet)
 
 User asked: "can the AI learn from itself, like when I prompt it, then it learns?" Answer built:

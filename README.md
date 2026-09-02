@@ -87,8 +87,10 @@ defined in the matching `.c`.
 | `audiogen.h` / `audiogen.c`       | Audio ↔ tokens (µ-law) for autoregressive audio **generation** (Phase G) |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
+| `reward.h` / `reward.c`           | Verifiable reward for a sampled agent response: format + grounding + action match |
+| `grpo.h` / `grpo.c`               | **GRPO**: RL from verifiable rewards — group-relative advantage, clipped policy gradient |
 | `selftest.h` / `selftest.c`       | Built-in smoke test (`run_selftest`): the default `transformer` run           |
-| `main.c`                          | Entry point + subcommands (`train`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
+| `main.c`                          | Entry point + subcommands (`train`, `llama-train`, `grpo`, `generate`, `agent`, `imggen`, `audgen`, `llama`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
 | `tools/`                          | Non-C helpers: crawlers (`crawl_wikipedia.py`, `crawl_stackoverflow.py`), SFT data (`make_sft.py`, `make_qa.py`, `mix_sft.py`, `sft_memtest.py`), `agent_local.py`, `upgrade_llma.py`, GPT-2/LLaMA converters |
@@ -417,6 +419,79 @@ moments for it, so adapters are folded in only at the end.
 > embeddings and `lm_head` simply cannot represent the new tokens, and attention adapters alone
 > can't fix that. The parameter saving is also only visible at scale: on the tiny smoke-test model
 > the adapters are 27.9% of the base, whereas at `d_model` 576 with `r=8` they are a few percent.
+
+### `transformer grpo <tasks.txt> [flags]` — RL from **verifiable rewards**
+
+Every other trainer here is supervised: it is shown the right answer and pushed toward it. `grpo`
+implements **GRPO** (Group Relative Policy Optimization — the algorithm behind DeepSeek-R1), which
+instead lets the model **act**, scores what it did, and pushes it toward its own better-than-average
+attempts and away from its worse-than-average ones.
+
+Per task, per step:
+
+1. **sample G rollouts** from the current policy (KV-cache decode *with* the LoRA adapters applied,
+   so the samples really do come from the policy being updated);
+2. **score each** with a verifiable reward (`reward.h`) — format, grounding, action match;
+3. **normalize within the group**: `Â_i = (r_i − mean) / (std + 1e-4)`. This is the "group relative"
+   part, and it is what replaces a value network: the group's own mean *is* the baseline;
+4. one clipped policy-gradient step, optionally pulled toward a reference policy by a KL penalty.
+
+```sh
+# build a task file whose reference actions are all grounded (see the warning below)
+python tools/grpo_tasks.py --out data/grpo_tasks.txt --actions-only data/clean_reason.txt
+
+transformer grpo data/grpo_tasks.txt \
+  --model model/smollm/reason_e2.bin --hf-tok model/smollm/tok.hf \
+  --out model/smollm/grpo.bin \
+  --group 8 --steps 200 --max-new 96 --temp 1.0 --lr 1e-5 --lora-r 8 --verbose
+```
+
+The task file is the **same `prompt<TAB>response` format** the SFT trainer reads — the response
+column becomes the *reference action* the reward scores against — so any corpus from
+`tools/clean_sft.py` drops straight in.
+
+**How this differs from the STaR loop** (`tools/self_train.py`): STaR is rejection sampling. It
+keeps the successful rollouts as SFT rows and throws the failures away, so a failed rollout teaches
+nothing. GRPO uses the failures too — a below-average rollout gets a *negative* advantage, actively
+suppressing it. That suppression is the capability rejection sampling does not have.
+
+**Three implementation notes worth knowing:**
+
+- **The whole backward is one function.** `∇_logits log π(o_t) = onehot − p`, so any objective of
+  the form `Σ w_t · log π(o_t)` is just the cross-entropy gradient with a per-token weight.
+  `pg_backward` (`loss.h`) is `cross_entropy_backward` with `1/N` replaced by `coeff[t]`; everything
+  downstream (`llama_backward_accum`, `clip_grad_norm`, `adam_step`, `llama_lora_merge`) is reused
+  untouched. The prompt is masked out with `targets[t] = -1`, exactly as in SFT.
+- **The reference policy is free.** With LoRA the base is frozen, so running the same model with the
+  adapters switched off *is* the reference. No second copy of a 621 MB checkpoint. `--kl` costs one
+  extra forward per rollout and no extra memory.
+- **Rollouts stop at `</tool>`/`</done>`**, not just at EOS. `toolcall_parse` takes the first block
+  and `agent.c` executes only that, so text after it is discarded at runtime — scoring or training
+  on tokens the harness throws away would optimize something that does not exist in deployment. It
+  also cuts rollout cost 2–3× in practice (a 135M model keeps talking long after it is done).
+
+The run saves **once, at the end**: mid-run saving would mean merging the adapters, and
+`llama_lora_merge` resets `B` to zero, after which `dA` is identically zero and training stalls.
+
+> **Honest scope.** GRPO learns from **variance**. If every rollout in a group scores the same, every
+> advantage is zero, and the group is skipped before any forward pass (the run reports how many).
+> Where a 135M model is *uniformly* right or *uniformly* wrong there is no signal at all — and lever
+> #4 measured that its residual errors are systematic and low-variance. On `reason_e2.bin` against
+> `data/grpo_tasks.txt` the mean reward is already ~0.94, so most groups are flat: the realistic win
+> is sharpening the cases it gets right only sometimes and suppressing the confidently-wrong ones,
+> not a new skill. Watch the `--verbose` breakdown for **reward hacking** — a rising total with a
+> flat `match` term means the model found a cheap way to satisfy format + grounding — and gate any
+> promotion on `tools/remeasure.py`, exactly as `4bea3b9` was gated.
+>
+> **A bad row in SFT data teaches one wrong answer; a bad row in an RL task file teaches the reward
+> to lie.** `tools/grpo_tasks.py` therefore puts every reference action through `clean_sft.verify()`
+> and drops what it rejects rather than trying to fix it.
+
+Verified in the smoke test: `[26]` the LoRA decode matches the LoRA training forward to `0.00e+00`
+(a wrong adapter/RoPE order would make every importance ratio meaningless), `[27]` the reward on a
+10-case adversarial probe, `[28]` the objective arithmetic including one-sided clipping and the
+`pg_backward(1/N) == cross_entropy_backward` identity, and `[29]` a numerical gradient check of the
+surrogate plus a closed GRPO loop that drives a toy reward from chance (0.083) to 1.000.
 
 ### `transformer generate [model.bin] [tok.bin]`
 

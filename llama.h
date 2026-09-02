@@ -15,6 +15,7 @@
 
 #include "tensor.h"
 #include "quant.h"
+#include "lora.h"
 
 typedef struct {
   int d_model, n_heads, n_kv, head_dim, d_ff;
@@ -104,6 +105,26 @@ void llama_kv_free(LlamaKV *kv);
 // Decode ONE token at position kv->len: append its K/V to the cache, attend over
 // positions 0..kv->len, and write logits (1, vocab). Advances kv->len.
 void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits);
+
+// A read-only view of the four per-layer adapter arrays of a LlamaLora, so the
+// decode path can apply adapters WITHOUT depending on llamatrain.h (which
+// includes this header). Build one with llama_lora_decode_view (llamatrain.h),
+// or by hand: each field is either NULL or an array of n_layers adapters.
+typedef struct {
+  const LoraAdapter *q, *k, *v, *o;
+} LlamaDecodeLora;
+
+// KV-cache decode WITH LoRA adapters applied — the incremental counterpart of
+// llama_forward_train_lora, needed to SAMPLE from an adapted policy without
+// re-running the whole prefix per token (which is what makes RL rollouts
+// affordable; see grpo.h). Passing lo == NULL is exactly llama_decode_step.
+//
+// The adapters must be applied in the same places and the same order as the
+// training forward — after the q/k/v bias but BEFORE RoPE, and onto the output
+// projection's result — or the two paths disagree and the importance ratio a
+// policy-gradient update computes is meaningless.
+void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
+                            Tensor *logits, const LlamaDecodeLora *lo);
 
 // ---------------------------------------------------------------------------
 // Quantized (int8, in-memory) model: same architecture, but the big weights

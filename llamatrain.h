@@ -150,4 +150,9 @@ void llama_backward_accum(LlamaModel *m, const int *ids, int seq_len,
 // Zero every adapter gradient (the LoRA counterpart of llama_zero_grad).
 void llama_lora_zero_grad(const LlamaLora *lo);
 
+// Pack the four adapter arrays into the view llama_decode_step_lora takes, so an
+// adapted policy can be SAMPLED from with the KV cache. Passing a NULL lo yields
+// an all-NULL view, which that function treats as "no adapters".
+LlamaDecodeLora llama_lora_decode_view(const LlamaLora *lo);
+
 #endif // LLAMATRAIN_H

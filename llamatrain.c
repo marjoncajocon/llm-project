@@ -416,6 +416,15 @@ void llama_lora_zero_grad(const LlamaLora *lo) {
   }
 }
 
+LlamaDecodeLora llama_lora_decode_view(const LlamaLora *lo) {
+  LlamaDecodeLora v;
+  v.q = lo ? lo->q : NULL;
+  v.k = lo ? lo->k : NULL;
+  v.v = lo ? lo->v : NULL;
+  v.o = lo ? lo->o : NULL;
+  return v;
+}
+
 int llama_lora_param_count(const LlamaLora *lo) {
   return 8 * lo->n_layers;   // A and B for each of q, k, v, o
 }

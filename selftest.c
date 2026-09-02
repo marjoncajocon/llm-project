@@ -31,6 +31,9 @@
 #include "llamatrain.h"
 #include "quant.h"
 #include "matrix.h"
+#include "activation.h"
+#include "reward.h"
+#include "grpo.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -1708,6 +1711,403 @@ int run_selftest(void) {
     free(gA); free(gB); free(ap);
     tensor_free(&alog); tensor_free(&aprob);
     llama_acts_free(&aa); llama_model_free(&am);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 26: the LoRA-aware KV-cache decode must match the LoRA training
+  // forward. This is the gate that keeps RL rollouts honest: the rollout is
+  // sampled through llama_decode_step_lora and the update runs through
+  // llama_forward_train_lora, so if the two apply the adapters differently (a
+  // wrong order relative to RoPE, say) then every importance ratio GRPO computes
+  // is measuring two different policies against each other.
+  // --------------------------------------------------------------------------
+  {
+    printf("[26] LoRA KV-cache decode == LoRA training forward\n");
+    const int vocab = 32, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    srand(17);
+    LlamaModel lm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64,
+                                             10000.0f, 1e-5f);
+    llama_model_randomize(&lm);
+    LlamaLora lo = llama_lora_create(&lm, 4, 8.0f);
+    llama_lora_init(&lo);
+    LlamaLoraActs la = llama_lora_acts_create(&lm, &lo, seq);
+    LlamaActs la_acts = llama_acts_create(&lm, seq);
+
+    // B starts at zero, which would make this test pass trivially against the
+    // base path — give the adapters a real, nonzero correction first.
+    Tensor **lp = (Tensor**)malloc((size_t)llama_lora_param_count(&lo) * sizeof(Tensor*));
+    int n_lp = llama_lora_collect_params(&lo, lp);
+    for (int p = 0; p < n_lp; p++)
+      for (size_t k = 0; k < lp[p]->size; k++)
+        lp[p]->data[k] += 0.05f * (float)((int)((k * 29 + (size_t)p * 7) % 11) - 5);
+
+    int ids[6] = {3, 7, 1, 9, 2, 5};
+    int fs[2] = {seq, vocab};
+    Tensor Lf = tensor_create(fs, 2);
+    llama_forward_train_lora(&lm, ids, seq, &la_acts, &Lf, &lo, &la);
+
+    LlamaDecodeLora dv = llama_lora_decode_view(&lo);
+    LlamaKV kv = llama_kv_create(&lm);
+    int ds[2] = {1, vocab};
+    Tensor Ld = tensor_create(ds, 2);
+    float maxd = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step_lora(&lm, &kv, ids[i], &Ld, &dv);
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(Ld.data[j] - Lf.data[i * vocab + j]);
+        if (d > maxd) maxd = d;
+      }
+    }
+    int lkv_ok = (maxd < 1e-3f);
+    printf("    max |logit diff| over all %d positions = %.2e -> %s\n", seq, maxd,
+           lkv_ok ? "OK" : "FAIL");
+    all_ok &= lkv_ok;
+
+    // A NULL view must be bit-identical to the plain, adapter-free decode.
+    LlamaKV kv2 = llama_kv_create(&lm);
+    LlamaKV kv3 = llama_kv_create(&lm);
+    Tensor La = tensor_create(ds, 2), Lb = tensor_create(ds, 2);
+    float nulld = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step_lora(&lm, &kv2, ids[i], &La, NULL);
+      llama_decode_step(&lm, &kv3, ids[i], &Lb);
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(La.data[j] - Lb.data[j]);
+        if (d > nulld) nulld = d;
+      }
+    }
+    int null_ok = (nulld == 0.0f);
+    printf("    NULL adapters == plain decode: max |diff| %.2e -> %s\n\n",
+           nulld, null_ok ? "OK" : "FAIL");
+    all_ok &= null_ok;
+
+    free(lp);
+    tensor_free(&Lf); tensor_free(&Ld); tensor_free(&La); tensor_free(&Lb);
+    llama_kv_free(&kv); llama_kv_free(&kv2); llama_kv_free(&kv3);
+    llama_lora_acts_free(&la); llama_lora_free(&lo);
+    llama_acts_free(&la_acts); llama_model_free(&lm);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 27: the verifiable reward (reward.h). An RL run is only as trustworthy
+  // as its reward, so this probes the adversarial cases the reward EXISTS to
+  // catch — a hallucinated filename, an empty write body, the ~5% char-slip
+  // (demo_note -> demonstra_note) — alongside responses that must score full
+  // marks. Mirrors the clean_sft adversarial probe the SFT data gate uses.
+  // --------------------------------------------------------------------------
+  {
+    printf("[27] Verifiable reward: grounding, format and action match\n");
+    const char *prompt =
+      "USER: create notes.txt containing hello world and read it back\nMODEL:";
+    const char *ref_write = "<tool name=\"write_file\" path=\"notes.txt\">hello world</tool>";
+
+    struct { const char *resp; const char *ref; int want_full; const char *what; } cases[] = {
+      // Must score a perfect 1.0 — well formed, grounded, and the right action.
+      {"<tool name=\"write_file\" path=\"notes.txt\">hello world</tool>", ref_write, 1,
+       "exact correct action"},
+      {"<think>I should write the file first</think><tool name=\"write_file\" "
+       "path=\"notes.txt\">hello world</tool>", ref_write, 1, "reasoning then action"},
+      {"<tool name=\"read_file\" path=\"notes.txt\"></tool>",
+       "<tool name=\"read_file\" path=\"notes.txt\"></tool>", 1, "read_file"},
+      {"<done>wrote and read notes.txt</done>", "<done>all done</done>", 1,
+       "done (summary text is free-form)"},
+      // Must LOSE marks — each for a specific, verifiable reason.
+      {"<tool name=\"write_file\" path=\"other.txt\">hello world</tool>", ref_write, 0,
+       "hallucinated path"},
+      {"<tool name=\"write_file\" path=\"notes.txt\"></tool>", ref_write, 0,
+       "empty write body"},
+      {"<tool name=\"write_file\" path=\"demonstra_note.txt\">hello world</tool>", ref_write, 0,
+       "char-slipped filename"},
+      {"<tool name=\"read_file\" path=\"notes.txt\">", ref_write, 0, "unterminated block"},
+      {"<tool name=\"read_file\" path=\"notes.txt\"></tool> and then I will stop", ref_write, 0,
+       "trailing rambling"},
+      {"<tool name=\"write_file\" path=\"notes.txt\">hello world</tool>",
+       "<tool name=\"read_file\" path=\"notes.txt\"></tool>", 0, "wrong tool"},
+    };
+    const int ncase = (int)(sizeof(cases) / sizeof(cases[0]));
+    int rw_ok = 1;
+    for (int i = 0; i < ncase; i++) {
+      RewardParts p;
+      float r = reward_score(prompt, cases[i].resp, cases[i].ref, &p);
+      const int full = (r > 0.999f);
+      if (full != cases[i].want_full) {
+        rw_ok = 0;
+        printf("    MISMATCH: %-30s r=%.2f (fmt %.2f grd %.2f mat %.2f) %s\n",
+               cases[i].what, (double)r, (double)p.format, (double)p.grounded,
+               (double)p.match, p.reason);
+      }
+    }
+    printf("    %d/%d cases scored as expected (4 perfect, 6 penalized) -> %s\n",
+           rw_ok ? ncase : ncase - 1, ncase, rw_ok ? "OK" : "FAIL");
+    all_ok &= rw_ok;
+
+    // The whole-token rule: "ok" must not match inside "cooking".
+    int tok_rule = reward_grounded_in("i am cooking dinner", "ok") == 0 &&
+                   reward_grounded_in("read notes.txt now", "notes.txt") == 1 &&
+                   reward_grounded_in("Read NOTES.TXT now", "notes.txt") == 1;
+    printf("    whole-token grounding ('ok' not inside 'cooking', case-insensitive) -> %s\n\n",
+           tok_rule ? "OK" : "FAIL");
+    all_ok &= tok_rule;
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 28: the GRPO objective as arithmetic (grpo.h). Three gates:
+  //   (a) a group whose rewards are all equal carries NO signal — every
+  //       advantage is zero and the trainer must skip it,
+  //   (b) advantages are the group's own z-scores (mean 0), which is what makes
+  //       the group's mean the baseline that replaces a value network,
+  //   (c) the ratio clip fires one-sidedly: it zeroes a token only when the
+  //       policy has ALREADY moved too far in the direction the advantage wants.
+  // --------------------------------------------------------------------------
+  {
+    printf("[28] GRPO objective: group-relative advantage + ratio clipping\n");
+    GrpoConfig gc = grpo_default_config();
+    gc.clip_eps = 0.2f;
+    gc.kl_beta = 0.0f;
+
+    // (a) zero variance => no signal
+    float flat_r[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    float adv[4];
+    int live_flat = grpo_advantages(flat_r, 4, adv);
+    int flat_ok = (live_flat == 0);
+    for (int i = 0; i < 4; i++) if (adv[i] != 0.0f) flat_ok = 0;
+    printf("    all-equal rewards -> skipped, advantages all zero -> %s\n",
+           flat_ok ? "OK" : "FAIL");
+    all_ok &= flat_ok;
+
+    // (b) advantages are z-scores: mean 0, better-than-average positive.
+    float rew[4] = {1.0f, 0.0f, 0.5f, 0.5f};
+    int live = grpo_advantages(rew, 4, adv);
+    double amean = 0.0;
+    for (int i = 0; i < 4; i++) amean += adv[i];
+    int adv_ok = live && fabs(amean) < 1e-5 && adv[0] > 0.0f && adv[1] < 0.0f &&
+                 fabsf(adv[2]) < 1e-5f && fabsf(adv[3]) < 1e-5f;
+    printf("    advantages %.3f %.3f %.3f %.3f (mean %.1e; best>0, worst<0) -> %s\n",
+           (double)adv[0], (double)adv[1], (double)adv[2], (double)adv[3], amean,
+           adv_ok ? "OK" : "FAIL");
+    all_ok &= adv_ok;
+
+    // (c) clipping. Four tokens: ratio well inside the band, far above it, and
+    //     far below it — checked against both a positive and a negative advantage.
+    const float lp_old[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // rho = exp(lp_new - lp_old): 1.0, 1.5 (above 1+eps), 0.5 (below 1-eps), 1.0
+    const float lp_new[4] = {0.0f, 0.405465f, -0.693147f, 0.0f};
+    float cpos[4], cneg[4];
+    grpo_token_coeffs(+1.0f, 1, 4, lp_new, lp_old, NULL, &gc, cpos);
+    grpo_token_coeffs(-1.0f, 1, 4, lp_new, lp_old, NULL, &gc, cneg);
+    // Positive advantage: the HIGH ratio is clipped away, the low one is kept.
+    // Negative advantage: the LOW ratio is clipped away, the high one is kept.
+    int clip_ok = (cpos[0] != 0.0f) && (cpos[1] == 0.0f) && (cpos[2] != 0.0f) &&
+                  (cneg[0] != 0.0f) && (cneg[1] != 0.0f) && (cneg[2] == 0.0f);
+    // And an unclipped token is exactly adv * rho / (G * len).
+    float want = 1.0f * 1.0f / (1.0f * 4.0f);
+    clip_ok &= (fabsf(cpos[0] - want) < 1e-6f);
+    printf("    clip eps 0.2: adv>0 drops rho=1.5, adv<0 drops rho=0.5, "
+           "unclipped = adv*rho/(G*len) -> %s\n", clip_ok ? "OK" : "FAIL");
+    all_ok &= clip_ok;
+
+    // pg_backward with a uniform 1/N coefficient must reproduce cross-entropy
+    // exactly — the identity the whole design rests on.
+    {
+      const int N = 4, Vv = 6;
+      int sh[2] = {N, Vv};
+      Tensor lg = tensor_create(sh, 2), pr = tensor_create(sh, 2);
+      Tensor lg2 = tensor_create(sh, 2);
+      for (int i = 0; i < N * Vv; i++) {
+        lg.data[i] = 0.1f * (float)((i * 7) % 11) - 0.5f;
+        lg2.data[i] = lg.data[i];
+      }
+      int tg[4] = {1, 3, -1, 5};                 // one masked row
+      cross_entropy_forward(&lg, tg, &pr);
+      tensor_zero_grad(&lg); tensor_zero_grad(&lg2);
+      cross_entropy_backward(&pr, tg, &lg);
+      float co[4];
+      for (int i = 0; i < N; i++) co[i] = 1.0f / 3.0f;   // 3 unmasked rows
+      pg_backward(&pr, tg, co, &lg2);
+      float pmax = 0.0f;
+      for (int i = 0; i < N * Vv; i++) {
+        float d = fabsf(lg.grad[i] - lg2.grad[i]);
+        if (d > pmax) pmax = d;
+      }
+      int pg_ok = (pmax < 1e-7f);
+      printf("    pg_backward(coeff=1/N) == cross_entropy_backward: max |diff| %.2e -> %s\n\n",
+             pmax, pg_ok ? "OK" : "FAIL");
+      all_ok &= pg_ok;
+      tensor_free(&lg); tensor_free(&lg2); tensor_free(&pr);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 29: the policy-gradient path end to end, in two gates.
+  //   (a) NUMERICAL GRADIENT CHECK of pg_backward composed with the model
+  //       backward. With coefficients held fixed, the surrogate is the scalar
+  //       J = sum_t coeff[t] * (-log p(target_t)), so it can be finite-
+  //       differenced like every other gradient in this file.
+  //   (b) a real (tiny) GRPO loop: sample groups from the policy, score them
+  //       with a synthetic verifiable reward, and check the mean reward RISES.
+  // --------------------------------------------------------------------------
+  {
+    printf("[29] Policy gradient: gradient check + a closed GRPO loop\n");
+    const int vocab = 16, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    srand(23);
+    LlamaModel pm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64,
+                                             10000.0f, 1e-5f);
+    llama_model_randomize(&pm);
+    LlamaActs pa = llama_acts_create(&pm, seq);
+    int ps[2] = {seq, vocab};
+    Tensor plog = tensor_create(ps, 2), pprob = tensor_create(ps, 2);
+
+    int pids[6] = {2, 5, 1, 7, 3, 4};
+    int ptgt[6] = {-1, -1, 1, 7, 3, -1};      // a masked prompt span, then a "response"
+    float pcoef[6] = {0.0f, 0.0f, 0.31f, -0.17f, 0.44f, 0.0f};
+
+    Tensor **pp = (Tensor**)malloc((size_t)llama_param_count(&pm) * sizeof(Tensor*));
+    int n_pp = llama_collect_params(&pm, pp);
+
+    llama_forward_train(&pm, pids, seq, &pa, &plog);
+    softmax_rowwise(&plog, &pprob);
+    tensor_zero_grad(&plog);
+    pg_backward(&pprob, ptgt, pcoef, &plog);
+    llama_backward(&pm, pids, seq, &pa, &plog);
+
+    const float peps = 1e-2f;
+    float pg_max = 0.0f, pg_cond = 0.0f;
+    for (int p = 0; p < n_pp; p++) {
+      Tensor *param = pp[p];
+      size_t step = param->size > 2 ? param->size / 2 : 1;
+      for (size_t k = 0; k < param->size; k += step) {
+        float base = param->data[k];
+        param->data[k] = base + peps;
+        llama_forward_train(&pm, pids, seq, &pa, &plog);
+        softmax_rowwise(&plog, &pprob);
+        float jp = 0.0f;
+        for (int i = 0; i < seq; i++)
+          if (ptgt[i] >= 0) jp += pcoef[i] * -logprob_of(&pprob, i, ptgt[i]);
+        param->data[k] = base - peps;
+        llama_forward_train(&pm, pids, seq, &pa, &plog);
+        softmax_rowwise(&plog, &pprob);
+        float jm = 0.0f;
+        for (int i = 0; i < seq; i++)
+          if (ptgt[i] >= 0) jm += pcoef[i] * -logprob_of(&pprob, i, ptgt[i]);
+        param->data[k] = base;
+        float numeric = (jp - jm) / (2.0f * peps);
+        float analytic = param->grad[k];
+        float rel = fabsf(analytic - numeric) / (fabsf(analytic) + fabsf(numeric) + 1e-8f);
+        if (rel > pg_max) pg_max = rel;
+        if (fabsf(analytic) > 1e-2f && rel > pg_cond) pg_cond = rel;
+      }
+    }
+    int pgrad_ok = (pg_cond < 1e-2f);
+    printf("    gradient check (%d param tensors): max rel error %.2e (all) | %.2e (|grad|>1e-2) -> %s\n",
+           n_pp, pg_max, pg_cond, pgrad_ok ? "OK" : "FAIL");
+    all_ok &= pgrad_ok;
+    free(pp);
+    tensor_free(&plog); tensor_free(&pprob);
+    llama_acts_free(&pa); llama_model_free(&pm);
+
+    // ---- (b) A closed GRPO loop on a toy verifiable reward ----
+    // Task: from a fixed prompt, emit the token GOAL. The reward is the fraction
+    // of sampled tokens that are GOAL — objective, computable, and nothing the
+    // model can talk its way into. If the loop is wired correctly the mean group
+    // reward must climb.
+    {
+      const int V2 = 12, GOAL = 7, RLEN = 4, GG = 6, STEPS = 40;
+      const int pn = 2;
+      srand(29);
+      LlamaModel gm = llama_model_create_train(V2, 16, 2, 4, 2, 4, 32, 32, 10000.0f, 1e-5f);
+      llama_model_randomize(&gm);
+      LlamaActs ga = llama_acts_create(&gm, pn + RLEN);
+      int gs[2] = {pn + RLEN, V2};
+      Tensor glog = tensor_create(gs, 2), gprob = tensor_create(gs, 2);
+      int d1[2] = {1, V2};
+      Tensor dlog = tensor_create(d1, 2), dprob = tensor_create(d1, 2);
+
+      Tensor **gp = (Tensor**)malloc((size_t)llama_param_count(&gm) * sizeof(Tensor*));
+      int n_gp = llama_collect_params(&gm, gp);
+      Adam gopt = adamw_create(gp, n_gp, 0.02f, 0.0f);
+
+      GrpoConfig cfg = grpo_default_config();
+      cfg.group = GG;
+      cfg.clip_eps = 0.2f;
+      cfg.kl_beta = 0.0f;
+      cfg.temperature = 1.0f;
+      cfg.top_k = 0;
+      cfg.top_p = 1.0f;
+
+      LlamaKV gkv = llama_kv_create(&gm);
+      Rng grng = rng_create(7);
+      int prompt_ids[2] = {1, 2};
+      int rid[6][4];
+      float rlp[6][4];
+      float rrew[6], radv[6], rcoef[4];
+      int rlens[6];
+      float first_mean = 0.0f, last_mean = 0.0f;
+
+      for (int s = 0; s < STEPS; s++) {
+        // Sample the group with the KV-cache decode (the real rollout path).
+        double gsum = 0.0;
+        for (int i = 0; i < GG; i++) {
+          gkv.len = 0;
+          for (int j = 0; j < pn; j++) llama_decode_step(&gm, &gkv, prompt_ids[j], &dlog);
+          int hits = 0;
+          for (int t = 0; t < RLEN; t++) {
+            softmax_rowwise(&dlog, &dprob);
+            int tk = sample_token(&dlog, 0, cfg.temperature, cfg.top_k, cfg.top_p, &grng);
+            rlp[i][t] = logprob_of(&dprob, 0, tk);
+            rid[i][t] = tk;
+            if (tk == GOAL) hits++;
+            llama_decode_step(&gm, &gkv, tk, &dlog);
+          }
+          rlens[i] = RLEN;
+          rrew[i] = (float)hits / (float)RLEN;
+          gsum += rrew[i];
+        }
+        const float mean_r = (float)(gsum / GG);
+        if (s == 0) first_mean = mean_r;
+        if (s == STEPS - 1) last_mean = mean_r;
+
+        if (!grpo_advantages(rrew, GG, radv)) continue;   // no spread, no update
+
+        llama_zero_grad(&gm);
+        int seq2[6], tgt2[6];
+        float coef2[6];
+        for (int i = 0; i < GG; i++) {
+          const int L = pn + RLEN;
+          seq2[0] = prompt_ids[0]; seq2[1] = prompt_ids[1];
+          for (int t = 0; t < RLEN; t++) seq2[pn + t] = rid[i][t];
+          for (int j = 0; j < L; j++) { tgt2[j] = -1; coef2[j] = 0.0f; }
+          for (int j = pn - 1; j <= L - 2; j++) tgt2[j] = seq2[j + 1];
+
+          llama_forward_train(&gm, seq2, L, &ga, &glog);
+          softmax_rowwise(&glog, &gprob);
+          float lp_new[4];
+          for (int t = 0; t < RLEN; t++)
+            lp_new[t] = logprob_of(&gprob, pn - 1 + t, rid[i][t]);
+          grpo_token_coeffs(radv[i], GG, rlens[i], lp_new, rlp[i], NULL, &cfg, rcoef);
+          for (int t = 0; t < RLEN; t++) coef2[pn - 1 + t] = rcoef[t];
+
+          tensor_zero_grad(&glog);
+          pg_backward(&gprob, tgt2, coef2, &glog);
+          llama_backward_accum(&gm, seq2, L, &ga, &glog, NULL, NULL);
+        }
+        clip_grad_norm(gp, n_gp, 1.0f);
+        adam_step(&gopt, gp, n_gp);
+      }
+
+      // Chance is 1/V2 ~ 0.083. The loop must get meaningfully above that.
+      int rl_ok = (last_mean > first_mean) && (last_mean > 0.5f);
+      printf("    closed loop (%d steps, G=%d, reward = fraction of tokens == %d):\n"
+             "      mean reward %.3f -> %.3f (chance %.3f) -> %s\n\n",
+             STEPS, GG, GOAL, (double)first_mean, (double)last_mean,
+             1.0 / (double)V2, rl_ok ? "OK" : "FAIL");
+      all_ok &= rl_ok;
+
+      adam_free(&gopt); free(gp);
+      llama_kv_free(&gkv);
+      tensor_free(&glog); tensor_free(&gprob);
+      tensor_free(&dlog); tensor_free(&dprob);
+      llama_acts_free(&ga); llama_model_free(&gm);
+    }
   }
 
   // --------------------------------------------------------------------------
