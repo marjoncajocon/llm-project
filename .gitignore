@@ -65,6 +65,8 @@ memtest_*.log
 memtest_*.err
 live_*.log
 live_*.err
+grpo_*.log
+grpo_*.err
 
 # Python bytecode cache (tools/ probes)
 __pycache__/

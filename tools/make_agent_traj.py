@@ -324,4 +324,5 @@ def main():
           % ", ".join("%d:%d" % (k, v) for k, v in sorted(steps_hist.items())))
 
 
-main()
+if __name__ == "__main__":
+    main()
