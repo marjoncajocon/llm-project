@@ -2987,6 +2987,63 @@ debate); #5 (optional) apply variable-length batching to the GPT `train_sft` pat
 tensor strides by seq_len, so it needs re-striding -- smaller payoff, agent uses the LLaMA path).
 
 
+### 2026-09-05 — GRPO's first real run, and the task file it exposed (`efae068`)
+
+- [x] **Ran GRPO as-is** on `data/grpo_tasks.txt` (`reason_e2.bin`, G=8, temp 1.0, `TF_THREADS=3`).
+      Plumbing is sound end to end: rollouts, reward, adapter merge, save, exit 0. But
+      **5 of 5 groups came back flat at a mean reward of exactly 1.0000.** Every advantage zero,
+      every group skipped before any forward pass. The earlier "~0.94" estimate was optimistic —
+      the model is at the ceiling. A 200-step run: ~83 min to learn nothing.
+- [x] **A/B'd the cause** instead of guessing. Same 5 tasks, same default seed, temperature the
+      only variable:
+
+      temp 1.0    5/5 flat    mean reward 1.0000    ~25 s/step
+      temp 1.5    2/5 flat    mean reward 0.9475    ~30 s/step
+
+      So the reward CAN discriminate — the tasks gave it nothing to discriminate. Not an
+      exploration problem either: temp 1.0 was never the binding constraint.
+      Caveat noted at the time: spread at temp 1.5 is **one-sided** (downward from a ceiling the
+      model already reaches), so training on it would teach robustness to hot sampling, not
+      capability. That is why the fix was harder tasks, not a hotter run.
+- [x] **`tools/hard_tasks.py`** — the fix. `make_agent_traj.py` is an SFT generator: it emits
+      every step of every chain, each a deterministic function of (template, position). Eleven
+      templates, 1-4 steps, memorized. **Those easy prefix steps are the flat groups.**
+      Two inversions: (1) emit ONLY each task's decision point; (2) make the WRONG action
+      grounded too — distractor filenames all appear in the prompt, so `grounded` pays out either
+      way and only `match` can separate good from bad. The model must decide, not copy.
+      Six families: `distractor` (3 files in play, act on one), `indirect` (goal names the file by
+      property, an `ls` observation supplies candidates), `mismatch` (read-back disagrees with the
+      write), `stop-yes`/`stop-no` (the premature-`<done>` bug of `25d1113`, both directions),
+      `longchain` (5-6 steps, decision past the memorized templates).
+- [x] **Measured, because "hard" is a claim about a checkpoint, not about text.**
+      `reason_e2.bin`, temp 1.0, 10 steps, 3 threads: **8/10 groups carry signal, mean reward
+      0.6712** — at the SAME temperature that gave a flat 1.0000 on the old file. Observed
+      failures are the designed-for ones: `action-mismatch(0.4)` on distractors, premature
+      `<done>` on stop-no. **Real bug surfaced:** the model parsed `list the files` as a filename
+      and emitted `read_file path="list"`.
+- [x] Reused `tools/grpo_tasks.py` as the grounding gate rather than trusting the new generator —
+      600/600 references passed. Generated task files stay gitignored under `data/`; the generator
+      is the artifact.
+- [x] `make_agent_traj.py`: added the `__main__` guard (it called `main()` at import time, so its
+      helpers could not be imported without running it). `.gitignore`: `grpo_*.log`/`.err`.
+
+Recipe:
+
+    python tools/hard_tasks.py --out data/hard_raw.txt --n 600 --wiki data/wiki \
+      --commands data/so_commands.txt --reason
+    python tools/grpo_tasks.py --out data/grpo_hard.txt data/hard_raw.txt
+    $env:TF_THREADS = "3"
+    .\transformer.exe grpo data/grpo_hard.txt --model model/smollm/reason_e2.bin \
+      --hf-tok model/smollm/tok.hf --out model/smollm/grpo_hard.bin --steps 100 --verbose
+
+**NOTHING PROMOTED.** No checkpoint from any of this was kept — `reason_e2.bin` is still the live
+model. Cost for the real run: **~84 s/step** (longer prompts, more sampled tokens), so 100 steps is
+~2.3 h at `TF_THREADS=3`. Gate any promotion on `tools/remeasure.py` + `tools/probe3.py` as usual.
+
+Still open and unvalidated: the **Colab GPU test** (`36785a8` + the committed binary `4eefb92`) —
+never run on a real GPU. `tools/colab_gpu_test.ipynb` is ready; the deliverable is selftest part
+**[30]** green.
+
 #-------------------------------#
 #for checking#
 Raw Coding (HumanEval+)

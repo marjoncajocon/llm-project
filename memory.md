@@ -8,6 +8,36 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > **Sync rule (user request):** this file mirrors Claude's memory — whenever the assistant
 > updates its memory, it must also update `memory.md` here.
 
+> **▶▶ LOCAL RUN LIMIT (user request, 2026-09-05):** set `$env:TF_THREADS = "3"` before ANY
+> local `transformer.exe` run — training, GRPO, benchmarks, selftest. The matmul pool in
+> `matrix.c` otherwise sizes itself from the CPU count and hangs the user's machine. This is a
+> *local* constraint only; a Colab/GPU box has none. It also makes timings incomparable to
+> older all-core numbers, so always state the thread count when reporting a benchmark.
+
+> **▶▶ GRPO RAN AT LAST — and the task file was the problem — ✅ (2026-09-05, `efae068`):**
+> GRPO (`1b17c2e`) was built and verified in September but never run at scale. Run as-is on
+> `data/grpo_tasks.txt` it produced **5 of 5 flat groups at a mean reward of exactly 1.0000** —
+> every advantage zero, every group skipped, no gradient. A 200-step run would have cost ~83 min
+> to learn nothing. A controlled A/B (same 5 tasks, same seed, temperature the only variable)
+> pinned the cause: **temp 1.0 → 5/5 flat, reward 1.0000; temp 1.5 → 2/5 flat, reward 0.9475.**
+> The reward discriminates fine; the tasks gave it nothing to discriminate.
+> **Why the SFT corpus cannot serve as RL data:** `make_agent_traj.py` emits EVERY step of every
+> chain, and each step is a deterministic function of (template, position) — 11 templates, 1-4
+> steps. The model memorized them; those easy prefix steps ARE the flat groups.
+> **`tools/hard_tasks.py`** inverts two of its choices: emit ONLY each task's decision point, and
+> build every task so the WRONG action is grounded too (distractor paths all appear in the prompt,
+> so `grounded` pays out either way and only `match` separates good from bad). Six families:
+> distractor / indirect / mismatch / stop-yes / stop-no / longchain.
+> **Measured on `reason_e2.bin`, temp 1.0, 10 steps, 3 threads: 8/10 groups carry signal, mean
+> reward 0.6712** — headroom above, spread below, at the SAME temperature that gave a flat 1.0000
+> on the old file. Real bug surfaced: the model read `list the files` as a filename and emitted
+> `read_file path="list"`.
+> Recipe: `python tools/hard_tasks.py --out data/hard_raw.txt --n 600 --wiki data/wiki
+> --commands data/so_commands.txt --reason` then `python tools/grpo_tasks.py --out
+> data/grpo_hard.txt data/hard_raw.txt` (600/600 passed the grounding gate).
+> **Cost: ~84s/step vs ~25s on the old file**, so a 100-step GRPO run is ~2.3 h at `TF_THREADS=3`.
+> **NOTHING PROMOTED** — no checkpoint from any of this was kept; `reason_e2.bin` is still live.
+
 > **▶▶ Pure-C tokenizer — engine parses HF models, NO Python at runtime — ✅ DONE (2026-07-22):**
 > User goal "our own llm can parse it, not python." `baf5f20` **`hftok.c/.h`** = from-scratch
 > byte-level BPE: loads a `.tok` vocab (id→bytes) into a bytes→id hash, hand-codes the GPT-2
