@@ -9,6 +9,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,25 +17,40 @@ import (
 )
 
 func main() {
+	which := flag.String("doc", "guide", "which document to build: guide | colab")
+	flag.Parse()
+
 	version := "engine @ agent-1 (GRPO + OpenCL GPU backend)"
 	date := time.Now().Format("2 January 2006")
 
+	// Both documents are two-pass for the same reason: pass 1 records the page
+	// each heading lands on, pass 2 prints a contents page using those numbers.
+	build := writeAll
+	mk := newDoc
+	name := "guide.pdf"
+	if *which == "colab" {
+		build, mk, name = writeColabAll, newColabDoc, "colab_grpo.pdf"
+	} else if *which != "guide" {
+		fmt.Fprintf(os.Stderr, "unknown -doc %q (want: guide | colab)\n", *which)
+		os.Exit(2)
+	}
+
 	var recorded []entry
-	p1 := newDoc(nil, &recorded)
-	writeAll(p1, version, date)
+	p1 := mk(nil, &recorded)
+	build(p1, version, date)
 	if err := p1.pdf.Error(); err != nil {
 		fmt.Fprintln(os.Stderr, "pass 1 failed:", err)
 		os.Exit(1)
 	}
 
-	p2 := newDoc(recorded, nil)
-	writeAll(p2, version, date)
+	p2 := mk(recorded, nil)
+	build(p2, version, date)
 	if err := p2.pdf.Error(); err != nil {
 		fmt.Fprintln(os.Stderr, "pass 2 failed:", err)
 		os.Exit(1)
 	}
 
-	out := filepath.Join("..", "..", "build", "guide.pdf")
+	out := filepath.Join("..", "..", "build", name)
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
