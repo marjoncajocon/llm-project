@@ -10,6 +10,19 @@
 // A: (M x K), B: (K x N), C: (M x N)
 void matmul(const Tensor *A, const Tensor *B, Tensor *C);
 
+// SIMD dispatch for matmul, matmul_backward, matmul_backward_dx and
+// qacc_columns. On an x86 CPU with AVX2+FMA, register-blocked intrinsic kernels
+// are chosen AT RUNTIME (CPUID), so portable baseline builds get them too; every
+// other target runs the portable C kernels. Decided at the first matmul;
+// $TF_SIMD=0 forces portable C. The SIMD kernels compute each output element as
+// one FMA chain in k order, so they stay bit-exact across row counts (decode vs
+// full forward) and thread counts -- but are NOT bit-identical to the portable
+// kernels (~1e-7 relative; selftest part [31]).
+int matmul_simd_available(void);     // this build AND this CPU can run them
+int matmul_simd_enabled(void);       // currently in use
+void matmul_set_simd(int on);        // force on/off (on is ignored if unavailable)
+const char *matmul_simd_name(void);  // "avx2+fma" or "portable C"
+
 // Matrix Addition: C = A + B (element-wise)
 void matadd(const Tensor *A, const Tensor *B, Tensor *C);
 
@@ -26,7 +39,8 @@ void bias_add(const Tensor *x, const Tensor *bias, Tensor *out);
 
 // Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC (reads C->grad).
 //
-// NUMERICS: dB accumulates in the same order as the naive scalar loop and is
+// NUMERICS (portable kernels; the AVX2 ones are described above):
+// dB accumulates in the same order as the naive scalar loop and is
 // bit-exact. dA is a dot-product reduction computed with several independent
 // accumulators so it can vectorize, which REASSOCIATES the sum — it is not
 // bit-identical to a naive left-to-right scalar sum (it is typically slightly

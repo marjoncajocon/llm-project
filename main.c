@@ -1161,6 +1161,134 @@ static int run_gpu_bench(int argc, char **argv) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// simd-bench: the portable C kernels vs the AVX2+FMA ones (matrix.c), same
+// binary, same shapes (SmolLM2-135M: d_model 576, d_ff 1536, vocab 49152).
+// Reported per shape as the MEDIAN of `reps` timed runs, with the two kernels
+// INTERLEAVED run by run, so a background load drifting during the benchmark
+// hits both sides alike instead of whichever happened to run second. Thread
+// count is whatever $TF_THREADS says -- run it with TF_THREADS=1 to compare
+// the kernels rather than the thread pool.
+// ---------------------------------------------------------------------------
+enum { SB_FWD, SB_BWD, SB_DX, SB_Q8 };
+
+static double sb_median(double *v, int n) {
+  for (int i = 1; i < n; i++)                          // insertion sort, n is tiny
+    for (int j = i; j > 0 && v[j] < v[j - 1]; j--) { double x = v[j]; v[j] = v[j - 1]; v[j - 1] = x; }
+  return (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+static void sb_one(int op, int M, int K, int N, int reps) {
+  int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
+  Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
+  for (size_t i = 0; i < A.size; i++) A.data[i] = (float)((i * 37) % 19) * 0.01f - 0.09f;
+  for (size_t i = 0; i < B.size; i++) B.data[i] = (float)((i * 53) % 23) * 0.01f - 0.11f;
+  for (size_t i = 0; i < C.size; i++) C.grad[i] = (float)((i * 29) % 17) * 0.01f - 0.08f;
+  signed char *qa = NULL, *qw = NULL;
+  int32_t *qacc = NULL;
+  if (op == SB_Q8) {
+    qa = (signed char*)malloc((size_t)K);
+    qw = (signed char*)malloc((size_t)K * N);
+    qacc = (int32_t*)malloc((size_t)N * sizeof(int32_t));
+    for (int k = 0; k < K; k++) qa[k] = (signed char)((k * 37) % 255 - 127);
+    for (size_t i = 0; i < (size_t)K * N; i++) qw[i] = (signed char)((i * 53) % 255 - 127);
+  }
+  // The output the two kernels are compared on.
+  const size_t n_out = (op == SB_FWD) ? C.size : (op == SB_Q8) ? (size_t)N : A.size + B.size;
+  float *out[2] = { (float*)malloc(n_out * sizeof(float)), (float*)malloc(n_out * sizeof(float)) };
+  double *ts[2] = { (double*)malloc((size_t)reps * sizeof(double)),
+                    (double*)malloc((size_t)reps * sizeof(double)) };
+
+  // Tiny products (decode shapes take ~50 us) are repeated inside one timed
+  // sample so the clock's resolution is not what gets measured. Backward runs
+  // then accumulate `iters` times -- harmless, the error check below uses the
+  // last sample, and for it iters is 1 on every shape benchmarked here.
+  const double work = (op == SB_BWD ? 4.0 : 2.0) * (double)M * (double)K * (double)N;
+  const int iters = (work < 2e8) ? (int)(2e8 / work) : 1;
+  for (int r = -1; r < reps; r++) {                    // r = -1 is an untimed warm-up
+    for (int mode = 0; mode < 2; mode++) {
+      matmul_set_simd(mode);
+      if (op == SB_BWD || op == SB_DX) {               // backward ACCUMULATES: reset
+        memset(A.grad, 0, A.size * sizeof(float));
+        memset(B.grad, 0, B.size * sizeof(float));
+      }
+      const double t0 = wall_now();
+      for (int it = 0; it < iters; it++) {
+        switch (op) {
+          case SB_FWD: matmul(&A, &B, &C); break;
+          case SB_BWD: matmul_backward(&A, &B, &C); break;
+          case SB_DX:  matmul_backward_dx(&A, &B, &C); break;
+          default:     qacc_columns(qa, qw, K, N, qacc); break;
+        }
+      }
+      const double dt = (wall_now() - t0) / iters;
+      if (r >= 0) ts[mode][r] = dt;
+      if (r == reps - 1) {
+        if (op == SB_FWD) memcpy(out[mode], C.data, C.size * sizeof(float));
+        else if (op == SB_Q8) for (int j = 0; j < N; j++) out[mode][j] = (float)qacc[j];
+        else {
+          memcpy(out[mode], A.grad, A.size * sizeof(float));
+          memcpy(out[mode] + A.size, B.grad, B.size * sizeof(float));
+        }
+      }
+    }
+  }
+  // Error as max|diff| / max|ref| over the whole output (the metric of parts
+  // [24]/[25]/[30]/[31]); for dx the B half is untouched zeros on both sides.
+  double md = 0.0, mv = 0.0;
+  for (size_t i = 0; i < n_out; i++) {
+    const double d = fabs((double)out[1][i] - (double)out[0][i]);
+    if (d > md) md = d;
+    if (fabs((double)out[0][i]) > mv) mv = fabs((double)out[0][i]);
+  }
+  const double tp = sb_median(ts[0], reps), tv = sb_median(ts[1], reps);
+  static const char *names[] = { "fwd ", "bwd ", "dx  ", "int8" };
+  printf("  %s %4d x %5d x %5d | portable %8.2f ms %6.1f G/s | avx2 %8.2f ms %6.1f G/s | %5.2fx | err %.1e\n",
+         names[op], M, K, N, tp * 1e3, work / tp / 1e9, tv * 1e3, work / tv / 1e9,
+         tp / tv, md / (mv + 1e-30));
+  fflush(stdout);
+  free(out[0]); free(out[1]); free(ts[0]); free(ts[1]);
+  free(qa); free(qw); free(qacc);
+  tensor_free(&A); tensor_free(&B); tensor_free(&C);
+}
+
+static int run_simd_bench(int argc, char **argv) {
+  int reps = (argc > 2) ? atoi(argv[2]) : 5;
+  if (reps < 1) reps = 1;
+  const char *thr = getenv("TF_THREADS");
+  printf("SIMD matmul benchmark: portable C vs AVX2+FMA, median of %d interleaved runs\n", reps);
+  printf("  threads: TF_THREADS=%s\n", thr ? thr : "(unset: all cores)");
+#if defined(__AVX2__) && defined(__FMA__)
+  printf("  portable C in THIS binary was compiled for AVX2+FMA (a native build), so it\n"
+         "  is already auto-vectorized: this measures register blocking, not SIMD width.\n");
+#else
+  printf("  portable C in THIS binary was compiled for the baseline ISA (no -mavx2), as\n"
+         "  in every cross/portable build: the AVX2 path comes from runtime dispatch.\n");
+#endif
+  if (!matmul_simd_available()) {
+    printf("  this CPU/build has no AVX2+FMA path -- nothing to compare.\n");
+    return 0;
+  }
+  printf("  G/s = GFLOP/s (int8: GOP/s, 1 MAC = 2 ops); err = max|diff| / max|ref|.\n");
+  const int T = 128;                                   // one training sequence
+  sb_one(SB_FWD, T, 576, 1536, reps);                  // SwiGLU gate / up
+  sb_one(SB_FWD, T, 1536, 576, reps);                  // SwiGLU down
+  sb_one(SB_FWD, T, 576, 576, reps);                   // attention projections
+  sb_one(SB_FWD, T, 576, 49152, reps);                 // lm_head
+  sb_one(SB_FWD, 1, 576, 1536, reps);                  // single-token decode (M=1)
+  sb_one(SB_FWD, 1, 1536, 576, reps);
+  sb_one(SB_FWD, 1, 576, 49152, reps);
+  sb_one(SB_BWD, T, 576, 1536, reps);                  // full backward: dA + dB
+  sb_one(SB_BWD, T, 1536, 576, reps);
+  sb_one(SB_BWD, T, 576, 576, reps);
+  sb_one(SB_DX, T, 576, 49152, reps);                  // lm_head is frozen under LoRA
+  sb_one(SB_Q8, 1, 576, 1536, reps);                   // int8 decode (qmatmul's core)
+  sb_one(SB_Q8, 1, 1536, 576, reps);
+  sb_one(SB_Q8, 1, 576, 49152, reps);
+  matmul_set_simd(1);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   // Global --gpu / --no-gpu, honoured by every subcommand. They are stripped from
   // argv before dispatch so the per-subcommand parsers never see them (they
@@ -1177,6 +1305,7 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "gpu-info") == 0) return run_gpu_info(argc, argv);
   if (argc > 1 && strcmp(argv[1], "gpu-bench") == 0) return run_gpu_bench(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "simd-bench") == 0) return run_simd_bench(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfgen") == 0) return run_hfgen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfchat") == 0) return run_hfchat(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
@@ -1203,6 +1332,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "unknown command '%s'\n", argv[1]);
     fprintf(stderr, "usage: transformer [train|llama-train|grpo|generate|agent|imggen|audgen|llama] ...\n");
     fprintf(stderr, "       transformer [gpu-info|gpu-bench]   (GPU backend status / CPU-vs-GPU timing)\n");
+    fprintf(stderr, "       transformer simd-bench [reps]      (portable C vs AVX2+FMA kernel timing)\n");
     fprintf(stderr, "       transformer            (no args: run the built-in self-test)\n");
     return 1;
   }

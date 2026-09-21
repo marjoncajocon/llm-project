@@ -91,7 +91,7 @@ defined in the matching `.c`.
 | `reward.h` / `reward.c`           | Verifiable reward for a sampled agent response: format + grounding + action match |
 | `grpo.h` / `grpo.c`               | **GRPO**: RL from verifiable rewards — group-relative advantage, clipped policy gradient |
 | `selftest.h` / `selftest.c`       | Built-in smoke test (`run_selftest`): the default `transformer` run           |
-| `main.c`                          | Entry point + subcommands (`train`, `llama-train`, `grpo`, `generate`, `agent`, `imggen`, `audgen`, `llama`, `gpu-info`, `gpu-bench`) |
+| `main.c`                          | Entry point + subcommands (`train`, `llama-train`, `grpo`, `generate`, `agent`, `imggen`, `audgen`, `llama`, `gpu-info`, `gpu-bench`, `simd-bench`) |
 | `data/`                           | Your training data (git-ignored; keeps a sample)             |
 | `model/`                          | One folder per model (`model/<name>/`); weights git-ignored, READMEs kept |
 | `tools/`                          | Non-C helpers: crawlers (`crawl_wikipedia.py`, `crawl_stackoverflow.py`), SFT data (`make_sft.py`, `make_qa.py`, `mix_sft.py`, `sft_memtest.py`), `agent_local.py`, `upgrade_llma.py`, GPT-2/LLaMA converters |
@@ -165,6 +165,9 @@ multiply one row by it loses badly.
 > Numerically the two paths agree: the forward matmul and `dB` are **bit-identical**, and `dA`
 > differs by 2.0e-07 only because `matrix.h` documents that the CPU reassociates that
 > reduction to vectorize. Smoke-test part `[30]` gates this on ragged shapes.
+> (That was measured against the portable CPU kernels. With the AVX2 kernels active the CPU side
+> is a different FMA/association order, so expect ~1e-7 rather than bit-identity; `[30]` is a
+> 1e-4 tolerance and was not re-run on a GPU for this change.)
 >
 > Known headroom (~2×): every operand is uploaded on every call. Caching weight *contents*
 > cannot be done safely without an explicit immutability hint from the model code, because
@@ -221,6 +224,56 @@ gradient, skipping `dW` for weights that will never be updated. LoRA fine-tuning
 throughout (and skips the embedding scatter): measured **61.2 → 42.4 ms/step, 1.44×**, on a
 d_model-256 / 4-layer model. Not a full halving — the forward pass and the adapters' own work
 don't shrink.
+
+### SIMD kernels (AVX2 + FMA, runtime dispatch)
+
+On x86 CPUs with AVX2+FMA, `matmul`, `matmul_backward`, `matmul_backward_dx` and the int8
+`qacc_columns` (the core of `qmatmul`) switch to hand-written intrinsic kernels in `matrix.c`.
+They are selected **at runtime** (CPUID + XGETBV, once, at the first matmul) and compiled with
+`__attribute__((target("avx2,fma")))`, so no build flag changes: the default build, the
+baseline-x86-64 cross builds and the Colab binary all get them, a CPU without AVX2 falls back to
+the portable C, and aarch64 / wasm32 compile none of it. `TF_SIMD=0` forces the portable path.
+`./transformer simd-bench [reps]` times one against the other in the same binary.
+
+What makes them faster is **register blocking**, not vector width — a native `zig cc` build
+already auto-vectorizes the portable loops with AVX2. A 4×16 tile of the output stays in
+registers for the whole reduction, `B` is packed into 128 KB panels (for `lm_head` an unpacked
+strip is a TLB miss per row), and `dA = dC @ Bᵀ` gathers `Bᵀ` while packing instead of
+transposing. Single-row forwards (decode, M=1) use a streaming AXPY instead: they are
+bandwidth-bound and gain little. The int8 kernel does 16 MACs per `vpmaddwd`.
+
+Measured with **`TF_THREADS=1`** (kernels, not the thread pool), i5-14400, median of 3 runs ×
+5 interleaved reps, a 3-thread training job sharing the CPU throughout. GFLOP/s in brackets:
+
+| shape (M×K×N), SmolLM2-135M | portable C, native build | AVX2 kernels | speedup | portable C, baseline x86-64 build | speedup there |
+| --- | --- | --- | --- | --- | --- |
+| fwd 128×576×1536 (gate/up) | 9.00 ms (25) | 2.04 ms (111) | **4.0×** | 10.45 ms (22) | 5.2× |
+| fwd 128×1536×576 (down) | 9.13 ms (25) | 2.12 ms (107) | **4.4×** | 10.84 ms (21) | 5.2× |
+| fwd 128×576×576 (q/o proj) | 1.75 ms (49) | 0.87 ms (98) | **2.1×** | 3.24 ms (26) | 4.0× |
+| fwd 128×576×49152 (lm_head) | 981 ms (7) | 111 ms (65) | **8.3×** | 1169 ms (6) | 9.9× |
+| fwd 1×576×1536 (decode) | 0.07 ms (25) | 0.07 ms (25) | 1.0× | 0.08 ms (22) | 1.2× |
+| fwd 1×576×49152 (decode lm_head) | 8.72 ms (6.5) | 7.98 ms (7.1) | 1.1× | 9.29 ms (6.1) | 1.3× |
+| bwd 128×576×1536 (dA + dB) | 17.1 ms (27) | 4.81 ms (94) | **3.5×** | 18.2 ms (25) | 3.9× |
+| bwd 128×1536×576 | 17.6 ms (26) | 5.44 ms (83) | **3.2×** | 18.7 ms (24) | 3.9× |
+| bwd 128×576×576 | 5.69 ms (30) | 1.69 ms (101) | **3.4×** | 5.87 ms (29) | 3.7× |
+| dx 128×576×49152 (frozen lm_head) | 994 ms (7) | 96 ms (75) | **10.1×** | 1132 ms (6) | 11.1× |
+| int8 decode 1×576×1536 | 0.05 ms (35) | 0.02 ms (83) | **2.4×** | 0.19 ms (9) | 7.6× |
+| int8 decode 1×576×49152 | 3.15 ms (18) | 1.58 ms (36) | **1.9×** | 5.98 ms (9.5) | 4.0× |
+
+The "native build" columns are the honest ones for this machine's default build; the "baseline"
+columns are what a portable binary (`make cross`, `cross-gpu`) gains from the dispatch alone.
+These are single-kernel numbers — end-to-end training/decode time was **not** measured here, and
+decode (M=1) is essentially unchanged.
+
+**Numerics.** Each output element is one FMA chain in reduction order, whichever tile, panel,
+row block or thread computes it — so the SIMD path is **bit-exact across row counts and thread
+counts**, and the KV-cache / LoRA-decode gates (`[4]`, `[19]`, `[22]`, `[26]`) stay `0.00e+00`
+(also on the baseline-x86-64 build, where the rest of the code is compiled without FMA). It is
+*not* bit-identical to the portable kernels: ~1e-7 relative on the forward (0 in a native build,
+where the portable loop is FMA-contracted too) and up to ~1e-6 on `dA`/`dB`, which associate
+differently. Against a double-precision reference the SIMD `dA` is the *more* accurate of the
+two (N=49152: 4.4e-06 vs 1.6e-05 relative). Selftest part `[31]` gates all of this on awkward
+shapes; the int8 kernel is integer arithmetic and must match exactly.
 
 ### Cross-compiling
 

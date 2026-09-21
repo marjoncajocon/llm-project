@@ -2233,6 +2233,179 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 31: the AVX2+FMA matmul kernels (matrix.c, roadmap B4) vs the portable
+  // C ones. Self-skipping on a CPU/build without AVX2+FMA. Every part above ran
+  // on whichever path the dispatch picked; this one runs BOTH on the same inputs.
+  //
+  // Shapes are awkward on purpose: 1 row, 1 column, K=1, sizes that are not
+  // multiples of 8 or 16 (the masked tail strip), 1-3 leftover rows next to
+  // 4-row blocks, N > 128 (more than one packed panel) and K, N or M > 256 (more
+  // than one p block: the forward's resumed chain, dA's and dB's added blocks).
+  // Four gates:
+  //  (a) SIMD vs portable within tol, as max|diff| / max|ref| over the tensor --
+  //      they legitimately differ in the last bits (FMA vs mul+add depending on
+  //      how the portable code was compiled, and a different dA/dB association),
+  //      so this is a tolerance, not equality. Both are also measured against a
+  //      double-precision reference, so "SIMD differs" can't hide "SIMD is worse".
+  //  (b) backward/dx ACCUMULATE into pre-seeded grads (the seed is in the
+  //      reference, so an overwriting kernel fails (a) outright);
+  //  (c) SIMD row i of an M-row matmul == the same row computed as a 1-row
+  //      matmul, BIT-EXACT: M=1 decode and the M=T forward take different code
+  //      paths (AXPY vs packed tiles), and parts [4]/[19]/[26] need them equal;
+  //  (d) the int8 column accumulate (qmatmul's core) is integer arithmetic, so
+  //      SIMD and portable must agree EXACTLY.
+  // --------------------------------------------------------------------------
+  {
+    printf("[31] SIMD matmul kernels (AVX2+FMA) vs portable C\n");
+    if (!matmul_simd_available()) {
+      printf("    skipped (%s: no AVX2+FMA path on this CPU/build)\n\n", matmul_simd_name());
+    } else {
+      const int was_on = matmul_simd_enabled();
+      const int gpu_was = gpu_is_enabled();
+      gpu_set_enabled(0);                         // compare CPU kernels, nothing else
+      const int SH[][3] = {                       // M, K, N
+        {1, 1, 1}, {1, 7, 9}, {2, 3, 1}, {3, 17, 5}, {4, 16, 16}, {5, 13, 31},
+        {9, 33, 47}, {7, 1, 300}, {130, 5, 3}, {1, 300, 70}, {6, 260, 129},
+        {5, 20, 300}, {300, 6, 17}, {21, 67, 145},
+      };
+      const int nsh = (int)(sizeof(SH) / sizeof(SH[0]));
+      double w_fwd = 0, w_da = 0, w_db = 0, w_dx = 0;        // SIMD vs portable
+      double ref_simd = 0, ref_port = 0;                     // each vs double ref
+      int rows_exact = 1;
+      unsigned lcg = 12345u;
+      #define RNDF() ((float)((lcg = lcg * 1103515245u + 12345u) >> 9 & 0xFFFF) / 32768.0f - 1.0f)
+      // max|x - ref| / max|ref|, ref in double
+      #define RELD(n, x, r, out) do {                                    \
+        double _md = 0, _mv = 0;                                         \
+        for (size_t _i = 0; _i < (size_t)(n); _i++) {                    \
+          double _d = fabs((double)(x)[_i] - (double)(r)[_i]);           \
+          if (_d > _md) _md = _d;                                        \
+          if (fabs((double)(r)[_i]) > _mv) _mv = fabs((double)(r)[_i]);  \
+        }                                                                \
+        (out) = _md / (_mv + 1e-30);                                     \
+      } while (0)
+      for (int s = 0; s < nsh; s++) {
+        const int M = SH[s][0], K = SH[s][1], N = SH[s][2];
+        int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
+        Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
+        for (size_t i = 0; i < A.size; i++) A.data[i] = RNDF();
+        for (size_t i = 0; i < B.size; i++) B.data[i] = RNDF();
+        for (size_t i = 0; i < C.size; i++) C.grad[i] = RNDF();
+        float *gA0 = (float*)malloc(A.size * sizeof(float));
+        float *gB0 = (float*)malloc(B.size * sizeof(float));
+        for (size_t i = 0; i < A.size; i++) gA0[i] = RNDF();
+        for (size_t i = 0; i < B.size; i++) gB0[i] = RNDF();
+
+        // double-precision references (grads include their seeds)
+        double *rC = (double*)malloc(C.size * sizeof(double));
+        double *rA = (double*)malloc(A.size * sizeof(double));
+        double *rB = (double*)malloc(B.size * sizeof(double));
+        for (int i = 0; i < M; i++)
+          for (int j = 0; j < N; j++) {
+            double acc = 0;
+            for (int k = 0; k < K; k++) acc += (double)A.data[i * K + k] * B.data[k * N + j];
+            rC[i * N + j] = acc;
+          }
+        for (int i = 0; i < M; i++)
+          for (int k = 0; k < K; k++) {
+            double acc = gA0[i * K + k];
+            for (int j = 0; j < N; j++) acc += (double)C.grad[i * N + j] * B.data[k * N + j];
+            rA[i * K + k] = acc;
+          }
+        for (int k = 0; k < K; k++)
+          for (int j = 0; j < N; j++) {
+            double acc = gB0[k * N + j];
+            for (int i = 0; i < M; i++) acc += (double)A.data[i * K + k] * C.grad[i * N + j];
+            rB[k * N + j] = acc;
+          }
+
+        float *out[2][4];                         // [portable|simd][C, dA, dB, dx]
+        for (int mode = 0; mode < 2; mode++) {
+          matmul_set_simd(mode);
+          out[mode][0] = (float*)malloc(C.size * sizeof(float));
+          out[mode][1] = (float*)malloc(A.size * sizeof(float));
+          out[mode][2] = (float*)malloc(B.size * sizeof(float));
+          out[mode][3] = (float*)malloc(A.size * sizeof(float));
+          matmul(&A, &B, &C);
+          memcpy(out[mode][0], C.data, C.size * sizeof(float));
+          memcpy(A.grad, gA0, A.size * sizeof(float));
+          memcpy(B.grad, gB0, B.size * sizeof(float));
+          matmul_backward(&A, &B, &C);
+          memcpy(out[mode][1], A.grad, A.size * sizeof(float));
+          memcpy(out[mode][2], B.grad, B.size * sizeof(float));
+          memcpy(A.grad, gA0, A.size * sizeof(float));
+          matmul_backward_dx(&A, &B, &C);
+          memcpy(out[mode][3], A.grad, A.size * sizeof(float));
+        }
+        double e;
+        RELD(C.size, out[1][0], out[0][0], e); if (e > w_fwd) w_fwd = e;
+        RELD(A.size, out[1][1], out[0][1], e); if (e > w_da) w_da = e;
+        RELD(B.size, out[1][2], out[0][2], e); if (e > w_db) w_db = e;
+        RELD(A.size, out[1][3], out[0][3], e); if (e > w_dx) w_dx = e;
+        for (int mode = 0; mode < 2; mode++) {
+          double *worst = mode ? &ref_simd : &ref_port;
+          RELD(C.size, out[mode][0], rC, e); if (e > *worst) *worst = e;
+          RELD(A.size, out[mode][1], rA, e); if (e > *worst) *worst = e;
+          RELD(B.size, out[mode][2], rB, e); if (e > *worst) *worst = e;
+          RELD(A.size, out[mode][3], rA, e); if (e > *worst) *worst = e;
+        }
+
+        // (c) row-by-row (M=1) SIMD forward == the full SIMD forward, exactly
+        matmul_set_simd(1);
+        int s1[2] = {1, K}, s2[2] = {1, N};
+        Tensor a1 = tensor_create(s1, 2), c1 = tensor_create(s2, 2);
+        for (int i = 0; i < M; i++) {
+          memcpy(a1.data, &A.data[(size_t)i * K], (size_t)K * sizeof(float));
+          matmul(&a1, &B, &c1);
+          if (memcmp(c1.data, &out[1][0][(size_t)i * N], (size_t)N * sizeof(float)) != 0)
+            rows_exact = 0;
+        }
+        tensor_free(&a1); tensor_free(&c1);
+
+        for (int mode = 0; mode < 2; mode++)
+          for (int q = 0; q < 4; q++) free(out[mode][q]);
+        free(rC); free(rA); free(rB); free(gA0); free(gB0);
+        tensor_free(&A); tensor_free(&B); tensor_free(&C);
+      }
+      #undef RELD
+
+      // (d) int8 column accumulate: exact integer equality on ragged K, N
+      const int QS[][2] = { {1, 1}, {1, 64}, {2, 17}, {33, 77}, {64, 100}, {5, 200}, {129, 1000} };
+      int q_exact = 1;
+      for (int s = 0; s < (int)(sizeof(QS) / sizeof(QS[0])); s++) {
+        const int K = QS[s][0], N = QS[s][1];
+        signed char *qa = (signed char*)malloc((size_t)K);
+        signed char *qw = (signed char*)malloc((size_t)K * N);
+        int32_t *acc0 = (int32_t*)malloc((size_t)N * sizeof(int32_t));
+        int32_t *acc1 = (int32_t*)malloc((size_t)N * sizeof(int32_t));
+        for (int k = 0; k < K; k++) qa[k] = (signed char)((int)(RNDF() * 127.0f));
+        for (size_t i = 0; i < (size_t)K * N; i++) qw[i] = (signed char)((int)(RNDF() * 127.0f));
+        qa[0] = -127; qw[0] = -127;               // the extremes, once
+        matmul_set_simd(0); qacc_columns(qa, qw, K, N, acc0);
+        matmul_set_simd(1); qacc_columns(qa, qw, K, N, acc1);
+        if (memcmp(acc0, acc1, (size_t)N * sizeof(int32_t)) != 0) q_exact = 0;
+        free(qa); free(qw); free(acc0); free(acc1);
+      }
+      #undef RNDF
+
+      matmul_set_simd(was_on);
+      gpu_set_enabled(gpu_was);
+      const double tol = 1e-5;
+      const int s_ok = (w_fwd < tol) && (w_da < tol) && (w_db < tol) && (w_dx < tol) &&
+                       (ref_simd < tol);
+      printf("    %d awkward shapes | SIMD vs portable: fwd %.1e | dA %.1e | dB %.1e | dx %.1e"
+             " (tol %.0e) -> %s\n", nsh, w_fwd, w_da, w_db, w_dx, tol, s_ok ? "OK" : "FAIL");
+      printf("    vs a double reference (incl. pre-seeded grads): SIMD %.1e | portable %.1e\n",
+             ref_simd, ref_port);
+      printf("    1-row matmuls == rows of the M-row matmul (bit-exact) -> %s\n",
+             rows_exact ? "OK" : "FAIL");
+      printf("    int8 column accumulate: SIMD == portable (exact) -> %s\n\n",
+             q_exact ? "OK" : "FAIL");
+      all_ok &= s_ok && rows_exact && q_exact;
+    }
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;
