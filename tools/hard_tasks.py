@@ -59,6 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from make_agent_traj import (  # noqa: E402
     EXTS, SEP, commands_from, contents_from, rationale_for, run_obs,
     slugs_from_wiki, tool_read, tool_run, tool_write,
+    Pools, _cl, add_v2_args, build_task_v2, load_pools, normalize_v2_args,
 )
 
 DONE = ["Task complete.", "All steps done.", "Finished the task."]
@@ -217,6 +218,180 @@ FAMILIES = {
 FAMILY_NAMES = sorted(FAMILIES)
 
 
+# ---------------------------------------------------------------------------
+# v2 (opt-in: --vfs / --goal-grammar / --unscripted-errors / --holdout-lexicon).
+# Same six families, but every prefix is EXECUTED against agent_world's virtual
+# filesystem, so observations follow the state; the decision point is a step
+# index into that execution. Nothing here runs without a flag.
+# ---------------------------------------------------------------------------
+def _v2_run(rng, P, opts, plan, legacy_goal, world, fam, decide):
+    """Execute `plan`, cut the transcript at step decide(ex), -> (prompt, ref, fam)."""
+    from agent_world import Exec, turns_prefix
+    from goal_grammar import render_goal
+    ex = Exec(world, rng, EXTS, rm_verbose=0.0).run(plan)
+    goal = render_goal(plan, rng, opts.holdout_lexicon) if opts.goal_grammar else legacy_goal
+    d = decide(ex)
+    ref = ex.done if d >= len(ex.steps) else ex.steps[d]
+    return turns_prefix(goal, ex.steps[:d]), (ref, d >= len(ex.steps)), fam
+
+
+def v2_distractor(rng, P, opts):
+    from agent_world import World
+    a = P.fname(rng)
+    b = P.fname(rng, avoid=(a,))
+    c = P.fname(rng, avoid=(a, b))
+    w1 = P.word(rng)
+    w2 = P.word(rng, avoid=(w1,))
+    w3 = P.word(rng, avoid=(w1, w2))
+    k = rng.randrange(3)
+    target = [a, b, c][k]
+    plan = [_cl("write", f=a, w=w1), _cl("write", f=b, w=w2), _cl("write", f=c, w=w3),
+            _cl("read_ord", f=target, k=k)]
+    goal = ("create %s with %s, %s with %s, and %s with %s, then read the %s one back"
+            % (a, w1, b, w2, c, w3, ["first", "second", "third"][k]))
+    return _v2_run(rng, P, opts, plan, goal, World(), "distractor", lambda ex: 3)
+
+
+def v2_indirect(rng, P, opts):
+    """Fixes a legacy ambiguity: a distractor could carry a `.log` EXTENSION while
+    the goal asked for "the log file". Here no candidate's full name (stem OR
+    extension) contains the fragment, except the target."""
+    from agent_world import World
+    desc, frag = rng.choice(PROPS)
+    target = "%s_%s%s" % (rng.choice(P.files)[:12], frag, rng.choice(EXTS))
+    others = []
+    for _ in range(500):
+        f = P.fname(rng, avoid=others + [target])
+        if frag not in f:
+            others.append(f)
+        if len(others) == 2:
+            break
+    files = dict((f, P.word(rng)) for f in others + [target])
+    verb = rng.choice(["read", "delete"])
+    plan = [_cl("ls"), _cl("desc", verb="read" if verb == "read" else "rm", p=frag, f=target)]
+    goal = "list the files, then %s %s" % (verb, desc)
+    return _v2_run(rng, P, opts, plan, goal, World(files), "indirect", lambda ex: 1)
+
+
+def v2_mismatch(rng, P, opts):
+    """State-consistent mismatch: the write stored only PART of the content (the
+    byte count says so), the read-back shows the truncated text -> re-write."""
+    from agent_world import World
+    f = P.fname(rng)
+    want = P.word(rng)
+    while len(want) < 2:
+        want = P.word(rng)
+    c = rng.choice(P.cmds)
+    plan = [_cl("write", f=f, w=want, fault="partial"), _cl("verify", f=f), _cl("run", c=c)]
+    goal = ("create %s containing %s, read it back to check, then run %s" % (f, want, c))
+    return _v2_run(rng, P, opts, plan, goal, World(), "mismatch", lambda ex: 2)
+
+
+def v2_stop_yes(rng, P, opts):
+    from agent_world import World
+    f = P.fname(rng)
+    w = P.word(rng)
+    c = rng.choice(P.cmds)
+    plan = [_cl("write", f=f, w=w), _cl("run", c=c)]
+    goal = "create %s containing %s and run %s" % (f, w, c)
+    return _v2_run(rng, P, opts, plan, goal, World(), "stop-yes", lambda ex: len(ex.steps))
+
+
+def v2_stop_no(rng, P, opts):
+    from agent_world import World
+    a = P.fname(rng)
+    b = P.fname(rng, avoid=(a,))
+    w1 = P.word(rng)
+    w2 = P.word(rng, avoid=(w1,))
+    plan = [_cl("write", f=a, w=w1), _cl("write", f=b, w=w2)]
+    goal = "create %s with %s, then create %s with %s" % (a, w1, b, w2)
+    if rng.random() < 0.5:
+        c = rng.choice(P.cmds)
+        plan.insert(1, _cl("run", c=c))
+        goal = "create %s with %s, run %s, then create %s with %s" % (a, w1, c, b, w2)
+    return _v2_run(rng, P, opts, plan, goal, World(), "stop-no",
+                   lambda ex: len(ex.steps) - 1)
+
+
+def v2_longchain(rng, P, opts):
+    from agent_world import World
+    a = P.fname(rng)
+    b = P.fname(rng, avoid=(a,))
+    w1 = P.word(rng)
+    w2 = P.word(rng, avoid=(w1,))
+    c1, c2 = rng.choice(P.cmds), rng.choice(P.cmds)
+    plan = [_cl("write", f=a, w=w1), _cl("run", c=c1), _cl("write", f=b, w=w2),
+            _cl("run", c=c2), _cl("read", f=a), _cl("rm", f=b)]
+    goal = ("create %s with %s, run %s, create %s with %s, run %s, "
+            "then read %s and delete %s" % (a, w1, c1, b, w2, c2, a, b))
+    d = 4 if rng.random() < 0.5 else 5
+    return _v2_run(rng, P, opts, plan, goal, World(), "longchain", lambda ex: d)
+
+
+def v2_recover(rng, P, opts):
+    """An UNANNOUNCED fault somewhere in an ordinary task; the decision is the
+    step right after it (look / fix+retry / retry / report-and-stop)."""
+    from agent_world import turns_prefix
+    for _ in range(50):
+        goal, ex = build_task_v2(rng, P, opts, force_inject=True)
+        if ex.fault_step is not None:
+            break
+    d = ex.fault_step + 1
+    ref = ex.done if d >= len(ex.steps) else ex.steps[d]
+    return (turns_prefix(goal, ex.steps[:d]), (ref, d >= len(ex.steps)),
+            "recover:" + ex.injected[1])
+
+
+FAMILIES_V2 = {
+    "distractor": v2_distractor,
+    "indirect": v2_indirect,
+    "mismatch": v2_mismatch,
+    "stop-yes": v2_stop_yes,
+    "stop-no": v2_stop_no,
+    "longchain": v2_longchain,
+    "recover": v2_recover,
+}
+
+
+def main_v2(args):
+    from agent_world import respond
+    rng = random.Random(args.seed)
+    files, contents, cmds = load_pools(args)
+    rng.shuffle(files)
+    P = Pools(files, contents, cmds)
+    if args.only and args.only not in FAMILIES_V2:
+        print("unknown family: %s (want one of: %s)" % (args.only, "|".join(sorted(FAMILIES_V2))))
+        return 2
+    rows, mix, seen, dupes = [], {}, set(), 0
+    for _ in range(args.n):
+        if args.only:
+            fn = FAMILIES_V2[args.only]
+        elif args.unscripted_errors > 0 and rng.random() < args.unscripted_errors:
+            fn = v2_recover
+        else:
+            fn = FAMILIES_V2[rng.choice(FAMILY_NAMES)]
+        prompt, (ref, is_done), fam = fn(rng, P, args)
+        if prompt in seen:
+            dupes += 1
+            continue
+        seen.add(prompt)
+        resp = respond(ref, rng, args.reason, is_done)
+        mix[fam] = mix.get(fam, 0) + 1
+        rows.append("%s\t%s" % (prompt.replace("\t", " "), resp))
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(rows) + "\n")
+    print("wrote %d tasks -> %s (v2: vfs=%s grammar=%s errors=%.2f holdout=%s)"
+          % (len(rows), args.out, args.vfs, args.goal_grammar, args.unscripted_errors,
+             args.holdout_lexicon))
+    if dupes:
+        print("  dropped %d duplicate prompt(s)" % dupes)
+    print("family mix:")
+    for k in sorted(mix, key=lambda k: -mix[k]):
+        print("  %-24s %d" % (k, mix[k]))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/hard_raw.txt")
@@ -229,14 +404,22 @@ def main():
                          "strips reasoning from both sides, so this is format hygiene)")
     ap.add_argument("--only", default=None,
                     help="restrict to one family (distractor|indirect|mismatch|"
-                         "stop-yes|stop-no|longchain)")
+                         "stop-yes|stop-no|longchain; recover needs --vfs)")
     ap.add_argument("--seed", type=int, default=1234)
-    args = ap.parse_args()
+    add_v2_args(ap)
+    args = normalize_v2_args(ap.parse_args())
+    if args.vfs:
+        # --unscripted-errors RATE here = share of tasks drawn from the `recover`
+        # family (an unannounced fault; decision = the step right after it)
+        return main_v2(args)
 
     rng = random.Random(args.seed)
-    files = slugs_from_wiki(args.wiki)
-    cmds = commands_from(args.commands)
-    contents = contents_from(files)
+    if args.holdout_lexicon:                 # legacy families, split lexicon
+        files, contents, cmds = load_pools(args)
+    else:
+        files = slugs_from_wiki(args.wiki)
+        cmds = commands_from(args.commands)
+        contents = contents_from(files)
     rng.shuffle(files)
 
     if args.only and args.only not in FAMILIES:
