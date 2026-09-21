@@ -7,7 +7,9 @@
 //
 // The loop, per task:
 //   1. sample G rollouts from the current policy (KV-cache decode WITH the LoRA
-//      adapters applied, so the samples come from the policy being updated),
+//      adapters applied, so the samples come from the policy being updated;
+//      the shared prompt is prefilled ONCE per group and its KV cache forked
+//      into each rollout),
 //   2. score each with reward.h — no reward model, no value network, no critic,
 //      which is exactly why this fits a 135M model on a CPU,
 //   3. normalize the rewards WITHIN the group:  Â_i = (r_i - mean) / (std + eps).
@@ -32,6 +34,9 @@
 // reference. No second copy of the checkpoint.
 #ifndef GRPO_H
 #define GRPO_H
+
+#include "llama.h"
+#include "sampler.h"
 
 typedef struct {
   // --- What to train, and from what ---
@@ -171,5 +176,18 @@ int grpo_advantages(const float *rewards, int G, const GrpoConfig *cfg, float *a
 void grpo_token_coeffs(float adv, float norm, int len, const float *logp_new,
                        const float *logp_old, const float *logp_ref,
                        const GrpoConfig *cfg, float *coeff_out);
+
+// Test hook (selftest [37]): sample one group of cfg->group rollouts from `prompt_ids`
+// through the SAME rollout() grpo_run uses, with no tokenizer (so no EOS / closing-tag
+// stops: every rollout runs to min(cfg->max_new, max_seq - n_prompt) tokens).
+//   shared_prefill = 1: prefill the prompt once, fork it into each rollout with
+//                       llama_kv_copy (what grpo_run does);
+//   shared_prefill = 0: re-prefill per rollout (the path grpo_run used before).
+// out_ids / out_logp are rollout-major with stride cfg->max_new; out_len has G
+// entries. Returns the number of prompt-prefill decode steps taken.
+long grpo_debug_sample_group(const LlamaModel *m, const LlamaDecodeLora *lo,
+                             const int *prompt_ids, int n_prompt, const GrpoConfig *cfg,
+                             int shared_prefill, Rng *rng,
+                             int *out_ids, float *out_logp, int *out_len);
 
 #endif // GRPO_H

@@ -69,7 +69,7 @@ static float llama_ce_loss(LlamaModel *m, LlamaActs *a, const int *ids, int seq_
 // Central-difference gradient check of params[0..n) against their .grad, for the
 // LLaMA-family CE loss with optional adapters (lo == NULL: the plain model) —
 // used by [31]. Tensors of at most `full` entries are checked at EVERY entry,
-// larger ones at two. Writes the max rel error over all entries and over the
+// larger ones at two. Writes thesame seed: ids %s (%d tokens) | max |logp diff| %.2e (shared vs per-rollout)"rel error over all entries and over the
 // entries clearing the float32 noise floor (|grad| > 1e-2, the rule of [2] and
 // [22]); returns how many entries cleared it (0 = a vacuous check).
 static int llama_grad_check(LlamaModel *m, LlamaActs *a, const LlamaLora *lo,
@@ -3566,6 +3566,131 @@ int run_selftest(void) {
            dc.muon ? "muon" : "adam", nmuon, ntot,
            bit_same ? "yes" : "NO", def_ok ? "OK" : "FAIL");
     all_ok &= def_ok;
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 37: shared prompt prefill for GRPO rollouts. grpo_run prefills a
+  // group's prompt ONCE (with the current adapters) and forks the KV cache into
+  // each of the G rollouts with llama_kv_copy, instead of re-decoding the prompt
+  // per rollout. That is a pure speedup only if it changes NOTHING: the sampled
+  // token ids and the recorded log-probs (pi_old) must equal the old per-rollout
+  // prefill bit for bit, with LoRA adapters nonzero, QK-norm on, and a windowed
+  // layer whose ring buffer wraps inside the prompt. Plus: llama_kv_copy must be
+  // an exact round trip, even into a cache holding a longer, different sequence.
+  // --------------------------------------------------------------------------
+  {
+    printf("[37] GRPO shared prompt prefill (prefill once per group, fork the KV cache)\n");
+    const int vocab = 24, dm = 16, nl = 3, nh = 4, nkv = 2, hd = 4, dff = 32, msq = 48;
+    const int W = 5, T = 12, G = 5, R = 10;
+    srand(37);
+    LlamaModel sm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, msq,
+                                             10000.0f, 1e-5f);
+    llama_model_set_qk_norm(&sm, 1);          // BEFORE randomize: gains get drawn too
+    llama_model_randomize(&sm);
+    llama_model_set_window(&sm, W, 2);        // layers 0,2 windowed (W=5 < T), layer 1 global
+    LlamaLora slo = llama_lora_create(&sm, 4, 8.0f);
+    llama_lora_init(&slo);
+    Tensor **lp = (Tensor**)malloc((size_t)llama_lora_param_count(&slo) * sizeof(Tensor*));
+    int n_lp = llama_lora_collect_params(&slo, lp);
+    for (int p = 0; p < n_lp; p++)            // B starts at zero: make the adapters bite
+      for (size_t k = 0; k < lp[p]->size; k++)
+        lp[p]->data[k] += 0.05f * (float)((int)((k * 31 + (size_t)p * 5) % 13) - 6);
+    LlamaDecodeLora sdv = llama_lora_decode_view(&slo);
+
+    int prompt[12] = {3, 17, 1, 9, 22, 5, 5, 14, 0, 8, 19, 2};
+    GrpoConfig cfg = grpo_default_config();
+    cfg.group = G; cfg.max_new = R;
+    cfg.temperature = 1.0f; cfg.top_k = 0; cfg.top_p = 1.0f;
+
+    int *ids_old = (int*)malloc((size_t)G * R * sizeof(int));
+    int *ids_new = (int*)malloc((size_t)G * R * sizeof(int));
+    int *ids_base = (int*)malloc((size_t)G * R * sizeof(int));
+    float *lp_old = (float*)malloc((size_t)G * R * sizeof(float));
+    float *lp_new = (float*)malloc((size_t)G * R * sizeof(float));
+    float *lp_base = (float*)malloc((size_t)G * R * sizeof(float));
+    int len_old[5], len_new[5], len_base[5];
+
+    Rng r_old = rng_create(4242), r_new = rng_create(4242), r_base = rng_create(4242);
+    long steps_old = grpo_debug_sample_group(&sm, &sdv, prompt, T, &cfg, 0, &r_old,
+                                             ids_old, lp_old, len_old);
+    long steps_new = grpo_debug_sample_group(&sm, &sdv, prompt, T, &cfg, 1, &r_new,
+                                             ids_new, lp_new, len_new);
+    // The same seed with the adapters OFF: must differ, or the LoRA half of the
+    // comparison would be vacuous.
+    grpo_debug_sample_group(&sm, NULL, prompt, T, &cfg, 1, &r_base, ids_base, lp_base, len_base);
+
+    int id_same = 1, n_tok = 0, n_distinct = 0;
+    float lpd = 0.0f, lora_d = 0.0f;
+    for (int i = 0; i < G; i++) {
+      if (len_old[i] != len_new[i]) id_same = 0;
+      for (int t = 0; t < len_old[i] && t < len_new[i]; t++) {
+        const size_t o = (size_t)i * R + t;
+        if (ids_old[o] != ids_new[o]) id_same = 0;
+        float d = fabsf(lp_old[o] - lp_new[o]);
+        if (d > lpd) lpd = d;
+        float e = fabsf(lp_new[o] - lp_base[o]);
+        if (e > lora_d) lora_d = e;
+        n_tok++;
+      }
+      // Rollouts should not all be the same sequence (the RNG really advances).
+      if (i > 0 && memcmp(&ids_new[(size_t)i * R], &ids_new[0], (size_t)R * sizeof(int)) != 0)
+        n_distinct++;
+    }
+    int share_ok = id_same && (lpd == 0.0f) && (lora_d > 0.0f) && (n_distinct > 0) &&
+                   (steps_old == (long)G * T) && (steps_new == T);
+    printf("    tiny model: QK-norm on, window %d on layers 0,2 (ring wraps: prompt %d > %d), LoRA r4 nonzero,\n"
+           "      shared template KV sized to the prompt (llama_kv_create_len) forked into a full cache\n",
+           W, T, W);
+    printf("    G=%d x %d tokens, same seed: ids %s (%d tokens) | max |logp diff| %.2e (shared vs per-rollout)"
+           " | %d/%d rollouts differ from rollout 0\n",
+           G, R, id_same ? "identical" : "DIFFER", n_tok, lpd, n_distinct, G - 1);
+    printf("    adapters matter: max |logp(LoRA) - logp(base)| %.2e | prompt decode steps %ld -> %ld -> %s\n",
+           lora_d, steps_old, steps_new, share_ok ? "OK" : "FAIL");
+    all_ok &= share_ok;
+
+    // llama_kv_copy round trip. dst first holds a LONGER, different sequence, so
+    // any stale slot or unwrapped-ring assumption would show up.
+    LlamaKV ka = llama_kv_create(&sm), kb = llama_kv_create(&sm);
+    int ds[2] = {1, vocab};
+    Tensor la = tensor_create(ds, 2), lb = tensor_create(ds, 2);
+    for (int i = 0; i < 20; i++) llama_decode_step_lora(&sm, &kb, (i * 7 + 3) % vocab, &lb, &sdv);
+    for (int i = 0; i < T; i++) llama_decode_step_lora(&sm, &ka, prompt[i], &la, &sdv);
+    llama_kv_copy(&kb, &ka);
+    int kv_same = (kb.len == ka.len);
+    for (int l = 0; l < nl; l++) {
+      const int used = ka.len < ka.cap[l] ? ka.len : ka.cap[l];
+      const size_t bytes = (size_t)used * ka.kv_dim * sizeof(float);
+      if (memcmp(ka.k[l], kb.k[l], bytes) != 0 || memcmp(ka.v[l], kb.v[l], bytes) != 0) kv_same = 0;
+    }
+    float cont = 0.0f;                        // then both continue identically
+    for (int i = 0; i < 8; i++) {
+      const int tk = (i * 5 + 1) % vocab;
+      llama_decode_step_lora(&sm, &ka, tk, &la, &sdv);
+      llama_decode_step_lora(&sm, &kb, tk, &lb, &sdv);
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(la.data[j] - lb.data[j]);
+        if (d > cont) cont = d;
+      }
+    }
+    int copy_ok = kv_same && (cont == 0.0f) && (ka.len == T + 8) && (kb.len == T + 8);
+    printf("    llama_kv_copy (caps %d/%d/%d, dst held a longer sequence): slots+len %s |"
+           " 8 further decode steps max |logit diff| %.2e -> %s\n",
+           ka.cap[0], ka.cap[1], ka.cap[2], kv_same ? "equal" : "DIFFER", cont,
+           copy_ok ? "OK" : "FAIL");
+    all_ok &= copy_ok;
+
+    // What it saves at GRPO scale: decode steps per group, G=8, prompt 110, response 40.
+    const long g8 = 8, tp = 110, rr = 40;
+    const long before = g8 * (tp + rr), after = tp + g8 * rr;
+    printf("    decode steps per group at G=%ld, prompt %ld, response %ld: %ld -> %ld (%.1f%% fewer)\n\n",
+           g8, tp, rr, before, after, 100.0 * (double)(before - after) / (double)before);
+
+    tensor_free(&la); tensor_free(&lb);
+    llama_kv_free(&ka); llama_kv_free(&kb);
+    free(ids_old); free(ids_new); free(ids_base);
+    free(lp_old); free(lp_new); free(lp_base);
+    free(lp);
+    llama_lora_free(&slo); llama_model_free(&sm);
   }
 
   // --------------------------------------------------------------------------

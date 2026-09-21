@@ -150,7 +150,23 @@ typedef struct {
 } LlamaKV;
 
 LlamaKV llama_kv_create(const LlamaModel *m);
+// Same, but holding only max_len positions (clamped to 1..m->max_seq): full layers
+// get max_len slots, windowed ones min(W, max_len). For a cache that will never
+// grow past max_len — e.g. a prompt-prefill template — at a fraction of the RAM.
+LlamaKV llama_kv_create_len(const LlamaModel *m, int max_len);
 void llama_kv_free(LlamaKV *kv);
+
+// Copy src's cached state into dst: len plus every layer's POPULATED slots
+// (min(len, cap[l]) per layer — correct for sliding-window ring buffers too,
+// since positions 0..len-1 occupy a slot prefix). Both caches must come from
+// the same model (n_layers, kv_dim), dst must hold src->len positions, and each
+// layer must map positions 0..len-1 to the same slots — equal caps, or a ring
+// that has not wrapped in either (so a llama_kv_create_len template can fork
+// into a full llama_kv_create cache); otherwise it aborts. Slots beyond the populated prefix are left untouched: they
+// are never read, because decode only visits positions < len (and writes a
+// slot before reading it). Used to prefill a shared prompt once and fork it
+// (grpo.c: one prefill per group, copied into each of the G rollouts).
+void llama_kv_copy(LlamaKV *dst, const LlamaKV *src);
 
 // Decode ONE token at position kv->len: append its K/V to the cache, attend over
 // positions 0..kv->len, and write logits (1, vocab). Advances kv->len.

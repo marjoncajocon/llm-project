@@ -356,6 +356,15 @@ static LlamaKV kv_create_ex(int n_layers, int max_seq, int kv_dim, const int *wi
   return kv;
 }
 
+LlamaKV llama_kv_create_len(const LlamaModel *m, int max_len) {
+  if (max_len < 1 || max_len > m->max_seq) max_len = m->max_seq;
+  int *w = (int*)malloc((size_t)m->n_layers * sizeof(int));
+  for (int l = 0; l < m->n_layers; l++) w[l] = m->blocks[l].window;
+  LlamaKV kv = kv_create_ex(m->n_layers, max_len, m->n_kv * m->head_dim, w);
+  free(w);
+  return kv;
+}
+
 LlamaKV llama_kv_create(const LlamaModel *m) {
   int *w = (int*)malloc((size_t)m->n_layers * sizeof(int));
   for (int l = 0; l < m->n_layers; l++) w[l] = m->blocks[l].window;
@@ -368,6 +377,33 @@ void llama_kv_free(LlamaKV *kv) {
   for (int l = 0; l < kv->n_layers; l++) { free(kv->k[l]); free(kv->v[l]); }
   free(kv->k); free(kv->v); free(kv->cap);
   kv->k = kv->v = NULL; kv->cap = NULL;
+}
+
+void llama_kv_copy(LlamaKV *dst, const LlamaKV *src) {
+  // Positions 0..len-1 must land in the same slots of both caches: either the
+  // layer caps are equal, or neither ring has wrapped yet (len <= both caps, so
+  // slot == position in each). That lets a template sized for just the prompt
+  // (llama_kv_create_len) fork into a full-length cache.
+  int same = (dst->n_layers == src->n_layers && dst->kv_dim == src->kv_dim &&
+              src->len <= dst->max_seq);
+  for (int l = 0; same && l < src->n_layers; l++)
+    same = (dst->cap[l] == src->cap[l]) ||
+           (src->len <= src->cap[l] && src->len <= dst->cap[l]);
+  if (!same) {
+    fprintf(stderr, "llama_kv_copy: cache geometry mismatch\n");
+    abort();
+  }
+  for (int l = 0; l < src->n_layers; l++) {
+    // Positions 0..len-1 live in slots p % cap, so the populated slots are
+    // 0..min(len, cap)-1 — a prefix whether or not the ring has wrapped.
+    const int used = (src->len < src->cap[l]) ? src->len : src->cap[l];
+    const size_t bytes = (size_t)used * src->kv_dim * sizeof(float);
+    if (bytes) {
+      memcpy(dst->k[l], src->k[l], bytes);
+      memcpy(dst->v[l], src->v[l], bytes);
+    }
+  }
+  dst->len = src->len;
 }
 
 // Single-query GQA attention of one new token (position pos) over one layer's

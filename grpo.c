@@ -269,15 +269,37 @@ static int copy_weights(LlamaModel *dst, LlamaModel *src) {
   return ok;
 }
 
-// One rollout: prefill the prompt through the KV cache, then sample up to
-// max_new tokens from the CURRENT policy (adapters included). Records the token
-// ids and the log-probability the policy assigned to each sampled token — the
-// pi_old the importance ratio is measured against.
+// Prefill: decode the prompt into `kv` from position 0, token by token, through
+// the CURRENT adapters, leaving the last prompt position's logits in `logits`.
+// Token-by-token (not one batched llama_forward_train_lora) on purpose: the
+// batched forward is only ~1e-3-close to decode (selftest [26]), and the sampled
+// rollouts must stay bit-identical to what a per-rollout decode would draw.
+static void prefill_prompt(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
+                           const int *prompt_ids, int n_prompt, Tensor *logits) {
+  kv->len = 0;
+  for (int i = 0; i < n_prompt; i++)
+    llama_decode_step_lora(m, kv, prompt_ids[i], logits, lo);
+}
+
+// One rollout: start from the prefilled prompt, then sample up to max_new tokens
+// from the CURRENT policy (adapters included). Records the token ids and the
+// log-probability the policy assigned to each sampled token — the pi_old the
+// importance ratio is measured against.
+//
+// Shared prefill: every rollout of a group starts from the SAME prompt, and the
+// prompt's KV entries and last logits depend only on the prompt and the weights
+// (no sampling), so grpo_run prefills it ONCE per group into a template cache
+// (`tmpl`, `tmpl_logits`) and each rollout forks it with llama_kv_copy. With
+// ~110-token prompts and ~40-token responses that removes most of the decode
+// work. The copy is bit-exact, and the prefill draws nothing from the RNG, so
+// the sampled tokens are identical to prefilling per rollout (selftest [37]).
+// tmpl == NULL prefills here instead (the old per-rollout path, kept for [37]).
 //
 typedef enum { STOP_CAP = 0, STOP_EOS = 1, STOP_TAG = 2 } StopReason;
 
 // Returns the number of sampled tokens, writes the detokenized text to `text`,
-// and reports HOW the rollout ended in *stop.
+// and reports HOW the rollout ended in *stop. tok == NULL (tests only) disables
+// the EOS / closing-tag stops and leaves `text` empty.
 //
 // Sampling stops at a closing </tool> or </done> as well as at EOS, because that
 // is what the deployed agent actually does: toolcall_parse takes the FIRST block
@@ -291,13 +313,17 @@ typedef enum { STOP_CAP = 0, STOP_EOS = 1, STOP_TAG = 2 } StopReason;
 // having never closed its block, and so loses the format term for a reason that
 // is the budget's fault rather than the policy's.
 static int rollout(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
+                   const LlamaKV *tmpl, const Tensor *tmpl_logits,
                    const HFTok *tok, const int *prompt_ids, int n_prompt,
                    const GrpoConfig *cfg, Rng *rng, Tensor *logits, Tensor *probs,
                    int *out_ids, float *out_logp, char *text, int text_cap,
                    StopReason *stop) {
-  kv->len = 0;
-  for (int i = 0; i < n_prompt; i++)
-    llama_decode_step_lora(m, kv, prompt_ids[i], logits, lo);
+  if (tmpl) {
+    llama_kv_copy(kv, tmpl);
+    memcpy(logits->data, tmpl_logits->data, logits->size * sizeof(float));
+  } else {
+    prefill_prompt(m, lo, kv, prompt_ids, n_prompt, logits);
+  }
 
   int n = 0;
   *stop = STOP_CAP;
@@ -312,16 +338,46 @@ static int rollout(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
     const int t = sample_token(logits, 0, cfg->temperature, cfg->top_k, cfg->top_p, rng);
     out_logp[n] = logprob_of(probs, 0, t);
     out_ids[n++] = t;
-    if (hftok_is_eog(tok, t)) { *stop = STOP_EOS; break; }
-    // Re-decode the whole response each step rather than tracking a partial
-    // decode: a BPE piece can straddle the tag, and n is at most --max-new, so
-    // this is nothing beside a 30-layer forward.
-    hftok_decode(tok, out_ids, n, text, text_cap);
-    if (strstr(text, "</tool>") || strstr(text, "</done>")) { *stop = STOP_TAG; break; }
+    if (tok) {
+      if (hftok_is_eog(tok, t)) { *stop = STOP_EOS; break; }
+      // Re-decode the whole response each step rather than tracking a partial
+      // decode: a BPE piece can straddle the tag, and n is at most --max-new, so
+      // this is nothing beside a 30-layer forward.
+      hftok_decode(tok, out_ids, n, text, text_cap);
+      if (strstr(text, "</tool>") || strstr(text, "</done>")) { *stop = STOP_TAG; break; }
+    }
     llama_decode_step_lora(m, kv, t, logits, lo);
   }
-  hftok_decode(tok, out_ids, n, text, text_cap);
+  if (tok) hftok_decode(tok, out_ids, n, text, text_cap);
   return n;
+}
+
+long grpo_debug_sample_group(const LlamaModel *m, const LlamaDecodeLora *lo,
+                             const int *prompt_ids, int n_prompt, const GrpoConfig *cfg,
+                             int shared_prefill, Rng *rng,
+                             int *out_ids, float *out_logp, int *out_len) {
+  const int G = cfg->group, V = m->vocab;
+  int ds[2] = {1, V};
+  Tensor logits = tensor_create(ds, 2), probs = tensor_create(ds, 2);
+  Tensor plogits = tensor_create(ds, 2);
+  LlamaKV kv = llama_kv_create(m), pkv = llama_kv_create_len(m, n_prompt);
+  char text[1];
+  long prefill_steps = 0;
+  if (shared_prefill) {
+    prefill_prompt(m, lo, &pkv, prompt_ids, n_prompt, &plogits);
+    prefill_steps += n_prompt;
+  }
+  for (int i = 0; i < G; i++) {
+    StopReason stop;
+    out_len[i] = rollout(m, lo, &kv, shared_prefill ? &pkv : NULL, &plogits, NULL,
+                         prompt_ids, n_prompt, cfg, rng, &logits, &probs,
+                         &out_ids[(size_t)i * cfg->max_new],
+                         &out_logp[(size_t)i * cfg->max_new], text, 1, &stop);
+    if (!shared_prefill) prefill_steps += n_prompt;
+  }
+  llama_kv_free(&kv); llama_kv_free(&pkv);
+  tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
+  return prefill_steps;
 }
 
 // Copy up to `cap` bytes of `s` onto one line for the verbose log: control
@@ -387,7 +443,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   // are dropped here rather than silently producing empty responses.
   int **pids = (int**)malloc((size_t)n_tasks * sizeof(int*));
   int *plen = (int*)malloc((size_t)n_tasks * sizeof(int));
-  int usable = 0, maxL = 0;
+  int usable = 0, maxL = 0, maxP = 0;
   int scratch[MAX_PROMPT_IDS];
   for (int i = 0; i < n_tasks; i++) {
     const int T = hftok_encode(&tok, tasks[i].prompt, scratch, MAX_PROMPT_IDS);
@@ -397,6 +453,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     if (!pids[i]) continue;
     memcpy(pids[i], scratch, (size_t)T * sizeof(int));
     plen[i] = T;
+    if (T > maxP) maxP = T;
     const int room = model.max_seq - T;
     const int newcap = (cfg->max_new < room) ? cfg->max_new : room;
     if (T + newcap > maxL) maxL = T + newcap;
@@ -437,6 +494,11 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   }
   Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
   LlamaKV kv = llama_kv_create(&model);
+  // The group's prompt, prefilled ONCE (with the current adapters) and forked
+  // into every rollout of the group — see rollout(). Sized for the longest prompt
+  // only, so it costs maxP positions of KV rather than a second max_seq cache.
+  LlamaKV pkv = llama_kv_create_len(&model, maxP);
+  Tensor plogits = tensor_create(dshape, 2);
 
   // Rollout storage for a whole step: groups_per_step groups of G rollouts each,
   // kept for the duration of the step so inner epochs can reuse them.
@@ -507,11 +569,14 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
       do { ti = rand() % n_tasks; } while (plen[ti] == 0);
       task_of_group[g] = ti;
       const int T = plen[ti];
+      // The adapters only change in the update phase below, so one prefill serves
+      // all G rollouts of this group. It draws nothing from the RNG.
+      prefill_prompt(&model, use_lora ? &dview : NULL, &pkv, pids[ti], T, &plogits);
       int off = 0;
       for (int i = 0; i < G; i++) {
         const int gi = g * G + i;
         StopReason stop = STOP_CAP;
-        rlen[gi] = rollout(&model, use_lora ? &dview : NULL, &kv, &tok,
+        rlen[gi] = rollout(&model, use_lora ? &dview : NULL, &kv, &pkv, &plogits, &tok,
                            pids[ti], T, cfg, &rng, &dlogits, &dprobs,
                            rid[gi], &flat_old[(size_t)g * G * cap_new + off],
                            text, TEXT_CAP, &stop);
@@ -676,7 +741,8 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   free(rlen); free(rrew); free(radv);
   for (int i = 0; i < NR; i++) free(rid[i]);
   free(rid);
-  llama_kv_free(&kv);
+  llama_kv_free(&kv); llama_kv_free(&pkv);
+  tensor_free(&plogits);
   free(params);
   if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
   adam_free(&opt);
