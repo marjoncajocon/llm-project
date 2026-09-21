@@ -103,6 +103,10 @@ float reward_score_v2(const char *prompt, const char *response,
 float reward_score_version(int version, const char *prompt, const char *response,
                            const char *reference, int capped, RewardParts *parts);
 
+// The largest value the (weighted) match term can take under `version`: 0.50 for
+// v1, 0.70 for v2. A rollout is an EXACT match when parts.match reaches it.
+float reward_match_max(int version);
+
 // "done", "prose", "read", "write", "run", "malformed".
 const char *reward_action_name(int action);
 

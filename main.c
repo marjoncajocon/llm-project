@@ -397,6 +397,18 @@ static void grpo_usage(void) {
     "Run control:\n"
     "  --seed N          RNG seed (default 1)\n"
     "  --verbose         print a scored sample rollout per group\n"
+    "Evaluation (no training):\n"
+    "  --eval-only       score the model instead of training it: no LoRA, no\n"
+    "                    optimizer, no backward, nothing saved. Tasks are visited\n"
+    "                    once each in FILE ORDER; rollout (task i, draw k) samples\n"
+    "                    from its own RNG seeded by hash(--seed, i, k), so two\n"
+    "                    checkpoints see PAIRED sampling noise. --temp defaults to 0\n"
+    "                    (greedy) here. Training-only flags are ignored.\n"
+    "  --k N             rollouts per task (default 1; use with --temp > 0)\n"
+    "  --limit N         only the first N tasks of the file\n"
+    "  --dump F.jsonl    one JSON line per rollout (task, k, family, reward terms,\n"
+    "                    exact, action, stop, tokens, response); compare two dumps\n"
+    "                    with: python tools/evalcard.py A.jsonl B.jsonl\n"
     "\n"
     "The run saves ONCE, at the end: mid-run saving would mean merging the\n"
     "adapters, which resets B to zero and stalls training.\n");
@@ -408,6 +420,7 @@ static int run_grpo(int argc, char **argv) {
   GrpoConfig cfg = grpo_default_config();
   const char *name = NULL;
   static char name_model[512], name_tok[512];
+  int temp_set = 0;
 
   for (int i = 3; i < argc; i++) {
     const char *f = argv[i];
@@ -419,7 +432,7 @@ static int run_grpo(int argc, char **argv) {
     else if (strcmp(f, "--name") == 0)    { NEED_VAL(); name = argv[++i]; }
     else if (strcmp(f, "--group") == 0)   { NEED_VAL(); cfg.group = atoi(argv[++i]); }
     else if (strcmp(f, "--max-new") == 0) { NEED_VAL(); cfg.max_new = atoi(argv[++i]); }
-    else if (strcmp(f, "--temp") == 0)    { NEED_VAL(); cfg.temperature = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--temp") == 0)    { NEED_VAL(); cfg.temperature = (float)atof(argv[++i]); temp_set = 1; }
     else if (strcmp(f, "--top-k") == 0)   { NEED_VAL(); cfg.top_k = atoi(argv[++i]); }
     else if (strcmp(f, "--top-p") == 0)   { NEED_VAL(); cfg.top_p = (float)atof(argv[++i]); }
     else if (strcmp(f, "--steps") == 0)   { NEED_VAL(); cfg.steps = atoi(argv[++i]); }
@@ -456,6 +469,10 @@ static int run_grpo(int argc, char **argv) {
     }
     else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
     else if (strcmp(f, "--verbose") == 0) { cfg.verbose = 1; }
+    else if (strcmp(f, "--eval-only") == 0) { cfg.eval_only = 1; }
+    else if (strcmp(f, "--k") == 0)       { NEED_VAL(); cfg.eval_k = atoi(argv[++i]); }
+    else if (strcmp(f, "--limit") == 0)   { NEED_VAL(); cfg.eval_limit = atoi(argv[++i]); }
+    else if (strcmp(f, "--dump") == 0)    { NEED_VAL(); cfg.eval_dump = argv[++i]; }
     else { fprintf(stderr, "unknown flag: %s\n", f); grpo_usage(); return 2; }
 #undef NEED_VAL
   }
@@ -464,6 +481,13 @@ static int run_grpo(int argc, char **argv) {
     cfg.out_model = name_model;
     printf("model dir: model/%s/\n", name);
   }
+  if (cfg.eval_only) {
+    if (cfg.eval_k < 1) { fprintf(stderr, "--k must be >= 1\n"); return 2; }
+    if (!temp_set) cfg.temperature = 0.0f;     // greedy unless asked otherwise
+    return grpo_eval_run(tasks, &cfg);
+  }
+  if (cfg.eval_k != 1 || cfg.eval_limit != 0 || cfg.eval_dump)
+    fprintf(stderr, "note: --k / --limit / --dump only apply with --eval-only\n");
   if (cfg.groups_per_step < 1) cfg.groups_per_step = 1;
   if (cfg.inner_epochs < 1) cfg.inner_epochs = 1;
   if (cfg.resample < 0) cfg.resample = 0;

@@ -16,6 +16,7 @@
 #include "reward.h"
 #include "sampler.h"
 #include "tensor.h"
+#include "toolcall.h"
 
 #define MAX_PROMPT_IDS 4096
 #define TEXT_CAP 16384         // detokenized rollout buffer (max_new tokens of text)
@@ -48,6 +49,10 @@ GrpoConfig grpo_default_config(void) {
   c.loss_agg = GRPO_AGG_SEQ;
   c.resample = 0;
   c.reward_version = 1;    // the original reward; v2 is opt-in (--reward v2)
+  c.eval_only = 0;
+  c.eval_k = 1;
+  c.eval_limit = 0;
+  c.eval_dump = NULL;
   c.seed = 1;
   c.verbose = 0;
   return c;
@@ -793,6 +798,324 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   llama_acts_free(&acts);
   llama_model_free(&model);
   for (int i = 0; i < n_tasks; i++) free(pids[i]);
+  free(pids); free(plen);
+  hftok_free(&tok);
+  tasks_free(tasks, n_tasks);
+  return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation (grpo --eval-only; see grpo.h)
+// ---------------------------------------------------------------------------
+
+static unsigned long long splitmix64(unsigned long long x) {
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+  return x ^ (x >> 31);
+}
+
+unsigned long long grpo_eval_rollout_seed(unsigned seed, int task, int k) {
+  unsigned long long h = splitmix64((unsigned long long)seed);
+  h = splitmix64(h ^ (unsigned long long)(unsigned)task);
+  h = splitmix64(h ^ ((unsigned long long)(unsigned)k << 32));
+  return h ? h : 1ULL;
+}
+
+// One evaluation rollout of task `task`, draw `kk`, from the prefilled template
+// (pkv, plogits). Its RNG is created HERE from (seed, task, kk) and dies with the
+// rollout, so no other rollout — of this checkpoint or any other — can shift it:
+// a checkpoint that answers task 3 in 12 tokens instead of 40 consumes 28 fewer
+// draws, and with one shared RNG every later task would then be sampled with
+// different noise. Here task 4 is sampled with the same noise either way.
+static int eval_rollout(const LlamaModel *m, LlamaKV *kv, const LlamaKV *pkv,
+                        const Tensor *plogits, const HFTok *tok, const int *pids, int T,
+                        int task, int kk, const GrpoConfig *cfg, Tensor *logits,
+                        Tensor *probs, int *ids, float *logp, char *text, int text_cap,
+                        StopReason *stop) {
+  Rng rng = rng_create(grpo_eval_rollout_seed(cfg->seed, task, kk));
+  return rollout(m, NULL, kv, pkv, plogits, tok, pids, T, cfg, &rng, logits, probs,
+                 ids, logp, text, text_cap, stop);
+}
+
+void grpo_debug_eval_task(const LlamaModel *m, const int *prompt_ids, int n_prompt,
+                          int task, const GrpoConfig *cfg,
+                          int *out_ids, float *out_logp, int *out_len) {
+  int ds[2] = {1, m->vocab};
+  Tensor logits = tensor_create(ds, 2), probs = tensor_create(ds, 2);
+  Tensor plogits = tensor_create(ds, 2);
+  LlamaKV kv = llama_kv_create(m), pkv = llama_kv_create_len(m, n_prompt);
+  char text[1];
+  prefill_prompt(m, NULL, &pkv, prompt_ids, n_prompt, &plogits);
+  for (int kk = 0; kk < cfg->eval_k; kk++) {
+    StopReason stop;
+    out_len[kk] = eval_rollout(m, &kv, &pkv, &plogits, NULL, prompt_ids, n_prompt, task, kk,
+                               cfg, &logits, &probs, &out_ids[(size_t)kk * cfg->max_new],
+                               &out_logp[(size_t)kk * cfg->max_new], text, 1, &stop);
+  }
+  llama_kv_free(&kv); llama_kv_free(&pkv);
+  tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
+}
+
+// A short task "family" from the REFERENCE action — what the task asks for:
+// write / read / run / delete (a run_command whose command is `rm ...`) / done /
+// prose. NULL when there is no reference or it does not parse.
+static const char *task_family(const char *reference) {
+  if (!reference || !reference[0]) return NULL;
+  const char *s = reference, *e;
+  while ((e = strstr(s, "</think>")) != NULL) s = e + 8;   // skip the reasoning
+  ToolCall tc;
+  toolcall_parse(s, &tc);
+  switch (tc.kind) {
+    case TOOL_WRITE_FILE: return "write";
+    case TOOL_READ_FILE:  return "read";
+    case TOOL_DONE:       return "done";
+    case TOOL_RUN_COMMAND: {
+      const char *c = tc.command;
+      while (*c == ' ') c++;
+      return (strncmp(c, "rm ", 3) == 0) ? "delete" : "run";
+    }
+    default:
+      return (strstr(s, "<tool") || strstr(s, "<done")) ? NULL : "prose";
+  }
+}
+
+// Length of the well-formed UTF-8 sequence at p, or 0 if it is not one.
+static int utf8_len(const unsigned char *p) {
+  int n;
+  unsigned cp;
+  if      ((p[0] & 0xE0) == 0xC0) { n = 2; cp = p[0] & 0x1Fu; }
+  else if ((p[0] & 0xF0) == 0xE0) { n = 3; cp = p[0] & 0x0Fu; }
+  else if ((p[0] & 0xF8) == 0xF0) { n = 4; cp = p[0] & 0x07u; }
+  else return 0;
+  for (int i = 1; i < n; i++) {                 // stops at the NUL, too
+    if ((p[i] & 0xC0) != 0x80) return 0;
+    cp = (cp << 6) | (p[i] & 0x3Fu);
+  }
+  if ((n == 2 && cp < 0x80) || (n == 3 && cp < 0x800) ||
+      (n == 4 && (cp < 0x10000 || cp > 0x10FFFF)) || (cp >= 0xD800 && cp <= 0xDFFF))
+    return 0;
+  return n;
+}
+
+// Write `s` as a JSON string. A byte-level BPE model can emit half a UTF-8
+// character; such a byte is written as \u00XX so the file stays valid JSON (and
+// two different broken bytes still compare different).
+static void json_str(FILE *f, const char *s) {
+  fputc('"', f);
+  const unsigned char *p = (const unsigned char*)s;
+  while (*p) {
+    const unsigned char c = *p;
+    if (c == '"' || c == '\\') { fputc('\\', f); fputc(c, f); p++; }
+    else if (c == '\n') { fputs("\\n", f); p++; }
+    else if (c == '\r') { fputs("\\r", f); p++; }
+    else if (c == '\t') { fputs("\\t", f); p++; }
+    else if (c < 0x20 || c == 0x7f) { fprintf(f, "\\u%04x", c); p++; }
+    else if (c < 0x80) { fputc(c, f); p++; }
+    else {
+      const int n = utf8_len(p);
+      if (n > 0) { fwrite(p, 1, (size_t)n, f); p += n; }
+      else { fprintf(f, "\\u%04x", c); p++; }
+    }
+  }
+  fputc('"', f);
+}
+
+// FNV-1a over prompt TAB reference: lets evalcard.py refuse to pair two dumps
+// made from different task files.
+static unsigned long long task_hash(const Task *t) {
+  unsigned long long h = 1469598103934665603ULL;
+  for (const unsigned char *p = (const unsigned char*)t->prompt; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+  h ^= '\t'; h *= 1099511628211ULL;
+  for (const unsigned char *p = (const unsigned char*)t->reference; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+  return h;
+}
+
+#define EVAL_FAMILIES 7
+static const char *const eval_family_names[EVAL_FAMILIES] =
+  {"write", "read", "run", "delete", "done", "prose", "(none)"};
+
+static int family_index(const char *fam) {
+  if (fam)
+    for (int i = 0; i < EVAL_FAMILIES - 1; i++)
+      if (strcmp(fam, eval_family_names[i]) == 0) return i;
+  return EVAL_FAMILIES - 1;
+}
+
+int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
+  if (!cfg->model || !cfg->hf_tok) {
+    fprintf(stderr, "error: grpo --eval-only needs --model <LLMA checkpoint> and --hf-tok <vocab.hf>\n");
+    return 1;
+  }
+  const int K = cfg->eval_k > 0 ? cfg->eval_k : 1;
+  GrpoConfig ec = *cfg;
+  ec.eval_k = K;
+
+  int n_tasks = 0;
+  Task *tasks = tasks_load(tasks_path, &n_tasks);
+  if (!tasks) return 1;
+  const int n_eval = (cfg->eval_limit > 0 && cfg->eval_limit < n_tasks) ? cfg->eval_limit : n_tasks;
+
+  HFTok tok;
+  if (hftok_load(&tok, cfg->hf_tok) != 0) {
+    fprintf(stderr, "error: cannot load HF tokenizer '%s'\n", cfg->hf_tok);
+    tasks_free(tasks, n_tasks);
+    return 1;
+  }
+  // Inference-only load: no gradient arrays, no adapters, no optimizer state.
+  LlamaModel model;
+  if (llama_model_load(cfg->model, &model) != 0) {
+    fprintf(stderr, "error: cannot load model '%s'\n", cfg->model);
+    hftok_free(&tok); tasks_free(tasks, n_tasks);
+    return 1;
+  }
+
+  FILE *dump = NULL;
+  if (cfg->eval_dump) {
+    dump = fopen(cfg->eval_dump, "wb");       // "wb": LF line ends on every platform
+    if (!dump) {
+      fprintf(stderr, "error: cannot write '%s'\n", cfg->eval_dump);
+      llama_model_free(&model); hftok_free(&tok); tasks_free(tasks, n_tasks);
+      return 1;
+    }
+  }
+
+  // Tokenize the evaluated prompts once; a prompt that leaves no room for a
+  // response is reported and skipped (it gets no dump line).
+  int **pids = (int**)calloc((size_t)n_eval, sizeof(int*));
+  int *plen = (int*)calloc((size_t)n_eval, sizeof(int));
+  int scratch[MAX_PROMPT_IDS];
+  int maxP = 1, too_long = 0;
+  for (int i = 0; i < n_eval; i++) {
+    const int T = hftok_encode(&tok, tasks[i].prompt, scratch, MAX_PROMPT_IDS);
+    if (T < 1 || T + 2 >= model.max_seq) { too_long++; continue; }
+    pids[i] = (int*)malloc((size_t)T * sizeof(int));
+    if (!pids[i]) continue;
+    memcpy(pids[i], scratch, (size_t)T * sizeof(int));
+    plen[i] = T;
+    if (T > maxP) maxP = T;
+  }
+
+  const int V = model.vocab;
+  int dshape[2] = {1, V};
+  Tensor logits = tensor_create(dshape, 2), probs = tensor_create(dshape, 2);
+  Tensor plogits = tensor_create(dshape, 2);
+  LlamaKV kv = llama_kv_create(&model);
+  LlamaKV pkv = llama_kv_create_len(&model, maxP);
+  const int cap_new = cfg->max_new > 0 ? cfg->max_new : 1;
+  int *ids = (int*)malloc((size_t)cap_new * sizeof(int));
+  float *logp = (float*)malloc((size_t)cap_new * sizeof(float));
+  char *text = (char*)malloc(TEXT_CAP);
+  char *line = (char*)malloc(LINE_CAP);
+  const float match_max = reward_match_max(cfg->reward_version);
+  const int rv = cfg->reward_version == 2 ? 2 : 1;
+
+  printf("GRPO EVAL: tasks 0..%d of %d in file order | k %d per task | reward v%d | seed %u\n",
+         n_eval - 1, n_tasks, K, rv, cfg->seed);
+  printf("  model %s (vocab %d, d_model %d, layers %d) | tok %s\n",
+         cfg->model, V, model.d_model, model.n_layers, cfg->hf_tok);
+  if (cfg->temperature <= 0.0f)
+    printf("  sampling: GREEDY (temp 0) | max-new %d\n", cfg->max_new);
+  else
+    printf("  sampling: temp %.2f top-k %d top-p %.2f max-new %d | per-rollout RNG = hash(seed, task, k)\n",
+           (double)cfg->temperature, cfg->top_k, (double)cfg->top_p, cfg->max_new);
+  printf("  inference only: no LoRA, no optimizer, no backward, nothing saved%s%s\n",
+         dump ? " | dump -> " : "", dump ? cfg->eval_dump : "");
+  if (cfg->temperature <= 0.0f && K > 1)
+    printf("  NOTE: temp 0 is greedy, so all %d rollouts of a task are identical; use --k 1\n", K);
+  fflush(stdout);
+
+  RewardMonitor mon;
+  memset(&mon, 0, sizeof(mon));
+  double sum_total = 0.0;
+  long n_exact = 0, n_roll = 0;
+  int tasks_done = 0, tasks_any_exact = 0, tasks_major_exact = 0;
+  double fam_total[EVAL_FAMILIES] = {0};
+  long fam_exact[EVAL_FAMILIES] = {0}, fam_n[EVAL_FAMILIES] = {0};
+  int fam_tasks[EVAL_FAMILIES] = {0};
+  const clock_t t0 = clock();
+
+  for (int ti = 0; ti < n_eval; ti++) {
+    if (plen[ti] == 0) continue;
+    const int T = plen[ti];
+    const char *fam = task_family(tasks[ti].reference);
+    const int fi = family_index(fam);
+    const unsigned long long th = task_hash(&tasks[ti]);
+    fam_tasks[fi]++;
+    // One prefill per task, forked into each of the K rollouts.
+    prefill_prompt(&model, NULL, &pkv, pids[ti], T, &plogits);
+    int task_exact = 0;
+    for (int kk = 0; kk < K; kk++) {
+      StopReason stop = STOP_CAP;
+      const int n = eval_rollout(&model, &kv, &pkv, &plogits, &tok, pids[ti], T, ti, kk, &ec,
+                                 &logits, &probs, ids, logp, text, TEXT_CAP, &stop);
+      RewardParts parts;
+      const float r = reward_score_version(cfg->reward_version, tasks[ti].prompt, text,
+                                           tasks[ti].reference, stop == STOP_CAP, &parts);
+      const int exact = (tasks[ti].reference[0] && parts.match >= match_max - 1e-4f);
+      mon_add(&mon, &parts, stop == STOP_CAP);
+      sum_total += r; n_exact += exact; n_roll++; task_exact += exact;
+      fam_total[fi] += r; fam_exact[fi] += exact; fam_n[fi]++;
+      const char *sname = stop == STOP_EOS ? "eos" : (stop == STOP_TAG ? "tag" : "cap");
+      if (dump) {
+        fprintf(dump, "{\"task\":%d,\"k\":%d,\"family\":", ti, kk);
+        if (fam) json_str(dump, fam); else fputs("null", dump);
+        fprintf(dump, ",\"reward\":\"v%d\",\"total\":%.6g,\"format\":%.6g,\"grounded\":%.6g,"
+                      "\"match\":%.6g,\"exact\":%d,\"action\":\"%s\",\"stop\":\"%s\",\"tokens\":%d,"
+                      "\"temp\":%g,\"seed\":%u,\"task_hash\":\"%016llx\",\"response\":",
+                rv, (double)r, (double)parts.format, (double)parts.grounded, (double)parts.match,
+                exact, reward_action_name(parts.action), sname, n,
+                (double)(cfg->temperature > 0.0f ? cfg->temperature : 0.0f), cfg->seed, th);
+        json_str(dump, text);
+        fputs("}\n", dump);
+      }
+      if (cfg->verbose) {
+        one_line(text, line, LINE_CAP);
+        printf("  task %4d k %d [%s] r=%.2f (fmt %.2f grd %.2f mat %.2f) [%s %d tok] %s\n      %s\n",
+               ti, kk, fam ? fam : "-", (double)r, (double)parts.format, (double)parts.grounded,
+               (double)parts.match, sname, n, parts.reason[0] ? parts.reason : "ok", line);
+      }
+    }
+    tasks_done++;
+    if (task_exact > 0) tasks_any_exact++;
+    if (2 * task_exact > K) tasks_major_exact++;
+    if (!cfg->verbose && (tasks_done % 25 == 0)) {
+      printf("  ... %d tasks, mean reward %.4f, exact %.1f%%\n", tasks_done,
+             sum_total / (double)n_roll, 100.0 * (double)n_exact / (double)n_roll);
+      fflush(stdout);
+    }
+  }
+
+  const double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+  if (n_roll > 0) {
+    printf("EVAL SUMMARY: %d tasks x %d = %ld rollouts (%d skipped: prompt too long) %.1fs\n",
+           tasks_done, K, n_roll, too_long, secs);
+    printf("  mean reward %.4f | exact-match %.2f%% (%ld/%ld rollouts)",
+           sum_total / (double)n_roll, 100.0 * (double)n_exact / (double)n_roll, n_exact, n_roll);
+    if (K > 1)
+      printf(" | tasks: majority-exact %.2f%%, any-of-%d exact %.2f%%",
+             100.0 * tasks_major_exact / tasks_done, K, 100.0 * tasks_any_exact / tasks_done);
+    printf("\n");
+    mon_print("  ", &mon);
+    printf("  per family (from the reference action):\n");
+    for (int f = 0; f < EVAL_FAMILIES; f++) {
+      if (fam_n[f] == 0) continue;
+      printf("    %-7s %4d tasks  mean %.4f  exact %6.2f%%\n", eval_family_names[f], fam_tasks[f],
+             fam_total[f] / (double)fam_n[f], 100.0 * (double)fam_exact[f] / (double)fam_n[f]);
+    }
+    if (dump) printf("  wrote %ld lines -> %s (compare with: python tools/evalcard.py A.jsonl B.jsonl)\n",
+                     n_roll, cfg->eval_dump);
+  } else {
+    printf("EVAL SUMMARY: no task could be evaluated (%d skipped: prompt too long)\n", too_long);
+  }
+
+  int rc = (n_roll > 0) ? 0 : 1;
+  if (dump && fclose(dump) != 0) { fprintf(stderr, "error writing '%s'\n", cfg->eval_dump); rc = 1; }
+  free(ids); free(logp); free(text); free(line);
+  llama_kv_free(&kv); llama_kv_free(&pkv);
+  tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
+  llama_model_free(&model);
+  for (int i = 0; i < n_eval; i++) free(pids[i]);
   free(pids); free(plen);
   hftok_free(&tok);
   tasks_free(tasks, n_tasks);
