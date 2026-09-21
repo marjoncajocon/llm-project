@@ -5538,6 +5538,329 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 45: groundwork for Qwen2.5 / Qwen3 as base models.
+  // (a) The Qwen2 pretokenizer (hftok.c) on a table of tricky strings -- the
+  //     expected splits are those of HF tokenizers' pre_tokenize_str on the real
+  //     Qwen2.5-Coder tokenizer.json (tools/verify_hftok.py checks the full ids
+  //     on a >5000-text corpus); a .tok v3 file's pretokenizer byte drives
+  //     hftok_encode, and a v2 file still loads as GPT-2.
+  // (b) Tied embeddings (LLMA v4 flag bit 2): lm_head aliases wte. Gradient
+  //     check; wte.grad == embedding part + head part (vs an untied twin);
+  //     decode == forward bit-exact; save/load round trip; parameter count and
+  //     Muon routing (wte once, on AdamW); an AdamW step equals an untied model
+  //     whose lm_head is kept equal to wte^T by construction.
+  // --------------------------------------------------------------------------
+  {
+    printf("[45] Qwen groundwork: Qwen2 pretokenizer + tied embeddings (lm_head = wte^T)\n");
+    int ok45 = 1;
+
+    // (a) pretokenizer table: input, then the pieces joined with '|'.
+    static const char *split_tab[][2] = {
+      { "(self.foo)", "(self|.foo|)" },
+      { "x+=1", "x|+=|1" },
+      { "12345", "1|2|3|4|5" },
+      { "3.14", "3|.|1|4" },
+      { "don't DON'T I'M", "don|'t| DON|'T| I|'M" },
+      { "we'Re", "we|'Re" },
+      { "  hello", " | hello" },
+      { "a\n\nb", "a|\n\n|b" },
+      { "foo  \n  bar", "foo|  \n| | bar" },
+      { "}\n\n", "}\n\n" },
+      { "\xE4\xB8\xAD\xE6\x96\x87" "abc", "\xE4\xB8\xAD\xE6\x96\x87" "abc" },   // CJK + Latin
+      { "\xF0\x9F\x98\x80" "foo", "\xF0\x9F\x98\x80" "foo" },                   // emoji + letters
+      { "\tfoo", "\tfoo" },
+      { "x  y", "x| | y" },
+      { "a ", "a| " },
+      { "\xC3\xA9t\xC3\xA9" "1", "\xC3\xA9t\xC3\xA9|1" },                        // e-acute t e-acute 1
+      { "'\xC5\xBF", "'\xC5\xBF" },                                               // ' + long s: (?i) folds
+      { " \xD9\xA1\xD9\xA2", " |\xD9\xA1|\xD9\xA2" },                             // Arabic-Indic digits
+      { "\xC2\xA0nbsp", "\xC2\xA0nbsp" },                                         // NBSP is \s, not \r\n
+      { "if(x){\n  return;\n}", "if|(x|){\n| | return|;\n|}" },
+      { "--flag=\"v\"", "--|flag|=\"|v|\"" },
+      { "\xE2\x85\xA7x", "\xE2\x85\xA7|x" },                                      // Roman numeral = \p{N}
+    };
+    const int n_split = (int)(sizeof(split_tab) / sizeof(split_tab[0]));
+    int split_bad = 0;
+    for (int i = 0; i < n_split; i++) {
+      const char *s = split_tab[i][0];
+      int st[64], ln[64];
+      const int np = hftok_pretok_split(HFTOK_PRE_QWEN2, s, (int)strlen(s), st, ln, 64);
+      char joined[256]; int jp = 0;
+      for (int k = 0; k < np && jp < 200; k++) {
+        if (k) joined[jp++] = '|';
+        memcpy(joined + jp, s + st[k], (size_t)ln[k]); jp += ln[k];
+      }
+      joined[jp] = '\0';
+      if (strcmp(joined, split_tab[i][1]) != 0) {
+        split_bad++;
+        printf("    MISMATCH split of case %d: got '%s'\n", i, joined);
+      }
+    }
+    // The GPT-2 rule on the same kind of text (unchanged): digit runs stay whole.
+    int g_st[8], g_ln[8];
+    const int g_np = hftok_pretok_split(HFTOK_PRE_GPT2, "x 12345", 7, g_st, g_ln, 8);
+    const int gpt2_ok = (g_np == 2 && g_ln[0] == 1 && g_ln[1] == 6);
+    printf("    Qwen2 pretokenizer: %d/%d tricky strings split exactly as HF (code '(self' '.foo'"
+           " 'x+=1', single digits, (?i) contractions, CJK/emoji/NBSP/Arabic digits, newline runs)"
+           " | GPT-2 rule keeps ' 12345' whole: %s\n",
+           n_split - split_bad, n_split, gpt2_ok ? "yes" : "NO");
+    ok45 &= (split_bad == 0) && gpt2_ok;
+
+    // .tok v2 vs v3: 256 byte tokens + one merge "12" (id 256). GPT-2 splits
+    // "x 12" as x| 12 -> [x, ' ', "12"]; Qwen2 as x| |1|2 -> no merge possible.
+    int tok_ok = 1;
+    for (int ver = 2; ver <= 3; ver++) {
+      FILE *tf = fopen("qwen_tok.tmp", "wb");
+      if (!tf) { tok_ok = 0; break; }
+      const uint32_t n_voc = 257; const int32_t eos = -1, bos = -1; const uint32_t v32 = (uint32_t)ver;
+      fwrite("HFTK", 1, 4, tf); fwrite(&v32, 4, 1, tf); fwrite(&n_voc, 4, 1, tf); fwrite(&eos, 4, 1, tf);
+      for (int b = 0; b < 256; b++) { uint16_t l = 1; unsigned char c = (unsigned char)b; fwrite(&l, 2, 1, tf); fwrite(&c, 1, 1, tf); }
+      { uint16_t l = 2; fwrite(&l, 2, 1, tf); fwrite("12", 1, 2, tf); }
+      const uint8_t tk = 0; const uint16_t sl = 0; const uint32_t nsp = 0;
+      fwrite(&bos, 4, 1, tf); fwrite(&tk, 1, 1, tf); fwrite(&sl, 2, 1, tf); fwrite(&nsp, 4, 1, tf);
+      if (ver == 3) { const uint8_t pk = HFTOK_PRE_QWEN2; fwrite(&pk, 1, 1, tf); }
+      fclose(tf);
+      HFTok ht;
+      if (hftok_load(&ht, "qwen_tok.tmp") != 0) { tok_ok = 0; break; }
+      int tids[16];
+      const int n = hftok_encode(&ht, "x 12", tids, 16);
+      if (ver == 2) tok_ok &= ht.pretok == HFTOK_PRE_GPT2 && n == 3 && tids[0] == 'x' && tids[1] == ' ' && tids[2] == 256;
+      else          tok_ok &= ht.pretok == HFTOK_PRE_QWEN2 && n == 4 && tids[2] == '1' && tids[3] == '2';
+      hftok_free(&ht);
+    }
+    remove("qwen_tok.tmp");
+    printf("    .tok header: v2 file -> GPT-2 split ('x 12' = x,' ',[12]); v3 pretok byte = Qwen2"
+           " -> x,' ',1,2 -> %s\n", tok_ok ? "OK" : "FAIL");
+    ok45 &= tok_ok;
+
+    // (b) tied embeddings.
+    const int vocab = 24, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    srand(45);
+    LlamaModel tm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    llama_model_set_tied(&tm, 1);
+    llama_model_randomize(&tm);
+    // Untied twin: identical weights, lm_head = wte^T materialized.
+    LlamaModel um = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    {
+      llama_model_set_tied(&um, 1);                  // same parameter list as tm ...
+      Tensor **a = (Tensor**)malloc((size_t)llama_param_count(&tm) * sizeof(Tensor*));
+      Tensor **b = (Tensor**)malloc((size_t)llama_param_count(&um) * sizeof(Tensor*));
+      const int na = llama_collect_params(&tm, a);
+      llama_collect_params(&um, b);
+      for (int i = 0; i < na; i++) memcpy(b[i]->data, a[i]->data, a[i]->size * sizeof(float));
+      free(a); free(b);
+      llama_model_set_tied(&um, 0);                  // ... then untie: lm_head = wte^T
+    }
+    const int ids[6] = {3, 17, 5, 3, 22, 9};         // token 3 twice: two embedding rows add
+    const int targets[6] = {17, 5, 3, 22, 9, 1};
+    int ls[2] = {seq, vocab};
+    Tensor logits = tensor_create(ls, 2), probs = tensor_create(ls, 2), ref = tensor_create(ls, 2);
+    LlamaActs ta = llama_acts_create(&tm, seq), ua = llama_acts_create(&um, seq);
+
+    // Parameter count / listing / Muon routing.
+    const int npt = llama_param_count(&tm), npu = llama_param_count(&um);
+    Tensor **tp = (Tensor**)malloc((size_t)npt * sizeof(Tensor*));
+    Tensor **up = (Tensor**)malloc((size_t)npu * sizeof(Tensor*));
+    llama_collect_params(&tm, tp); llama_collect_params(&um, up);
+    size_t elt = 0, elu = 0; int wte_seen = 0, dup = 0;
+    for (int i = 0; i < npt; i++) {
+      elt += tp[i]->size;
+      wte_seen += (tp[i]->data == tm.wte.data);
+      for (int j = 0; j < i; j++) dup += (tp[i]->data == tp[j]->data);
+    }
+    for (int i = 0; i < npu; i++) elu += up[i]->size;
+    int *mask = (int*)malloc((size_t)npt * sizeof(int));
+    Tensor *ex[2] = { &tm.wte, &tm.lm_head };
+    const int nmu = muon_route(tp, npt, ex, 2, mask);
+    const int count_ok = npt == 2 + 12 * nl && npu == npt + 1 && wte_seen == 1 && dup == 0 &&
+                         elu - elt == (size_t)vocab * dm && tm.lm_head.data == NULL &&
+                         nmu == 7 * nl && mask[0] == 0;
+    printf("    params: tied %d tensors / %zu floats vs untied %d / %zu (saves vocab*d_model = %d);"
+           " wte listed once, Muon %d matrices, wte on AdamW -> %s\n",
+           npt, elt, npu, elu, vocab * dm, nmu, count_ok ? "OK" : "FAIL");
+    ok45 &= count_ok;
+    free(mask);
+
+    // Forward: tied == untied twin (different dot-product order: float tolerance).
+    llama_model_forward(&tm, ids, seq, &ref);
+    llama_model_forward(&um, ids, seq, &logits);
+    float fdiff = 0.0f;
+    for (size_t i = 0; i < ref.size; i++) fdiff = fmaxf(fdiff, fabsf(ref.data[i] - logits.data[i]));
+    // Decode == forward, bit for bit (matmul_nt computes every logit the same way at M = 1).
+    LlamaKV kv = llama_kv_create(&tm);
+    int one[2] = {1, vocab};
+    Tensor dl = tensor_create_nograd(one, 2);
+    float ddiff = 0.0f;
+    for (int p = 0; p < seq; p++) {
+      llama_decode_step(&tm, &kv, ids[p], &dl);
+      for (int v = 0; v < vocab; v++) ddiff = fmaxf(ddiff, fabsf(dl.data[v] - ref.data[p * vocab + v]));
+    }
+    llama_kv_free(&kv); tensor_free(&dl);
+    // Training forward == inference forward, bit for bit.
+    llama_forward_train(&tm, ids, seq, &ta, &logits);
+    float tdiff = 0.0f;
+    for (size_t i = 0; i < ref.size; i++) tdiff = fmaxf(tdiff, fabsf(ref.data[i] - logits.data[i]));
+    const int fwd_ok = fdiff < 1e-5f && ddiff == 0.0f && tdiff == 0.0f;
+    printf("    forward: tied vs untied twin max |diff| %.2e (tol 1e-5) | KV decode == forward %.2e"
+           " | train fwd == fwd %.2e -> %s\n", fdiff, ddiff, tdiff, fwd_ok ? "OK" : "FAIL");
+    ok45 &= fwd_ok;
+
+    // Gradients: numeric check of every tied parameter (every wte entry), then
+    // wte.grad(tied) == wte.grad(untied: embedding part) + lm_head.grad(untied)^T.
+    llama_ce_loss(&tm, &ta, ids, seq, targets, &logits, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward(&tm, ids, seq, &ta, &logits);
+    // Every entry of every tensor, central differences with eps = 3e-3: wte
+    // entries are ~0.05, so the usual eps = 1e-2 is a 20% nudge whose truncation
+    // error alone reaches ~3e-2 relative -- on an UNTIED model just the same.
+    float gmax_cond = 0.0f;
+    int judged = 0;
+    for (int p = 0; p < npt; p++)
+      for (size_t k = 0; k < tp[p]->size; k++) {
+        const float geps = 3e-3f, base = tp[p]->data[k];
+        tp[p]->data[k] = base + geps;
+        const float lp = llama_ce_loss(&tm, &ta, ids, seq, targets, &logits, &probs);
+        tp[p]->data[k] = base - geps;
+        const float lmn = llama_ce_loss(&tm, &ta, ids, seq, targets, &logits, &probs);
+        tp[p]->data[k] = base;
+        const float num = (lp - lmn) / (2.0f * geps), an = tp[p]->grad[k];
+        if (fabsf(an) > 1e-2f) {
+          judged++;
+          gmax_cond = fmaxf(gmax_cond, fabsf(an - num) / (fabsf(an) + fabsf(num) + 1e-8f));
+        }
+      }
+    llama_ce_loss(&tm, &ta, ids, seq, targets, &logits, &probs);   // fresh activations + grads
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward(&tm, ids, seq, &ta, &logits);
+    llama_ce_loss(&um, &ua, ids, seq, targets, &logits, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward(&um, ids, seq, &ua, &logits);
+    float gsum = 0.0f, hpart = 0.0f;
+    for (int v = 0; v < vocab; v++)
+      for (int j = 0; j < dm; j++) {
+        const float head = um.lm_head.grad[(size_t)j * vocab + v];
+        const float want = um.wte.grad[(size_t)v * dm + j] + head;
+        gsum = fmaxf(gsum, fabsf(tm.wte.grad[(size_t)v * dm + j] - want));
+        hpart = fmaxf(hpart, fabsf(head));
+      }
+    const int grad_ok = judged > 0 && gmax_cond < 1e-2f && gsum < 1e-5f && hpart > 1e-3f;
+    printf("    gradients: numeric check (all %d tensors, every entry, eps 3e-3) max rel %.2e (|g|>1e-2, %d judged)"
+           " | wte.grad == emb + head^T of the untied twin: max |diff| %.2e (head part up to %.2e) -> %s\n",
+           npt, gmax_cond, judged, gsum, hpart, grad_ok ? "OK" : "FAIL");
+    ok45 &= grad_ok;
+
+    // Save / load round trip: v4, flags = TIED only, no lm_head bytes, same logits.
+    int io_ok = 0;
+    long fsize = -1; uint32_t hdr[2] = {0, 0}, fl = 0;
+    if (llama_model_save("tied_ckpt.tmp", &tm) == 0) {
+      FILE *cf = fopen("tied_ckpt.tmp", "rb");
+      if (cf) {
+        if (fread(hdr, 4, 2, cf) == 2 && fseek(cf, 8 + 32 + 8, SEEK_SET) == 0) {
+          if (fread(&fl, 4, 1, cf) != 1) fl = 0;
+        }
+        fseek(cf, 0, SEEK_END); fsize = ftell(cf); fclose(cf);
+      }
+      LlamaModel lm2;
+      if (llama_model_load("tied_ckpt.tmp", &lm2) == 0) {
+        Tensor l2 = tensor_create(ls, 2);
+        llama_model_forward(&lm2, ids, seq, &l2);
+        float rd = 0.0f;
+        for (size_t i = 0; i < ref.size; i++) rd = fmaxf(rd, fabsf(ref.data[i] - l2.data[i]));
+        io_ok = lm2.tied == 1 && lm2.lm_head.data == NULL && rd == 0.0f && hdr[1] == 4 && fl == 4u &&
+                fsize == (long)(8 + 32 + 8 + 4 + elt * sizeof(float));
+        tensor_free(&l2);
+        llama_model_free(&lm2);
+      }
+    }
+    remove("tied_ckpt.tmp");
+    // The untied twin still saves as plain v2 (old files unchanged).
+    uint32_t uh[2] = {0, 0};
+    if (llama_model_save("tied_ckpt.tmp", &um) == 0) {
+      FILE *cf = fopen("tied_ckpt.tmp", "rb");
+      if (cf) { if (fread(uh, 4, 2, cf) != 2) uh[1] = 0; fclose(cf); }
+    }
+    remove("tied_ckpt.tmp");
+    io_ok &= (uh[1] == 2);
+    printf("    save/load: tied file v%u flags 0x%x, %ld bytes (= header + %zu floats, no lm_head),"
+           " reloads tied, logits bit-identical | untied twin still v%u -> %s\n",
+           hdr[1], fl, fsize, elt, uh[1], io_ok ? "OK" : "FAIL");
+    ok45 &= io_ok;
+
+    // int8: quantizing a tied model builds lm_head from wte^T in column blocks;
+    // it must equal quantizing the untied twin's materialized wte^T byte for byte.
+    QLlamaModel qt = q_llama_quantize_from(&tm), qu = q_llama_quantize_from(&um);
+    const int q_ok = memcmp(qt.lm_head.q, qu.lm_head.q, (size_t)dm * vocab) == 0 &&
+                     memcmp(qt.lm_head.scale, qu.lm_head.scale, (size_t)vocab * sizeof(float)) == 0;
+    q_llama_model_free(&qt); q_llama_model_free(&qu);
+
+    // LoRA (frozen base) on a tied model: the head's dB is skipped -> wte.grad stays 0.
+    LlamaLora lo = llama_lora_create(&tm, 2, 2.0f);
+    llama_lora_init(&lo);
+    LlamaLoraActs la = llama_lora_acts_create(&tm, &lo, seq);
+    llama_forward_train_lora(&tm, ids, seq, &ta, &logits, &lo, &la);
+    cross_entropy_forward(&logits, targets, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward_lora(&tm, ids, seq, &ta, &logits, &lo, &la);
+    float wg = 0.0f;
+    for (size_t i = 0; i < tm.wte.size; i++) wg = fmaxf(wg, fabsf(tm.wte.grad[i]));
+    llama_lora_acts_free(&la); llama_lora_free(&lo);
+    printf("    int8 lm_head from tied wte == from materialized wte^T (bytes): %s | LoRA on a tied"
+           " base leaves wte.grad = %.1e -> %s\n", q_ok ? "yes" : "NO", wg,
+           (q_ok && wg == 0.0f) ? "OK" : "FAIL");
+    ok45 &= q_ok && wg == 0.0f;
+
+    // Optimizer: 5 AdamW steps. Tied model: one param wte with grad emb + head.
+    // Untied reference kept tied BY CONSTRUCTION: fold lm_head.grad^T into
+    // wte.grad, step every tensor except lm_head, then reset lm_head = wte^T.
+    Tensor **uq = (Tensor**)malloc((size_t)npu * sizeof(Tensor*));
+    int nuq = 0;
+    for (int i = 0; i < npu; i++) if (up[i] != &um.lm_head) uq[nuq++] = up[i];
+    Adam oa = adamw_create(tp, npt, 0.01f, 0.1f), ob = adamw_create(uq, nuq, 0.01f, 0.1f);
+    for (int s = 0; s < 5; s++) {
+      llama_ce_loss(&tm, &ta, ids, seq, targets, &logits, &probs);
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, targets, &logits);
+      llama_backward(&tm, ids, seq, &ta, &logits);
+      adam_step(&oa, tp, npt);
+      llama_ce_loss(&um, &ua, ids, seq, targets, &logits, &probs);
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, targets, &logits);
+      llama_backward(&um, ids, seq, &ua, &logits);
+      for (int v = 0; v < vocab; v++)
+        for (int j = 0; j < dm; j++)
+          um.wte.grad[(size_t)v * dm + j] += um.lm_head.grad[(size_t)j * vocab + v];
+      adam_step(&ob, uq, nuq);
+      for (int v = 0; v < vocab; v++)
+        for (int j = 0; j < dm; j++)
+          um.lm_head.data[(size_t)j * vocab + v] = um.wte.data[(size_t)v * dm + j];
+    }
+    float pdiff = 0.0f;
+    for (int i = 0; i < nuq && i < npt; i++)
+      for (size_t k = 0; k < tp[i]->size; k++) pdiff = fmaxf(pdiff, fabsf(tp[i]->data[k] - uq[i]->data[k]));
+    llama_model_forward(&tm, ids, seq, &ref);
+    llama_model_forward(&um, ids, seq, &logits);
+    float ldiff = 0.0f;
+    for (size_t i = 0; i < ref.size; i++) ldiff = fmaxf(ldiff, fabsf(ref.data[i] - logits.data[i]));
+    const int opt_ok = nuq == npt && pdiff < 1e-5f && ldiff < 1e-4f;
+    printf("    5 AdamW steps: tied vs untied-kept-tied max |param diff| %.2e (tol 1e-5),"
+           " logits %.2e (tol 1e-4; float summation order only) -> %s\n",
+           pdiff, ldiff, opt_ok ? "OK" : "FAIL");
+    ok45 &= opt_ok;
+    adam_free(&oa); adam_free(&ob);
+    free(uq); free(tp); free(up);
+    llama_acts_free(&ta); llama_acts_free(&ua);
+    tensor_free(&logits); tensor_free(&probs); tensor_free(&ref);
+    llama_model_free(&tm); llama_model_free(&um);
+
+    printf("    -> %s\n\n", ok45 ? "OK" : "FAIL");
+    all_ok &= ok45;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

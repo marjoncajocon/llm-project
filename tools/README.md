@@ -79,8 +79,18 @@ python tools/convert_llama.py --model Qwen/Qwen3-0.6B --out model/qwen3/model.bi
 - **No RoPE weight permutation** is needed: `rope.c` uses HF's half-split ("rotate_half")
   convention, so HF `q_proj`/`k_proj` load directly.
 - HF linear weights are `(out, in)` (applied as `x@Wᵀ`); our matmul is `x@W` with `W (in, out)`, so
-  each linear weight is **transposed**. Norm gains + the token embedding are copied as-is; tied
-  models use `lm_head = embed_tokens.weightᵀ`.
+  each linear weight is **transposed**. Norm gains + the token embedding are copied as-is.
+- **Tied heads** (`tie_word_embeddings: true`, e.g. Qwen2.5/Qwen3/SmolLM2) are written **tied**: v4
+  flag bit 2, no `lm_head` in the file — the engine computes `hn @ wteᵀ` directly (saves
+  vocab×d_model floats: 545 MB for Qwen2.5-0.5B). `--int8` writes tied models untied (the int8
+  decode path needs its own head matrix).
+- **Refuses** what the engine cannot run instead of converting it wrongly: RoPE scaling (any
+  non-default `rope_type`), partial rotary, `attn_output_gate`, linear-attention `layer_types`,
+  chunked attention, NoPE, logit soft-capping, MoE, `mlp_bias`, non-SiLU MLPs, unknown
+  `model_type`s, and any checkpoint tensor it has no slot for (e.g. an `o_proj.bias`).
+- **Sharded** checkpoints (`model.safetensors.index.json`) and **local HF dirs** (`--model path/`)
+  are supported; tensors are memory-mapped and streamed in 16 MB chunks (RAM ≈ one raw tensor).
+- `python tools/convert_llama.py --model Qwen/Qwen2.5-Coder-0.5B-Instruct --out model/qwen25c/model.bin --max-seq 4096`
 - **q/k/v attention biases** are supported (LLMA/LLMQ v2): zero for LLaMA/SmolLM, read from
   `q/k/v_proj.bias` for Qwen2/Qwen2.5. (`o_proj` and the MLP have no bias.) So both
   `HuggingFaceTB/SmolLM2-*` and `Qwen/Qwen2.5-0.5B` convert and run.
@@ -92,7 +102,17 @@ python tools/convert_llama.py --model Qwen/Qwen3-0.6B --out model/qwen3/model.bi
   small. The C side is verified against an independent numpy reference on a `--tiny --qk-norm`
   file; a full Qwen3-0.6B vs HF comparison has NOT been run yet.
 
-Requires Python 3 + NumPy + safetensors + huggingface_hub, and internet for the download.
+Requires Python 3 + NumPy + huggingface_hub (no torch/safetensors package needed), and internet
+for the download unless `--model` is a local dir.
+
+### `export_tokenizer.py` / `verify_hftok.py` / `gen_unitab.py` — the C tokenizer
+
+`export_tokenizer.py <hf-repo | local-dir | gpt2> <out.tok>` writes the `.tok` (v3) file `hftok.c`
+reads: vocab bytes, specials, chat template, and the **pretokenizer kind** taken from tokenizer.json
+(GPT-2 regex, or the Qwen2/2.5/3 regex; anything else is refused). `verify_hftok.py <tokenizer.json>
+<file.tok>` compares the C encoder with HF `tokenizers` id-for-id and pretoken-for-pretoken on a
+>5000-text corpus (code, numbers, contractions, Unicode, whitespace, fuzz) — 0 mismatches for
+Qwen2.5-Coder and Qwen3. `gen_unitab.py > unitab.h` regenerates the Unicode \p{L}/\p{N}/\s tables.
 
 ### `llama_tok.py` / `llama_chat.py` — tokenizer bridge + one-command text generation
 
