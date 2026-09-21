@@ -3247,6 +3247,46 @@ depends on how peaked the real logits are (random weights give flat rows — no 
 135M model it was not measured (not enough free RAM). Threading threshold 2^17 vs 2^19 at 3
 threads: 23.3 vs 24.9 ms/token.
 
+### 2026-09-21 — data-v2: held-out lexicon, world-state observations, unscripted errors, goal grammar (branch `data-v2`)
+
+**Why.** The eval task files were drawn from the SAME ~11 templates and word pool as training
+(`overlap.py` on the live files: `grpo_hard_eval.txt` vs `grpo_hard.txt + clean_reason.txt` =
+goal-13gram overlap 22%, masked-skeleton overlap **100%** (18 skeletons), 98% of eval contents seen
+in train). Observations were template literals (terminal `rm` always "", `ls` names never tied to
+state), and the only error ever seen was the one the goal announced ("if it is missing create it").
+
+**What (all opt-in; no flag = byte-identical output, checked by `cmp` over 16 files / 2 seeds /
+--reason / --only / no-wiki, and `data/grpo_hard.txt` reproduces from the recipe):**
+- `tools/agent_lexicon.py` — `--holdout-lexicon train|eval [--holdout-frac 0.2]` on make_agent_traj,
+  hard_tasks, make_qa: salted-md5 split of slugs/contents/commands (item-keyed, pool-order and seed
+  independent) + a 30% split of every goal-grammar phrasing pool (near-duplicate pools paired).
+- `tools/agent_world.py` — `--vfs`: plans run against a dict workspace; write → bytes stored, read
+  → content or `error: cannot read 'f'`/`error: f: not found`, rm → ""/`removed 'f'` (rm -v) or rm's
+  error + `[exit status 1]`, ls → the real sorted files. `replay()` = open-world consistency check
+  (ls is a complete snapshot) → `clean_sft.py --replay`. Legacy corpora pass it except hard_tasks'
+  `mismatch` family (109/600: read-back contradicts the write) — v2 mismatch is a PARTIAL write
+  ("wrote 3 bytes", read shows the prefix), so it is state-consistent.
+- `--unscripted-errors RATE` (implies --vfs): one fault per task, no warning in the goal —
+  not-found (→ `ls`, then read a same-stem file or `<done>` reporting), command-not-found (→ known
+  substitute e.g. python3→python, else report), non-zero exit (network → one retry, else report),
+  denied by user (→ stop + report), failed write (→ retry). Recovery rationales quote the observation;
+  replay rejects a rationale that ignores an error. hard_tasks: RATE = share of `recover` family.
+- `tools/goal_grammar.py` — `--goal-grammar` (implies --vfs): goals rendered from the plan (verb
+  synonyms, pronouns only when unambiguous, connectives, openers, quoting, "B, but first A",
+  numbered steps) + 6 new families (ls→read, copy, write→ls, ...). 700 tasks: 19 → 696 distinct
+  masked goal skeletons. v2 `indirect` also fixes a legacy ambiguity (a `.log` distractor for "the log
+  file").
+- `tools/overlap.py` — exact / goal-13gram / row-13gram / masked-skeleton / skeleton-6gram / lexical
+  overlap; `clean_sft.py --decontam EVAL [--decontam-n 13] [--decontam-skeleton]` drops overlapping rows.
+
+**Sample build** (`out/build_v2.sh` in the branch clone, outputs untracked): eval = hard_tasks
+`--holdout-lexicon eval --goal-grammar --unscripted-errors 0.3 --n 200 --seed 2026` → grpo_tasks gate
+200/200; train = traj 700 + hard 600 + qa 300 on the train side → clean_sft verify 3295/3295, replay
+3295/3295, decontam 0 dropped. Eval vs train: exact 0, goal-13gram 0%, skeleton 0%, skeleton-6gram 3%,
+lexical 0% (files/contents/commands); control (same recipe, no holdout): skeleton-6gram 75.5%,
+51–78% lexical. Row-13gram stays 50–70% either way (tool markup, canned run output, fixed rationale
+wording) — informational only. NOTHING TRAINED OR MEASURED ON A MODEL.
+
 #-------------------------------#
 #for checking#
 Raw Coding (HumanEval+)

@@ -26,12 +26,23 @@ between generation and training:
     python tools/clean_sft.py --out data/clean.txt --report data/clean_report.txt \
         data/traj_reason.txt data/qa.txt data/toolcalls.txt
 
+Opt-in stages (off by default; without them output is byte-identical):
+  --replay     drop agent rows whose transcript contradicts every possible
+               workspace state (read after rm succeeds, ls hiding a written file,
+               wrong byte count, rationale that ignores an error; agent_world.py)
+  --decontam E drop rows overlapping held-out eval file E: same prompt or a shared
+               goal 13-gram (+ --decontam-skeleton: same masked goal; overlap.py)
+
 Deterministic given --seed. Output is the same prompt<TAB>response format the SFT
 loader (train.c --sft) already reads, so it drops straight into training.
 """
 import argparse
+import os
 import random
 import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # agent_world / overlap
 
 EXT_RE = re.compile(r"[\w./-]*\.(?:txt|md|log|json|csv)\b", re.IGNORECASE)
 PATH_RE = re.compile(r'path="([^"]*)"')
@@ -128,6 +139,16 @@ def main():
                     help="--balance cap = factor x median type count (default 2.0)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--shuffle", action="store_true", help="shuffle the final set")
+    ap.add_argument("--replay", action="store_true",
+                    help="also drop agent rows whose transcript contradicts ANY consistent "
+                         "workspace state (tools/agent_world.py replay)")
+    ap.add_argument("--decontam", action="append", default=[], metavar="EVAL",
+                    help="drop training rows overlapping this eval file (repeatable): same "
+                         "prompt, or a shared goal n-gram (tools/overlap.py)")
+    ap.add_argument("--decontam-n", type=int, default=13, help="n-gram size for --decontam")
+    ap.add_argument("--decontam-skeleton", action="store_true",
+                    help="--decontam also drops rows whose argument-masked goal skeleton "
+                         "matches an eval skeleton (strict: removes whole templates)")
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
@@ -158,6 +179,52 @@ def main():
         (len(verified), total_in, total_in - len(verified)))
     for k, v in sorted(drop_reasons.items(), key=lambda kv: -kv[1]):
         out("  - %-22s %d" % (k, v))
+
+    # ---- 1b. replay: observations must follow a world state (opt-in) ----
+    if args.replay:
+        from agent_world import replay
+        kept, rr = [], {}
+        for p, r, src in verified:
+            why = replay(p, r)
+            if why is None:
+                kept.append((p, r, src))
+            else:
+                key = why.split(":", 1)[0]
+                rr[key] = rr.get(key, 0) + 1
+        out("\nREPLAY: kept %d / %d (%d inconsistent with any workspace state)" %
+            (len(kept), len(verified), len(verified) - len(kept)))
+        for k, v in sorted(rr.items(), key=lambda kv: -kv[1]):
+            out("  - %-30s %d" % (k, v))
+        verified = kept
+
+    # ---- 1c. decontaminate against held-out eval files (opt-in) ----
+    if args.decontam:
+        import overlap
+        ev = []
+        for path in args.decontam:
+            ev += overlap.read_rows(path)
+        idx = overlap.NgramIndex(set(overlap.goal_of(p) for p, _ in ev), args.decontam_n)
+        ev_prompts = set(p for p, _ in ev)
+        ev_sk = set(overlap.skeletons(ev)) if args.decontam_skeleton else set()
+        tr_sk = (overlap.skeletons([(p, r) for p, r, _ in verified])
+                 if args.decontam_skeleton else [None] * len(verified))
+        kept, dr = [], {}
+        for (p, r, src), sk in zip(verified, tr_sk):
+            if p in ev_prompts:
+                why = "same-prompt"
+            elif idx.hits(overlap.goal_of(p)):
+                why = "goal-%dgram" % args.decontam_n
+            elif sk is not None and sk in ev_sk:
+                why = "skeleton"
+            else:
+                kept.append((p, r, src))
+                continue
+            dr[why] = dr.get(why, 0) + 1
+        out("\nDECONTAM: kept %d / %d vs %d eval rows from %s" %
+            (len(kept), len(verified), len(ev), ", ".join(args.decontam)))
+        for k, v in sorted(dr.items(), key=lambda kv: -kv[1]):
+            out("  - %-22s %d" % (k, v))
+        verified = kept
 
     # ---- 2. dedupe (exact + case/whitespace-normalized) ----
     seen, deduped, dups = set(), [], 0

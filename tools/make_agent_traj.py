@@ -291,6 +291,237 @@ def emit_pairs(goal, steps, rng, reason):
     return pairs
 
 
+# ---------------------------------------------------------------------------
+# v2: plan -> world -> observations (opt-in; see --vfs / --goal-grammar /
+# --unscripted-errors / --holdout-lexicon). NOTHING below runs without a flag,
+# so the legacy stream above stays byte-identical for the same seed.
+# ---------------------------------------------------------------------------
+class Pools:
+    """The generator's lexicon: filename slugs, write contents, commands."""
+
+    def __init__(self, files, contents, cmds):
+        self.files, self.contents, self.cmds = files, contents, cmds
+
+    def fname(self, rng, avoid=()):
+        for _ in range(200):
+            f = rng.choice(self.files) + rng.choice(EXTS)
+            if f not in avoid:
+                return f
+        return f
+
+    def word(self, rng, avoid=()):
+        for _ in range(200):
+            w = rng.choice(self.contents)
+            if w not in avoid:
+                return w
+        return w
+
+
+def _cl(op, **kw):
+    kw["op"] = op
+    return kw
+
+
+def plan_legacy_family(rng, P):
+    """The 12 legacy families as PLANS, same mix, plus their legacy goal text."""
+    f1 = P.fname(rng)
+    f2 = P.fname(rng, avoid=(f1,))
+    w = P.word(rng)
+    w2 = P.word(rng, avoid=(w,))
+    c = rng.choice(P.cmds)
+    k = rng.random()
+    if k < 0.12:
+        g = rng.choice(["create %s containing %s and read it back",
+                        "write %s to %s, then read it to confirm"])
+        goal = (g % (f1, w)) if "containing" in g else (g % (w, f1))
+        return [_cl("write", f=f1, w=w), _cl("verify", f=f1)], goal
+    if k < 0.24:
+        return ([_cl("write", f=f1, w=w), _cl("write", f=f2, w=w2)],
+                "create %s with %s, then create %s with %s" % (f1, w, f2, w2))
+    if k < 0.35:
+        return ([_cl("read", f=f1), _cl("rm", f=f1)],
+                rng.choice(["read %s then delete it", "open %s and then remove it"]) % f1)
+    if k < 0.46:
+        return [_cl("run", c=c), _cl("ls")], "run %s and then list the files" % c
+    if k < 0.57:
+        return ([_cl("write", f=f1, w=w), _cl("run", c=c), _cl("verify", f=f1)],
+                "create %s containing %s, run %s, then read it back to verify" % (f1, w, c))
+    if k < 0.67:
+        g = rng.choice(["create %s with %s, read it back, then delete it",
+                        "write %s to %s, confirm it by reading, then remove it"])
+        goal = (g % (f1, w)) if g.startswith("create") else (g % (w, f1))
+        return [_cl("write", f=f1, w=w), _cl("verify", f=f1), _cl("rm", f=f1)], goal
+    if k < 0.77:
+        g = rng.choice(["read %s, but if it is missing create it with %s and read it again",
+                        "open %s; if it does not exist, write %s to it and re-read it"])
+        return [_cl("ensure", f=f1, w=w, reread=True)], g % (f1, w)
+    if k < 0.83:
+        return ([_cl("write", f=f1, w=w), _cl("write", f=f2, w=w2), _cl("run", c=c),
+                 _cl("read", f=f1)],
+                "create %s with %s and %s with %s, run %s, then read %s"
+                % (f1, w, f2, w2, c, f1))
+    if k < 0.89:
+        return ([_cl("ensure", f=f1, w=w, reread=False), _cl("run", c=c),
+                 _cl("reread", f=f1)],
+                "read %s; if it is missing create it with %s, then run %s and read it again"
+                % (f1, w, c))
+    if k < 0.94:
+        return ([_cl("write", f=f1, w=w), _cl("verify", f=f1), _cl("run", c=c),
+                 _cl("rm", f=f1)],
+                "create %s with %s, read it back, run %s, then delete it" % (f1, w, c))
+    if k < 0.97:
+        g = rng.choice(["create %s with %s", "save %s to %s"])
+        goal = (g % (f1, w)) if g.startswith("create") else (g % (w, f1))
+        return [_cl("write", f=f1, w=w)], goal
+    return [_cl("run", c=c)], rng.choice(["run %s", "execute %s", "please run %s"]) % c
+
+
+def plan_extra_family(rng, P):
+    """Families only the grammar can phrase (no legacy template exists)."""
+    f1 = P.fname(rng)
+    f2 = P.fname(rng, avoid=(f1,))
+    w = P.word(rng)
+    c = rng.choice(P.cmds)
+    k = rng.random()
+    if k < 0.2:
+        return [_cl("ls"), _cl("read", f=f1)]
+    if k < 0.35:
+        return [_cl("read", f=f1)]
+    if k < 0.55:
+        pl = [_cl("copy", f=f1, g=f2)]
+        if rng.random() < 0.5:
+            pl.append(_cl("verify", f=f2))
+        return pl
+    if k < 0.7:
+        return [_cl("write", f=f1, w=w), _cl("ls")]
+    if k < 0.8:
+        return [_cl("rm", f=f1)]
+    if k < 0.9:
+        return [_cl("read", f=f1), _cl("run", c=c), _cl("rm", f=f1)]
+    return [_cl("write", f=f1, w=w), _cl("run", c=c), _cl("ls"), _cl("verify", f=f1)]
+
+
+def world_for(plan, rng, P, extras=(0, 3)):
+    """Initial workspace: every file the plan READS or DELETES before writing it
+    exists (content from the pool), plus a few unrelated files so `ls` is real."""
+    from agent_world import World, plan_files
+    files, touched = {}, set()
+    for f, op in plan_files(plan):
+        touched.add(f)
+        if op in ("read", "verify", "reread", "rm", "copy", "desc", "read_ord"):
+            files[f] = P.word(rng)
+    for _ in range(rng.randint(*extras)):
+        x = P.fname(rng, avoid=touched | set(files))
+        files[x] = P.word(rng)
+    return World(files)
+
+
+INJECT_KINDS = ["not-found", "cmd-not-found", "nonzero-exit", "denied", "write-failed"]
+# every plan can host a denial, only some a missing file -- weight the kinds so
+# the always-available ones do not crowd out the informative ones
+INJECT_WEIGHT = {"not-found": 3.0, "cmd-not-found": 2.0, "nonzero-exit": 2.0,
+                 "denied": 1.0, "write-failed": 1.0}
+
+
+def pick_injection(rng, plan, world, want=None):
+    """A random (clause, kind) fault the plan admits; the kind is drawn first
+    (weighted over the kinds this plan can host), then the clause."""
+    from agent_world import injection_points
+    pts = injection_points(plan, world)
+    if want:
+        pts = [p for p in pts if p[1] == want]
+    if not pts:
+        return None
+    kinds = sorted(set(k for _, k in pts), key=INJECT_KINDS.index)
+    kind = rng.choices(kinds, weights=[INJECT_WEIGHT[k] for k in kinds])[0]
+    return rng.choice([p for p in pts if p[1] == kind])
+
+
+def build_task_v2(rng, P, opts, force_inject=False, want_kind=None, plan=None, goal=None,
+                  world=None):
+    """-> (goal, Exec) for one task run against a fresh world."""
+    from agent_world import Exec, prepare_injection
+    from goal_grammar import render_goal
+    if plan is None:
+        if opts.goal_grammar and rng.random() < 0.3:
+            plan, goal = plan_extra_family(rng, P), None
+        else:
+            plan, goal = plan_legacy_family(rng, P)
+    if world is None:
+        world = world_for(plan, rng, P)
+    inject = None
+    if force_inject or (opts.unscripted_errors > 0 and rng.random() < opts.unscripted_errors):
+        inject = pick_injection(rng, plan, world, want_kind)
+    prepare_injection(world, plan, inject, rng, EXTS)
+    ex = Exec(world, rng, EXTS, rm_verbose=0.3).run(plan, inject)
+    if opts.goal_grammar or goal is None:
+        goal = render_goal(plan, rng, opts.holdout_lexicon)
+    return goal, ex
+
+
+def load_pools(args):
+    """Pools for the v2 / holdout paths (the legacy path builds its own)."""
+    from agent_lexicon import apply_holdout
+    from agent_world import STATEFUL_VERBS
+    lim = 100000 if args.holdout_lexicon else 300
+    files = slugs_from_wiki(args.wiki, limit=lim)
+    cmds = commands_from(args.commands, limit=lim)
+    contents = contents_from(files)
+    if args.holdout_lexicon:
+        files, contents, cmds = apply_holdout(files, contents, cmds, args.holdout_lexicon,
+                                              args.holdout_frac)
+    if args.vfs:
+        cmds = [c for c in cmds if (c.split() or [""])[0] not in STATEFUL_VERBS] or ["make"]
+    return files, contents, cmds
+
+
+def add_v2_args(ap):
+    ap.add_argument("--vfs", action="store_true",
+                    help="observations computed from a virtual filesystem (agent_world.py)")
+    ap.add_argument("--goal-grammar", action="store_true",
+                    help="render goals from goal_grammar.py (implies --vfs; adds families)")
+    ap.add_argument("--unscripted-errors", type=float, default=0.0, metavar="RATE",
+                    help="share of tasks with ONE unannounced fault + recovery (implies --vfs)")
+    ap.add_argument("--holdout-lexicon", choices=["train", "eval"], default=None,
+                    help="restrict words/commands/phrasings to one side of the fixed split")
+    ap.add_argument("--holdout-frac", type=float, default=0.2,
+                    help="share of the lexicon reserved for eval (default 0.2)")
+
+
+def normalize_v2_args(args):
+    if (args.goal_grammar or args.unscripted_errors > 0) and not args.vfs:
+        args.vfs = True
+        print("note: --goal-grammar / --unscripted-errors imply --vfs")
+    return args
+
+
+def main_v2(args):
+    from agent_world import emit_pairs_v2
+    rng = random.Random(args.seed)
+    files, contents, cmds = load_pools(args)
+    rng.shuffle(files)
+    P = Pools(files, contents, cmds)
+    rows, steps_hist, inj = [], {}, {}
+    for _ in range(args.n):
+        goal, ex = build_task_v2(rng, P, args)
+        steps_hist[len(ex.steps)] = steps_hist.get(len(ex.steps), 0) + 1
+        k = ex.injected[1] if ex.injected else "none"
+        inj[k] = inj.get(k, 0) + 1
+        for prompt, resp in emit_pairs_v2(goal, ex.steps, ex.done, rng, args.reason):
+            rows.append("%s\t%s" % (prompt.replace("\t", " "), resp))
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(rows) + "\n")
+    print("wrote %d pairs from %d tasks -> %s (v2: vfs=%s grammar=%s errors=%.2f "
+          "holdout=%s; %d files, %d contents, %d commands)"
+          % (len(rows), args.n, args.out, args.vfs, args.goal_grammar,
+             args.unscripted_errors, args.holdout_lexicon, len(files), len(contents),
+             len(cmds)))
+    print("  task lengths (steps -> count): %s"
+          % ", ".join("%d:%d" % (k, v) for k, v in sorted(steps_hist.items())))
+    print("  injected faults: %s" % ", ".join("%s:%d" % kv for kv in sorted(inj.items())))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/traj.txt")
@@ -300,12 +531,18 @@ def main():
     ap.add_argument("--reason", action="store_true",
                     help="reasoning-dense: prefix each action with <think>rationale</think>")
     ap.add_argument("--seed", type=int, default=1234)
-    args = ap.parse_args()
+    add_v2_args(ap)
+    args = normalize_v2_args(ap.parse_args())
+    if args.vfs:
+        return main_v2(args)
 
     rng = random.Random(args.seed)
-    files = slugs_from_wiki(args.wiki)
-    cmds = commands_from(args.commands)
-    contents = contents_from(files)          # large, varied write-content pool
+    if args.holdout_lexicon:                 # legacy templates, split lexicon
+        files, contents, cmds = load_pools(args)
+    else:
+        files = slugs_from_wiki(args.wiki)
+        cmds = commands_from(args.commands)
+        contents = contents_from(files)          # large, varied write-content pool
     rng.shuffle(files)
 
     rows, steps_hist = [], {}

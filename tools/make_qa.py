@@ -70,11 +70,23 @@ def main():
     ap.add_argument("--out", default="data/qa.txt")
     ap.add_argument("--n", type=int, default=400, help="max pairs to emit")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--holdout-lexicon", choices=["train", "eval"], default=None,
+                    help="keep only articles whose filename slug is on this side of the "
+                         "agent_lexicon split (so QA does not leak eval-only words)")
+    ap.add_argument("--holdout-frac", type=float, default=0.2)
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
     files = sorted(f for f in os.listdir(args.wiki) if f.endswith(".txt"))
     rng.shuffle(files)
+    if args.holdout_lexicon:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from agent_lexicon import side_of
+        # the same slug make_agent_traj.slugs_from_wiki derives from the filename
+        files = [f for f in files if side_of(
+            re.sub(r"[^A-Za-z0-9]+", "_", f[:-4].lower()).strip("_")[:20],
+            args.holdout_frac) == args.holdout_lexicon]
 
     rows, skipped = [], 0
     for fn in files:
