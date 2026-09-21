@@ -171,6 +171,318 @@ static void parallel_for(int total, range_fn fn, void *ctx) {
 #endif  // POOL_DISABLED
 
 // ===========================================================================
+// AVX2 + FMA kernels (roadmap B4), with RUNTIME dispatch.
+//
+// WHY RUNTIME DISPATCH, not `#ifdef __AVX2__`: __AVX2__ says what the COMPILER
+// was told, not what the CPU has. A native `zig cc` build already targets the
+// host CPU (it behaves like -march=native), but every portable binary -- `make
+// cross`, the Colab `cross-gpu` artifact, a plain `gcc -O2` -- targets baseline
+// x86-64 (SSE2 only) and would never get the fast path; and a binary built WITH
+// -mavx2 dies with SIGILL on a CPU without it. So the kernels are compiled with
+// __attribute__((target("avx2,fma"))) (no global -mavx2; the rest of the program
+// stays baseline), and CPUID + XGETBV decide ONCE, at the first matmul, whether
+// to call them. Non-x86 targets (aarch64, wasm32) and compilers without GNU
+// attributes compile none of this and run the portable kernels, unchanged.
+// $TF_SIMD=0 (or matmul_set_simd(0)) forces the portable path, for A/B runs.
+//
+// WHY THEY BEAT THE AUTO-VECTORIZED KERNELS: the portable forward already
+// vectorizes (its inner loop is an AXPY) -- but it LOADS AND STORES the output
+// row once per k, and streams all of B from L3/RAM once per output row. These
+// are register-blocked: a 4 x 16 tile of C lives in 8 ymm registers for the
+// whole p loop (no C traffic), each B load feeds 4 FMAs, and B is packed into
+// small strip-major panels that stay in L1/L2 while every row block passes over
+// them. The classic GEMM micro-kernel, just small. (Measured gains and the
+// cases where there are none -- M=1 decode -- are in README / notes.md.)
+//
+// ONE MICRO-KERNEL SERVES ALL THREE PRODUCTS. gemm_tile computes
+//     T[r][c] (+)= sum_p  a(r, p) * b(p, c)       p ascending, one FMA per step
+// with a(r,p) = a[r*a_rs + p*a_ps] at arbitrary strides, so
+//   forward   C  = A   @ B   : a = rows of A     (a_rs = K, a_ps = 1)
+//   dB       dB += A^T @ dC  : a = columns of A  (a_rs = 1, a_ps = K), no copy
+//   dA       dA += dC  @ B^T : B^T gathered from B while packing
+//
+// NUMERICS / BIT-EXACTNESS. A forward output element is ONE fused-multiply-add
+// chain over k in ascending order, started from 0 -- whichever tile, panel, row
+// block, code path (tiles vs the decode AXPY) or thread produced it. So a 1-row
+// decode matmul and a T-row prefill matmul give bit-identical rows, and results
+// do not depend on $TF_THREADS: selftest parts [4]/[19]/[22]/[26] (KV-cache and
+// LoRA decode == full forward, 0.00e+00) rely on exactly that. The backward
+// forms sum each MM_KC-deep block the same way and ADD it to the gradient; block
+// boundaries depend only on the shape, so they are thread-independent too. What
+// is NOT identical is SIMD vs portable: FMA rounds once where mul+add rounds
+// twice, and dA/dB associate differently -- ~1e-7..1e-6 relative, gated by
+// selftest part [31]. The choice is made once per process, never mixed in a run.
+// ===========================================================================
+
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__)) \
+    && !defined(TF_NO_SIMD)
+#  define MM_X86_SIMD 1
+#  include <immintrin.h>
+#  include <cpuid.h>
+#endif
+
+static int S_simd = -1;   // -1 = not yet decided, 0 = portable C, 1 = AVX2+FMA
+
+#if defined(MM_X86_SIMD)
+
+// AVX2 and FMA must be in the CPU (CPUID) AND enabled by the OS (XGETBV: YMM
+// state is saved on context switch). Checking CPUID alone is the classic bug --
+// it crashes under an OS or VM that has AVX turned off.
+static int cpu_has_avx2_fma(void) {
+  unsigned a, b, c, d;
+  if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+  const int fma = (c >> 12) & 1, osxsave = (c >> 27) & 1, avx = (c >> 28) & 1;
+  if (!fma || !osxsave || !avx) return 0;
+  unsigned xlo, xhi;
+  __asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+  (void)xhi;
+  if ((xlo & 6u) != 6u) return 0;                 // XMM (bit 1) + YMM (bit 2) state
+  if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return 0;
+  return (b >> 5) & 1;                             // AVX2
+}
+
+#define SIMD_FN      __attribute__((target("avx2,fma")))
+#define SIMD_INLINE  static inline __attribute__((always_inline, target("avx2,fma")))
+
+// maskload/maskstore lane masks: the first w (0..8) of 8 lanes.
+static const int32_t mm_mask_src[16] = { -1, -1, -1, -1, -1, -1, -1, -1,
+                                          0,  0,  0,  0,  0,  0,  0,  0 };
+SIMD_INLINE __m256i lane_mask(int w) {
+  if (w < 0) w = 0;
+  if (w > 8) w = 8;
+  return _mm256_loadu_si256((const __m256i*)(mm_mask_src + 8 - w));
+}
+
+// Tile modes. The reduction (p) is split into MM_KC-deep blocks and a tile
+// covers one block, so a tile either starts or continues an element's sum:
+//   MM_STORE : acc = 0,  C  = acc   (forward, first p block)
+//   MM_CONT  : acc = C,  C  = acc   (forward, later p blocks: the running sum
+//              was parked in C as a float, so resuming from it is EXACTLY the
+//              one unbroken FMA chain -- p-blocking changes no bits)
+//   MM_ADD   : acc = 0,  C += acc   (backward: gradients accumulate)
+enum { MM_STORE, MM_CONT, MM_ADD };
+
+// The micro-kernel: an R x (8V) tile, R <= 4, V <= 8, R*V <= 8 accumulators.
+// Only ever called with compile-time-constant R/V/masked/mode, so after
+// inlining acc[][] is plain registers and every branch below folds away.
+// `masked`: the ragged last strip (V == 2, only w < 16 columns valid); loads
+// and stores are masked so nothing outside b / c is touched.
+SIMD_INLINE void gemm_tile(const float *a, size_t a_rs, size_t a_ps,
+                           const float *b, size_t ldb, float *c, size_t ldc,
+                           int P, int R, int V, int masked, int w, int mode) {
+  __m256 acc[4][8];
+  __m256i m[8];
+  for (int v = 0; v < V; v++) m[v] = lane_mask(masked ? w - 8 * v : 8);
+  for (int r = 0; r < R; r++)
+    for (int v = 0; v < V; v++) {
+      const float *cp = c + (size_t)r * ldc + 8 * v;
+      acc[r][v] = (mode != MM_CONT) ? _mm256_setzero_ps()
+                : masked ? _mm256_maskload_ps(cp, m[v]) : _mm256_loadu_ps(cp);
+    }
+  for (int p = 0; p < P; p++) {
+    const float *bp = b + (size_t)p * ldb;
+    __m256 bv[8];
+    for (int v = 0; v < V; v++)
+      bv[v] = masked ? _mm256_maskload_ps(bp + 8 * v, m[v]) : _mm256_loadu_ps(bp + 8 * v);
+    const float *ap = a + (size_t)p * a_ps;
+    for (int r = 0; r < R; r++) {
+      const __m256 av = _mm256_broadcast_ss(ap + (size_t)r * a_rs);
+      for (int v = 0; v < V; v++) acc[r][v] = _mm256_fmadd_ps(av, bv[v], acc[r][v]);
+    }
+  }
+  for (int r = 0; r < R; r++)
+    for (int v = 0; v < V; v++) {
+      float *cp = c + (size_t)r * ldc + 8 * v;
+      __m256 out = acc[r][v];
+      if (mode == MM_ADD)
+        out = _mm256_add_ps(masked ? _mm256_maskload_ps(cp, m[v]) : _mm256_loadu_ps(cp), out);
+      if (masked) _mm256_maskstore_ps(cp, m[v], out);
+      else        _mm256_storeu_ps(cp, out);
+    }
+}
+
+// One output row as an AXPY sweep: c = 0, then c[:] = fma(a(p), b[p,:], c[:])
+// for p ascending, four b rows per pass over c. This is the forward for fewer
+// than 4 rows -- in particular single-token decode (M=1), which is bandwidth-
+// bound: it reads each b row front to back, the hardware prefetcher's favourite
+// pattern, and needs no packing (which would cost as much as the product).
+// Parking the running sum in c between passes is exact, so every element is the
+// SAME FMA chain gemm_tile produces: a decode row and the matching prefill row
+// are bit-identical.
+SIMD_FN static void axpy_row(const float *a, size_t a_ps, const float *b, size_t ldb,
+                             float *c, int P, int ncols) {
+  const int n8 = ncols / 8 * 8;
+  const __m256i mt = lane_mask(ncols - n8);
+  for (int j = 0; j < ncols; j++) c[j] = 0.0f;
+  int p = 0;
+  for (; p + 4 <= P; p += 4) {
+    const __m256 a0 = _mm256_broadcast_ss(a + (size_t)(p + 0) * a_ps);
+    const __m256 a1 = _mm256_broadcast_ss(a + (size_t)(p + 1) * a_ps);
+    const __m256 a2 = _mm256_broadcast_ss(a + (size_t)(p + 2) * a_ps);
+    const __m256 a3 = _mm256_broadcast_ss(a + (size_t)(p + 3) * a_ps);
+    const float *b0 = b + (size_t)p * ldb, *b1 = b0 + ldb, *b2 = b1 + ldb, *b3 = b2 + ldb;
+    int j = 0;
+    for (; j < n8; j += 8) {
+      __m256 cv = _mm256_loadu_ps(c + j);
+      cv = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b0 + j), cv);
+      cv = _mm256_fmadd_ps(a1, _mm256_loadu_ps(b1 + j), cv);
+      cv = _mm256_fmadd_ps(a2, _mm256_loadu_ps(b2 + j), cv);
+      cv = _mm256_fmadd_ps(a3, _mm256_loadu_ps(b3 + j), cv);
+      _mm256_storeu_ps(c + j, cv);
+    }
+    if (j < ncols) {
+      __m256 cv = _mm256_maskload_ps(c + j, mt);
+      cv = _mm256_fmadd_ps(a0, _mm256_maskload_ps(b0 + j, mt), cv);
+      cv = _mm256_fmadd_ps(a1, _mm256_maskload_ps(b1 + j, mt), cv);
+      cv = _mm256_fmadd_ps(a2, _mm256_maskload_ps(b2 + j, mt), cv);
+      cv = _mm256_fmadd_ps(a3, _mm256_maskload_ps(b3 + j, mt), cv);
+      _mm256_maskstore_ps(c + j, mt, cv);
+    }
+  }
+  for (; p < P; p++) {
+    const __m256 a0 = _mm256_broadcast_ss(a + (size_t)p * a_ps);
+    const float *b0 = b + (size_t)p * ldb;
+    int j = 0;
+    for (; j < n8; j += 8)
+      _mm256_storeu_ps(c + j, _mm256_fmadd_ps(a0, _mm256_loadu_ps(b0 + j), _mm256_loadu_ps(c + j)));
+    if (j < ncols)
+      _mm256_maskstore_ps(c + j, mt, _mm256_fmadd_ps(a0, _mm256_maskload_ps(b0 + j, mt),
+                                                     _mm256_maskload_ps(c + j, mt)));
+  }
+}
+
+// Blocking. MM_KC = depth of a p block, MM_NC = columns per packed panel (a
+// multiple of 16); a packed panel is MM_KC x MM_NC floats = 128 KB, L2-sized.
+#define MM_KC 256
+#define MM_NC 128
+
+// Pack b(p, c) = b[p*b_ps + c*b_cs], p < kc, c < nc, into strip-major order:
+// dst[strip][p][16], the last strip zero-padded, so the micro-kernel streams a
+// strip as one contiguous kc x 64-byte run. WHY PACK: walked in place, a
+// 16-column strip hops across kc rows of b at stride ldb -- 196 KB per row for
+// lm_head, so every row is a new page (a TLB miss) and the hardware prefetcher
+// sees no stream. Measured before packing: lm_head at a third of the small
+// shapes' GFLOP/s, and software prefetch did not recover it. b_cs != 1 is dA's
+// transposed operand, gathered here straight from B with no transposed copy.
+SIMD_FN static void pack_panel(const float *b, size_t b_ps, size_t b_cs, int kc, int nc,
+                               float *dst) {
+  for (int s = 0; s * 16 < nc; s++) {
+    const int w = (nc - s * 16 < 16) ? nc - s * 16 : 16;
+    float *d = dst + (size_t)s * kc * 16;
+    if (b_cs == 1) {
+      for (int p = 0; p < kc; p++) {
+        const float *src = b + (size_t)p * b_ps + (size_t)s * 16;
+        float *dp = d + (size_t)p * 16;
+        if (w == 16) {
+          _mm256_storeu_ps(dp, _mm256_loadu_ps(src));
+          _mm256_storeu_ps(dp + 8, _mm256_loadu_ps(src + 8));
+        } else {
+          for (int x = 0; x < 16; x++) dp[x] = (x < w) ? src[x] : 0.0f;
+        }
+      }
+    } else {                          // transposed: read along p, which is contiguous
+      for (int x = 0; x < 16; x++) {
+        const float *src = b + (size_t)(s * 16 + x) * b_cs;
+        for (int p = 0; p < kc; p++) d[(size_t)p * 16 + x] = (x < w) ? src[(size_t)p * b_ps] : 0.0f;
+      }
+    }
+  }
+}
+
+// T[r][c] (+)= sum_{p<P} a(r,p) * b(p,c) for output rows [r0, r1) and columns
+// [0, ncols); a(r,p) = a[r*a_rs + p*a_ps], b(p,c) = b[p*b_ps + c*b_cs], T has
+// row stride ldc. `accum` selects the backward's MM_ADD over the forward's
+// MM_STORE/MM_CONT. For each MM_KC-deep p block and MM_NC-wide panel, b is
+// packed once, then each 16-column strip is swept by 4-row tiles (the strip
+// stays in L1 across row blocks) and 1-3 leftover rows get an R-row tile.
+// Returns 0 only if the panel buffer cannot be allocated (nothing written yet).
+SIMD_FN static int gemm_rows(int r0, int r1, int ncols, int P,
+                             const float *a, size_t a_rs, size_t a_ps,
+                             const float *b, size_t b_ps, size_t b_cs,
+                             float *c, size_t ldc, int accum) {
+  if (r1 <= r0 || ncols <= 0) return 1;
+  if (!accum && b_cs == 1 && r1 - r0 < 4) {          // decode-shaped forward
+    for (int r = r0; r < r1; r++)
+      axpy_row(a + (size_t)r * a_rs, a_ps, b, b_ps, c + (size_t)r * ldc, P, ncols);
+    return 1;
+  }
+  if (P <= 0) {                                      // empty sum: C = 0 / C += 0
+    if (!accum)
+      for (int r = r0; r < r1; r++)
+        for (int j = 0; j < ncols; j++) c[(size_t)r * ldc + j] = 0.0f;
+    return 1;
+  }
+  float *buf = (float*)malloc((size_t)MM_KC * MM_NC * sizeof(float));
+  if (!buf) return 0;
+  const int r4 = r0 + (r1 - r0) / 4 * 4, rl = r1 - r4;
+  for (int pc = 0; pc < P; pc += MM_KC) {
+    const int kc = (P - pc < MM_KC) ? P - pc : MM_KC;
+    const int mode = accum ? MM_ADD : (pc == 0 ? MM_STORE : MM_CONT);
+    const float *ap = a + (size_t)pc * a_ps;
+    for (int jc = 0; jc < ncols; jc += MM_NC) {
+      const int nc = (ncols - jc < MM_NC) ? ncols - jc : MM_NC;
+      pack_panel(b + (size_t)pc * b_ps + (size_t)jc * b_cs, b_ps, b_cs, kc, nc, buf);
+      for (int s = 0; s * 16 < nc; s++) {
+        const float *bs = buf + (size_t)s * kc * 16;
+        const int j = jc + s * 16, w = (nc - s * 16 < 16) ? nc - s * 16 : 16;
+        // R, masked and mode must reach gemm_tile as constants, so every
+        // combination is spelled out; each arm is its own specialized kernel.
+#define TILE(r, R, MSK, MODE) gemm_tile(ap + (size_t)(r) * a_rs, a_rs, a_ps, bs, 16,   \
+                                        c + (size_t)(r) * ldc + j, ldc, kc, R, 2, MSK, w, MODE)
+#define TILES(MSK, MODE)                                                          \
+        do {                                                                      \
+          for (int r = r0; r < r4; r += 4) TILE(r, 4, MSK, MODE);                 \
+          if (rl == 3) TILE(r4, 3, MSK, MODE);                                    \
+          else if (rl == 2) TILE(r4, 2, MSK, MODE);                               \
+          else if (rl == 1) TILE(r4, 1, MSK, MODE);                               \
+        } while (0)
+        if (w == 16) {
+          if (mode == MM_STORE)     TILES(0, MM_STORE);
+          else if (mode == MM_CONT) TILES(0, MM_CONT);
+          else                      TILES(0, MM_ADD);
+        } else {
+          if (mode == MM_STORE)     TILES(1, MM_STORE);
+          else if (mode == MM_CONT) TILES(1, MM_CONT);
+          else                      TILES(1, MM_ADD);
+        }
+#undef TILES
+#undef TILE
+      }
+    }
+  }
+  free(buf);
+  return 1;
+}
+
+#endif  // MM_X86_SIMD
+
+int matmul_simd_available(void) {
+#if defined(MM_X86_SIMD)
+  static int avail = -1;
+  if (avail < 0) avail = cpu_has_avx2_fma();
+  return avail;
+#else
+  return 0;
+#endif
+}
+
+// Decided once, at the first matmul, in the calling thread: the pool's workers
+// are handed an already-chosen kernel and never read this.
+static int simd_on(void) {
+  if (S_simd < 0) {
+    const char *env = getenv("TF_SIMD");
+    S_simd = (matmul_simd_available() && !(env && env[0] == '0')) ? 1 : 0;
+  }
+  return S_simd;
+}
+
+int matmul_simd_enabled(void) { return simd_on(); }
+
+void matmul_set_simd(int on) { S_simd = (on && matmul_simd_available()) ? 1 : 0; }
+
+const char *matmul_simd_name(void) { return simd_on() ? "avx2+fma" : "portable C"; }
+
+// ===========================================================================
 // Matrix multiply (forward) - C = A @ B, A:(M,K) B:(K,N) C:(M,N)
 // ===========================================================================
 typedef struct { const float *A, *B; float *C; int K, N; } MMFwd;
@@ -191,6 +503,16 @@ static void mm_fwd_rows(int i0, int i1, void *ctx) {
   }
 }
 
+#if defined(MM_X86_SIMD)
+// AVX2 forward for output rows [i0, i1): C rows = A rows @ B, from 0.
+SIMD_FN static void mm_fwd_rows_avx2(int i0, int i1, void *ctx) {
+  const MMFwd *t = (const MMFwd*)ctx;
+  if (!gemm_rows(i0, i1, t->N, t->K, t->A, (size_t)t->K, 1, t->B, (size_t)t->N, 1,
+                 t->C, (size_t)t->N, 0))
+    mm_fwd_rows(i0, i1, ctx);                     // OOM: portable kernel instead
+}
+#endif
+
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
@@ -199,8 +521,12 @@ void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   // too small to be worth the dispatch; the CPU path below is then unchanged.
   if (gpu_matmul(A->data, B->data, C->data, M, K, N)) return;
   MMFwd t = { A->data, B->data, C->data, K, N };
-  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_fwd_rows(0, M, &t); return; }
-  parallel_for(M, mm_fwd_rows, &t);
+  range_fn fn = mm_fwd_rows;
+#if defined(MM_X86_SIMD)
+  if (simd_on()) fn = mm_fwd_rows_avx2;
+#endif
+  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { fn(0, M, &t); return; }
+  parallel_for(M, fn, &t);
 }
 
 // Matrix Addition: C = A + B (element-wise)
@@ -305,19 +631,52 @@ static void mm_bwd_dB(int k0, int k1, void *ctx) {
   free(acc);
 }
 
+#if defined(MM_X86_SIMD)
+// AVX2 dA[i,k] += sum_j dC[i,j] * B[k,j]   (parallel over rows i).
+// As a GEMM this is dC @ B^T; the micro-kernel's b operand is B^T, which
+// pack_panel gathers straight out of B (b_ps = 1 walks j, b_cs = N walks k), so
+// there is no transposed copy of B (it would be 113 MB for lm_head). The j sum
+// is split into MM_KC-deep blocks that are ADDED to dA one after another; block
+// boundaries depend on N alone, never on the row range, so threading stays
+// bit-exact.
+SIMD_FN static void mm_bwd_dA_avx2(int i0, int i1, void *ctx) {
+  const MMBwd *t = (const MMBwd*)ctx;
+  const int K = t->K, N = t->N;
+  if (!gemm_rows(i0, i1, K, N, t->C->grad, (size_t)N, 1, t->B->data, 1, (size_t)N,
+                 t->A->grad, (size_t)K, 1))
+    mm_bwd_dA(i0, i1, ctx);                       // OOM: portable kernel instead
+}
+
+// AVX2 dB[k,j] += sum_i A[i,k] * dC[i,j]   (parallel over rows k).
+// The a operand is A^T, read through strides (a_rs = 1 walks k, a_ps = K walks
+// i): again no transpose. For M <= MM_KC this has exactly the portable kernel's
+// structure -- a fresh sum over i, ascending, then added to dB.
+SIMD_FN static void mm_bwd_dB_avx2(int k0, int k1, void *ctx) {
+  const MMBwd *t = (const MMBwd*)ctx;
+  const int M = t->M, K = t->K, N = t->N;
+  if (!gemm_rows(k0, k1, N, M, t->A->data, 1, (size_t)K, t->C->grad, (size_t)N, 1,
+                 t->B->grad, (size_t)N, 1))
+    mm_bwd_dB(k0, k1, ctx);
+}
+#endif
+
 // Backward of C = A @ B: dA += dC @ B^T, dB += A^T @ dC
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
   if (gpu_matmul_backward(A->data, B->data, C->grad, A->grad, B->grad, M, K, N)) return;
   MMBwd t = { A, B, C, M, K, N };
+  range_fn fa = mm_bwd_dA, fb = mm_bwd_dB;
+#if defined(MM_X86_SIMD)
+  if (simd_on()) { fa = mm_bwd_dA_avx2; fb = mm_bwd_dB_avx2; }
+#endif
   if ((size_t)M * N * K < MM_THREAD_THRESHOLD) {
-    mm_bwd_dA(0, M, &t);
-    mm_bwd_dB(0, K, &t);
+    fa(0, M, &t);
+    fb(0, K, &t);
     return;
   }
-  parallel_for(M, mm_bwd_dA, &t);
-  parallel_for(K, mm_bwd_dB, &t);
+  parallel_for(M, fa, &t);
+  parallel_for(K, fb, &t);
 }
 
 // Input-gradient half only: dA += dC @ B^T, leaving B->grad untouched. For a
@@ -328,8 +687,12 @@ void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C) {
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
   if (gpu_matmul_backward_dx(B->data, C->grad, A->grad, M, K, N)) return;
   MMBwd t = { A, B, C, M, K, N };
-  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { mm_bwd_dA(0, M, &t); return; }
-  parallel_for(M, mm_bwd_dA, &t);
+  range_fn fa = mm_bwd_dA;
+#if defined(MM_X86_SIMD)
+  if (simd_on()) fa = mm_bwd_dA_avx2;
+#endif
+  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { fa(0, M, &t); return; }
+  parallel_for(M, fa, &t);
 }
 
 // Backward of C = A + B: dA += dC, dB += dC
@@ -374,8 +737,84 @@ static void qacc_rows(int j0, int j1, void *ctx) {
   }
 }
 
+#if defined(MM_X86_SIMD)
+// AVX2 int8 column strip: acc[j .. j+16U) += sum over k in [k0, k1), U = 1 or
+// 4 (U=4 covers one 64-byte line of each weight row). Two k at a time: rows k
+// and k+1 are widened to int16 and interleaved, so one vpmaddwd yields
+// qa[k]*qw[k,c] + qa[k+1]*qw[k+1,c] per column in int32 -- 16 MACs per
+// instruction, where the portable loop needs a vpmulld per 8. `first` starts
+// from 0 instead of loading acc.
+SIMD_INLINE void qacc_strip(const signed char *qa, const signed char *qw, int k0, int k1,
+                            int N, int32_t *acc, int U, int first) {
+  __m256i lo[4], hi[4];
+  for (int u = 0; u < U; u++) {
+    lo[u] = hi[u] = _mm256_setzero_si256();
+    if (!first) lo[u] = _mm256_loadu_si256((const __m256i*)(acc + 16 * u));   // cols 0-7
+    if (!first) hi[u] = _mm256_loadu_si256((const __m256i*)(acc + 16 * u + 8)); // cols 8-15
+    // Re-shuffle to the madd layout (lo = cols 0-3 | 8-11, hi = 4-7 | 12-15).
+    const __m256i l = lo[u], h = hi[u];
+    lo[u] = _mm256_permute2x128_si256(l, h, 0x20);
+    hi[u] = _mm256_permute2x128_si256(l, h, 0x31);
+  }
+  for (int k = k0; k < k1; k += 2) {
+    const int two = (k + 1 < k1);                // odd count: the last step pairs with 0
+    const uint32_t pk = (uint16_t)(int16_t)qa[k] |
+                        ((uint32_t)(uint16_t)(int16_t)(two ? qa[k + 1] : 0) << 16);
+    const __m256i pair = _mm256_set1_epi32((int)pk);
+    const signed char *r0 = qw + (size_t)k * N;
+    for (int u = 0; u < U; u++) {
+      const __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(r0 + 16 * u)));
+      const __m256i w1 = two ? _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(r0 + N + 16 * u)))
+                             : _mm256_setzero_si256();
+      // per 128-bit half: unpacklo -> columns 0-3 (| 8-11), unpackhi -> 4-7 (| 12-15)
+      lo[u] = _mm256_add_epi32(lo[u], _mm256_madd_epi16(_mm256_unpacklo_epi16(w0, w1), pair));
+      hi[u] = _mm256_add_epi32(hi[u], _mm256_madd_epi16(_mm256_unpackhi_epi16(w0, w1), pair));
+    }
+  }
+  for (int u = 0; u < U; u++) {
+    _mm256_storeu_si256((__m256i*)(acc + 16 * u),     _mm256_permute2x128_si256(lo[u], hi[u], 0x20));
+    _mm256_storeu_si256((__m256i*)(acc + 16 * u + 8), _mm256_permute2x128_si256(lo[u], hi[u], 0x31));
+  }
+}
+
+// The k loop is cut into MM_QKB-row blocks, and each block sweeps ALL of this
+// thread's columns before the next. Without that, a strip walks every one of
+// the K weight rows at stride N -- for lm_head (N = 49152) a new page per row,
+// no prefetcher stream -- and the kernel measured 0.7x the portable one there.
+// With it, only MM_QKB rows are live at once, each read front to back. The acc
+// round trip per block is cheap (32 k per load/store instead of 1). All
+// INTEGER arithmetic, so the result is bit-identical to the portable kernel
+// whatever the order: this one needs no tolerance at all.
+#define MM_QKB 32
+SIMD_FN static void qacc_rows_avx2(int j0, int j1, void *ctx) {
+  const QAcc *t = (const QAcc*)ctx;
+  const int K = t->K, N = t->N;
+  const int j16 = j0 + (j1 - j0) / 16 * 16;
+  for (int kb = 0; kb < K; kb += MM_QKB) {
+    const int ke = (K - kb < MM_QKB) ? K : kb + MM_QKB;
+    int j = j0;
+    if (kb == 0) {
+      for (; j + 64 <= j16; j += 64) qacc_strip(t->qa, t->qw + j, kb, ke, N, t->acc + j, 4, 1);
+      for (; j < j16; j += 16)       qacc_strip(t->qa, t->qw + j, kb, ke, N, t->acc + j, 1, 1);
+    } else {
+      for (; j + 64 <= j16; j += 64) qacc_strip(t->qa, t->qw + j, kb, ke, N, t->acc + j, 4, 0);
+      for (; j < j16; j += 16)       qacc_strip(t->qa, t->qw + j, kb, ke, N, t->acc + j, 1, 0);
+    }
+  }
+  for (int j = j16; j < j1; j++) {               // < 16 ragged columns
+    int32_t s = 0;
+    for (int k = 0; k < K; k++) s += (int32_t)t->qa[k] * (int32_t)t->qw[(size_t)k * N + j];
+    t->acc[j] = s;
+  }
+}
+#endif
+
 void qacc_columns(const signed char *qa, const signed char *qw, int K, int N, int32_t *acc) {
   QAcc t = { qa, qw, K, N, acc };
-  if ((size_t)K * N < MM_THREAD_THRESHOLD) { qacc_rows(0, N, &t); return; }
-  parallel_for(N, qacc_rows, &t);
+  range_fn fn = qacc_rows;
+#if defined(MM_X86_SIMD)
+  if (simd_on()) fn = qacc_rows_avx2;
+#endif
+  if ((size_t)K * N < MM_THREAD_THRESHOLD) { fn(0, N, &t); return; }
+  parallel_for(N, fn, &t);
 }

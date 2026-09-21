@@ -27,7 +27,8 @@ green (`-Wall` clean, smoke test `PASSED`, artifacts cleaned) and is committed.
       --d-ff --ctx --merges --steps --lr --seed`). Defaults: d_model 128, 3 layers, 4 heads,
       ctx 64. Each `model.bin`+`tok.bin` is a self-contained model (→ many role-specific AIs).
 - [ ] Train/val split + held-out loss reporting; checkpoint-every-N; resume-from-checkpoint.
-- [ ] B4 remainder — threaded/SIMD matmul + int8 quant (needed for big models to train fast).
+- [x] B4 remainder — threaded/SIMD matmul + int8 quant (threads + int8 earlier; AVX2+FMA
+      kernels with runtime dispatch 2026-09-21, see the entry at the end).
 
 **Phase E — Multimodal (images), the big future build (user goal: understand/describe images):**
 - [x] Step E1 — Image decode: `image.c` reads binary **PPM (P6)** → HWC floats in [0,1]
@@ -101,7 +102,7 @@ LMs). Diffusion is the SOTA alternative but a much bigger, different build — n
 - [x] Step B1 — Better sampling: temperature + top-k/top-p + seeded RNG (`sampler.c`)
 - [x] Step B2 — KV cache (incremental decode; verified bit-exact vs full forward)
 - [x] Step B3 — `generate` subcommand: token-in/token-out REPL (KV cache + sampler)
-- [~] Step B4 — Performance: cache-friendly `ikj` matmul done; threads/SIMD/int8 quant TODO
+- [x] Step B4 — Performance: `ikj` matmul, thread pool, int8 quant, AVX2+FMA kernels (runtime dispatch)
 
 **Phase C — The agent layer (tools + approval), pure C:**
 - [x] Step C1 — Tool protocol: parse `<tool …>` / `<done>` blocks (`toolcall.c`)
@@ -3112,6 +3113,70 @@ model. Cost for the real run: **~84 s/step** (longer prompts, more sampled token
 Still open and unvalidated: the **Colab GPU test** (`36785a8` + the committed binary `4eefb92`) —
 never run on a real GPU. `tools/colab_gpu_test.ipynb` is ready; the deliverable is selftest part
 **[30]** green.
+
+### 2026-09-21 — B4: AVX2+FMA matmul kernels, runtime-dispatched (branch `simd`)
+
+- [x] **Measured first, again, and it changed the design.** A native `zig cc` build already
+      defines `__AVX2__`/`__FMA__` (zig behaves like `-march=native`), so the "scalar" kernels
+      were ALREADY auto-vectorized AVX2 with FMA contraction. At `TF_THREADS=1` they ran at only
+      ~25 GFLOP/s on the layer shapes and **~7 GFLOP/s on lm_head**. The bottleneck is memory
+      traffic, not vector width: the forward loads+stores the whole output row once per k, and
+      streams all of B from L3/RAM once per output row.
+- [x] **One register-blocked micro-kernel for all three products** (`gemm_tile` in matrix.c): a
+      4×16 output tile in 8 ymm accumulators, `a(r,p)` read through arbitrary strides so dB reads
+      Aᵀ in place, B packed into 128 KB strip-major panels (`MM_KC`=256 × `MM_NC`=128). Packing is
+      what fixed lm_head: an in-place 16-column strip hops rows at a 196 KB stride — a TLB miss
+      per row and no prefetch stream; software prefetch did NOT recover it (tried, 37 GF/s),
+      packing did (65 GF/s). dA = dC @ Bᵀ gathers Bᵀ during packing, no transposed copy.
+      M<4 forwards (decode) use a streaming AXPY instead — the first tile version made M=1
+      decode **0.7×** (strided walk again); the AXPY brings it to parity.
+- [x] **int8 `qacc_columns`**: `vpmaddwd` on interleaved k/k+1 rows = 16 MACs per instruction,
+      accumulators in registers, k cut into 32-row blocks (without the blocking lm_head int8
+      decode measured 0.7× — same strided-walk problem). Integer arithmetic ⇒ bit-identical.
+- [x] **Runtime dispatch** (`__attribute__((target("avx2,fma")))` + CPUID/XGETBV), not
+      `#ifdef __AVX2__`: the flag says what the compiler was told, not what the CPU has — every
+      portable build (`make cross`, `cross-gpu`/Colab) is baseline SSE2 and would never get the
+      kernels, and a `-mavx2` binary SIGILLs on older CPUs. `TF_SIMD=0` forces portable C.
+- [x] **Bit-exactness kept by construction, not by loosening a test.** Every output element is
+      one FMA chain in reduction order from 0; p-blocking parks the running sum in C as a float,
+      so resuming is exact; the decode AXPY computes the same chain. So rows don't depend on M,
+      tile, or thread count: `[4]`/`[19]`/`[22]`/`[26]` stay **0.00e+00** — on the native build
+      AND on a baseline x86-64 build (portable code without FMA, kernels with it). What changed:
+      `[24]` merge 1.31e-06 → 1.43e-06, `[25]` accum 4.66e-10 → 9.31e-10 (both far inside tol).
+      `TF_SIMD=0` reproduces the old selftest output byte for byte.
+- [x] **Selftest part [34]**: 14 awkward shapes (1 row/col, K=1, non-multiples of 8/16, leftover
+      rows, >1 panel, >1 p block incl. M/K/N=300) — SIMD vs portable fwd 0 / dA 4.7e-07 / dB
+      3.2e-07 / dx 4.7e-07 (tol 1e-5); vs a double reference SIMD 5.6e-07, portable 5.0e-07;
+      1-row matmuls == rows of the M-row matmul bit-exact; int8 exact. A mutation (break the
+      p-block resume) fails it (0.97 error). Self-skips without AVX2.
+- [x] **`simd-bench`** subcommand: same binary, kernels interleaved run by run, median of reps.
+
+**Numbers — `TF_THREADS=1`, i5-14400, median of 3 runs × 5 reps, overnight 3-thread job sharing
+the CPU the whole time** (GFLOP/s; native build = this machine's default `zig cc` build):
+
+    shape (SmolLM2-135M)        portable(native)   AVX2      speedup | baseline-x86-64 portable -> AVX2
+    fwd 128x576x1536            25                 111       4.0x    | 22 -> 112   5.2x
+    fwd 128x1536x576            25                 107       4.4x    | 21 -> 106   5.2x
+    fwd 128x576x576             49                  98       2.1x    | 26 -> 105   4.0x
+    fwd 128x576x49152 lm_head    7.4                65       8.3x    | 6.2 -> 65   9.9x
+    fwd 1x576x1536  decode      25                  25       1.0x    | 22 -> 25    1.2x
+    fwd 1x576x49152 decode       6.5                 7.1     1.1x    | 6.1 -> 8.1  1.3x
+    bwd 128x576x1536 (dA+dB)    27                  94       3.5x    | 25 -> 96    3.9x
+    bwd 128x1536x576            26                  83       3.2x    | 24 -> 96    3.9x
+    bwd 128x576x576             30                 101       3.4x    | 29 -> 107   3.7x
+    dx  128x576x49152           7.3                 75      10.1x    | 6.4 -> 70  11.1x
+    int8 1x576x1536 (GOP/s)     35                  83       2.4x    | 9.4 -> 72   7.6x
+    int8 1x576x49152            18                  36       1.9x    | 9.5 -> 38   4.0x
+
+HONEST CAVEATS: kernel-level only — no end-to-end train/decode timing (not allowed to run
+train/grpo alongside the overnight job). Decode (M=1, fp32) is bandwidth-bound and essentially
+unchanged. Speedup ranges across the 3 runs were up to ±20% on lm_head (shared CPU). Multi-thread
+scaling of the new kernels was not benchmarked; each worker packs its own B panels (redundant
+O(K·N) work per thread, noise at M=128 but not at a handful of rows per thread). The GPU part
+[30] was not re-run: CPU-vs-GPU "bit-identical forward" in the README predates this.
+PRE-EXISTING, not from this change: the wasm32-wasi build (run under Node WASI) FAILS part [29]'s
+gradient check (1.47e-02 vs the 1e-2 gate) -- identical output at HEAD `489bc28` without these
+changes; wasm has no AVX2 path, so it runs the untouched portable kernels ([34] self-skips).
 
 #-------------------------------#
 #for checking#
