@@ -5378,6 +5378,166 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 44: GRPO difficulty-aware task sampling (--prio) + training diagnostics.
+  // (a) Default path: grpo_draw_task(NULL, ...) consumes rand() EXACTLY like the
+  //     original inline draw `do ti = rand() % n; while (plen[ti] == 0);` -- same
+  //     indices, same next rand() -- and a --prio draw consumes no rand() at all.
+  // (b) Synthetic curriculum: 40 tasks in four kinds (mastered p=1, learnable
+  //     hard p=0.15, medium p=0.5, impossible p=0), G=8 binary rollouts per
+  //     group, 2000 draws. The learnable-hard tasks must be drawn more often than
+  //     the mastered ones (and than the impossible ones), and fewer groups come
+  //     back flat than under uniform draws. Every weight stays in [0.01, 1].
+  // (c) Deterministic: the same seed gives the same draw sequence, another seed
+  //     a different one.
+  // (d) The entropy diagnostic (grpo_row_entropy on softmax_rowwise output, what
+  //     the trainer reads) matches a direct log-sum-exp computation from the
+  //     logits; uniform -> log V; the clip counter of grpo_token_coeffs_ex counts
+  //     exactly the clipped tokens and leaves the coefficients unchanged.
+  // --------------------------------------------------------------------------
+  {
+    printf("[44] GRPO --prio task sampler (Kimi k1.5 + GRESO) and training diagnostics\n");
+
+    // (a) the default draw vs a reimplementation of the original inline loop
+    enum { NT44 = 40 };
+    int plen44[NT44];
+    for (int i = 0; i < NT44; i++) plen44[i] = (i % 7 == 3) ? 0 : 5 + i;  // some unusable
+    int same_seq = 1;
+    srand(4401);
+    int got44[200];
+    for (int k = 0; k < 200; k++) got44[k] = grpo_draw_task(NULL, plen44, NT44);
+    const int next_new = rand();
+    srand(4401);
+    for (int k = 0; k < 200; k++) {
+      int ti;
+      do { ti = rand() % NT44; } while (plen44[ti] == 0);
+      if (ti != got44[k]) same_seq = 0;
+    }
+    const int next_old = rand();
+    GrpoConfig pc = grpo_default_config();
+    pc.prio = 1; pc.seed = 44;
+    GrpoPrio pz = grpo_prio_create(NT44, &pc);
+    srand(4402);
+    const int r_before = rand();
+    srand(4402);
+    int usable_ok = 1;
+    for (int k = 0; k < 500; k++) usable_ok &= plen44[grpo_draw_task(&pz, plen44, NT44)] != 0;
+    const int r_after = rand();
+    grpo_prio_free(&pz);
+    const int stream_ok = same_seq && next_new == next_old && r_before == r_after && usable_ok;
+    printf("    default draw: 200 tasks identical to the original rand() loop -> %s, next rand()"
+           " %s; --prio draws consume no rand() -> %s, never an unusable task -> %s\n",
+           same_seq ? "yes" : "NO", next_new == next_old ? "equal" : "DIFFERS",
+           r_before == r_after ? "yes" : "NO", usable_ok ? "yes" : "NO");
+
+    // (b) synthetic curriculum. Kind k = i % 4: 0 mastered, 1 hard, 2 medium, 3 impossible.
+    const double pk[4] = {1.0, 0.15, 0.5, 0.0};
+    const char *kname[4] = {"mastered p=1", "hard p=.15", "medium p=.5", "impossible p=0"};
+    int ones[NT44];
+    for (int i = 0; i < NT44; i++) ones[i] = 1;
+    unsigned long long hash[3] = {0, 0, 0};
+    long cnt[4] = {0, 0, 0, 0};
+    int flat_prio = 0, bounds_ok = 1;
+    const int DRAWS = 2000, G44 = 8;
+    for (int run = 0; run < 3; run++) {            // run 0, 1: seed 44 (twice); run 2: seed 45
+      GrpoConfig sc = grpo_default_config();
+      sc.prio = 1;
+      sc.seed = run < 2 ? 44 : 45;
+      GrpoPrio sp = grpo_prio_create(NT44, &sc);
+      unsigned long long lcg = 0x44ULL;           // outcome noise, the same in every run
+      unsigned long long h = 1469598103934665603ULL;
+      for (int d = 0; d < DRAWS; d++) {
+        const int ti = grpo_draw_task(&sp, ones, NT44);
+        h = (h ^ (unsigned long long)ti) * 1099511628211ULL;
+        int succ = 0;
+        for (int gg = 0; gg < G44; gg++) {
+          lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+          const double u = (double)(lcg >> 11) * (1.0 / 9007199254740992.0);
+          succ += u < pk[ti % 4];
+        }
+        const int flat = (succ == 0 || succ == G44);
+        grpo_prio_update(&sp, ti, (float)succ / G44, flat);
+        if (run == 0) { cnt[ti % 4]++; flat_prio += flat; }
+        for (int i = 0; i < NT44; i++) {
+          const float w = grpo_prio_weight(&sp, i);
+          if (!(w >= GRPO_PRIO_W_FLOOR && w <= 1.0f)) bounds_ok = 0;
+        }
+      }
+      hash[run] = h;
+      if (run == 0) {
+        int seen, mast, hard;
+        grpo_prio_summary(&sp, NULL, &seen, &mast, &hard);
+        printf("    synthetic 40 tasks x %d draws (G=%d): share", DRAWS, G44);
+        for (int k = 0; k < 4; k++) printf(" %s %.1f%%%s", kname[k], 100.0 * cnt[k] / DRAWS,
+                                           k < 3 ? "," : "");
+        printf("\n    seen %d, mastered %d, too-hard %d\n", seen, mast, hard);
+      }
+      grpo_prio_free(&sp);
+    }
+    // Flat rate under UNIFORM draws, in closed form: mastered and impossible are
+    // always flat; the others with P(all 0) + P(all 1).
+    double flat_unif = 0.0;
+    for (int k = 0; k < 4; k++) flat_unif += 0.25 * (pow(pk[k], G44) + pow(1.0 - pk[k], G44));
+    const int deterministic = hash[0] == hash[1] && hash[2] != hash[0];
+    const int prefer_ok = cnt[1] > cnt[0] && cnt[1] > cnt[3] && cnt[2] > cnt[0];
+    const int flat_ok = (double)flat_prio / DRAWS < flat_unif;
+    printf("    flat groups: %.1f%% with --prio vs %.1f%% expected uniform -> %s | hard drawn more"
+           " than mastered and impossible -> %s | weights in [%.2f, 1] -> %s\n",
+           100.0 * flat_prio / DRAWS, 100.0 * flat_unif, flat_ok ? "fewer" : "NOT FEWER",
+           prefer_ok ? "yes" : "NO", (double)GRPO_PRIO_W_FLOOR, bounds_ok ? "yes" : "NO");
+    printf("    same seed -> same %d draws: %s; seed 45 -> different draws: %s\n", DRAWS,
+           hash[0] == hash[1] ? "yes" : "NO",
+           hash[2] != hash[0] ? "yes" : "NO");
+
+    // (d) entropy from the probs the trainer already has, vs a direct computation
+    const int VV = 37, RR = 5;
+    int es[2] = {RR, VV};
+    Tensor el = tensor_create(es, 2), ep44 = tensor_create(es, 2);
+    srand(4403);
+    for (int i = 0; i < RR * VV; i++)
+      el.data[i] = (float)((double)rand() / RAND_MAX - 0.5) * (float)(2 + 3 * (i / VV));
+    softmax_rowwise(&el, &ep44);
+    double max_err = 0.0;
+    for (int r = 0; r < RR; r++) {
+      const float *z = &el.data[r * VV];
+      double mz = z[0];
+      for (int v = 1; v < VV; v++) if (z[v] > mz) mz = z[v];
+      double se = 0.0, sez = 0.0;
+      for (int v = 0; v < VV; v++) { const double e = exp(z[v] - mz); se += e; sez += e * (z[v] - mz); }
+      const double direct = log(se) - sez / se;   // H = log Z - E_p[z]
+      const double err = fabs(grpo_row_entropy(&ep44.data[r * VV], VV) - direct);
+      if (err > max_err) max_err = err;
+    }
+    float unif[37], onehot[37];
+    for (int v = 0; v < VV; v++) { unif[v] = 1.0f / VV; onehot[v] = v == 5 ? 1.0f : 0.0f; }
+    const double hu = grpo_row_entropy(unif, VV), h1 = grpo_row_entropy(onehot, VV);
+    tensor_free(&el); tensor_free(&ep44);
+    const int ent_ok = max_err < 1e-5 && fabs(hu - log((double)VV)) < 1e-5 && h1 == 0.0;
+    printf("    entropy: %d rows vs log-sum-exp max |err| %.2e, uniform %.5f (log V %.5f), one-hot %.1f -> %s\n",
+           RR, max_err, hu, log((double)VV), h1, ent_ok ? "match" : "MISMATCH");
+
+    // clip counter: advantage > 0 clips rho > 1 + eps_high, advantage < 0 clips rho < 1 - eps
+    GrpoConfig cc = grpo_default_config();
+    cc.clip_eps = 0.2f; cc.clip_eps_high = 0.28f;
+    const float lold[6] = {0, 0, 0, 0, 0, 0};
+    const float lnew[6] = {0.0f, 0.1f, 0.3f, -0.1f, -0.3f, 0.26f};   // rho 1, 1.105, 1.35, .905, .741, 1.297
+    float c_a[6], c_b[6], c_c[6], c_d[6];
+    int n_pos = 0, n_neg = 0;
+    grpo_token_coeffs_ex(1.0f, 1.0f, 6, lnew, lold, NULL, &cc, c_a, &n_pos);
+    grpo_token_coeffs(1.0f, 1.0f, 6, lnew, lold, NULL, &cc, c_b);
+    grpo_token_coeffs_ex(-1.0f, 1.0f, 6, lnew, lold, NULL, &cc, c_c, &n_neg);
+    grpo_token_coeffs(-1.0f, 1.0f, 6, lnew, lold, NULL, &cc, c_d);
+    const int clip_ok = n_pos == 2 && n_neg == 1 && memcmp(c_a, c_b, sizeof(c_a)) == 0 &&
+                        memcmp(c_c, c_d, sizeof(c_c)) == 0;
+    printf("    clip counter: A>0 clipped %d/6 (want 2), A<0 clipped %d/6 (want 1), coefficients"
+           " unchanged -> %s\n", n_pos, n_neg, clip_ok ? "ok" : "WRONG");
+
+    const int ok44 = stream_ok && prefer_ok && flat_ok && bounds_ok && deterministic &&
+                     ent_ok && clip_ok;
+    printf("    -> %s\n\n", ok44 ? "OK" : "FAIL");
+    all_ok &= ok44;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

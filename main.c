@@ -477,6 +477,20 @@ static void grpo_usage(void) {
     "  --dapo            preset: --clip-high 0.28 --loss-agg token --resample 2\n"
     "  --dr-grpo         preset: --no-std --loss-agg const\n"
     "                    (flags after a preset override it)\n"
+    "Task sampling:\n"
+    "  --prio            difficulty-aware draw instead of uniform: weight per task\n"
+    "                    w = max(0.01, clamp(1 - success_ema, wmin, 1)\n"
+    "                                 x 0.5^mastered_streak x 0.7^too_hard_streak),\n"
+    "                    unseen tasks weight 1. A streak counts consecutive FLAT\n"
+    "                    groups (no gradient) all-correct (mastered) or all equally\n"
+    "                    wrong (too hard for now). Kimi k1.5 + GRESO. Own RNG\n"
+    "                    stream from --seed. Implies --diag. Works with --dapo.\n"
+    "  --prio-alpha F    EMA rate of the per-task stats (default 0.3)\n"
+    "  --prio-wmin F     lower clip of the (1 - success) term (default 0.05)\n"
+    "  --prio-hi F       a flat group at reward >= F is mastered (default 0.9)\n"
+    "  --diag            append diagnostics to every report: policy entropy over the\n"
+    "                    sampled tokens, live-group fraction, Adam updates, ratio-clip\n"
+    "                    fraction; task coverage summary at the end (default off)\n"
     "  --kl F            KL penalty toward the reference policy (default 0 = off).\n"
     "                    The reference is the FROZEN BASE -- the same weights with\n"
     "                    the adapters off -- so it costs one extra forward per\n"
@@ -547,6 +561,11 @@ static int run_grpo(int argc, char **argv) {
     else if (strcmp(f, "--resample") == 0){ NEED_VAL(); cfg.resample = atoi(argv[++i]); }
     else if (strcmp(f, "--dapo") == 0)    { grpo_preset_dapo(&cfg); }
     else if (strcmp(f, "--dr-grpo") == 0) { grpo_preset_dr_grpo(&cfg); }
+    else if (strcmp(f, "--prio") == 0)    { cfg.prio = 1; }
+    else if (strcmp(f, "--prio-alpha") == 0) { NEED_VAL(); cfg.prio_alpha = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--prio-wmin") == 0)  { NEED_VAL(); cfg.prio_wmin = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--prio-hi") == 0)    { NEED_VAL(); cfg.prio_hi = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--diag") == 0)    { cfg.diag = 1; }
     else if (strcmp(f, "--loss-agg") == 0) {
       NEED_VAL();
       const char *m = argv[++i];

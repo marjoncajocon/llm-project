@@ -84,6 +84,19 @@ typedef struct {
                             // fresh task and resample, up to this many times, so the step
                             // is not spent on a group with no gradient (0 => off)
 
+  // --- Difficulty-aware task sampling (--prio; see GrpoPrio below) ---
+  int prio;                 // 1 => draw tasks by grpo_prio_weight instead of uniform
+                            // rand(); 0 (default) => the original rand() draw, untouched
+  float prio_alpha;         // EMA rate for the per-task statistics (default 0.3)
+  float prio_wmin;          // lower clip of the (1 - success) term (default 0.05)
+  float prio_hi;            // a flat group whose reward is >= this is "all correct"
+                            // (mastered); a flat group below it is "all wrong"
+                            // (too hard for now). Default 0.9.
+  int diag;                 // 1 => append training diagnostics to the report lines
+                            // (entropy, live-group fraction, Adam updates, clip
+                            // fraction) and a task-coverage summary at the end.
+                            // Implied by --prio. 0 (default) => the log is unchanged.
+
   // --- The reward ---
   int reward_version;       // 1 (default) => reward_score, the original reward;
                             // 2 => reward_score_v2: format gates, capped rollouts
@@ -191,6 +204,90 @@ int grpo_advantages(const float *rewards, int G, const GrpoConfig *cfg, float *a
 void grpo_token_coeffs(float adv, float norm, int len, const float *logp_new,
                        const float *logp_old, const float *logp_ref,
                        const GrpoConfig *cfg, float *coeff_out);
+
+// grpo_token_coeffs, also counting the tokens whose policy-gradient term the ratio
+// clip removed (the "clip fraction" numerator). *n_clipped is ADDED to, so a caller
+// can accumulate across rollouts; NULL => not counted. Same coeff_out either way.
+void grpo_token_coeffs_ex(float adv, float norm, int len, const float *logp_new,
+                          const float *logp_old, const float *logp_ref,
+                          const GrpoConfig *cfg, float *coeff_out, int *n_clipped);
+
+// Shannon entropy -sum p log p (nats) of one probability row of length V. Zero
+// entries contribute nothing. The trainer applies it to the rows of the softmax
+// the update forward ALREADY built (no extra forward) for the diagnostics line.
+double grpo_row_entropy(const float *p, int V);
+
+// ---------------------------------------------------------------------------
+// Difficulty-aware task sampling (--prio)
+//
+// The problem it answers: with uniform draws, a large share of groups come back
+// FLAT (every rollout scores the same => zero advantage => no gradient). The
+// 135M run in logs/v3/train_G1_grpo.log had 47 of 100 groups flat. Two ideas from
+// the literature, combined:
+//   - Kimi k1.5 curriculum sampling: weight a problem by (1 - success rate), so
+//     the steps go to what the policy does not solve yet;
+//   - GRESO (arXiv 2506.02177): a prompt with a HISTORY of zero-variance groups
+//     will very likely be zero-variance again, so skip it with a probability
+//     that grows with the streak.
+//
+// Per task i the sampler keeps (all start "unseen"):
+//   succ_i   EMA of the group's mean reward (rewards are in [0, 1])
+//   flat_i   EMA of the indicator "the group was flat"         (reported only)
+//   hi_i     current streak of consecutive flat groups at reward >= prio_hi
+//            (all correct: MASTERED); reset by any other group
+//   lo_i     current streak of consecutive flat groups below prio_hi
+//            (all equally wrong: TOO HARD for now); reset by any other group
+// with EMA x <- (1 - alpha) x + alpha * new, the first observation taken as is.
+//
+// The draw weight:
+//   unseen task:  w_i = GRPO_PRIO_W_UNSEEN (= 1, the maximum: every task is looked at)
+//   seen task:    base = clamp(1 - succ_i, prio_wmin, 1)
+//                 w_i  = max(GRPO_PRIO_W_FLOOR, base * DECAY_HI^min(hi_i, 8)
+//                                                    * DECAY_LO^min(lo_i, 8))
+//   with DECAY_HI = 0.5 (mastered fades fast), DECAY_LO = 0.7 (too-hard is
+//   retried, but rarely), W_FLOOR = 0.01 (no task ever becomes unreachable, so a
+//   task the policy has since started to make progress on can come back).
+// Only one of hi_i / lo_i is nonzero at a time. Every weight lies in
+// [GRPO_PRIO_W_FLOOR, 1]. Task i is drawn with probability w_i / sum_j w_j over
+// the usable tasks, from the sampler's own SplitMix64 stream seeded by --seed:
+// deterministic, and independent of rand() and of the rollout RNG.
+// ---------------------------------------------------------------------------
+#define GRPO_PRIO_W_UNSEEN 1.0f
+#define GRPO_PRIO_W_FLOOR  0.01f
+#define GRPO_PRIO_DECAY_HI 0.5f
+#define GRPO_PRIO_DECAY_LO 0.7f
+#define GRPO_PRIO_STREAK_CAP 8
+
+typedef struct {
+  int seen;                 // groups observed for this task (0 => unseen)
+  float succ;               // EMA of mean group reward
+  float flat;               // EMA of "group was flat"
+  int streak_hi, streak_lo; // consecutive flat-all-correct / flat-below-top groups
+} GrpoTaskStat;
+
+typedef struct {
+  int n;                    // number of tasks
+  GrpoTaskStat *st;         // n entries
+  unsigned long long rng;   // SplitMix64 state (the draw stream)
+  float alpha, w_min, hi;
+  long draws;               // weighted draws taken
+} GrpoPrio;
+
+GrpoPrio grpo_prio_create(int n_tasks, const GrpoConfig *cfg);
+void grpo_prio_free(GrpoPrio *p);
+// The draw weight of task i (formula above); always in [GRPO_PRIO_W_FLOOR, 1].
+float grpo_prio_weight(const GrpoPrio *p, int i);
+// Record one scored group of task i: its mean reward and whether it was flat.
+void grpo_prio_update(GrpoPrio *p, int i, float mean_reward, int flat);
+// Draw a task index whose plen[] is nonzero. p == NULL => the ORIGINAL draw,
+// `do ti = rand() % n_tasks; while (plen[ti] == 0);`, exactly (the default
+// path); otherwise a weighted draw from p's own stream (consumes no rand()).
+int grpo_draw_task(GrpoPrio *p, const int *plen, int n_tasks);
+// Coverage summary over tasks with plen[i] != 0 (plen may be NULL => all):
+// distinct tasks seen, mastered (last group flat at >= prio_hi), too hard (last
+// group flat below prio_hi).
+void grpo_prio_summary(const GrpoPrio *p, const int *plen, int *seen, int *mastered,
+                       int *too_hard);
 
 // Test hook (selftest [37]): sample one group of cfg->group rollouts from `prompt_ids`
 // through the SAME rollout() grpo_run uses, with no tokenizer (so no EOS / closing-tag
