@@ -435,6 +435,10 @@ static void prefill_prompt(const LlamaModel *m, const LlamaDecodeLora *lo, Llama
 //
 typedef enum { STOP_CAP = 0, STOP_EOS = 1, STOP_TAG = 2 } StopReason;
 
+// Test hooks only (grpo_debug_rollout_group): with no tokenizer, sampling this
+// token ends a rollout as EOS would. -1 (always, outside that hook) = never.
+static int S_debug_stop_tok = -1;
+
 // Returns the number of sampled tokens, writes the detokenized text to `text`,
 // and reports HOW the rollout ended in *stop. tok == NULL (tests only) disables
 // the EOS / closing-tag stops and leaves `text` empty.
@@ -483,11 +487,184 @@ static int rollout(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
       // this is nothing beside a 30-layer forward.
       hftok_decode(tok, out_ids, n, text, text_cap);
       if (strstr(text, "</tool>") || strstr(text, "</done>")) { *stop = STOP_TAG; break; }
-    }
+    } else if (t == S_debug_stop_tok) { *stop = STOP_EOS; break; }   // tests only
     llama_decode_step_lora(m, kv, t, logits, lo);
   }
   if (tok) hftok_decode(tok, out_ids, n, text, text_cap);
   return n;
+}
+
+// Batched rollouts (--batch-rollouts): the G rollouts of one group, decoded in
+// LOCKSTEP. Each round, every live rollout samples its next token from its own
+// logits row with its OWN rng (rngs[i]) and runs exactly rollout()'s stop logic
+// (EOS, closing tag, cap); the survivors are then decoded together by ONE
+// llama_decode_batch_lora call, whose row for rollout i is bit-identical to the
+// llama_decode_step_lora rollout() would run. The weights are read once per
+// round instead of once per rollout -- the whole point: a 135M decode step is
+// bound by streaming ~540 MB of weights, not by arithmetic.
+//
+// So with the same rngs[i], rollout i here produces exactly the ids, log-probs,
+// text and stop reason that rollout() produces for it alone (selftest [48]). What
+// batching CANNOT preserve is a SHARED rng: interleaving the draws of G rollouts
+// reorders it. Hence the callers give every rollout its own stream.
+//
+// One difference in work, none in output: rollout() decodes the last sampled
+// token of a rollout that hits the cap (its logits are never read); this skips it.
+//
+// kvs: G caches (each able to hold n_prompt + cap positions); blogits: (G, V)
+// scratch; probs: (1, V). Rollout i's outputs go to out_ids[i], out_logp[i],
+// text[i]. Returns the number of batched decode calls made.
+static long rollout_batch(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kvs, int G,
+                          const LlamaKV *tmpl, const Tensor *tmpl_logits, const HFTok *tok,
+                          int n_prompt, const GrpoConfig *cfg, Rng *rngs, Tensor *blogits,
+                          Tensor *probs, int *const *out_ids, float *const *out_logp,
+                          char *const *text, int text_cap, StopReason *stop, int *out_len) {
+  const int V = m->vocab;
+  int *live = (int*)malloc((size_t)G * sizeof(int));
+  int *row = (int*)malloc((size_t)G * sizeof(int));      // rollout i's row in blogits
+  int *dtok = (int*)malloc((size_t)G * sizeof(int));
+  LlamaKV **dkv = (LlamaKV**)malloc((size_t)G * sizeof(LlamaKV*));
+  const int room = m->max_seq - n_prompt;
+  const int cap = (cfg->max_new < room) ? cfg->max_new : room;
+  for (int i = 0; i < G; i++) {
+    llama_kv_copy(&kvs[i], tmpl);
+    memcpy(&blogits->data[(size_t)i * V], tmpl_logits->data, (size_t)V * sizeof(float));
+    out_len[i] = 0; stop[i] = STOP_CAP; text[i][0] = '\0';
+    row[i] = i; live[i] = (cap > 0);
+  }
+  long calls = 0;
+  for (;;) {
+    int nd = 0;
+    for (int i = 0; i < G; i++) {
+      if (!live[i]) continue;
+      // Row i as a (1, V) tensor: softmax_rowwise / logprob_of see exactly the
+      // single-rollout (1, V) logits, so the log-prob is bit-identical too.
+      int vs[2] = {1, V};
+      Tensor lr = *blogits;
+      lr.data = &blogits->data[(size_t)row[i] * V]; lr.grad = NULL;
+      lr.shape = vs; lr.ndim = 2; lr.size = (size_t)V;
+      softmax_rowwise(&lr, probs);
+      const int t = sample_token(&lr, 0, cfg->temperature, cfg->top_k, cfg->top_p, &rngs[i]);
+      const int n = out_len[i];
+      out_logp[i][n] = logprob_of(probs, 0, t);
+      out_ids[i][n] = t;
+      out_len[i] = n + 1;
+      if (tok) {
+        if (hftok_is_eog(tok, t)) { stop[i] = STOP_EOS; live[i] = 0; continue; }
+        hftok_decode(tok, out_ids[i], n + 1, text[i], text_cap);
+        if (strstr(text[i], "</tool>") || strstr(text[i], "</done>")) {
+          stop[i] = STOP_TAG; live[i] = 0; continue;
+        }
+      } else if (t == S_debug_stop_tok) { stop[i] = STOP_EOS; live[i] = 0; continue; }
+      if (n + 1 >= cap) { live[i] = 0; continue; }       // STOP_CAP: nothing left to decode
+      dkv[nd] = &kvs[i]; dtok[nd] = t; row[i] = nd; nd++;
+    }
+    if (nd == 0) break;
+    // The survivors' logits land in rows 0..nd-1, in rollout order. Rows are
+    // only overwritten here, after every live rollout has sampled from its row.
+    int bs[2] = {nd, V};
+    Tensor bl = *blogits;
+    bl.grad = NULL; bl.shape = bs; bl.size = (size_t)nd * V;
+    llama_decode_batch_lora(m, dkv, dtok, nd, &bl, lo);
+    calls++;
+  }
+  if (tok)
+    for (int i = 0; i < G; i++) hftok_decode(tok, out_ids[i], out_len[i], text[i], text_cap);
+  free(live); free(row); free(dtok); free(dkv);
+  return calls;
+}
+
+// Scratch for rollout_batch: G caches sized for prompt + response only (the
+// template forks into them: llama_kv_copy), (G, V) logits, G text buffers.
+typedef struct {
+  int G;
+  LlamaKV *kv;
+  Tensor logits;
+  Rng *rng;
+  char **text;
+  int **ids;          // G x cap_new
+  float **logp;       // G x cap_new
+  StopReason *stop;
+  int *len;
+} RolloutBatch;
+
+static RolloutBatch rollout_batch_create(const LlamaModel *m, int G, int max_len,
+                                         int cap_new, int text_cap) {
+  RolloutBatch b;
+  b.G = G;
+  b.kv = (LlamaKV*)malloc((size_t)G * sizeof(LlamaKV));
+  for (int i = 0; i < G; i++) b.kv[i] = llama_kv_create_len(m, max_len);
+  int s[2] = {G, m->vocab};
+  b.logits = tensor_create_nograd(s, 2);
+  b.rng = (Rng*)malloc((size_t)G * sizeof(Rng));
+  b.text = (char**)malloc((size_t)G * sizeof(char*));
+  b.ids = (int**)malloc((size_t)G * sizeof(int*));
+  b.logp = (float**)malloc((size_t)G * sizeof(float*));
+  for (int i = 0; i < G; i++) {
+    b.text[i] = (char*)malloc((size_t)text_cap);
+    b.ids[i] = (int*)malloc((size_t)cap_new * sizeof(int));
+    b.logp[i] = (float*)malloc((size_t)cap_new * sizeof(float));
+  }
+  b.stop = (StopReason*)malloc((size_t)G * sizeof(StopReason));
+  b.len = (int*)malloc((size_t)G * sizeof(int));
+  return b;
+}
+
+static void rollout_batch_free(RolloutBatch *b) {
+  for (int i = 0; i < b->G; i++) {
+    llama_kv_free(&b->kv[i]);
+    free(b->text[i]); free(b->ids[i]); free(b->logp[i]);
+  }
+  free(b->kv); free(b->rng); free(b->text); free(b->ids); free(b->logp);
+  free(b->stop); free(b->len);
+  tensor_free(&b->logits);
+}
+
+static long rollout_batch_run(const LlamaModel *m, const LlamaDecodeLora *lo, RolloutBatch *b,
+                              const LlamaKV *tmpl, const Tensor *tmpl_logits, const HFTok *tok,
+                              int n_prompt, const GrpoConfig *cfg, Tensor *probs, int text_cap) {
+  return rollout_batch(m, lo, b->kv, b->G, tmpl, tmpl_logits, tok, n_prompt, cfg, b->rng,
+                       &b->logits, probs, b->ids, b->logp, b->text, text_cap, b->stop, b->len);
+}
+
+long grpo_debug_rollout_group(const LlamaModel *m, const LlamaDecodeLora *lo,
+                              const int *prompt_ids, int n_prompt, const GrpoConfig *cfg,
+                              const unsigned long long *seeds, int batched, int stop_tok,
+                              int *out_ids, float *out_logp, int *out_len) {
+  const int G = cfg->group, V = m->vocab;
+  int ds[2] = {1, V};
+  Tensor logits = tensor_create(ds, 2), probs = tensor_create(ds, 2);
+  Tensor plogits = tensor_create(ds, 2);
+  LlamaKV pkv = llama_kv_create_len(m, n_prompt);
+  S_debug_stop_tok = stop_tok;
+  prefill_prompt(m, lo, &pkv, prompt_ids, n_prompt, &plogits);
+  long calls = 0;
+  if (batched) {
+    RolloutBatch b = rollout_batch_create(m, G, n_prompt + cfg->max_new, cfg->max_new, 1);
+    for (int i = 0; i < G; i++) b.rng[i] = rng_create(seeds[i]);
+    calls = rollout_batch_run(m, lo, &b, &pkv, &plogits, NULL, n_prompt, cfg, &probs, 1);
+    for (int i = 0; i < G; i++) {
+      out_len[i] = b.len[i];
+      memcpy(&out_ids[(size_t)i * cfg->max_new], b.ids[i], (size_t)b.len[i] * sizeof(int));
+      memcpy(&out_logp[(size_t)i * cfg->max_new], b.logp[i], (size_t)b.len[i] * sizeof(float));
+    }
+    rollout_batch_free(&b);
+  } else {
+    LlamaKV kv = llama_kv_create(m);
+    char text[1];
+    for (int i = 0; i < G; i++) {
+      StopReason stop;
+      Rng rng = rng_create(seeds[i]);
+      out_len[i] = rollout(m, lo, &kv, &pkv, &plogits, NULL, prompt_ids, n_prompt, cfg, &rng,
+                           &logits, &probs, &out_ids[(size_t)i * cfg->max_new],
+                           &out_logp[(size_t)i * cfg->max_new], text, 1, &stop);
+    }
+    llama_kv_free(&kv);
+  }
+  S_debug_stop_tok = -1;
+  llama_kv_free(&pkv);
+  tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
+  return calls;
 }
 
 long grpo_debug_sample_group(const LlamaModel *m, const LlamaDecodeLora *lo,
@@ -678,12 +855,19 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     adam_set_lr_mult(&opt, mult, n_params);
     free(mult);
   }
-  LlamaKV kv = llama_kv_create(&model);
+  // --batch-rollouts: G caches of maxL positions (prompt + response) replace the
+  // one max_seq cache, which then shrinks to a 1-position stub.
+  const int batched = cfg->batch_rollouts;
+  LlamaKV kv = batched ? llama_kv_create_len(&model, 1) : llama_kv_create(&model);
   // The group's prompt, prefilled ONCE (with the current adapters) and forked
   // into every rollout of the group — see rollout(). Sized for the longest prompt
   // only, so it costs maxP positions of KV rather than a second max_seq cache.
   LlamaKV pkv = llama_kv_create_len(&model, maxP);
   Tensor plogits = tensor_create(dshape, 2);
+  RolloutBatch rb;
+  memset(&rb, 0, sizeof(rb));
+  if (batched) rb = rollout_batch_create(&model, G, maxL, cfg->max_new, TEXT_CAP);
+  long batch_group = 0;                     // groups sampled so far (seeds the streams)
 
   // Rollout storage for a whole step: groups_per_step groups of G rollouts each,
   // kept for the duration of the step so inner epochs can reuse them.
@@ -732,6 +916,9 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
            (double)prio.hi);
   else if (diag)
     printf("  diagnostics: on (task draw: uniform, as default)\n");
+  if (batched)
+    printf("  rollouts: BATCHED -- the %d of a group decoded in lockstep; rollout i of group g"
+           " samples from its own RNG = hash(seed, g, i)\n", G);
   if (use_lora) {
     printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo%s, base FROZEN (%d adapter tensors)\n",
            cfg->lora_r, (double)(cfg->lora_alpha > 0.0f ? cfg->lora_alpha : (float)cfg->lora_r),
@@ -782,22 +969,40 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
       // The adapters only change in the update phase below, so one prefill serves
       // all G rollouts of this group. It draws nothing from the RNG.
       prefill_prompt(&model, use_lora ? &dview : NULL, &pkv, pids[ti], T, &plogits);
+      if (batched) {
+        // --batch-rollouts: all G in lockstep, rollout i on its own stream.
+        for (int i = 0; i < G; i++)
+          rb.rng[i] = rng_create(grpo_batch_rollout_seed(cfg->seed, batch_group, i));
+        batch_group++;
+        rollout_batch_run(&model, use_lora ? &dview : NULL, &rb, &pkv, &plogits, &tok, T,
+                          cfg, &dprobs, TEXT_CAP);
+      }
       int off = 0;
       for (int i = 0; i < G; i++) {
         const int gi = g * G + i;
         StopReason stop = STOP_CAP;
-        rlen[gi] = rollout(&model, use_lora ? &dview : NULL, &kv, &pkv, &plogits, &tok,
-                           pids[ti], T, cfg, &rng, &dlogits, &dprobs,
-                           rid[gi], &flat_old[(size_t)g * G * cap_new + off],
-                           text, TEXT_CAP, &stop);
+        const char *rtext = text;
+        if (batched) {                     // copy out in the unbatched layout
+          rlen[gi] = rb.len[i];
+          stop = rb.stop[i];
+          rtext = rb.text[i];
+          memcpy(rid[gi], rb.ids[i], (size_t)rb.len[i] * sizeof(int));
+          memcpy(&flat_old[(size_t)g * G * cap_new + off], rb.logp[i],
+                 (size_t)rb.len[i] * sizeof(float));
+        } else {
+          rlen[gi] = rollout(&model, use_lora ? &dview : NULL, &kv, &pkv, &plogits, &tok,
+                             pids[ti], T, cfg, &rng, &dlogits, &dprobs,
+                             rid[gi], &flat_old[(size_t)g * G * cap_new + off],
+                             text, TEXT_CAP, &stop);
+        }
         if (stop == STOP_CAP) capped++;
         RewardParts parts;
-        rrew[gi] = reward_score_version(cfg->reward_version, tasks[ti].prompt, text,
+        rrew[gi] = reward_score_version(cfg->reward_version, tasks[ti].prompt, rtext,
                                         tasks[ti].reference, stop == STOP_CAP, &parts);
         mon_add(&mon_win, &parts, stop == STOP_CAP);
         mon_add(&mon_run, &parts, stop == STOP_CAP);
         if (cfg->verbose && i == 0) {
-          one_line(text, line, LINE_CAP);
+          one_line(rtext, line, LINE_CAP);
           printf("      sample r=%.2f (fmt %.2f grd %.2f mat %.2f) [%s %d tok] %s\n"
                  "        %s\n",
                  (double)rrew[gi], (double)parts.format, (double)parts.grounded,
@@ -1031,6 +1236,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   free(params);
   if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
   adam_free(&opt);
+  if (batched) rollout_batch_free(&rb);
   tensor_free(&logits); tensor_free(&probs);
   tensor_free(&dlogits); tensor_free(&dprobs);
   llama_acts_free(&acts);
@@ -1060,6 +1266,14 @@ unsigned long long grpo_eval_rollout_seed(unsigned seed, int task, int k) {
   return h ? h : 1ULL;
 }
 
+unsigned long long grpo_batch_rollout_seed(unsigned seed, long group, int i) {
+  // 'BTCH' domain tag: never the eval stream of the same (seed, task, k).
+  unsigned long long h = splitmix64(0x4254434800000000ULL ^ (unsigned long long)seed);
+  h = splitmix64(h ^ (unsigned long long)group);
+  h = splitmix64(h ^ ((unsigned long long)(unsigned)i << 32));
+  return h ? h : 1ULL;
+}
+
 // One evaluation rollout of task `task`, draw `kk`, from the prefilled template
 // (pkv, plogits). Its RNG is created HERE from (seed, task, kk) and dies with the
 // rollout, so no other rollout — of this checkpoint or any other — can shift it:
@@ -1085,7 +1299,19 @@ void grpo_debug_eval_task(const LlamaModel *m, const int *prompt_ids, int n_prom
   LlamaKV kv = llama_kv_create(m), pkv = llama_kv_create_len(m, n_prompt);
   char text[1];
   prefill_prompt(m, NULL, &pkv, prompt_ids, n_prompt, &plogits);
-  for (int kk = 0; kk < cfg->eval_k; kk++) {
+  if (cfg->batch_rollouts) {                 // the K rollouts in lockstep
+    const int K = cfg->eval_k;
+    RolloutBatch b = rollout_batch_create(m, K, n_prompt + cfg->max_new, cfg->max_new, 1);
+    for (int kk = 0; kk < K; kk++) b.rng[kk] = rng_create(grpo_eval_rollout_seed(cfg->seed, task, kk));
+    rollout_batch_run(m, NULL, &b, &pkv, &plogits, NULL, n_prompt, cfg, &probs, 1);
+    for (int kk = 0; kk < K; kk++) {
+      out_len[kk] = b.len[kk];
+      memcpy(&out_ids[(size_t)kk * cfg->max_new], b.ids[kk], (size_t)b.len[kk] * sizeof(int));
+      memcpy(&out_logp[(size_t)kk * cfg->max_new], b.logp[kk], (size_t)b.len[kk] * sizeof(float));
+    }
+    rollout_batch_free(&b);
+  }
+  for (int kk = 0; kk < cfg->eval_k && !cfg->batch_rollouts; kk++) {
     StopReason stop;
     out_len[kk] = eval_rollout(m, &kv, &pkv, &plogits, NULL, prompt_ids, n_prompt, task, kk,
                                cfg, &logits, &probs, &out_ids[(size_t)kk * cfg->max_new],
@@ -1238,12 +1464,18 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
   int dshape[2] = {1, V};
   Tensor logits = tensor_create(dshape, 2), probs = tensor_create(dshape, 2);
   Tensor plogits = tensor_create(dshape, 2);
-  LlamaKV kv = llama_kv_create(&model);
-  LlamaKV pkv = llama_kv_create_len(&model, maxP);
+  const int batched = cfg->batch_rollouts;
   const int cap_new = cfg->max_new > 0 ? cfg->max_new : 1;
+  // --batch-rollouts: K caches of prompt + response positions replace the one
+  // max_seq cache (then a 1-position stub).
+  LlamaKV kv = batched ? llama_kv_create_len(&model, 1) : llama_kv_create(&model);
+  LlamaKV pkv = llama_kv_create_len(&model, maxP);
+  RolloutBatch rb;
+  memset(&rb, 0, sizeof(rb));
+  if (batched) rb = rollout_batch_create(&model, K, maxP + cap_new, cap_new, TEXT_CAP);
   int *ids = (int*)malloc((size_t)cap_new * sizeof(int));
   float *logp = (float*)malloc((size_t)cap_new * sizeof(float));
-  char *text = (char*)malloc(TEXT_CAP);
+  char *etext = (char*)malloc(TEXT_CAP);
   char *line = (char*)malloc(LINE_CAP);
   const float match_max = reward_match_max(cfg->reward_version);
   const int rv = cfg->reward_version == 2 ? 2 : 1;
@@ -1259,6 +1491,9 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
            (double)cfg->temperature, cfg->top_k, (double)cfg->top_p, cfg->max_new);
   printf("  inference only: no LoRA, no optimizer, no backward, nothing saved%s%s\n",
          dump ? " | dump -> " : "", dump ? cfg->eval_dump : "");
+  if (batched)
+    printf("  rollouts: BATCHED -- the %d of a task decoded in lockstep (same per-rollout RNGs,"
+           " identical output)\n", K);
   if (cfg->temperature <= 0.0f && K > 1)
     printf("  NOTE: temp 0 is greedy, so all %d rollouts of a task are identical; use --k 1\n", K);
   fflush(stdout);
@@ -1282,11 +1517,21 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
     fam_tasks[fi]++;
     // One prefill per task, forked into each of the K rollouts.
     prefill_prompt(&model, NULL, &pkv, pids[ti], T, &plogits);
+    if (batched) {                  // all K at once, rollout kk on its eval stream
+      for (int kk = 0; kk < K; kk++) rb.rng[kk] = rng_create(grpo_eval_rollout_seed(ec.seed, ti, kk));
+      rollout_batch_run(&model, NULL, &rb, &pkv, &plogits, &tok, T, &ec, &probs, TEXT_CAP);
+    }
     int task_exact = 0;
     for (int kk = 0; kk < K; kk++) {
       StopReason stop = STOP_CAP;
-      const int n = eval_rollout(&model, &kv, &pkv, &plogits, &tok, pids[ti], T, ti, kk, &ec,
-                                 &logits, &probs, ids, logp, text, TEXT_CAP, &stop);
+      int n;
+      const char *text = etext;
+      if (batched) {
+        n = rb.len[kk]; stop = rb.stop[kk]; text = rb.text[kk];
+      } else {
+        n = eval_rollout(&model, &kv, &pkv, &plogits, &tok, pids[ti], T, ti, kk, &ec,
+                         &logits, &probs, ids, logp, etext, TEXT_CAP, &stop);
+      }
       RewardParts parts;
       const float r = reward_score_version(cfg->reward_version, tasks[ti].prompt, text,
                                            tasks[ti].reference, stop == STOP_CAP, &parts);
@@ -1349,7 +1594,8 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
 
   int rc = (n_roll > 0) ? 0 : 1;
   if (dump && fclose(dump) != 0) { fprintf(stderr, "error writing '%s'\n", cfg->eval_dump); rc = 1; }
-  free(ids); free(logp); free(text); free(line);
+  free(ids); free(logp); free(etext); free(line);
+  if (batched) rollout_batch_free(&rb);
   llama_kv_free(&kv); llama_kv_free(&pkv);
   tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
   llama_model_free(&model);

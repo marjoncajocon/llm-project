@@ -113,6 +113,14 @@ typedef struct {
   // --- Run control ---
   unsigned seed;
   int verbose;              // 1 => print a scored sample rollout per group
+  int batch_rollouts;       // 1 => decode a group's rollouts in lockstep through
+                            // llama_decode_batch_lora (--batch-rollouts). Every
+                            // rollout then draws from its OWN Rng: in training
+                            // rng_create(grpo_batch_rollout_seed(seed, group#, i))
+                            // (distribution-equivalent to the shared-RNG default,
+                            // not draw-identical); in eval the usual
+                            // grpo_eval_rollout_seed (byte-identical to unbatched).
+                            // 0 (default) => the one-rollout-at-a-time path.
 } GrpoConfig;
 
 // How a rollout's per-token terms are normalized. This is not a detail: it decides
@@ -328,11 +336,31 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg);
 // The per-rollout RNG seed: a SplitMix64 hash of (seed, task index, k). Never 0.
 unsigned long long grpo_eval_rollout_seed(unsigned seed, int task, int k);
 
+// Training with --batch-rollouts: the seed of rollout i of the run's g-th sampled
+// group (g counts every group drawn, resample attempts included, from 0). A
+// SplitMix64 hash of (seed, g, i) in a domain of its own, so it never coincides
+// with an eval stream or the --prio stream. Never 0.
+unsigned long long grpo_batch_rollout_seed(unsigned seed, long group, int i);
+
+// Test hook (selftest [48]): sample ONE group of cfg->group rollouts of the
+// prompt with the adapters `lo`, shared prefill and no tokenizer, rollout i
+// drawing from rng_create(seeds[i]). batched = 1 decodes them in lockstep through
+// llama_decode_batch_lora (what --batch-rollouts runs), 0 one at a time through
+// rollout(). stop_tok >= 0 stands in for EOS (a rollout ends on sampling it),
+// so rollouts finish at different lengths and drop out of the batch. Output
+// layout as grpo_debug_sample_group. Returns the number of batched decode calls
+// (0 when batched == 0).
+long grpo_debug_rollout_group(const LlamaModel *m, const LlamaDecodeLora *lo,
+                              const int *prompt_ids, int n_prompt, const GrpoConfig *cfg,
+                              const unsigned long long *seeds, int batched, int stop_tok,
+                              int *out_ids, float *out_logp, int *out_len);
+
 // Test hook (selftest [39]): evaluate ONE task exactly as grpo_eval_run does —
 // shared prefill, cfg->eval_k rollouts, rollout k drawing from
 // rng_create(grpo_eval_rollout_seed(cfg->seed, task, k)) — with no tokenizer (no
 // EOS / closing-tag stop). out_ids / out_logp are rollout-major with stride
-// cfg->max_new; out_len has eval_k entries.
+// cfg->max_new; out_len has eval_k entries. cfg->batch_rollouts = 1 runs the
+// eval_k rollouts in lockstep, as grpo_eval_run then does.
 void grpo_debug_eval_task(const LlamaModel *m, const int *prompt_ids, int n_prompt,
                           int task, const GrpoConfig *cfg,
                           int *out_ids, float *out_logp, int *out_len);

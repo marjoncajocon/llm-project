@@ -504,6 +504,15 @@ static void grpo_usage(void) {
     "Run control:\n"
     "  --seed N          RNG seed (default 1)\n"
     "  --verbose         print a scored sample rollout per group\n"
+    "  --batch-rollouts  decode a group's G rollouts in LOCKSTEP: one G-row matmul\n"
+    "                    per layer per token instead of G one-row ones, so the\n"
+    "                    weights stream from memory once per step, not once per\n"
+    "                    rollout; a rollout drops out at EOS / closing tag / cap.\n"
+    "                    Each rollout draws from its OWN RNG (hash of seed, group,\n"
+    "                    rollout): training is distribution-equivalent to the\n"
+    "                    default shared-RNG path, not draw-identical. With\n"
+    "                    --eval-only the output is BYTE-IDENTICAL (eval already\n"
+    "                    uses per-rollout RNGs). Default off.\n"
     "Evaluation (no training):\n"
     "  --eval-only       score the model instead of training it: no LoRA, no\n"
     "                    optimizer, no backward, nothing saved. Tasks are visited\n"
@@ -583,6 +592,7 @@ static int run_grpo(int argc, char **argv) {
     }
     else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
     else if (strcmp(f, "--verbose") == 0) { cfg.verbose = 1; }
+    else if (strcmp(f, "--batch-rollouts") == 0) { cfg.batch_rollouts = 1; }
     else if (strcmp(f, "--eval-only") == 0) { cfg.eval_only = 1; }
     else if (strcmp(f, "--k") == 0)       { NEED_VAL(); cfg.eval_k = atoi(argv[++i]); }
     else if (strcmp(f, "--limit") == 0)   { NEED_VAL(); cfg.eval_limit = atoi(argv[++i]); }

@@ -700,6 +700,23 @@ Verified by `[39]`: two eval runs are bit-identical; evaluating task 1 with a di
 a shorter budget leaves tasks 0 and 2 bit-identical (with the old shared RNG the same change shifts
 task 2); parameters are bit-identical and gradients zero afterwards.
 
+#### Batched rollouts (`--batch-rollouts`, opt-in)
+
+By default each rollout decodes alone, token by token (M = 1), so every weight streams from DRAM
+once per token *per rollout*. `--batch-rollouts` decodes a group's G rollouts (or an eval task's k)
+in **lockstep** through `llama_decode_batch_lora`: one G-row matmul per layer per token, with RoPE,
+the KV append and attention per row at that row's own position in its own cache; a rollout drops
+out of the batch at EOS, the closing tag or the cap. Row i is **bit-identical** to
+`llama_decode_step_lora` on the same cache (the matmul row-independence of `[34]`/`[38]`).
+
+RNG semantics: lockstep interleaves the draws, so the training default's ONE shared sampling RNG
+cannot be reproduced. With the flag, rollout i of the run's g-th sampled group draws from its own
+stream `hash(--seed, g, i)` — training is **distribution-equivalent** to the default, not
+draw-identical. `--eval-only` already gives every rollout its own `hash(--seed, task, k)` stream, so
+there the flag is **byte-identical** (same dump, same summary numbers). Measured on a synthetic
+SmolLM2-135M-shaped model (G = 8, one thread; see the commit message): ~3.4x (6 layers) to ~4x
+(2 layers) less decode time per token per rollout. Verified by `[48]`.
+
 ### `transformer generate [model.bin] [tok.bin]`
 
 A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`),

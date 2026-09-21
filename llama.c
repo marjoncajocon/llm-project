@@ -571,6 +571,147 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
   tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
 }
 
+// ---------------------------------------------------------------------------
+// Batched decode: one token for each of n independent sequences (see llama.h).
+// ---------------------------------------------------------------------------
+
+// Per-row attention for the batch: row i attends over its OWN cache at its own
+// position. Rows are independent and each is computed by exactly one call of
+// decode_attention (the single-step arithmetic), so splitting rows across the
+// pool changes no bits. `sc` holds n rows of `sc_stride` floats.
+typedef struct {
+  const float *q; float *o; LlamaKV *const *kvs; const int *pos;
+  int layer, window, n_heads, n_kv, hd, qd, sc_stride; float *sc;
+} BatchAttnJob;
+
+static void batch_attn_rows(int i0, int i1, void *ctx) {
+  const BatchAttnJob *t = (const BatchAttnJob*)ctx;
+  for (int i = i0; i < i1; i++) {
+    const LlamaKV *kv = t->kvs[i];
+    decode_attention(&t->q[(size_t)i * t->qd], kv->k[t->layer], kv->v[t->layer],
+                     kv->cap[t->layer], t->window, t->pos[i], t->n_heads, t->n_kv, t->hd,
+                     &t->sc[(size_t)i * t->sc_stride], &t->o[(size_t)i * t->qd]);
+  }
+}
+
+// Row i of x as a (1, cols) tensor sharing x's data (no grad).
+static Tensor row_view(const Tensor *x, int i, int *shape) {
+  Tensor v = *x;
+  shape[0] = 1; shape[1] = x->shape[1];
+  v.data = x->data + (size_t)i * (size_t)x->shape[1];
+  v.grad = NULL;
+  v.shape = shape;
+  v.ndim = 2;
+  v.size = (size_t)x->shape[1];
+  return v;
+}
+
+void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const int *tok,
+                             int n, Tensor *logits, const LlamaDecodeLora *lo) {
+  if (n <= 0) return;
+  const int dm = m->d_model, hd = m->head_dim;
+  const int qd = m->n_heads * hd, kvd = m->n_kv * hd;
+  if (logits && (logits->ndim != 2 || logits->shape[0] != n || logits->shape[1] != m->vocab)) {
+    fprintf(stderr, "llama_decode_batch_lora: logits must be (%d, %d)\n", n, m->vocab);
+    abort();
+  }
+
+  int *pos = (int*)malloc((size_t)n * sizeof(int));
+  int maxpos = 0;
+  for (int i = 0; i < n; i++) {
+    pos[i] = kvs[i]->len;                      // row i's own position
+    if (pos[i] >= kvs[i]->max_seq) {
+      fprintf(stderr, "llama_decode_batch_lora: row %d cache is full (%d)\n", i, pos[i]);
+      abort();
+    }
+    if (pos[i] > maxpos) maxpos = pos[i];
+  }
+
+  Tensor x = mat(n, dm);                       // n residual streams
+  for (int i = 0; i < n; i++)
+    memcpy(&x.data[(size_t)i * dm], &m->wte.data[(size_t)tok[i] * dm], (size_t)dm * sizeof(float));
+
+  Tensor xn = mat(n, dm), q = mat(n, qd), k = mat(n, kvd), v = mat(n, kvd);
+  Tensor o = mat(n, qd), ao = mat(n, dm), hn = mat(n, dm), f = mat(n, dm);
+  const int sc_stride = maxpos + 1;
+  float *sc = (float*)malloc((size_t)n * sc_stride * sizeof(float));
+  SwigluCache sc_ff = swiglu_cache_create(n, m->d_ff);
+
+  LoraCache lcq, lck, lcv, lco;
+  if (lo) {
+    lcq = lora_cache_create(n, lo->q[0].r, qd);
+    lck = lora_cache_create(n, lo->k[0].r, kvd);
+    lcv = lora_cache_create(n, lo->v[0].r, kvd);
+    lco = lora_cache_create(n, lo->o[0].r, dm);
+  }
+  const int mlp = (lo && lo->gate);
+  LoraCache lcg, lcu, lcd;
+  SwigluLora slv;
+  if (mlp) {
+    lcg = lora_cache_create(n, lo->gate[0].r, m->d_ff);
+    lcu = lora_cache_create(n, lo->up[0].r, m->d_ff);
+    lcd = lora_cache_create(n, lo->down[0].r, dm);
+    slv.cg = &lcg; slv.cu = &lcu; slv.cd = &lcd;
+  }
+
+  for (int l = 0; l < m->n_layers; l++) {
+    const LlamaBlock *b = &m->blocks[l];
+    // Everything up to attention is row-wise: n-row matmuls (each row the same
+    // FMA chain as a 1-row matmul), row-broadcast bias, row-wise adapters/norms.
+    rmsnorm(&x, &b->attn_norm, &xn, m->eps);
+    matmul(&xn, &b->Wq, &q); bias_add(&q, &b->b_q, &q);
+    matmul(&xn, &b->Wk, &k); bias_add(&k, &b->b_k, &k);
+    matmul(&xn, &b->Wv, &v); bias_add(&v, &b->b_v, &v);
+    if (lo) {
+      lora_forward(&lo->q[l], &xn, &q, &lcq);
+      lora_forward(&lo->k[l], &xn, &k, &lck);
+      lora_forward(&lo->v[l], &xn, &v, &lcv);
+    }
+    if (b->qk_norm) {
+      rmsnorm_heads(&q, &b->q_norm, &q, m->eps);
+      rmsnorm_heads(&k, &b->k_norm, &k, m->eps);
+    }
+    for (int i = 0; i < n; i++) {              // RoPE at each row's OWN position
+      int s1[2], s2[2];
+      Tensor qi = row_view(&q, i, s1), ki = row_view(&k, i, s2);
+      rope_heads_pos(&qi, m->n_heads, m->rope_base, pos[i]);
+      rope_heads_pos(&ki, m->n_kv, m->rope_base, pos[i]);
+      LlamaKV *kv = kvs[i];
+      const size_t slot = (size_t)(pos[i] % kv->cap[l]) * kvd;
+      memcpy(&kv->k[l][slot], &k.data[(size_t)i * kvd], (size_t)kvd * sizeof(float));
+      memcpy(&kv->v[l][slot], &v.data[(size_t)i * kvd], (size_t)kvd * sizeof(float));
+    }
+    if (!logits && l == m->n_layers - 1) break;
+    BatchAttnJob aj = { q.data, o.data, kvs, pos, l, b->window, m->n_heads, m->n_kv, hd, qd,
+                        sc_stride, sc };
+    if (n > 1) tf_parallel_for(n, batch_attn_rows, &aj);
+    else batch_attn_rows(0, n, &aj);
+    matmul(&o, &b->Wo, &ao);
+    if (lo) lora_forward(&lo->o[l], &o, &ao, &lco);
+    for (size_t j = 0; j < x.size; j++) x.data[j] += ao.data[j];   // residual
+
+    rmsnorm(&x, &b->ffn_norm, &hn, m->eps);
+    if (mlp) { slv.gate = &lo->gate[l]; slv.up = &lo->up[l]; slv.down = &lo->down[l]; }
+    swiglu_forward_lora(&hn, &b->Wgate, &b->Wup, &b->Wdown, &sc_ff, &f, mlp ? &slv : NULL);
+    for (size_t j = 0; j < x.size; j++) x.data[j] += f.data[j];     // residual
+  }
+
+  if (logits) {
+    rmsnorm(&x, &m->final_norm, &hn, m->eps);
+    llama_head_forward(m, &hn, logits);        // (n, vocab); tied -> hn @ wte^T
+  }
+  for (int i = 0; i < n; i++) kvs[i]->len = pos[i] + 1;
+
+  free(sc); free(pos); swiglu_cache_free(&sc_ff);
+  if (lo) {
+    lora_cache_free(&lcq); lora_cache_free(&lck);
+    lora_cache_free(&lcv); lora_cache_free(&lco);
+  }
+  if (mlp) { lora_cache_free(&lcg); lora_cache_free(&lcu); lora_cache_free(&lcd); }
+  tensor_free(&x); tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
+  tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
+}
+
 // Read the optional per-layer window block that follows the float config (and,
 // in v4, the flags word): absent in v2 and in v4 without LLMA_FLAG_WINDOWS
 // (every window 0 = full attention), n_layers int32 in v3 and in v4 with it.

@@ -225,6 +225,24 @@ typedef struct {
 void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
                             Tensor *logits, const LlamaDecodeLora *lo);
 
+// BATCHED decode: one token for each of n INDEPENDENT sequences in one pass —
+// row i decodes tok[i] at position kvs[i]->len into its own cache kvs[i] (which
+// may all sit at different lengths, and have ring-wrapped windowed layers), and
+// writes its logits to row i of `logits` (n, vocab); every kvs[i]->len advances.
+// The n rows share every weight read: each layer runs n-row matmuls (one pass
+// over the weights instead of n), while RoPE, the cache append and attention are
+// per row at the row's own position. logits == NULL skips the head (as above).
+//
+// Row i is BIT-IDENTICAL to llama_decode_step_lora(m, kvs[i], tok[i], ..., lo):
+// every row-wise op (RMSNorm, bias, SiLU, residual, LoRA scale-add) is per row,
+// and a matmul row is the same FMA chain whatever the row count or thread split
+// (selftest [34]/[38]; checked for this function in [48]). The kvs[i] must be
+// DISTINCT caches of this model. (A GPU-offloaded build may route an n-row
+// matmul to the device where a 1-row one stays on the CPU: not bit-exact there.)
+// Used by grpo.c --batch-rollouts to decode a group's G rollouts in lockstep.
+void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const int *tok,
+                             int n, Tensor *logits, const LlamaDecodeLora *lo);
+
 // ---------------------------------------------------------------------------
 // Quantized (int8, in-memory) model: same architecture, but the big weights
 // (embedding, all block linears, output head) are kept as int8 QTensors and

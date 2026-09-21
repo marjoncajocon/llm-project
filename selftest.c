@@ -6449,6 +6449,192 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // [48] Batched rollout decode (grpo --batch-rollouts). llama_decode_batch_lora
+  // decodes one token for each of n independent sequences with n-row matmuls; row
+  // i must be BIT-IDENTICAL to llama_decode_step_lora on the same cache and token.
+  // (a) 7 sequences at different positions (prompts of different lengths) step
+  //     together and drop out one by one, so the batch runs at every row count
+  //     7..1 (AVX2: 4-row tiles + 3/2/1-row rests, and the <4-row AXPY path) --
+  //     with attention + MLP LoRA nonzero, QK-norm, q/k/v biases, windowed layers
+  //     whose rings wrap, a tied head; SIMD kernels and portable C. Logits AND
+  //     caches must be equal.
+  // (b) GRPO: a group sampled in lockstep == the same group one rollout at a
+  //     time with the same per-rollout seeds (a stand-in EOS token so rollouts
+  //     end at different lengths and leave the batch) -- ids, log-probs, lengths.
+  // (c) eval-only: --batch-rollouts gives the unbatched ids/log-probs exactly.
+  // --------------------------------------------------------------------------
+  {
+    printf("[48] Batched rollout decode: G rollouts in lockstep, rows bit-exact vs single-step decode\n");
+    int ok48 = 1;
+    const int vocab = 300, dm = 64, nl = 3, nh = 4, nkv = 2, hd = 16, dff = 160, msq = 64;
+    const int W = 6, NS = 7;
+    srand(48);
+    LlamaModel bm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, msq, 10000.0f, 1e-5f);
+    llama_model_set_qk_norm(&bm, 1);
+    llama_model_set_tied(&bm, 1);             // head = wte^T (matmul_nt)
+    llama_model_randomize(&bm);
+    llama_model_set_window(&bm, W, 2);        // layers 0,2 windowed (W=6 ring), layer 1 global
+    for (int l = 0; l < nl; l++)              // nonzero q/k/v biases (Qwen2-style)
+      for (int j = 0; j < nh * hd; j++) {
+        bm.blocks[l].b_q.data[j] = 0.01f * (float)((j * 7 + l) % 11 - 5);
+        if (j < nkv * hd) {
+          bm.blocks[l].b_k.data[j] = 0.01f * (float)((j * 3 + l) % 9 - 4);
+          bm.blocks[l].b_v.data[j] = 0.01f * (float)((j * 5 + l) % 7 - 3);
+        }
+      }
+    LlamaLora blo = llama_lora_create_ex(&bm, 4, 8.0f, 1);   // attention + MLP adapters
+    llama_lora_init(&blo);
+    Tensor **blp = (Tensor**)malloc((size_t)llama_lora_param_count(&blo) * sizeof(Tensor*));
+    const int n_blp = llama_lora_collect_params(&blo, blp);
+    for (int p = 0; p < n_blp; p++)           // B starts at zero: make the adapters bite
+      for (size_t k = 0; k < blp[p]->size; k++)
+        blp[p]->data[k] += 0.03f * (float)((int)((k * 29 + (size_t)p * 3) % 13) - 6);
+    LlamaDecodeLora bdv = llama_lora_decode_view(&blo);
+
+    // (a) Prompts of 3..15 tokens (most past W: rings wrap), then 2..14 decoded
+    // tokens each, so the sequences finish at different steps.
+    const int plen48[7] = {3, 15, 8, 11, 5, 13, 9}, glen48[7] = {14, 2, 9, 5, 12, 7, 11};
+    const int simd_prev = matmul_simd_enabled();
+    const int n_modes = simd_prev ? 2 : 1;   // SIMD in use: also run portable C
+    int a_ok = 1, rows_seen[8] = {0};
+    long rows_cmp = 0;
+    float lora_eff = 0.0f;
+    for (int mode = 0; mode < n_modes; mode++) {
+      matmul_set_simd(mode == 0 ? simd_prev : 0);
+      LlamaKV ref[7], bat[7];
+      int ls1[2] = {1, vocab};
+      Tensor lref = tensor_create_nograd(ls1, 2), lnol = tensor_create_nograd(ls1, 2);
+      for (int s = 0; s < NS; s++) {          // the same prompt into both caches
+        ref[s] = llama_kv_create(&bm);
+        bat[s] = llama_kv_create_len(&bm, plen48[s] + glen48[s]);
+        for (int t = 0; t < plen48[s]; t++)
+          llama_decode_step_lora(&bm, &ref[s], (s * 37 + t * 11 + 5) % vocab, NULL, &bdv);
+        llama_kv_copy(&bat[s], &ref[s]);
+      }
+      for (int step = 0; ; step++) {
+        LlamaKV *kp[7];
+        int tk[7], who[7], n = 0;
+        for (int s = 0; s < NS; s++)
+          if (step < glen48[s]) {
+            kp[n] = &bat[s]; tk[n] = (s * 13 + step * 17 + 1) % vocab; who[n] = s; n++;
+          }
+        if (n == 0) break;
+        int ls[2] = {n, vocab};
+        Tensor lb = tensor_create_nograd(ls, 2);
+        llama_decode_batch_lora(&bm, kp, tk, n, &lb, &bdv);
+        rows_seen[n] = 1;
+        for (int r = 0; r < n; r++) {
+          const int s = who[r];
+          if (mode == 0 && step == 0) {       // do the adapters bite? (same step, no LoRA)
+            LlamaKV tmp = llama_kv_create(&bm);
+            llama_kv_copy(&tmp, &ref[s]);
+            llama_decode_step_lora(&bm, &tmp, tk[r], &lnol, NULL);
+            llama_kv_free(&tmp);
+          }
+          llama_decode_step_lora(&bm, &ref[s], tk[r], &lref, &bdv);
+          if (memcmp(lref.data, &lb.data[(size_t)r * vocab], (size_t)vocab * sizeof(float)) != 0)
+            a_ok = 0;
+          if (mode == 0 && step == 0)
+            for (int j = 0; j < vocab; j++) {
+              const float d = fabsf(lnol.data[j] - lref.data[j]);
+              if (d > lora_eff) lora_eff = d;
+            }
+          rows_cmp++;
+        }
+        tensor_free(&lb);
+      }
+      for (int s = 0; s < NS; s++) {          // caches: same len, same populated slots
+        if (ref[s].len != bat[s].len || ref[s].len != plen48[s] + glen48[s]) a_ok = 0;
+        for (int l = 0; l < nl; l++) {
+          const int used = ref[s].len < bat[s].cap[l] ? ref[s].len : bat[s].cap[l];
+          const size_t by = (size_t)used * ref[s].kv_dim * sizeof(float);
+          if (ref[s].cap[l] != (bm.blocks[l].window > 0 ? W : msq)) a_ok = 0;
+          if (memcmp(ref[s].k[l], bat[s].k[l], by) || memcmp(ref[s].v[l], bat[s].v[l], by)) a_ok = 0;
+        }
+        llama_kv_free(&ref[s]); llama_kv_free(&bat[s]);
+      }
+      tensor_free(&lref); tensor_free(&lnol);
+    }
+    matmul_set_simd(simd_prev);
+    int all_rows = 1;
+    for (int r = 1; r <= NS; r++) all_rows &= rows_seen[r];
+    a_ok &= all_rows && lora_eff > 1e-4f;
+    printf("    (a) %d seqs, prompts 3..15 (window-%d rings wrap), 2..14 steps each: %ld rows at batch"
+           " sizes 7..1 (%s), %s\n", NS, W, rows_cmp, all_rows ? "all hit" : "NOT all hit",
+           n_modes == 2 ? "AVX2 kernels + portable C" : "portable C");
+    printf("        QK-norm, q/k/v bias, tied head, LoRA attn+MLP (moves logits by %.2e): logits + KV"
+           " caches bit-identical to llama_decode_step_lora -> %s\n", lora_eff, a_ok ? "OK" : "FAIL");
+    ok48 &= a_ok;
+
+    // (b) GRPO lockstep group vs one at a time, same per-rollout seeds.
+    int prompt48[10] = {7, 150, 3, 44, 299, 12, 12, 80, 5, 201};
+    GrpoConfig gc = grpo_default_config();
+    gc.group = 6; gc.max_new = 16;
+    gc.temperature = 1.3f; gc.top_k = 0; gc.top_p = 1.0f;
+    unsigned long long seeds[6];
+    for (int i = 0; i < 6; i++) seeds[i] = grpo_batch_rollout_seed(48u, 3, i);
+    int stop_tok;                             // a token rollout 1 draws mid-way
+    {
+      int ids0[6 * 16], len0[6];
+      float lp0[6 * 16];
+      grpo_debug_rollout_group(&bm, &bdv, prompt48, 10, &gc, seeds, 0, -1, ids0, lp0, len0);
+      stop_tok = ids0[1 * 16 + 5];
+    }
+    int idsA[6 * 16], idsB[6 * 16], lenA[6], lenB[6];
+    float lpA[6 * 16], lpB[6 * 16];
+    grpo_debug_rollout_group(&bm, &bdv, prompt48, 10, &gc, seeds, 0, stop_tok, idsA, lpA, lenA);
+    const long calls = grpo_debug_rollout_group(&bm, &bdv, prompt48, 10, &gc, seeds, 1, stop_tok,
+                                                idsB, lpB, lenB);
+    int b_ok = 1, minl = 99, maxl = 0, ntok = 0;
+    for (int i = 0; i < 6; i++) {
+      if (lenA[i] != lenB[i]) b_ok = 0;
+      if (lenA[i] < minl) minl = lenA[i];
+      if (lenA[i] > maxl) maxl = lenA[i];
+      for (int t = 0; t < lenA[i] && t < lenB[i]; t++, ntok++)
+        if (idsA[i * 16 + t] != idsB[i * 16 + t] ||
+            memcmp(&lpA[i * 16 + t], &lpB[i * 16 + t], sizeof(float)) != 0) b_ok = 0;
+    }
+    // One batched call per round until the longest rollout ends (its last token
+    // is never decoded: at most maxl - 1 calls).
+    b_ok &= (minl < maxl) && (calls <= maxl - 1) && (calls >= minl);
+    const unsigned long long e0 = grpo_eval_rollout_seed(48u, 3, 0);
+    b_ok &= seeds[0] != 0 && seeds[0] != seeds[1] && seeds[0] != e0 &&
+            grpo_batch_rollout_seed(48u, 4, 0) != seeds[0];
+    printf("    (b) GRPO group G=6, LoRA attn+MLP, lockstep vs one at a time, same seeds, stand-in EOS:"
+           " lengths %d..%d, %d tokens, ids + log-probs %s | %ld batched decode calls -> %s\n",
+           minl, maxl, ntok, b_ok ? "identical" : "DIFFER", calls, b_ok ? "OK" : "FAIL");
+    ok48 &= b_ok;
+
+    // (c) eval-only: batched vs unbatched with the eval per-rollout RNGs.
+    GrpoConfig ecfg = grpo_default_config();
+    ecfg.eval_k = 5; ecfg.max_new = 12; ecfg.seed = 48;
+    ecfg.temperature = 1.0f; ecfg.top_k = 40; ecfg.top_p = 0.9f;
+    int eA[5 * 12], eB[5 * 12], elA[5], elB[5];
+    float epA[5 * 12], epB[5 * 12];
+    grpo_debug_eval_task(&bm, prompt48, 10, 7, &ecfg, eA, epA, elA);
+    ecfg.batch_rollouts = 1;
+    grpo_debug_eval_task(&bm, prompt48, 10, 7, &ecfg, eB, epB, elB);
+    int c_ok = 1, c_tok = 0, c_div = 0;
+    for (int k = 0; k < 5; k++) {
+      if (elA[k] != elB[k]) c_ok = 0;
+      for (int t = 0; t < elA[k] && t < elB[k]; t++, c_tok++)
+        if (eA[k * 12 + t] != eB[k * 12 + t] ||
+            memcmp(&epA[k * 12 + t], &epB[k * 12 + t], sizeof(float)) != 0) c_ok = 0;
+      if (k > 0 && memcmp(&eA[k * 12], &eA[0], 12 * sizeof(int)) != 0) c_div++;
+    }
+    c_ok &= c_div > 0;
+    printf("    (c) eval-only k=5 (temp 1, top-k 40, top-p 0.9): --batch-rollouts ids + log-probs %s to"
+           " unbatched (%d tokens, %d/4 rollouts differ from k=0) -> %s\n",
+           c_ok ? "identical" : "DIFFER", c_tok, c_div, c_ok ? "OK" : "FAIL");
+    ok48 &= c_ok;
+
+    free(blp);
+    llama_lora_free(&blo); llama_model_free(&bm);
+    printf("    -> %s\n\n", ok48 ? "OK" : "FAIL");
+    all_ok &= ok48;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;
