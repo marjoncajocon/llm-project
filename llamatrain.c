@@ -204,7 +204,7 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
   }
 
   rmsnorm(&a->block_out[m->n_layers - 1], &m->final_norm, &a->final_hn, m->eps);
-  matmul(&a->final_hn, &m->lm_head, logits);          // (seq_len, vocab)
+  llama_head_forward(m, &a->final_hn, logits);        // (seq_len, vocab); tied: @ wte^T
 }
 
 void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
@@ -236,8 +236,10 @@ static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
   // the backward) and skip the embedding scatter entirely.
   const int frozen = (lo != NULL);
 
-  // logits = final_hn @ lm_head
-  if (frozen) matmul_backward_dx(&a->final_hn, &m->lm_head, logits);
+  // logits = final_hn @ lm_head   (tied: final_hn @ wte^T -- the head's weight
+  // gradient lands in wte.grad, and the embedding scatter below adds to it)
+  if (m->tied) matmul_nt_backward(&a->final_hn, &m->wte, logits, !frozen);
+  else if (frozen) matmul_backward_dx(&a->final_hn, &m->lm_head, logits);
   else        matmul_backward(&a->final_hn, &m->lm_head, logits);
   // final_hn = RMSNorm(block_out[L-1], final_norm)
   rmsnorm_backward(&a->block_out[m->n_layers - 1], &m->final_norm, &a->final_hn,
@@ -322,8 +324,9 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
 // ---------------------------------------------------------------------------
 
 int llama_param_count(const LlamaModel *m) {
-  // wte, final_norm, lm_head + 12 per layer (+ q_norm, k_norm with QK-norm)
-  return 3 + (m->qk_norm ? 14 : 12) * m->n_layers;
+  // wte, final_norm, lm_head + 12 per layer (+ q_norm, k_norm with QK-norm).
+  // A tied head is wte itself: listed ONCE, so no optimizer steps it twice.
+  return (m->tied ? 2 : 3) + (m->qk_norm ? 14 : 12) * m->n_layers;
 }
 
 int llama_collect_params(LlamaModel *m, Tensor **list) {
@@ -349,7 +352,7 @@ int llama_collect_params(LlamaModel *m, Tensor **list) {
     list[n++] = &b->Wdown;
   }
   list[n++] = &m->final_norm;
-  list[n++] = &m->lm_head;
+  if (!m->tied) list[n++] = &m->lm_head;
   return n;
 }
 

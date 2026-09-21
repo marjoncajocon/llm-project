@@ -73,7 +73,8 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
                     LlamaActs *a, Tensor *logits);
 
 // Number of learnable parameter tensors (== 3 + 12*n_layers, or 3 + 14*n_layers
-// with QK-norm). Use this to size the buffer passed to llama_collect_params.
+// with QK-norm; one fewer with a tied head, whose weight is wte, listed once)
+// Use this to size the buffer passed to llama_collect_params.
 int llama_param_count(const LlamaModel *m);
 
 // Fill list[] with pointers to all learnable parameter tensors, in canonical

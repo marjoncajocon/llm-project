@@ -657,6 +657,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
                                      loaded.n_kv, loaded.head_dim, loaded.d_ff,
                                      loaded.max_seq, loaded.rope_base, loaded.eps);
     llama_model_set_qk_norm(&model, loaded.qk_norm);   // keep the base's QK-norm (Qwen3)
+    llama_model_set_tied(&model, loaded.tied);         // and its tied head (Qwen2.5/3)
     llama_model_randomize(&model);          // any new row/column starts random
     copy_weights_grow(&model, &loaded);     // ...then every pretrained weight lands on top
     llama_model_copy_window(&model, &loaded);   // and its sliding-window config
@@ -809,6 +810,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
                                             model.n_heads, model.n_kv, model.head_dim,
                                             model.d_ff, model.max_seq, model.rope_base, model.eps);
     llama_model_set_qk_norm(&t, model.qk_norm);        // keep the checkpoint's QK-norm
+    llama_model_set_tied(&t, model.tied);              // and its tied head
     copy_weights_grow(&t, &model);
     llama_model_copy_window(&t, &model);
     llama_model_free(&model);

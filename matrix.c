@@ -777,6 +777,183 @@ void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C) {
   parallel_for(M, fa, &t);
 }
 
+// ===========================================================================
+// C = A @ B^T with B stored (N, K) -- a TIED output head (logits = hn @ wte^T)
+// without a transposed copy of B (it would be 545 MB for Qwen2.5's 151936 x 896).
+// ===========================================================================
+typedef struct { const float *A, *B; float *C; int M, K, N; } MMNT;
+
+// C[i,n] = sum_k A[i,k] * B[n,k] for rows [i0,i1) x columns [n0,n1). Each
+// element is ONE dot product computed the same way whatever the row/column range,
+// so any split (rows, columns, threads, decode M = 1 vs a full forward) gives the
+// same bits. ACC_LANES partial sums let the compiler vectorize the reduction.
+// B is walked in blocks of MM_NT_NB rows (~230 KB at K = 896: L2-resident) with
+// every row of A inside, so a many-row forward streams B from DRAM once, not
+// once per row. Blocking changes the visiting order only, never a sum.
+#define MM_NT_NB 64
+static float mm_nt_dot(const float *a, const float *b, int K) {
+  float acc[ACC_LANES];
+  for (int u = 0; u < ACC_LANES; u++) acc[u] = 0.0f;
+  int k = 0;
+  for (; k + ACC_LANES <= K; k += ACC_LANES)
+    for (int u = 0; u < ACC_LANES; u++) acc[u] += a[k + u] * b[k + u];
+  float sum = 0.0f;
+  for (int u = 0; u < ACC_LANES; u++) sum += acc[u];
+  for (; k < K; k++) sum += a[k] * b[k];
+  return sum;
+}
+
+static void mm_nt_block(const MMNT *t, int i0, int i1, int n0, int n1) {
+  const int K = t->K, N = t->N;
+  for (int nb = n0; nb < n1; nb += MM_NT_NB) {
+    const int ne = (n1 - nb < MM_NT_NB) ? n1 : nb + MM_NT_NB;
+    for (int i = i0; i < i1; i++)
+      for (int n = nb; n < ne; n++)
+        t->C[(size_t)i * N + n] = mm_nt_dot(&t->A[(size_t)i * K], &t->B[(size_t)n * K], K);
+  }
+}
+
+static void mm_nt_rows(int i0, int i1, void *ctx) {
+  const MMNT *t = (const MMNT*)ctx;
+  mm_nt_block(t, i0, i1, 0, t->N);
+}
+
+static void mm_nt_cols(int u0, int u1, void *ctx) {
+  const MMNT *t = (const MMNT*)ctx;
+  const long lo = (long)u0 * MM_COL_UNIT, hi = (long)u1 * MM_COL_UNIT;
+  mm_nt_block(t, 0, t->M, (lo < t->N) ? (int)lo : t->N, (hi < t->N) ? (int)hi : t->N);
+}
+
+#if defined(MM_X86_SIMD)
+// AVX2: every element is the SAME computation -- one 8-lane FMA chain over k in
+// steps of 8 from zero, a fixed horizontal sum, then the K % 8 tail added in k
+// order -- whether it is computed in the 4x2 register block or the 1x1 edge
+// kernel. So the result does not depend on M (decode vs full forward), on the
+// row/column range, or on threads. (Not bit-identical to the portable kernel.)
+SIMD_FN static inline float nt_finish(__m256 acc, const float *a, const float *b, int k8, int K) {
+  __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+  s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+  s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+  float sum = _mm_cvtss_f32(s);
+  for (int k = k8; k < K; k++)
+    sum = _mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss(a[k]), _mm_set_ss(b[k]), _mm_set_ss(sum)));
+  return sum;
+}
+
+SIMD_FN static void mm_nt_block_avx2(const MMNT *t, int i0, int i1, int n0, int n1) {
+  const int K = t->K, N = t->N, k8 = K & ~7;
+  for (int nb = n0; nb < n1; nb += MM_NT_NB) {
+    const int ne = (n1 - nb < MM_NT_NB) ? n1 : nb + MM_NT_NB;
+    int i = i0;
+    for (; i + 4 <= i1; i += 4) {
+      const float *a0 = &t->A[(size_t)i * K], *a1 = a0 + K, *a2 = a1 + K, *a3 = a2 + K;
+      int n = nb;
+      for (; n + 2 <= ne; n += 2) {
+        const float *b0 = &t->B[(size_t)n * K], *b1 = b0 + K;
+        __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps(), c10 = _mm256_setzero_ps(),
+               c11 = _mm256_setzero_ps(), c20 = _mm256_setzero_ps(), c21 = _mm256_setzero_ps(),
+               c30 = _mm256_setzero_ps(), c31 = _mm256_setzero_ps();
+        for (int k = 0; k < k8; k += 8) {
+          const __m256 vb0 = _mm256_loadu_ps(b0 + k), vb1 = _mm256_loadu_ps(b1 + k);
+          __m256 va = _mm256_loadu_ps(a0 + k);
+          c00 = _mm256_fmadd_ps(va, vb0, c00); c01 = _mm256_fmadd_ps(va, vb1, c01);
+          va = _mm256_loadu_ps(a1 + k);
+          c10 = _mm256_fmadd_ps(va, vb0, c10); c11 = _mm256_fmadd_ps(va, vb1, c11);
+          va = _mm256_loadu_ps(a2 + k);
+          c20 = _mm256_fmadd_ps(va, vb0, c20); c21 = _mm256_fmadd_ps(va, vb1, c21);
+          va = _mm256_loadu_ps(a3 + k);
+          c30 = _mm256_fmadd_ps(va, vb0, c30); c31 = _mm256_fmadd_ps(va, vb1, c31);
+        }
+        float *C0 = &t->C[(size_t)i * N + n];
+        C0[0] = nt_finish(c00, a0, b0, k8, K);         C0[1] = nt_finish(c01, a0, b1, k8, K);
+        C0[N] = nt_finish(c10, a1, b0, k8, K);         C0[N + 1] = nt_finish(c11, a1, b1, k8, K);
+        C0[2 * N] = nt_finish(c20, a2, b0, k8, K);     C0[2 * N + 1] = nt_finish(c21, a2, b1, k8, K);
+        C0[3 * N] = nt_finish(c30, a3, b0, k8, K);     C0[3 * N + 1] = nt_finish(c31, a3, b1, k8, K);
+      }
+      for (; n < ne; n++)
+        for (int r = 0; r < 4; r++) {
+          const float *a = &t->A[(size_t)(i + r) * K], *b = &t->B[(size_t)n * K];
+          __m256 c = _mm256_setzero_ps();
+          for (int k = 0; k < k8; k += 8) c = _mm256_fmadd_ps(_mm256_loadu_ps(a + k), _mm256_loadu_ps(b + k), c);
+          t->C[(size_t)(i + r) * N + n] = nt_finish(c, a, b, k8, K);
+        }
+    }
+    for (; i < i1; i++) {                            // leftover rows (decode: all of them)
+      const float *a = &t->A[(size_t)i * K];
+      for (int n = nb; n < ne; n++) {
+        const float *b = &t->B[(size_t)n * K];
+        __m256 c = _mm256_setzero_ps();
+        for (int k = 0; k < k8; k += 8) c = _mm256_fmadd_ps(_mm256_loadu_ps(a + k), _mm256_loadu_ps(b + k), c);
+        t->C[(size_t)i * N + n] = nt_finish(c, a, b, k8, K);
+      }
+    }
+  }
+}
+
+SIMD_FN static void mm_nt_rows_avx2(int i0, int i1, void *ctx) {
+  const MMNT *t = (const MMNT*)ctx;
+  mm_nt_block_avx2(t, i0, i1, 0, t->N);
+}
+
+SIMD_FN static void mm_nt_cols_avx2(int u0, int u1, void *ctx) {
+  const MMNT *t = (const MMNT*)ctx;
+  const long lo = (long)u0 * MM_COL_UNIT, hi = (long)u1 * MM_COL_UNIT;
+  mm_nt_block_avx2(t, 0, t->M, (lo < t->N) ? (int)lo : t->N, (hi < t->N) ? (int)hi : t->N);
+}
+#endif
+
+void matmul_nt(const Tensor *A, const Tensor *B, Tensor *C) {
+  TF_ASSERT(A->ndim == 2 && B->ndim == 2 && C->ndim == 2 && A->shape[1] == B->shape[1] &&
+            C->shape[0] == A->shape[0] && C->shape[1] == B->shape[0]);
+  const int M = A->shape[0], K = A->shape[1], N = B->shape[0];
+  MMNT t = { A->data, B->data, C->data, M, K, N };
+  range_fn fr = mm_nt_rows, fc = mm_nt_cols;
+#if defined(MM_X86_SIMD)
+  if (simd_on()) { fr = mm_nt_rows_avx2; fc = mm_nt_cols_avx2; }
+#endif
+  const size_t macs = (size_t)M * N * K;
+  // Few rows (decode): split the output columns, as matmul does.
+  if (macs >= MM_COL_THRESHOLD && N >= 2 * MM_COL_UNIT) {
+    const int nt = pool_threads();
+    if (nt > 1 && M < MM_COL_ROWS * nt) {
+      parallel_for((N + MM_COL_UNIT - 1) / MM_COL_UNIT, fc, &t);
+      return;
+    }
+  }
+  if (macs < MM_THREAD_THRESHOLD) { fr(0, M, &t); return; }
+  parallel_for(M, fr, &t);
+}
+
+void matmul_nt_backward(const Tensor *A, const Tensor *B, const Tensor *C, int want_dB) {
+  TF_ASSERT(A->ndim == 2 && B->ndim == 2 && C->ndim == 2 && A->shape[1] == B->shape[1] &&
+            C->shape[0] == A->shape[0] && C->shape[1] == B->shape[0]);
+  const int M = A->shape[0], K = A->shape[1], N = B->shape[0];
+  // Views over the existing buffers, so the ordinary kernels do the work.
+  int sMN[2] = {M, N}, sNK[2] = {N, K}, sMK[2] = {M, K};
+  // dA += dC @ B: a plain (M,N) @ (N,K) product into scratch, then added.
+  {
+    Tensor dC = { C->grad, NULL, sMN, 2, (size_t)M * N };
+    Tensor Bv = { B->data, NULL, sNK, 2, (size_t)N * K };
+    Tensor tmp = tensor_create_nograd(sMK, 2);
+    matmul(&dC, &Bv, &tmp);
+    for (size_t i = 0; i < tmp.size; i++) A->grad[i] += tmp.data[i];
+    tensor_free(&tmp);
+  }
+  if (!want_dB) return;
+  // dB[n,k] += sum_i dC[i,n] * A[i,k]: exactly matmul_backward's dB half for the
+  // product X(M,N) @ Y(N,K) with X = dC and output gradient A -- reuse its kernels.
+  Tensor Xv = { C->grad, NULL, sMN, 2, (size_t)M * N };   // plays A: data = dC
+  Tensor Yg = { NULL, B->grad, sNK, 2, (size_t)N * K };   // plays B: grad = dB
+  Tensor Zg = { NULL, A->data, sMK, 2, (size_t)M * K };   // plays C: grad = A
+  MMBwd t = { &Xv, &Yg, &Zg, M, N, K };
+  range_fn fb = mm_bwd_dB;
+#if defined(MM_X86_SIMD)
+  if (simd_on()) fb = mm_bwd_dB_avx2;
+#endif
+  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { fb(0, N, &t); return; }
+  parallel_for(N, fb, &t);
+}
+
 // Backward of C = A + B: dA += dC, dB += dC
 void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B) {
   tf_check_same_size(C, A);

@@ -1,5 +1,5 @@
 // hftok.h - Pure-C byte-level BPE tokenizer (loads a model's exported vocab), so
-// the engine tokenizes GPT-2 / LLaMA-family models ITSELF with no Python at
+// the engine tokenizes GPT-2 / LLaMA-family / Qwen models ITSELF with no Python at
 // runtime. The vocab is written once by tools/export_tokenizer.py into a .tok
 // file (id -> bytes); encoding is the tiktoken/byte-level-BPE rule "merge the
 // adjacent pair whose combined bytes have the lowest id".
@@ -15,6 +15,11 @@
 #define HFTOK_TMPL_PLAIN  0   // "User: ...\nAssistant: ..." fallback
 #define HFTOK_TMPL_CHATML 1   // <|im_start|>role\n...<|im_end|> (Qwen, SmolLM2)
 #define HFTOK_TMPL_LLAMA3 2   // <|start_header_id|>role<|end_header_id|>...<|eot_id|>
+
+// Pretokenizer kinds (the regex that splits text into words before BPE). Stored
+// in .tok v3; v1/v2 files are GPT-2.
+#define HFTOK_PRE_GPT2  0   // GPT-2 regex (' ?\p{L}+| ?\p{N}+|...'): GPT-2, SmolLM2
+#define HFTOK_PRE_QWEN2 1   // Qwen2/2.5/3 regex: single digits, [^\r\n\p{L}\p{N}]?\p{L}+, ...
 
 typedef struct {
   int n_vocab;
@@ -35,15 +40,22 @@ typedef struct {
 
   int template_kind;           // HFTOK_TMPL_*
   char *default_system;        // model's default system prompt ("" if none)
+  int pretok;                  // HFTOK_PRE_* (v3 files; GPT-2 for v1/v2)
 } HFTok;
 
-// Load a .tok file (v1 or v2). Returns 0 on success.
+// Load a .tok file (v1, v2 or v3). Returns 0 on success. v3 = v2 + one trailing
+// byte, the pretokenizer kind (unknown kinds are rejected).
 int hftok_load(HFTok *t, const char *path);
 void hftok_free(HFTok *t);
 
 // Encode UTF-8 text into token ids (writes up to max_ids). Special-token strings
 // present in the text are emitted as their single id. Returns the count.
 int hftok_encode(const HFTok *t, const char *text, int *ids, int max_ids);
+
+// Split text[0,len) into pretokens with the given HFTOK_PRE_* rule (no special-
+// token handling): starts[i]/lens[i] are byte offsets/lengths, at most max of them.
+// Returns the count. Exposed for tests (selftest [45], `hftok split`).
+int hftok_pretok_split(int kind, const char *text, int len, int *starts, int *lens, int max);
 
 // Decode ids back into bytes (NUL-terminated). Returns the byte length.
 int hftok_decode(const HFTok *t, const int *ids, int n, char *out, int max_out);
