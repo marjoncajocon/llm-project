@@ -35,6 +35,7 @@
 #include "reward.h"
 #include "grpo.h"
 #include "gpu.h"
+#include "moe.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -227,6 +228,96 @@ static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
                       const int *targets, Tensor *logits, Tensor *probs) {
   gpt_forward_train(m, ids, seq_len, a, logits);
   return cross_entropy_forward(logits, targets, probs);
+}
+
+// ---- MoE helpers for part [31] -------------------------------------------
+
+// Deterministic fill (independent of rand() state): a scrambled sawtooth in
+// [-scale, scale). `mul` and `off` decorrelate tensors from each other.
+static void moe_fill(Tensor *T, int mul, int off, float scale) {
+  for (size_t i = 0; i < T->size; i++)
+    T->data[i] = ((float)(((int)i * mul + off) % 97) / 48.5f - 1.0f) * scale;
+}
+
+// L = sum(w * y) + aux_coef * aux. Also reports whether the routing (the chosen
+// expert ids of every token) differs from `ref_sel` -- a finite-difference probe
+// that flips a top-k choice measures a jump, not a derivative.
+static float moe_scalar_loss(const MoeLayer *m, const Tensor *x, MoeCache *c, Tensor *y,
+                             const float *w, float aux_coef, const int *ref_sel,
+                             int *flipped) {
+  float aux = moe_forward(m, x, c, y);
+  float l = aux_coef * aux;
+  for (size_t i = 0; i < y->size; i++) l += w[i] * y->data[i];
+  if (ref_sel && memcmp(ref_sel, c->sel, (size_t)c->n * c->top_k * sizeof(int)) != 0)
+    *flipped = 1;
+  return l;
+}
+
+// Full numerical gradient check of one MoE configuration over x and EVERY
+// parameter. The routing is NOT frozen: the real forward (softmax + top-k) runs
+// at every probe, and each probe's selection is compared against the base one.
+// The inputs are chosen so the k-th / (k+1)-th probability gap (`margin`) is
+// far larger than anything an h=1e-3 nudge can close, and the test then
+// PROVES that no probe flipped (`flips` must be 0) rather than assuming it.
+// use_task=0 zeroes w, isolating the aux-loss gradient.
+static float moe_gradcheck(int E, int k, int renorm, int shared, int use_task,
+                           float aux_coef, int *flips, float *margin, int *checked) {
+  const int n = 5, dm = 4, df = 5;
+  MoeLayer m = moe_create(dm, df, E, k, renorm, shared);
+  int np = moe_n_params(&m);
+  Tensor **ps = (Tensor**)malloc((np + 1) * sizeof(Tensor*));
+  moe_params(&m, ps);
+  for (int i = 0; i < np; i++) moe_fill(ps[i], 13 + 6 * i, 7 * i, 0.5f);
+  moe_fill(&m.W_router, 29, 3, 2.0f);   // a decisive router: wide top-k margins
+  int xs[2] = {n, dm};
+  Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+  moe_fill(&x, 31, 11, 1.0f);
+  ps[np] = &x;
+  MoeCache c = moe_cache_create(&m, n);
+  float *w = (float*)malloc(n * dm * sizeof(float));
+  for (int i = 0; i < n * dm; i++) w[i] = use_task ? ((i * 23 % 100) / 50.0f) - 1.0f : 0.0f;
+
+  // Analytic: forward, dL/dy = w, backward with the aux term.
+  moe_forward(&m, &x, &c, &y);
+  for (int i = 0; i <= np; i++) tensor_zero_grad(ps[i]);
+  memcpy(y.grad, w, n * dm * sizeof(float));
+  moe_backward(&m, &x, &c, &y, aux_coef);
+
+  int *ref = (int*)malloc((size_t)n * k * sizeof(int));
+  memcpy(ref, c.sel, (size_t)n * k * sizeof(int));
+  *margin = 1.0f;
+  if (k < E)
+    for (int t = 0; t < n; t++) {
+      const float *p = c.probs.data + (size_t)t * E;
+      float kth = p[ref[t * k + k - 1]], best_out = 0.0f;
+      for (int e = 0; e < E; e++) {
+        int in = 0;
+        for (int j = 0; j < k; j++) if (ref[t * k + j] == e) in = 1;
+        if (!in && p[e] > best_out) best_out = p[e];
+      }
+      if (kth - best_out < *margin) *margin = kth - best_out;
+    }
+
+  const float h = 1e-3f;
+  float max_rel = 0.0f;
+  *flips = 0; *checked = 0;
+  for (int pi = 0; pi <= np; pi++) {
+    Tensor *T = ps[pi];
+    for (size_t q = 0; q < T->size; q++) {
+      float s = T->data[q];
+      int fl = 0;
+      T->data[q] = s + h; float lp = moe_scalar_loss(&m, &x, &c, &y, w, aux_coef, ref, &fl);
+      T->data[q] = s - h; float lm = moe_scalar_loss(&m, &x, &c, &y, w, aux_coef, ref, &fl);
+      T->data[q] = s;
+      *flips += fl;
+      float num = (lp - lm) / (2.0f * h), g = T->grad[q];
+      float rel = fabsf(num - g) / (fabsf(g) + 1e-3f);
+      if (fabsf(g) > 1e-2f) { (*checked)++; if (rel > max_rel) max_rel = rel; }
+    }
+  }
+  free(ref); free(w); free(ps);
+  moe_cache_free(&c); tensor_free(&x); tensor_free(&y); moe_free(&m);
+  return max_rel;
 }
 
 int run_selftest(void) {
@@ -1907,7 +1998,7 @@ int run_selftest(void) {
     // (a) zero variance => no signal
     float flat_r[4] = {0.5f, 0.5f, 0.5f, 0.5f};
     float adv[4];
-    int live_flat = grpo_advantages(flat_r, 4, adv);
+    int live_flat = grpo_advantages(flat_r, 4, &gc, adv);
     int flat_ok = (live_flat == 0);
     for (int i = 0; i < 4; i++) if (adv[i] != 0.0f) flat_ok = 0;
     printf("    all-equal rewards -> skipped, advantages all zero -> %s\n",
@@ -1916,7 +2007,7 @@ int run_selftest(void) {
 
     // (b) advantages are z-scores: mean 0, better-than-average positive.
     float rew[4] = {1.0f, 0.0f, 0.5f, 0.5f};
-    int live = grpo_advantages(rew, 4, adv);
+    int live = grpo_advantages(rew, 4, &gc, adv);
     double amean = 0.0;
     for (int i = 0; i < 4; i++) amean += adv[i];
     int adv_ok = live && fabs(amean) < 1e-5 && adv[0] > 0.0f && adv[1] < 0.0f &&
@@ -1932,8 +2023,9 @@ int run_selftest(void) {
     // rho = exp(lp_new - lp_old): 1.0, 1.5 (above 1+eps), 0.5 (below 1-eps), 1.0
     const float lp_new[4] = {0.0f, 0.405465f, -0.693147f, 0.0f};
     float cpos[4], cneg[4];
-    grpo_token_coeffs(+1.0f, 1, 4, lp_new, lp_old, NULL, &gc, cpos);
-    grpo_token_coeffs(-1.0f, 1, 4, lp_new, lp_old, NULL, &gc, cneg);
+    const float n14 = grpo_loss_norm(&gc, 1, 4, 0);     // seq: G * len = 4
+    grpo_token_coeffs(+1.0f, n14, 4, lp_new, lp_old, NULL, &gc, cpos);
+    grpo_token_coeffs(-1.0f, n14, 4, lp_new, lp_old, NULL, &gc, cneg);
     // Positive advantage: the HIGH ratio is clipped away, the low one is kept.
     // Negative advantage: the LOW ratio is clipped away, the high one is kept.
     int clip_ok = (cpos[0] != 0.0f) && (cpos[1] == 0.0f) && (cpos[2] != 0.0f) &&
@@ -1944,6 +2036,58 @@ int run_selftest(void) {
     printf("    clip eps 0.2: adv>0 drops rho=1.5, adv<0 drops rho=0.5, "
            "unclipped = adv*rho/(G*len) -> %s\n", clip_ok ? "OK" : "FAIL");
     all_ok &= clip_ok;
+
+    // (d) DAPO clip-higher: rho = 1.25 sits between 1+0.2 and 1+0.28. Symmetric
+    //     clipping drops it for adv > 0; clip-higher keeps it. The LOWER bound
+    //     must not move: rho = 0.75 with adv < 0 is dropped either way.
+    {
+      const float hi_new[2] = {0.223144f, -0.287682f};   // rho 1.25, 0.75
+      const float hi_old[2] = {0.0f, 0.0f};
+      GrpoConfig sym = gc, dapo = gc;
+      grpo_preset_dapo(&dapo);
+      float s_pos[2], d_pos[2], s_neg[2], d_neg[2];
+      grpo_token_coeffs(+1.0f, 2.0f, 2, hi_new, hi_old, NULL, &sym, s_pos);
+      grpo_token_coeffs(+1.0f, 2.0f, 2, hi_new, hi_old, NULL, &dapo, d_pos);
+      grpo_token_coeffs(-1.0f, 2.0f, 2, hi_new, hi_old, NULL, &sym, s_neg);
+      grpo_token_coeffs(-1.0f, 2.0f, 2, hi_new, hi_old, NULL, &dapo, d_neg);
+      int hi_ok = (s_pos[0] == 0.0f) && (d_pos[0] != 0.0f) &&
+                  (s_neg[1] == 0.0f) && (d_neg[1] == 0.0f) &&
+                  fabsf(d_pos[0] - 1.25f / 2.0f) < 1e-5f;
+      printf("    clip-higher 0.28: adv>0 keeps rho=1.25 (symmetric drops it), "
+             "lower bound unchanged -> %s\n", hi_ok ? "OK" : "FAIL");
+      all_ok &= hi_ok;
+    }
+
+    // (e) Dr. GRPO advantage: r - mean, no std division. For {1, 0, .5, .5} the
+    //     mean is 0.5, so exactly {+.5, -.5, 0, 0}.
+    {
+      GrpoConfig dr = gc;
+      grpo_preset_dr_grpo(&dr);
+      float dadv[4], dflat[4];
+      int dlive = grpo_advantages(rew, 4, &dr, dadv);
+      int dr_ok = dlive && fabsf(dadv[0] - 0.5f) < 1e-6f && fabsf(dadv[1] + 0.5f) < 1e-6f &&
+                  fabsf(dadv[2]) < 1e-6f && fabsf(dadv[3]) < 1e-6f;
+      // ...and a flat group is still flat without the std.
+      dr_ok &= (grpo_advantages(flat_r, 4, &dr, dflat) == 0);
+      printf("    no-std advantages %.3f %.3f %.3f %.3f = r - mean, flat still skipped -> %s\n",
+             (double)dadv[0], (double)dadv[1], (double)dadv[2], (double)dadv[3],
+             dr_ok ? "OK" : "FAIL");
+      all_ok &= dr_ok;
+    }
+
+    // (f) the three loss normalizers, for G = 4, max_new = 96, a 10-token rollout,
+    //     60 live tokens in the step: seq 40, token 60, const 384.
+    {
+      GrpoConfig a = gc;
+      a.group = 4; a.max_new = 96;
+      a.loss_agg = GRPO_AGG_SEQ;   const float ns = grpo_loss_norm(&a, 4, 10, 60);
+      a.loss_agg = GRPO_AGG_TOKEN; const float nt = grpo_loss_norm(&a, 4, 10, 60);
+      a.loss_agg = GRPO_AGG_CONST; const float nc = grpo_loss_norm(&a, 4, 10, 60);
+      int agg_ok = ns == 40.0f && nt == 60.0f && nc == 384.0f;
+      printf("    loss-agg normalizers seq %.0f / token %.0f / const %.0f -> %s\n",
+             (double)ns, (double)nt, (double)nc, agg_ok ? "OK" : "FAIL");
+      all_ok &= agg_ok;
+    }
 
     // pg_backward with a uniform 1/N coefficient must reproduce cross-entropy
     // exactly — the identity the whole design rests on.
@@ -2105,7 +2249,7 @@ int run_selftest(void) {
         if (s == 0) first_mean = mean_r;
         if (s == STEPS - 1) last_mean = mean_r;
 
-        if (!grpo_advantages(rrew, GG, radv)) continue;   // no spread, no update
+        if (!grpo_advantages(rrew, GG, &cfg, radv)) continue;   // no spread, no update
 
         llama_zero_grad(&gm);
         int seq2[6], tgt2[6];
@@ -2122,7 +2266,8 @@ int run_selftest(void) {
           float lp_new[4];
           for (int t = 0; t < RLEN; t++)
             lp_new[t] = logprob_of(&gprob, pn - 1 + t, rid[i][t]);
-          grpo_token_coeffs(radv[i], GG, rlens[i], lp_new, rlp[i], NULL, &cfg, rcoef);
+          grpo_token_coeffs(radv[i], grpo_loss_norm(&cfg, GG, rlens[i], 0), rlens[i],
+                            lp_new, rlp[i], NULL, &cfg, rcoef);
           for (int t = 0; t < RLEN; t++) coef2[pn - 1 + t] = rcoef[t];
 
           tensor_zero_grad(&glog);
@@ -2271,7 +2416,434 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
-  // Part 31: QK-norm (Qwen3) — a per-head RMSNorm on q and k, with one learned
+  // Part 31: Mixture-of-Experts FFN (moe.h) -- the FFN of DeepSeek-V3, Qwen3-MoE,
+  // Kimi, GLM. A router picks top-k of E SwiGLU experts per token. Four gates:
+  //   (a) numerical gradient check of x and EVERY parameter (router, all
+  //       experts, shared expert) through the real softmax + top-k forward.
+  //       Routing is not frozen; instead each probe's selection is compared to
+  //       the base selection and the gate REQUIRES zero flips (a flip would make
+  //       the finite difference measure a jump). Three configs: k=2 renormalized
+  //       gates + shared expert; k=1 raw-probability gates (Switch); aux-only.
+  //   (b) the aux loss has its defining values: 1 for a uniform router, ~E for
+  //       a router collapsed onto one expert.
+  //   (c) compute scales with k, not E: measured expert FLOPs per token are
+  //       6*k*d*d_ff for every E, and unchosen experts are never run -- filled
+  //       with NaN, they leave the output bit-identical and the backward finite.
+  //   (d) the aux gradient does its job: Adam on the aux loss alone takes a
+  //       router that sends most tokens to one expert and balances it.
+  // --------------------------------------------------------------------------
+  {
+    printf("[31] Mixture-of-Experts FFN: router + top-k SwiGLU experts + aux loss\n");
+
+    // (a) gradient checks.
+    int moe_ok = 1;
+    {
+      struct { int E, k, renorm, shared, task; float aux; const char *name; } cf[3] = {
+        {4, 2, 1, 1, 1, 0.1f, "k=2 renorm + shared, task+aux"},
+        {4, 1, 0, 0, 1, 0.1f, "k=1 raw gate (Switch), task+aux"},
+        {4, 2, 1, 0, 0, 1.0f, "k=2, aux loss ONLY"},
+      };
+      for (int i = 0; i < 3; i++) {
+        int flips, checked; float margin;
+        float rel = moe_gradcheck(cf[i].E, cf[i].k, cf[i].renorm, cf[i].shared,
+                                  cf[i].task, cf[i].aux, &flips, &margin, &checked);
+        int ok = rel < 1e-2f && flips == 0 && checked > 0;
+        printf("    grad check %-31s: max rel %.2e over %3d entries | top-k margin %.3f,"
+               " routing flips %d -> %s\n", cf[i].name, rel, checked, margin, flips,
+               ok ? "OK" : "FAIL");
+        moe_ok &= ok;
+      }
+    }
+
+    // (b) aux-loss values at the two ends.
+    {
+      const int n = 16, dm = 4, E = 4;
+      int xs[2] = {n, dm};
+      Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+      moe_fill(&x, 31, 5, 1.0f);
+      MoeLayer m = moe_create(dm, 6, E, 1, 0, 0);
+      MoeCache c = moe_cache_create(&m, n);
+      memset(m.W_router.data, 0, m.W_router.size * sizeof(float));
+      float aux_uniform = moe_forward(&m, &x, &c, &y);
+      for (int t = 0; t < n; t++) x.data[t * dm] = 1.0f;          // a constant feature...
+      m.W_router.data[0 * E + 0] = 20.0f;                          // ...that says "expert 0"
+      float aux_collapsed = moe_forward(&m, &x, &c, &y);
+      int ok = fabsf(aux_uniform - 1.0f) < 1e-5f && aux_collapsed > 0.95f * E;
+      printf("    aux loss: uniform router %.4f (expect 1) | collapsed router %.3f"
+             " (expect ~E=%d) -> %s\n", aux_uniform, aux_collapsed, E, ok ? "OK" : "FAIL");
+      moe_ok &= ok;
+      moe_cache_free(&c); moe_free(&m); tensor_free(&x); tensor_free(&y);
+    }
+
+    // (c) compute scales with k, not E.
+    {
+      const int n = 16, dm = 8, df = 16;
+      int xs[2] = {n, dm};
+      Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+      moe_fill(&x, 37, 1, 1.0f);
+      int scale_ok = 1;
+      printf("    expert FLOPs/token, measured:  E=4    E=16   (expect 6*k*d*d_ff)\n");
+      for (int k = 1; k <= 4; k *= 2) {
+        double per_tok[2]; long long rows[2]; int Es[2] = {4, 16};
+        for (int ei = 0; ei < 2; ei++) {
+          MoeLayer m = moe_create(dm, df, Es[ei], k, 1, 0);
+          MoeCache c = moe_cache_create(&m, n);
+          moe_forward(&m, &x, &c, &y);
+          per_tok[ei] = c.flops_experts / n; rows[ei] = c.expert_rows;
+          moe_cache_free(&c); moe_free(&m);
+        }
+        double want = 6.0 * k * dm * df;
+        int ok = per_tok[0] == want && per_tok[1] == want &&
+                 rows[0] == (long long)n * k && rows[1] == (long long)n * k;
+        printf("      k=%d                          %-6.0f %-6.0f (%.0f) -> %s\n",
+               k, per_tok[0], per_tok[1], want, ok ? "OK" : "FAIL");
+        scale_ok &= ok;
+      }
+      moe_ok &= scale_ok;
+
+      // NaN poisoning: route 3 tokens through E=8, k=2 (at most 6 of 8 experts
+      // used), then fill every unused expert with NaN. If the implementation ran
+      // an unchosen expert at all -- even to multiply it by a zero gate -- NaN*0
+      // is NaN and the output would change.
+      const int n2 = 3, E2 = 8, k2 = 2;
+      int xs2[2] = {n2, dm};
+      Tensor x2 = tensor_create(xs2, 2), y2 = tensor_create(xs2, 2);
+      moe_fill(&x2, 41, 9, 1.0f);
+      MoeLayer m = moe_create(dm, df, E2, k2, 1, 1);
+      MoeCache c = moe_cache_create(&m, n2);
+      moe_forward(&m, &x2, &c, &y2);
+      float ref[3 * 8];
+      memcpy(ref, y2.data, sizeof ref);
+      int used[8] = {0}, n_unused = 0;
+      for (int a = 0; a < n2 * k2; a++) used[c.sel[a]] = 1;
+      for (int e = 0; e < E2; e++) if (!used[e]) {
+        n_unused++;
+        for (size_t i = 0; i < m.W_gate[e].size; i++) m.W_gate[e].data[i] = NAN;
+        for (size_t i = 0; i < m.W_up[e].size; i++)   m.W_up[e].data[i] = NAN;
+        for (size_t i = 0; i < m.W_down[e].size; i++) m.W_down[e].data[i] = NAN;
+      }
+      moe_forward(&m, &x2, &c, &y2);
+      int same = memcmp(ref, y2.data, sizeof ref) == 0;
+      tensor_zero_grad(&x2);
+      for (size_t i = 0; i < y2.size; i++) y2.grad[i] = 1.0f;
+      moe_backward(&m, &x2, &c, &y2, 0.01f);
+      int finite = 1;
+      for (size_t i = 0; i < x2.size; i++) if (!isfinite(x2.grad[i])) finite = 0;
+      int ok = same && finite && n_unused > 0;
+      printf("    %d of %d experts unchosen, filled with NaN: output bit-identical %s,"
+             " backward finite %s -> %s\n", n_unused, E2, same ? "yes" : "NO",
+             finite ? "yes" : "NO", ok ? "OK" : "FAIL");
+      moe_ok &= ok;
+      moe_cache_free(&c); moe_free(&m);
+      tensor_free(&x); tensor_free(&y); tensor_free(&x2); tensor_free(&y2);
+    }
+
+    // (d) the aux gradient balances a lopsided router (router trained alone).
+    {
+      const int n = 32, dm = 8, E = 4;
+      int xs[2] = {n, dm};
+      Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+      moe_fill(&x, 43, 2, 1.0f);
+      for (int t = 0; t < n; t++) x.data[t * dm] = 1.0f;   // shared feature = bias
+      MoeLayer m = moe_create(dm, 8, E, 1, 0, 0);
+      moe_fill(&m.W_router, 47, 4, 0.5f);
+      m.W_router.data[0 * E + 0] = 3.0f;                    // most tokens -> expert 0
+      MoeCache c = moe_cache_create(&m, n);
+      Tensor *rp[1] = {&m.W_router};
+      Adam opt = adam_create(rp, 1, 0.05f);
+      memset(y.grad, 0, y.size * sizeof(float));            // no task loss
+      float aux0 = moe_forward(&m, &x, &c, &y);
+      int max0 = 0;
+      for (int e = 0; e < E; e++) if (c.count[e] > max0) max0 = c.count[e];
+      for (int step = 0; step < 150; step++) {
+        moe_forward(&m, &x, &c, &y);
+        tensor_zero_grad(&m.W_router); tensor_zero_grad(&x);
+        moe_backward(&m, &x, &c, &y, 1.0f);
+        adam_step(&opt, rp, 1);
+      }
+      float auxN = moe_forward(&m, &x, &c, &y);
+      int maxN = 0;
+      for (int e = 0; e < E; e++) if (c.count[e] > maxN) maxN = c.count[e];
+      int ok = auxN < aux0 && maxN < max0 && maxN <= n / 2;
+      printf("    Adam on aux only (150 steps): aux %.3f -> %.3f, busiest expert %d/%d"
+             " -> %d/%d tokens -> %s\n\n", aux0, auxN, max0, n, maxN, n, ok ? "OK" : "FAIL");
+      moe_ok &= ok;
+      adam_free(&opt); moe_cache_free(&c); moe_free(&m);
+      tensor_free(&x); tensor_free(&y);
+    }
+    all_ok &= moe_ok;
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 32: SLIDING-WINDOW attention (gqa.h window, per layer via
+  // llama_model_set_window). Position i attends only to [i-W+1, i]. Gates:
+  //   (a) numerical gradient check of GQA WITH a window that actually cuts in
+  //       (the masked keys must get exactly no gradient, the rest the right one),
+  //   (b) W >= seq_len is full causal attention BIT-EXACTLY — at the GQA level
+  //       and through a whole model — so a "large enough" window is free,
+  //   (c) a token outside the window has ZERO influence: perturbing an
+  //       out-of-window K/V row leaves that output row bit-identical, and in a
+  //       stacked all-windowed model the receptive field is exactly L*(W-1)
+  //       positions back (perturbing token 0 changes positions <= L*(W-1) and
+  //       leaves every later position bit-identical),
+  //   (d) KV-cache decode == full forward, BIT-EXACT, with the window on and a
+  //       global layer mixed in, running long enough that the per-layer ring
+  //       buffer (cap = W slots) wraps several times; plus the int8 decode path,
+  //       the training forward, and a v3 checkpoint round-trip.
+  // --------------------------------------------------------------------------
+  {
+    printf("[32] Sliding-window attention (per-layer window, local/global mix)\n");
+
+    // (a) + (b) + (c, GQA level)
+    {
+      const int n = 6, H = 4, KV = 2, hd = 3, W = 2;
+      int qs[2] = {n, H * hd}, ks[2] = {n, KV * hd};
+      Tensor Q = tensor_create(qs, 2), O = tensor_create(qs, 2), Of = tensor_create(qs, 2);
+      Tensor K = tensor_create(ks, 2), V = tensor_create(ks, 2);
+      GqaCache c = gqa_cache_create(n, H, KV, hd);
+      for (int i = 0; i < n * H * hd; i++) Q.data[i] = ((i * 13 % 100) / 50.0f) - 1.0f;
+      for (int i = 0; i < n * KV * hd; i++) {
+        K.data[i] = ((i * 17 % 100) / 50.0f) - 1.0f;
+        V.data[i] = ((i * 23 % 100) / 50.0f) - 1.0f;
+      }
+      float w[72];
+      for (int i = 0; i < n * H * hd; i++) w[i] = ((i * 31 % 100) / 50.0f) - 1.0f;
+
+      // (a) analytic grads (L = sum(w * O)) vs central differences, window W.
+      c.window = W;
+      gqa_forward(&Q, &K, &V, &c, &O);
+      tensor_zero_grad(&Q); tensor_zero_grad(&K); tensor_zero_grad(&V);
+      for (int i = 0; i < n * H * hd; i++) O.grad[i] = w[i];
+      gqa_backward(&Q, &K, &V, &c, &O);
+      const float h = 1e-3f;
+      float max_cond = 0.0f;
+      Tensor *ps[3] = {&Q, &K, &V};
+      for (int pi = 0; pi < 3; pi++) {
+        Tensor *T = ps[pi];
+        int sz = T->shape[0] * T->shape[1];
+        for (int k = 0; k < sz; k++) {
+          float s = T->data[k];
+          T->data[k] = s + h; gqa_forward(&Q, &K, &V, &c, &O);
+          float lp = 0.0f; for (int i = 0; i < n * H * hd; i++) lp += w[i] * O.data[i];
+          T->data[k] = s - h; gqa_forward(&Q, &K, &V, &c, &O);
+          float lm = 0.0f; for (int i = 0; i < n * H * hd; i++) lm += w[i] * O.data[i];
+          T->data[k] = s;
+          float num = (lp - lm) / (2.0f * h), rel = fabsf(num - T->grad[k]) / (fabsf(T->grad[k]) + 1e-3f);
+          if (fabsf(T->grad[k]) > 1e-2f && rel > max_cond) max_cond = rel;
+        }
+      }
+      // The window must actually change the result (else (a) proves nothing new).
+      gqa_forward(&Q, &K, &V, &c, &O);
+      c.window = 0;
+      gqa_forward(&Q, &K, &V, &c, &Of);
+      float cut = 0.0f;
+      for (int i = 0; i < n * H * hd; i++) { float d = fabsf(O.data[i] - Of.data[i]); if (d > cut) cut = d; }
+      int grad_ok = (max_cond < 1e-2f) && (cut > 1e-4f);
+      printf("    (a) gradient check W=%d, n=%d (Q, K, V): max rel error %.2e | window changes output by %.2e -> %s\n",
+             W, n, max_cond, cut, grad_ok ? "OK" : "FAIL");
+      all_ok &= grad_ok;
+
+      // (b) W >= n must equal full causal attention exactly (W = n and W = n+5).
+      float big = 0.0f;
+      const int bigw[2] = {n, n + 5};
+      for (int t = 0; t < 2; t++) {
+        c.window = bigw[t];
+        gqa_forward(&Q, &K, &V, &c, &O);
+        for (int i = 0; i < n * H * hd; i++) { float d = fabsf(O.data[i] - Of.data[i]); if (d > big) big = d; }
+      }
+      int big_ok = (big == 0.0f);
+      printf("    (b) GQA: W=%d and W=%d vs full causal: max |diff| = %.2e (must be exactly 0) -> %s\n",
+             n, n + 5, big, big_ok ? "OK" : "FAIL");
+      all_ok &= big_ok;
+
+      // (c, GQA level) perturb K/V of position 1: with W=2, rows i >= 3 cannot
+      // see it (bit-identical), rows 1 and 2 can (must change).
+      c.window = W;
+      gqa_forward(&Q, &K, &V, &c, &Of);
+      for (int d = 0; d < KV * hd; d++) { K.data[1 * KV * hd + d] += 0.7f; V.data[1 * KV * hd + d] -= 0.9f; }
+      gqa_forward(&Q, &K, &V, &c, &O);
+      float out_win = 0.0f, in_win = 0.0f;
+      for (int i = 0; i < n; i++)
+        for (int j = 0; j < H * hd; j++) {
+          float d = fabsf(O.data[i * H * hd + j] - Of.data[i * H * hd + j]);
+          if (i >= 1 + W) { if (d > out_win) out_win = d; }
+          else if (i >= 1 && d > in_win) in_win = d;
+        }
+      int iso_ok = (out_win == 0.0f) && (in_win > 1e-4f);
+      printf("    (c) GQA: perturb K/V at pos 1 (W=%d): rows >= %d max|diff| = %.2e (==0), rows 1..%d |diff| = %.2e (>0) -> %s\n",
+             W, 1 + W, out_win, W, in_win, iso_ok ? "OK" : "FAIL");
+      all_ok &= iso_ok;
+      gqa_cache_free(&c);
+      tensor_free(&Q); tensor_free(&K); tensor_free(&V); tensor_free(&O); tensor_free(&Of);
+    }
+
+    const int vocab = 32, dm = 8, nh = 4, nkv = 2, hd = 2, dff = 16;
+
+    // (b, model level) + (c, model level): receptive field of a stacked window.
+    {
+      const int nl = 2, W = 2, seq = 8;
+      srand(31);
+      LlamaModel lm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+      llama_model_randomize(&lm);
+      int ids[8]  = {3, 7, 1, 9, 2, 5, 11, 4};
+      int ids2[8] = {20, 7, 1, 9, 2, 5, 11, 4};   // differs only in token 0
+      int ls[2] = {seq, vocab};
+      Tensor Lfull = tensor_create(ls, 2), L1 = tensor_create(ls, 2), L2 = tensor_create(ls, 2);
+
+      llama_model_forward(&lm, ids, seq, &Lfull);
+      llama_model_set_window(&lm, seq, 2);          // W = seq_len on the local layers
+      llama_model_forward(&lm, ids, seq, &L1);
+      float big = 0.0f;
+      for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L1.data[i] - Lfull.data[i]); if (d > big) big = d; }
+      int big_ok = (big == 0.0f);
+      printf("    (b) model: window = seq_len (%d) vs no window: max |logit diff| = %.2e (must be exactly 0) -> %s\n",
+             seq, big, big_ok ? "OK" : "FAIL");
+      all_ok &= big_ok;
+
+      llama_model_set_window(&lm, W, 0);            // every layer windowed (Mistral-style)
+      llama_model_forward(&lm, ids, seq, &L1);
+      llama_model_forward(&lm, ids2, seq, &L2);
+      const int reach = nl * (W - 1);               // last position token 0 can reach
+      float far = 0.0f, near = 1e30f;
+      for (int i = 0; i < seq; i++) {
+        float mx = 0.0f;
+        for (int j = 0; j < vocab; j++) { float d = fabsf(L1.data[i * vocab + j] - L2.data[i * vocab + j]); if (d > mx) mx = d; }
+        if (i > reach) { if (mx > far) far = mx; }
+        else if (mx < near) near = mx;
+      }
+      int rf_ok = (far == 0.0f) && (near > 1e-6f);
+      printf("    (c) model: %d layers all W=%d, perturb token 0: positions > %d max|diff| = %.2e (==0), positions 0..%d min|diff| = %.2e (>0) -> %s\n",
+             nl, W, reach, far, reach, near, rf_ok ? "OK" : "FAIL");
+      all_ok &= rf_ok;
+
+      // With one GLOBAL layer mixed in, token 0 reaches every position again.
+      llama_model_set_window(&lm, W, 2);            // layer 1 global
+      llama_model_forward(&lm, ids, seq, &L1);
+      llama_model_forward(&lm, ids2, seq, &L2);
+      float last = 0.0f;
+      for (int j = 0; j < vocab; j++) { float d = fabsf(L1.data[(seq - 1) * vocab + j] - L2.data[(seq - 1) * vocab + j]); if (d > last) last = d; }
+      int glob_ok = (last > 1e-6f);
+      printf("        with layer 1 global (--global-every 2): last position |diff| = %.2e (>0) -> %s\n",
+             last, glob_ok ? "OK" : "FAIL");
+      all_ok &= glob_ok;
+      tensor_free(&Lfull); tensor_free(&L1); tensor_free(&L2);
+      llama_model_free(&lm);
+    }
+
+    // (d) decode == forward, bit-exact, ring buffer wrapping; int8 path;
+    // training forward; checkpoint round-trip.
+    {
+      const int nl = 3, W = 3, seq = 11;            // layers 0,1 local (W=3), layer 2 global
+      srand(37);
+      LlamaModel lm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 32, 10000.0f, 1e-5f);
+      llama_model_randomize(&lm);
+      llama_model_set_window(&lm, W, 3);
+      int ids[11] = {3, 7, 1, 9, 2, 5, 11, 4, 30, 17, 6};
+      int fs[2] = {seq, vocab}, ds[2] = {1, vocab};
+      Tensor Lf = tensor_create(fs, 2), Ld = tensor_create(ds, 2), Lt = tensor_create(fs, 2);
+      llama_model_forward(&lm, ids, seq, &Lf);
+
+      LlamaKV kv = llama_kv_create(&lm);
+      float maxd = 0.0f;
+      for (int i = 0; i < seq; i++) {
+        llama_decode_step(&lm, &kv, ids[i], &Ld);
+        for (int j = 0; j < vocab; j++) { float d = fabsf(Ld.data[j] - Lf.data[i * vocab + j]); if (d > maxd) maxd = d; }
+      }
+      int dec_ok = (maxd == 0.0f) && kv.cap[0] == W && kv.cap[1] == W && kv.cap[2] == kv.max_seq;
+      printf("    (d) KV decode (%d positions, ring cap %d/%d/%d slots of max_seq %d) vs full forward: max |logit diff| = %.2e -> %s\n",
+             seq, kv.cap[0], kv.cap[1], kv.cap[2], kv.max_seq, maxd, dec_ok ? "OK" : "FAIL");
+      all_ok &= dec_ok;
+
+      // Reusing the cache for a new sequence (len = 0) must still be exact.
+      kv.len = 0;
+      float again = 0.0f;
+      for (int i = 0; i < seq; i++) {
+        llama_decode_step(&lm, &kv, ids[i], &Ld);
+        for (int j = 0; j < vocab; j++) { float d = fabsf(Ld.data[j] - Lf.data[i * vocab + j]); if (d > again) again = d; }
+      }
+      int again_ok = (again == 0.0f);
+      printf("        cache reused (len reset to 0): max |diff| = %.2e -> %s\n", again, again_ok ? "OK" : "FAIL");
+      all_ok &= again_ok;
+
+      // int8 decode honours the window too. It carries quantization error, so
+      // the gate is relative: it must track the WINDOWED fp32 forward (within
+      // 2% — three layers of int8 at d_model 8 sit near 1%, cf. [21]) and sit
+      // clearly closer to it than to the full-attention forward.
+      Tensor Lnw = tensor_create(fs, 2);
+      llama_model_set_window(&lm, 0, 0);
+      llama_model_forward(&lm, ids, seq, &Lnw);
+      llama_model_set_window(&lm, W, 3);
+      QLlamaModel qm = q_llama_quantize_from(&lm);
+      LlamaKV qkv = q_llama_kv_create(&qm);
+      double num = 0.0, den = 0.0, num_nw = 0.0;
+      for (int i = 0; i < seq; i++) {
+        q_llama_decode_step(&qm, &qkv, ids[i], &Ld);
+        for (int j = 0; j < vocab; j++) {
+          double d = (double)Ld.data[j] - Lf.data[i * vocab + j];
+          double e = (double)Ld.data[j] - Lnw.data[i * vocab + j];
+          num += d * d; num_nw += e * e;
+          den += (double)Lf.data[i * vocab + j] * Lf.data[i * vocab + j];
+        }
+      }
+      double qrel = sqrt(num / (den + 1e-30)), qrel_nw = sqrt(num_nw / (den + 1e-30));
+      int q_ok = (qrel < 2e-2) && (qrel < 0.5 * qrel_nw) && qkv.cap[0] == W;
+      printf("        int8 decode (windowed): L2 rel error %.2e vs windowed fp32 (<2e-2), %.2e vs full-attention fp32 -> %s\n",
+             qrel, qrel_nw, q_ok ? "OK" : "FAIL");
+      all_ok &= q_ok;
+      tensor_free(&Lnw);
+
+      // The training forward must see the same window (else the backward would
+      // differentiate a different function than inference runs).
+      LlamaActs acts = llama_acts_create(&lm, seq);
+      llama_forward_train(&lm, ids, seq, &acts, &Lt);
+      float tr = 0.0f;
+      for (int i = 0; i < seq * vocab; i++) { float d = fabsf(Lt.data[i] - Lf.data[i]); if (d > tr) tr = d; }
+      int tr_ok = (tr == 0.0f);
+      printf("        train forward == inference forward (windowed): max |diff| = %.2e -> %s\n",
+             tr, tr_ok ? "OK" : "FAIL");
+      all_ok &= tr_ok;
+
+      // Checkpoint: a windowed model saves as v3 and round-trips exactly; an
+      // unwindowed one still saves as v2 (readable by pre-window builds).
+      int rt_ok = 0;
+      uint32_t ver_w = 0, ver_0 = 0;
+      if (llama_model_save("swa_ckpt.tmp", &lm) == 0) {
+        FILE *f = fopen("swa_ckpt.tmp", "rb");
+        if (f) { uint32_t hdr[2]; if (fread(hdr, sizeof(uint32_t), 2, f) == 2) ver_w = hdr[1]; fclose(f); }
+        LlamaModel lm2;
+        if (llama_model_load("swa_ckpt.tmp", &lm2) == 0) {
+          Tensor L3 = tensor_create(fs, 2);
+          llama_model_forward(&lm2, ids, seq, &L3);
+          float md = 0.0f;
+          for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L3.data[i] - Lf.data[i]); if (d > md) md = d; }
+          int same_w = 1;
+          for (int l = 0; l < nl; l++) if (lm2.blocks[l].window != lm.blocks[l].window) same_w = 0;
+          rt_ok = (md == 0.0f) && same_w && ver_w == 3;
+          tensor_free(&L3);
+          llama_model_free(&lm2);
+        }
+      }
+      llama_model_set_window(&lm, 0, 0);            // window off -> must write v2
+      if (llama_model_save("swa_ckpt.tmp", &lm) == 0) {
+        FILE *f = fopen("swa_ckpt.tmp", "rb");
+        if (f) { uint32_t hdr[2]; if (fread(hdr, sizeof(uint32_t), 2, f) == 2) ver_0 = hdr[1]; fclose(f); }
+      }
+      remove("swa_ckpt.tmp");
+      rt_ok = rt_ok && ver_0 == 2;
+      printf("        checkpoint: windowed -> v%u, round-trip windows + logits exact; no window -> v%u -> %s\n\n",
+             ver_w, ver_0, rt_ok ? "OK" : "FAIL");
+      all_ok &= rt_ok;
+
+      llama_acts_free(&acts);
+      llama_kv_free(&qkv); q_llama_model_free(&qm);
+      llama_kv_free(&kv);
+      tensor_free(&Lf); tensor_free(&Ld); tensor_free(&Lt);
+      llama_model_free(&lm);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 33: QK-norm (Qwen3) — a per-head RMSNorm on q and k, with one learned
   // head_dim gain each shared across heads, applied after the projection (+bias,
   // +LoRA) and BEFORE RoPE. It is an optional per-model feature, so this part
   // turns it on and re-runs every gate the plain path has, on the new path:
@@ -2280,12 +2852,15 @@ int run_selftest(void) {
   //   (c) end-to-end gradient check over every parameter (q_norm/k_norm at
   //       every entry), and over LoRA adapters that now feed through the norm,
   //   (d) KV-cache decode == full forward, bit for bit (plain and with LoRA),
-  //   (e) LLMA v3 checkpoint round-trip (flag + gains survive; a model without
-  //       the feature is still written as v2), and the int8 decode path.
+  //   (e) LLMA v4 checkpoint round-trip (flag + gains survive; a model without
+  //       any feature is still v2, windows-only still v3), and the int8 path,
+  //   (f) QK-norm COMBINED with sliding windows ([32]): v4 with both flag bits
+  //       -> reload -> logits bit-exact, and decode == forward with the rings
+  //       wrapping.
   // --------------------------------------------------------------------------
   {
     const int vocab = 24, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 4, dff = 16, seq = 5;
-    printf("[31] QK-norm (Qwen3): per-head q/k RMSNorm before RoPE\n");
+    printf("[33] QK-norm (Qwen3): per-head q/k RMSNorm before RoPE\n");
     srand(41);
     LlamaModel qm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64,
                                              10000.0f, 1e-5f);
@@ -2414,7 +2989,7 @@ int run_selftest(void) {
            lkv_diff, lkv_ok ? "OK" : "FAIL");
     all_ok &= kv_ok & lkv_ok;
 
-    // (e) checkpoint: QK-norm model -> v3 with flag bit 0; reload must keep the
+    // (e) checkpoint: QK-norm model -> v4 with flags 0x1; reload must keep the
     //     flag and give bit-identical logits. A plain model must still be v2.
     int rt_ok = 0;
     uint32_t hq[3] = {0, 0, 0}, hp[2] = {0, 0};
@@ -2432,7 +3007,7 @@ int run_selftest(void) {
         float md = 0.0f;
         for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L2.data[i] - ref.data[i]); if (d > md) md = d; }
         rt_ok = (md == 0.0f) && qm2.qk_norm && qm2.blocks[nl - 1].qk_norm &&
-                hq[1] == 3u && hq[2] == 1u;
+                hq[1] == 4u && hq[2] == 1u;
         printf("    LLMA v%u (flags 0x%x) round-trip: qk_norm=%d, max |logit diff| = %.2e",
                hq[1], hq[2], qm2.qk_norm, md);
         tensor_free(&L2);
@@ -2466,8 +3041,81 @@ int run_selftest(void) {
     remove("plain_ckpt.tmp");
     llama_model_free(&pm);
     rt_ok &= (hp[1] == 2u);
-    printf(" | plain model still v%u -> %s\n\n", hp[1], rt_ok ? "OK" : "FAIL");
+    printf(" | plain model still v%u -> %s\n", hp[1], rt_ok ? "OK" : "FAIL");
     all_ok &= rt_ok;
+
+    // (f) window + QK-norm together. 3 layers (local, local, global), W = 2 and
+    //     7 positions, so the 2-slot rings wrap several times.
+    {
+      const int cl = 3, cseq = 7, W = 2;
+      int cids[7] = {3, 7, 1, 9, 2, 5, 8};
+      srand(43);
+      LlamaModel cm = llama_model_create(vocab, dm, cl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+      llama_model_set_qk_norm(&cm, 1);
+      llama_model_randomize(&cm);
+      llama_model_set_window(&cm, W, 3);          // layer 2 global, layers 0-1 windowed
+      int cs[2] = {cseq, vocab};
+      Tensor Lc = tensor_create(cs, 2), Lc2 = tensor_create(cs, 2);
+      llama_model_forward(&cm, cids, cseq, &Lc);
+
+      // A windows-only model (same weights, QK-norm off) must still be v3.
+      uint32_t hw[2] = {0, 0};
+      for (int l = 0; l < cl; l++) cm.blocks[l].qk_norm = 0;
+      cm.qk_norm = 0;
+      if (llama_model_save("win_ckpt.tmp", &cm) == 0) {
+        FILE *hf = fopen("win_ckpt.tmp", "rb");
+        if (hf) { if (fread(hw, sizeof(uint32_t), 2, hf) != 2) hw[1] = 0; fclose(hf); }
+      }
+      remove("win_ckpt.tmp");
+      for (int l = 0; l < cl; l++) cm.blocks[l].qk_norm = 1;   // gains untouched
+      cm.qk_norm = 1;
+
+      int c_ok = 0;
+      uint32_t hc[2] = {0, 0}, cflags = 0;
+      int32_t cw[3] = {-1, -1, -1};
+      float c_md = -1.0f, c_kv = -1.0f;
+      if (llama_model_save("combo_ckpt.tmp", &cm) == 0) {
+        FILE *hf = fopen("combo_ckpt.tmp", "rb");
+        if (hf) {
+          if (fread(hc, sizeof(uint32_t), 2, hf) == 2 && fseek(hf, 8 + 32 + 8, SEEK_SET) == 0 &&
+              fread(&cflags, sizeof(uint32_t), 1, hf) == 1 &&
+              fread(cw, sizeof(int32_t), 3, hf) == 3) { /* header read */ }
+          fclose(hf);
+        }
+        LlamaModel cm2;
+        if (llama_model_load("combo_ckpt.tmp", &cm2) == 0) {
+          llama_model_forward(&cm2, cids, cseq, &Lc2);
+          c_md = 0.0f;
+          for (int i = 0; i < cseq * vocab; i++) {
+            float d = fabsf(Lc2.data[i] - Lc.data[i]);
+            if (d > c_md) c_md = d;
+          }
+          LlamaKV ckv = llama_kv_create(&cm2);
+          c_kv = 0.0f;
+          for (int i = 0; i < cseq; i++) {
+            llama_decode_step(&cm2, &ckv, cids[i], &Ld);
+            for (int j = 0; j < vocab; j++) {
+              float d = fabsf(Ld.data[j] - Lc.data[i * vocab + j]);
+              if (d > c_kv) c_kv = d;
+            }
+          }
+          int same_cfg = cm2.qk_norm;
+          for (int l = 0; l < cl; l++)
+            same_cfg &= (cm2.blocks[l].window == cm.blocks[l].window) && cm2.blocks[l].qk_norm;
+          c_ok = same_cfg && (c_md == 0.0f) && (c_kv == 0.0f) && hc[1] == 4u &&
+                 cflags == 3u && cw[0] == W && cw[1] == W && cw[2] == 0 && hw[1] == 3u;
+          llama_kv_free(&ckv);
+          llama_model_free(&cm2);
+        }
+      }
+      remove("combo_ckpt.tmp");
+      printf("    window+QK-norm: v%u flags 0x%x windows {%d,%d,%d} round-trip max |diff| %.2e | "
+             "decode == forward (rings wrap) %.2e | windows-only still v%u -> %s\n\n",
+             hc[1], cflags, cw[0], cw[1], cw[2], c_md, c_kv, hw[1], c_ok ? "OK" : "FAIL");
+      all_ok &= c_ok;
+      tensor_free(&Lc); tensor_free(&Lc2);
+      llama_model_free(&cm);
+    }
 
     free(qp); free(gains); free(lp);
     llama_kv_free(&kv); llama_kv_free(&kv2);

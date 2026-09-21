@@ -245,9 +245,14 @@ static void train_usage(void) {
     "\n"
     "`llama-train` takes the SAME flags but trains the modern LLaMA-family\n"
     "architecture (RMSNorm+RoPE+GQA+SwiGLU) and writes an LLMA checkpoint that\n"
-    "`transformer llama` generates from. Two extra flags:\n"
+    "`transformer llama` generates from. Extra flags:\n"
     "  --kv-heads N      GQA key/value heads (default = --heads, i.e. plain MHA)\n"
     "  --rope-base F     RoPE frequency base (default 10000)\n"
+    "  --window W        sliding-window attention: each position attends only to\n"
+    "                    its W most recent positions (default 0 = full attention)\n"
+    "  --global-every N  with --window: every Nth layer stays full/global\n"
+    "                    (2 = alternate like Gemma 2; 6 = 5 local : 1 global like\n"
+    "                    Gemma 3; default 0 = every layer windowed, like Mistral)\n"
     "  --lora-r N        LoRA rank: FREEZE the base and train only low-rank adapters\n"
     "                    on Wq/Wk/Wv/Wo (merged into the weights before saving).\n"
     "                    Pair with --resume to fine-tune a pretrained checkpoint.\n"
@@ -293,6 +298,8 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--batch") == 0)   { NEED_VAL(); cfg.batch = atoi(argv[++i]); }
     else if (strcmp(f, "--kv-heads") == 0 && llama) { NEED_VAL(); cfg.n_kv = atoi(argv[++i]); }
     else if (strcmp(f, "--rope-base") == 0 && llama) { NEED_VAL(); cfg.rope_base = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--window") == 0 && llama) { NEED_VAL(); cfg.window = atoi(argv[++i]); }
+    else if (strcmp(f, "--global-every") == 0 && llama) { NEED_VAL(); cfg.global_every = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
     else if (strcmp(f, "--hf-tok") == 0 && llama) { NEED_VAL(); cfg.hf_tok = argv[++i]; }
@@ -354,6 +361,18 @@ static void grpo_usage(void) {
     "  --lora-alpha F    LoRA scaling (default 16)\n"
     "Objective:\n"
     "  --clip-eps F      PPO-style ratio clip, 1 +/- eps (default 0.2; 0 = off)\n"
+    "  --clip-high F     DAPO clip-higher: upper bound 1 + F instead of 1 + eps\n"
+    "                    (default: symmetric). Wider lets a rare-but-good token\n"
+    "                    grow faster -- the guard against entropy collapse.\n"
+    "  --no-std          advantage = r - mean, not (r - mean)/std (Dr. GRPO)\n"
+    "  --loss-agg M      seq   = 1/(G*len) per rollout (default, original GRPO)\n"
+    "                    token = every response token in the step weighs the same (DAPO)\n"
+    "                    const = 1/(G*max_new), length-independent (Dr. GRPO)\n"
+    "  --resample N      when a group comes back FLAT, draw a fresh task and\n"
+    "                    resample, up to N times (DAPO dynamic sampling; default 0)\n"
+    "  --dapo            preset: --clip-high 0.28 --loss-agg token --resample 2\n"
+    "  --dr-grpo         preset: --no-std --loss-agg const\n"
+    "                    (flags after a preset override it)\n"
     "  --kl F            KL penalty toward the reference policy (default 0 = off).\n"
     "                    The reference is the FROZEN BASE -- the same weights with\n"
     "                    the adapters off -- so it costs one extra forward per\n"
@@ -398,6 +417,19 @@ static int run_grpo(int argc, char **argv) {
     else if (strcmp(f, "--lora-alpha") == 0) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
     else if (strcmp(f, "--clip-eps") == 0){ NEED_VAL(); cfg.clip_eps = (float)atof(argv[++i]); }
     else if (strcmp(f, "--kl") == 0)      { NEED_VAL(); cfg.kl_beta = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--clip-high") == 0) { NEED_VAL(); cfg.clip_eps_high = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--no-std") == 0)  { cfg.std_norm = 0; }
+    else if (strcmp(f, "--resample") == 0){ NEED_VAL(); cfg.resample = atoi(argv[++i]); }
+    else if (strcmp(f, "--dapo") == 0)    { grpo_preset_dapo(&cfg); }
+    else if (strcmp(f, "--dr-grpo") == 0) { grpo_preset_dr_grpo(&cfg); }
+    else if (strcmp(f, "--loss-agg") == 0) {
+      NEED_VAL();
+      const char *m = argv[++i];
+      if      (strcmp(m, "seq") == 0)   cfg.loss_agg = GRPO_AGG_SEQ;
+      else if (strcmp(m, "token") == 0) cfg.loss_agg = GRPO_AGG_TOKEN;
+      else if (strcmp(m, "const") == 0) cfg.loss_agg = GRPO_AGG_CONST;
+      else { fprintf(stderr, "--loss-agg must be seq, token or const (got '%s')\n", m); return 2; }
+    }
     else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
     else if (strcmp(f, "--verbose") == 0) { cfg.verbose = 1; }
     else { fprintf(stderr, "unknown flag: %s\n", f); grpo_usage(); return 2; }
@@ -410,6 +442,7 @@ static int run_grpo(int argc, char **argv) {
   }
   if (cfg.groups_per_step < 1) cfg.groups_per_step = 1;
   if (cfg.inner_epochs < 1) cfg.inner_epochs = 1;
+  if (cfg.resample < 0) cfg.resample = 0;
   return grpo_run(tasks, &cfg);
 }
 

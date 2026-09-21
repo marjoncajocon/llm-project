@@ -467,7 +467,50 @@ download, 3.0 s once cached). `model/qwen/*.bin` git-ignored.
 Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
 Block/model forward-only (add backward to fine-tune).
 
-## Modern architecture — step 15: QK-norm (Qwen3 support) — DONE (2026-09-21, branch `qknorm`)
+## Modern architecture — step 15: sliding-window attention (per layer) — DONE (2026-09-21)
+
+Mistral, Gemma 2/3, gpt-oss and most hybrid designs restrict some or all layers to a **sliding
+window**: position i attends only to j in `[max(0, i-W+1), i]` (W positions, itself included).
+- `gqa.h/.c`: `GqaCache.window` (0 from `gqa_cache_create`, the caller sets it) + a shared
+  `gqa_window_lo(i, W)`. Forward and backward just start the j-loop at `lo` instead of 0 (masked keys:
+  weight 0, no gradient). **W <= 0 runs the identical arithmetic as before** — whole smoke-test output
+  diffed byte-identical against the pre-change build. W >= n is also exactly full attention.
+- **Representation: one int per layer** (`LlamaBlock.window`, `QLlamaBlock.window`; <= 0 = global),
+  because the real patterns disagree (Mistral: all windowed; Gemma 2 / gpt-oss: alternate; Gemma 3:
+  5 local : 1 global; Qwen2: upper layers only). `llama_model_set_window(m, W, N)` builds the common
+  "every Nth layer global" pattern (layer l global iff `(l+1) % N == 0`; N = 0 -> all windowed);
+  anything else is set per block directly. `llama_model_copy_window` keeps it across the trainable
+  rebuilds in `train.c` (both resume paths) and `grpo.c`.
+- **KV cache = per-layer ring buffer.** `LlamaKV.cap[l] = min(W, max_seq)` slots for a windowed layer
+  (position p in slot `p % cap`), `max_seq` for a global one; `len` stays the absolute position, so
+  every caller that resets `kv.len = 0` works unchanged. The single-token attention is now one shared
+  `decode_attention()` (fp32 + int8 paths, LoRA decode inherits it), visiting positions in ascending
+  order lo..pos exactly like `gqa_forward` -> **still bit-exact** after the ring wraps.
+- **Checkpoint LLMA/LLMQ v3** = v2 + `n_layers` int32 windows right after the float config. Written
+  ONLY when some layer has a window; otherwise v2, byte-identical to before (so older builds keep
+  reading it). Loaders accept v2 (all windows 0) and v3; negative/absurd windows rejected.
+  `convert_llama.py` writes v3 from `layer_types` / `sliding_window` (Qwen2's `use_sliding_window`
+  and `max_window_layers` honoured); `--tiny --window W --global-every N` for a no-download test.
+  Verified: the old converter's `--tiny` v2 file loads and generates identically in old and new
+  builds; a windowed v3 LLMA and a windowed int8 LLMQ both load and generate.
+- CLI: `llama-train --window W --global-every N` (fresh models; `--resume` keeps the checkpoint's).
+
+Verified — new smoke-test **part `[32]`**: (a) GQA gradient check with W=2 over Q/K/V, max rel
+**4.19e-03**; (b) W = n and W = n+5 vs full: **0.00e+00**, and through a whole model: **0.00e+00**;
+(c) perturbing an out-of-window K/V row leaves those output rows **exactly** unchanged, and in a
+2-layer all-windowed W=2 model perturbing token 0 changes positions 0..2 only (receptive field
+L·(W-1) = 2) with later positions **0.00e+00**; one global layer restores full reach; (d) KV decode
+vs full forward, 3 layers (local, local, global), W=3, 11 positions so the 3-slot rings wrap:
+**0.00e+00**, also after reusing the cache; int8 windowed decode 1.04e-02 vs windowed fp32 (1.25 vs
+full-attention fp32); training forward == inference forward **0.00e+00**; v3 round-trip exact, no
+window -> v2. A deliberate off-by-one in the decode window fails (d). `-Wall` clean.
+
+Caveats: the batched forward/backward still allocate the full `n x n` attention buffer and skip the
+masked work only by loop bounds (compute is O(n·W) but memory is not); converter support covers
+LLaMA-shaped models only (Mistral yes; Gemma/gpt-oss need other architecture pieces first);
+LLMA v3 files are not readable by pre-window builds.
+
+## Modern architecture — step 16: QK-norm (Qwen3 support) — DONE (2026-09-21, branch `qknorm`)
 
 Qwen3 applies an RMSNorm per head to q and k (learned `q_norm`/`k_norm`, head_dim each, shared
 across heads) after the projection and BEFORE RoPE. Unlike the step-14 biases this is an
@@ -478,14 +521,18 @@ parameter set to 3 + 14/layer). `rmsnorm_heads[_backward]` (rmsnorm.c) = plain r
 adapters, before RoPE), `q_llama_decode_step`, and `llamatrain.c` (raw q/k cached in new `qp`/`kp`
 acts, NULL without QK-norm; backward = `rmsnorm_heads_backward` between RoPE and bias/matmul).
 `grpo.c`/`train.c` carry the flag over when rebuilding a trainable model from a checkpoint.
-**Checkpoint:** v3 = v2 + a u32 flags word after the config (bit 0 = QK-norm; gains stored per
-layer right after `b_v`). A model without features is still written as **v2, byte-identical**;
-v2 files load unchanged; unknown versions / flag bits are rejected. `convert_llama.py` detects
-`self_attn.q_norm.weight`, writes v3, and gained `--max-seq` (Qwen3's 40960 ctx would make the
-up-front KV cache ~9 GB for Qwen3-0.6B) and `--tiny --qk-norm`.
-Verified: selftest `[31]` (live, train==inference 0.00, grad check incl. every gain entry and
-LoRA-through-norm, KV decode 0.00 plain + LoRA, v3 round-trip 0.00, int8 path) and `[1]`-`[30]`
-byte-identical to before. A `--tiny --qk-norm` file matches an independent float64 numpy
+**Checkpoint LLMA/LLMQ v4** (v3 is taken by the sliding-window format above and kept exactly):
+v4 = v2 config + a u32 flags word (bit 0 = QK-norm, bit 1 = windows present) + the n_layers int32
+windows iff bit 1; with bit 0 each layer stores `q_norm`, `k_norm` right after `b_v`. The writer
+picks the lowest version that holds the model: v2 (no feature, byte-identical), v3 (windows only,
+unchanged), v4 (any QK-norm). Loaders accept v2/v3/v4 and reject unknown versions / flag bits.
+`convert_llama.py` detects `self_attn.q_norm.weight`, writes v4 (windows + QK-norm together work),
+and gained `--max-seq` (Qwen3's 40960 ctx would make the up-front KV cache ~9 GB for Qwen3-0.6B)
+and `--tiny --qk-norm` (combinable with `--window`/`--global-every`).
+Verified: selftest `[33]` (live, train==inference 0.00, grad check incl. every gain entry and
+LoRA-through-norm, KV decode 0.00 plain + LoRA, v4 round-trip 0.00, int8 path, and a combined
+window + QK-norm model: v4 flags 0x3 round-trip exact, decode == forward with wrapping rings) and
+`[1]`-`[32]` byte-identical to agent-1 @ 46faa66. A `--tiny --qk-norm` file matches an independent float64 numpy
 reference (written from HF's Qwen3Attention) to 1.7e-07. **Not yet run:** real Qwen3-0.6B vs HF
 (no torch on this box and ~0.8 GB free RAM during the overnight job).
 

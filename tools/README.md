@@ -85,8 +85,9 @@ python tools/convert_llama.py --model Qwen/Qwen3-0.6B --out model/qwen3/model.bi
   `q/k/v_proj.bias` for Qwen2/Qwen2.5. (`o_proj` and the MLP have no bias.) So both
   `HuggingFaceTB/SmolLM2-*` and `Qwen/Qwen2.5-0.5B` convert and run.
 - **QK-norm (Qwen3)** is supported: when `self_attn.q_norm`/`k_norm` weights are present they are
-  written per layer (after `b_v`) into a **v3** file with feature flag bit 0; models without it are
-  still written as v2 (byte-identical to before). Qwen3's `max_position_embeddings` is 40960, and the
+  written per layer (after `b_v`) into a **v4** file: a u32 flags word after the float config (bit 0 =
+  QK-norm, bit 1 = the per-layer window block follows), so QK-norm and sliding windows combine.
+  Models without QK-norm are written exactly as before (v2, or v3 when windowed). Qwen3's `max_position_embeddings` is 40960, and the
   C KV cache is allocated for all of it up front — pass **`--max-seq 4096`** (any cap) to keep it
   small. The C side is verified against an independent numpy reference on a `--tiny --qk-norm`
   file; a full Qwen3-0.6B vs HF comparison has NOT been run yet.

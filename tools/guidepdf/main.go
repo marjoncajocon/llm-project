@@ -581,6 +581,11 @@ func secGRPO(d *doc) {
 	d.table([]string{"Flag", "Default", "Meaning"}, []float64{34, 18, 122}, [][]string{
 		{"--clip-eps", "0.2", "PPO-style ratio clip, 1 +/- eps. Removes gradient that would push a token further in a direction it has already moved too far. 0 disables clipping."},
 		{"--kl", "0 (off)", "KL penalty pulling the policy toward a reference. The reference is the FROZEN BASE - the same weights with the adapters switched off - so it costs one extra forward per rollout and no extra memory. Raise it if the model drifts into degenerate text."},
+		{"--clip-high", "= --clip-eps", "DAPO clip-higher: the UPPER ratio bound becomes 1 + F. A wider upper bound lets a rare token that turned out good grow faster - the guard against entropy collapse. The lower bound is unchanged."},
+		{"--no-std", "off", "Dr. GRPO: advantage = r - mean instead of (r - mean) / std. Dividing by std up-weights nearly-flat groups, which is a difficulty bias rather than a signal."},
+		{"--loss-agg", "seq", "How token terms are averaged. seq = 1/(G*len) per rollout (original GRPO; a long wrong answer is punished less per token). token = every response token in the step weighs the same (DAPO). const = 1/(G*max-new) (Dr. GRPO)."},
+		{"--resample", "0", "DAPO dynamic sampling: when a group comes back flat, draw a fresh task and resample, up to N times, so the step is not spent on a group with no gradient. Costs extra rollouts."},
+		{"--dapo / --dr-grpo", "off", "Presets. --dapo = --clip-high 0.28 --loss-agg token --resample 2. --dr-grpo = --no-std --loss-agg const. Flags after a preset override it."},
 		{"--seed", "1", "RNG seed."},
 		{"--verbose", "off", "Print one scored sample rollout per group, with the reward broken down by term."},
 	})

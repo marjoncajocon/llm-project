@@ -51,6 +51,8 @@ TrainConfig train_default_config(void) {
   c.lora_r = 0;            // 0 => full fine-tune (no adapters)
   c.lora_alpha = 0.0f;     // 0 => alpha = r, i.e. scale 1
   c.hf_tok = NULL;         // NULL => train/load our own byte-level BPE
+  c.window = 0;            // 0 => full causal attention (no sliding window)
+  c.global_every = 0;
   return c;
 }
 
@@ -605,6 +607,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     llama_model_set_qk_norm(&model, loaded.qk_norm);   // keep the base's QK-norm (Qwen3)
     llama_model_randomize(&model);          // any new row/column starts random
     copy_weights_grow(&model, &loaded);     // ...then every pretrained weight lands on top
+    llama_model_copy_window(&model, &loaded);   // and its sliding-window config
     llama_model_free(&loaded);
     printf("LLaMA SFT (fine-tune): %d examples | vocab %d -> %d | seq len %d | d_model=%d layers=%d heads=%d kv=%d eos=%d lr=%g\n",
            nex, anytok_vocab(&tok), vocab, maxL, model.d_model, model.n_layers,
@@ -614,6 +617,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
                                      cfg->n_heads, n_kv, head_dim, d_ff, maxL,
                                      cfg->rope_base, 1e-5f);
     llama_model_randomize(&model);
+    llama_model_set_window(&model, cfg->window, cfg->global_every);
     printf("LLaMA SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
            nex, anytok_vocab(&tok), maxL, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, cfg->lr);
   }
@@ -754,6 +758,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
                                             model.d_ff, model.max_seq, model.rope_base, model.eps);
     llama_model_set_qk_norm(&t, model.qk_norm);        // keep the checkpoint's QK-norm
     copy_weights_grow(&t, &model);
+    llama_model_copy_window(&t, &model);
     llama_model_free(&model);
     model = t;
     printf("resumed LLMA model %s (vocab %d, d_model %d, layers %d, heads %d, kv %d)\n",
@@ -765,6 +770,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
                                      cfg->n_heads, n_kv, head_dim, d_ff, cfg->ctx,
                                      cfg->rope_base, 1e-5f);
     llama_model_randomize(&model);
+    llama_model_set_window(&model, cfg->window, cfg->global_every);
     printf("LLaMA model: d_model=%d heads=%d kv=%d head_dim=%d layers=%d d_ff=%d ctx=%d rope_base=%g lr=%g\n",
            cfg->d_model, cfg->n_heads, n_kv, head_dim, cfg->n_layers, d_ff, cfg->ctx,
            cfg->rope_base, cfg->lr);

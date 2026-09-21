@@ -36,6 +36,7 @@ static LlamaBlock block_create_ex(int d_model, int n_heads, int n_kv, int head_d
   b.d_model = d_model; b.n_heads = n_heads; b.n_kv = n_kv; b.head_dim = head_dim;
   b.d_ff = d_ff; b.rope_base = rope_base; b.eps = eps;
   b.qk_norm = 0;                           // off until llama_model_set_qk_norm
+  b.window = 0;                               // full causal attention by default
   const int qd = n_heads * head_dim, kvd = n_kv * head_dim;
   b.attn_norm = vec_of(d_model, grad);
   b.Wq = mat_of(d_model, qd, grad);
@@ -103,6 +104,7 @@ void llama_block_forward(const LlamaBlock *b, const Tensor *x, Tensor *out) {
   Tensor o = mat(n, qd), ao = mat(n, dm), h = mat(n, dm);
   Tensor hn = mat(n, dm), f = mat(n, dm);
   GqaCache gc = gqa_cache_create(n, b->n_heads, b->n_kv, b->head_dim);
+  gc.window = b->window;                     // sliding window (0 = full causal)
   SwigluCache sc = swiglu_cache_create(n, b->d_ff);
 
   // --- Attention sub-layer ---
@@ -189,6 +191,18 @@ void llama_model_randomize(LlamaModel *m) {
   fill_rand(&m->lm_head, 0.05f);
 }
 
+void llama_model_set_window(LlamaModel *m, int window, int global_every) {
+  for (int l = 0; l < m->n_layers; l++) {
+    const int global = (window <= 0) || (global_every > 0 && (l + 1) % global_every == 0);
+    m->blocks[l].window = global ? 0 : window;
+  }
+}
+
+void llama_model_copy_window(LlamaModel *dst, const LlamaModel *src) {
+  for (int l = 0; l < dst->n_layers && l < src->n_layers; l++)
+    dst->blocks[l].window = src->blocks[l].window;
+}
+
 void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tensor *logits) {
   const int dm = m->d_model;
   Tensor a = mat(seq_len, dm), b = mat(seq_len, dm), hn = mat(seq_len, dm);
@@ -217,9 +231,13 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
 #define LLMA_MAGIC   0x414D4C4Cu  // 'LLMA' little-endian bytes L,L,M,A (f32 weights)
 #define LLMQ_MAGIC   0x514D4C4Cu  // 'LLMQ' little-endian bytes L,L,M,Q (int8 weights)
 #define LLMA_VERSION 2u           // v2 adds q/k/v attention biases (zero for LLaMA/SmolLM)
-#define LLMA_VERSION_FLAGS 3u     // v3 = v2 + a u32 feature-flags word after the config
+#define LLMA_VERSION_WINDOW 3u    // v3 = v2 + n_layers int32 sliding windows after the
+                                  // float config; written only when a window is set
+#define LLMA_VERSION_FLAGS 4u     // v4 = v2 + a u32 feature-flags word after the float
+                                  // config, then the windows iff LLMA_FLAG_WINDOWS
 #define LLMA_FLAG_QK_NORM 1u      // bit 0: per-head q/k RMSNorm (Qwen3) — q_norm, k_norm
-#define LLMA_KNOWN_FLAGS  (LLMA_FLAG_QK_NORM)
+#define LLMA_FLAG_WINDOWS 2u      // bit 1: the n_layers int32 window block is present
+#define LLMA_KNOWN_FLAGS  (LLMA_FLAG_QK_NORM | LLMA_FLAG_WINDOWS)
 #define TENSORS_PER_LAYER 14      // attn_norm, Wq,Wk,Wv, b_q,b_k,b_v, [q_norm,k_norm], Wo,
                                   // ffn_norm, Wgate,Wup,Wdown  (the [..] only if QK-norm)
 
@@ -271,10 +289,14 @@ int llama_model_save(const char *path, const LlamaModel *m) {
   FILE *f = fopen(tmp, "wb");
   if (!f) { fprintf(stderr, "Error: cannot open '%s' for writing\n", tmp); free(tmp); return 1; }
 
-  // A model using no optional feature is written as plain v2, byte-identical to
-  // what this function always wrote, so older builds can still read it.
-  const uint32_t flags = m->qk_norm ? LLMA_FLAG_QK_NORM : 0u;
-  uint32_t header[2] = {LLMA_MAGIC, flags ? LLMA_VERSION_FLAGS : LLMA_VERSION};
+  // The lowest version that can hold the model, so older builds keep reading
+  // what they can: no feature -> v2 (byte-identical to a pre-feature file);
+  // windows only -> v3 (unchanged); QK-norm -> v4, windows then via flag bit 1.
+  int windowed = 0;
+  for (int l = 0; l < m->n_layers; l++) if (m->blocks[l].window > 0) windowed = 1;
+  const uint32_t flags = m->qk_norm ? (LLMA_FLAG_QK_NORM | (windowed ? LLMA_FLAG_WINDOWS : 0u)) : 0u;
+  uint32_t header[2] = {LLMA_MAGIC, flags ? LLMA_VERSION_FLAGS
+                                          : windowed ? LLMA_VERSION_WINDOW : LLMA_VERSION};
   int32_t cfg[8] = {m->vocab, m->d_model, m->n_layers, m->n_heads,
                     m->n_kv, m->head_dim, m->d_ff, m->max_seq};
   float fcfg[2] = {m->rope_base, m->eps};
@@ -284,6 +306,10 @@ int llama_model_save(const char *path, const LlamaModel *m) {
   ok &= (fwrite(cfg, sizeof(int32_t), 8, f) == 8);
   ok &= (fwrite(fcfg, sizeof(float), 2, f) == 2);
   if (flags) ok &= (fwrite(&flags, sizeof(uint32_t), 1, f) == 1);
+  for (int l = 0; l < m->n_layers && windowed && ok; l++) {
+    int32_t w = m->blocks[l].window > 0 ? m->blocks[l].window : 0;   // normalize "off" to 0
+    ok &= (fwrite(&w, sizeof(int32_t), 1, f) == 1);
+  }
 
   const Tensor **list = (const Tensor**)malloc((size_t)(1 + TENSORS_PER_LAYER * m->n_layers + 2) * sizeof(const Tensor*));
   int count = llama_collect(m, list);
@@ -310,25 +336,75 @@ int llama_model_save(const char *path, const LlamaModel *m) {
 // KV cache + incremental decode
 // ---------------------------------------------------------------------------
 
-LlamaKV llama_kv_create(const LlamaModel *m) {
+// Shared by the fp32 and int8 caches (their block types differ; the per-layer
+// window, passed in as a plain array, does not).
+static LlamaKV kv_create_ex(int n_layers, int max_seq, int kv_dim, const int *windows) {
   LlamaKV kv;
-  kv.n_layers = m->n_layers;
-  kv.max_seq = m->max_seq;
-  kv.kv_dim = m->n_kv * m->head_dim;
+  kv.n_layers = n_layers;
+  kv.max_seq = max_seq;
+  kv.kv_dim = kv_dim;
   kv.len = 0;
-  kv.k = (float**)malloc((size_t)m->n_layers * sizeof(float*));
-  kv.v = (float**)malloc((size_t)m->n_layers * sizeof(float*));
-  for (int l = 0; l < m->n_layers; l++) {
-    kv.k[l] = (float*)malloc((size_t)m->max_seq * kv.kv_dim * sizeof(float));
-    kv.v[l] = (float*)malloc((size_t)m->max_seq * kv.kv_dim * sizeof(float));
+  kv.cap = (int*)malloc((size_t)n_layers * sizeof(int));
+  kv.k = (float**)malloc((size_t)n_layers * sizeof(float*));
+  kv.v = (float**)malloc((size_t)n_layers * sizeof(float*));
+  for (int l = 0; l < n_layers; l++) {
+    // A windowed layer only ever reads its last W positions: a W-slot ring.
+    kv.cap[l] = (windows[l] > 0 && windows[l] < max_seq) ? windows[l] : max_seq;
+    kv.k[l] = (float*)malloc((size_t)kv.cap[l] * kv_dim * sizeof(float));
+    kv.v[l] = (float*)malloc((size_t)kv.cap[l] * kv_dim * sizeof(float));
   }
+  return kv;
+}
+
+LlamaKV llama_kv_create(const LlamaModel *m) {
+  int *w = (int*)malloc((size_t)m->n_layers * sizeof(int));
+  for (int l = 0; l < m->n_layers; l++) w[l] = m->blocks[l].window;
+  LlamaKV kv = kv_create_ex(m->n_layers, m->max_seq, m->n_kv * m->head_dim, w);
+  free(w);
   return kv;
 }
 
 void llama_kv_free(LlamaKV *kv) {
   for (int l = 0; l < kv->n_layers; l++) { free(kv->k[l]); free(kv->v[l]); }
-  free(kv->k); free(kv->v);
-  kv->k = kv->v = NULL;
+  free(kv->k); free(kv->v); free(kv->cap);
+  kv->k = kv->v = NULL; kv->cap = NULL;
+}
+
+// Single-query GQA attention of one new token (position pos) over one layer's
+// cache (kc, vc) of `cap` ring slots, honouring the sliding window; writes o
+// (n_heads*hd). Shared by the fp32 and int8 decode paths. Keys are visited in
+// ascending POSITION order lo..pos — the same order and arithmetic as
+// gqa_forward — which keeps decode bit-exact vs the full forward even after the
+// ring has wrapped. `sc` is scratch of at least pos+1 floats.
+static void decode_attention(const float *q, const float *kc, const float *vc,
+                             int cap, int window, int pos, int n_heads, int n_kv,
+                             int hd, float *sc, float *o) {
+  const int group = n_heads / n_kv, kvd = n_kv * hd;
+  const float scale = 1.0f / sqrtf((float)hd);
+  const int lo = gqa_window_lo(pos, window);
+  for (int head = 0; head < n_heads; head++) {
+    const int kvh = head / group;
+    const float *qh = &q[head * hd];
+    float maxs = -INFINITY;
+    for (int jj = lo; jj <= pos; jj++) {
+      const float *kj = &kc[(size_t)(jj % cap) * kvd + kvh * hd];
+      float dot = 0.0f;
+      for (int d = 0; d < hd; d++) dot += qh[d] * kj[d];
+      float s = dot * scale;
+      sc[jj] = s;
+      if (s > maxs) maxs = s;
+    }
+    float sum = 0.0f;
+    for (int jj = lo; jj <= pos; jj++) { float e = expf(sc[jj] - maxs); sc[jj] = e; sum += e; }
+    float inv = 1.0f / sum;
+    float *oh = &o[head * hd];
+    for (int d = 0; d < hd; d++) oh[d] = 0.0f;
+    for (int jj = lo; jj <= pos; jj++) {
+      float w = sc[jj] * inv;
+      const float *vj = &vc[(size_t)(jj % cap) * kvd + kvh * hd];
+      for (int d = 0; d < hd; d++) oh[d] += w * vj[d];
+    }
+  }
 }
 
 void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits) {
@@ -340,8 +416,6 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
   const int dm = m->d_model, hd = m->head_dim;
   const int qd = m->n_heads * hd, kvd = m->n_kv * hd;
   const int pos = kv->len;                 // this token's position
-  const int group = m->n_heads / m->n_kv;
-  const float scale = 1.0f / sqrtf((float)hd);
 
   Tensor x = mat(1, dm);                     // running residual stream (1 row)
   for (int j = 0; j < dm; j++) x.data[j] = m->wte.data[token * dm + j];
@@ -381,32 +455,11 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
     }
     rope_heads_pos(&q, m->n_heads, m->rope_base, pos);
     rope_heads_pos(&k, m->n_kv, m->rope_base, pos);
-    memcpy(&kv->k[l][pos * kvd], k.data, (size_t)kvd * sizeof(float));   // append to cache
-    memcpy(&kv->v[l][pos * kvd], v.data, (size_t)kvd * sizeof(float));
-
-    for (int head = 0; head < m->n_heads; head++) {
-      const int kvh = head / group;
-      const float *qh = &q.data[head * hd];
-      float maxs = -INFINITY;
-      for (int jj = 0; jj <= pos; jj++) {
-        const float *kj = &kv->k[l][jj * kvd + kvh * hd];
-        float dot = 0.0f;
-        for (int d = 0; d < hd; d++) dot += qh[d] * kj[d];
-        float s = dot * scale;
-        sc[jj] = s;
-        if (s > maxs) maxs = s;
-      }
-      float sum = 0.0f;
-      for (int jj = 0; jj <= pos; jj++) { float e = expf(sc[jj] - maxs); sc[jj] = e; sum += e; }
-      float inv = 1.0f / sum;
-      float *oh = &o.data[head * hd];
-      for (int d = 0; d < hd; d++) oh[d] = 0.0f;
-      for (int jj = 0; jj <= pos; jj++) {
-        float w = sc[jj] * inv;
-        const float *vj = &kv->v[l][jj * kvd + kvh * hd];
-        for (int d = 0; d < hd; d++) oh[d] += w * vj[d];
-      }
-    }
+    const size_t slot = (size_t)(pos % kv->cap[l]) * kvd;   // ring slot (== pos if full)
+    memcpy(&kv->k[l][slot], k.data, (size_t)kvd * sizeof(float));   // append to cache
+    memcpy(&kv->v[l][slot], v.data, (size_t)kvd * sizeof(float));
+    decode_attention(q.data, kv->k[l], kv->v[l], kv->cap[l], b->window, pos,
+                     m->n_heads, m->n_kv, hd, sc, o.data);
     matmul(&o, &b->Wo, &ao);
     if (lo) lora_forward(&lo->o[l], &o, &ao, &lco);
     for (int j = 0; j < dm; j++) x.data[j] += ao.data[j];       // residual
@@ -428,6 +481,21 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
   }
   tensor_free(&x); tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
   tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
+}
+
+// Read the optional per-layer window block that follows the float config (and,
+// in v4, the flags word): absent in v2 and in v4 without LLMA_FLAG_WINDOWS
+// (every window 0 = full attention), n_layers int32 in v3 and in v4 with it.
+// Rejects a negative or absurd window. Returns 1 on success, 0 on truncation/bad value.
+static int read_windows(FILE *f, uint32_t version, uint32_t flags, int n_layers, int32_t *win) {
+  for (int l = 0; l < n_layers; l++) win[l] = 0;
+  const int present = (version == LLMA_VERSION_WINDOW) ||
+                      (version == LLMA_VERSION_FLAGS && (flags & LLMA_FLAG_WINDOWS));
+  if (!present) return 1;
+  if (fread(win, sizeof(int32_t), (size_t)n_layers, f) != (size_t)n_layers) return 0;
+  for (int l = 0; l < n_layers; l++)
+    if (win[l] < 0 || win[l] > 1000000) return 0;
+  return 1;
 }
 
 // Validate the 8 config ints of an LLMA/LLMQ header before building a model.
@@ -455,7 +523,8 @@ static int llama_config_valid(const int32_t *cfg) {
 }
 
 // Read an LLMA/LLMQ header — magic + version, the 8 config ints, the 2 floats
-// and, for v3 only, the feature-flags word (a v2 file has none: flags = 0).
+// and, for v4 only, the feature-flags word (v2/v3 have none: flags = 0; v3's
+// windows are implied by the version). The window block is read separately.
 // Rejects unknown versions and unknown flag bits (a feature this build cannot
 // run must fail loudly, not load as a silently different model). The caller
 // checks the magic. Returns 0 on success, else prints why and returns nonzero.
@@ -469,7 +538,8 @@ static int read_header(FILE *f, const char *path, uint32_t *header, int32_t *cfg
     fprintf(stderr, "Error: '%s' is truncated (bad header)\n", path);
     return 1;
   }
-  if (header[1] != LLMA_VERSION && header[1] != LLMA_VERSION_FLAGS) {
+  if (header[1] != LLMA_VERSION && header[1] != LLMA_VERSION_WINDOW &&
+      header[1] != LLMA_VERSION_FLAGS) {
     fprintf(stderr, "Error: '%s' is checkpoint version %u (this build reads v%u-v%u)\n",
             path, header[1], LLMA_VERSION, LLMA_VERSION_FLAGS);
     return 1;
@@ -498,11 +568,18 @@ int llama_model_load(const char *path, LlamaModel *out) {
     fprintf(stderr, "Error: '%s' has an invalid/unsupported config\n", path);
     fclose(f); return 1;
   }
+  int32_t *win = (int32_t*)malloc((size_t)cfg[2] * sizeof(int32_t));
+  if (!win || !read_windows(f, header[1], flags, cfg[2], win)) {
+    fprintf(stderr, "Error: '%s' has a truncated/invalid sliding-window block\n", path);
+    free(win); fclose(f); return 1;
+  }
 
   *out = llama_model_create(cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
                             cfg[6], cfg[7], fcfg[0], fcfg[1]);
   // Before llama_collect: the flag decides which tensors the file holds.
   llama_model_set_qk_norm(out, (flags & LLMA_FLAG_QK_NORM) != 0);
+  for (int l = 0; l < out->n_layers; l++) out->blocks[l].window = win[l];
+  free(win);
 
   int ok = 1;
   const Tensor **list = (const Tensor**)malloc((size_t)(1 + TENSORS_PER_LAYER * out->n_layers + 2) * sizeof(const Tensor*));
@@ -540,6 +617,7 @@ int llama_model_load(const char *path, LlamaModel *out) {
 static QLlamaBlock q_block_create(int d_model, int n_heads, int n_kv, int head_dim, int d_ff) {
   QLlamaBlock b;
   const int qd = n_heads * head_dim, kvd = n_kv * head_dim;
+  b.window = 0;
   b.attn_norm = vec(d_model); b.ffn_norm = vec(d_model);
   b.b_q = vec(qd); b.b_k = vec(kvd); b.b_v = vec(kvd);
   b.q_norm = vec(head_dim); b.k_norm = vec(head_dim);
@@ -593,6 +671,7 @@ QLlamaModel q_llama_quantize_from(const LlamaModel *s) {
   for (int l = 0; l < s->n_layers; l++) {
     const LlamaBlock *a = &s->blocks[l];
     QLlamaBlock *b = &m.blocks[l];
+    b->window = a->window;
     memcpy(b->attn_norm.data, a->attn_norm.data, dmb);
     memcpy(b->ffn_norm.data, a->ffn_norm.data, dmb);
     memcpy(b->b_q.data, a->b_q.data, (size_t)a->b_q.size * sizeof(float));
@@ -611,25 +690,17 @@ QLlamaModel q_llama_quantize_from(const LlamaModel *s) {
 }
 
 LlamaKV q_llama_kv_create(const QLlamaModel *m) {
-  LlamaKV kv;
-  kv.n_layers = m->n_layers;
-  kv.max_seq = m->max_seq;
-  kv.kv_dim = m->n_kv * m->head_dim;
-  kv.len = 0;
-  kv.k = (float**)malloc((size_t)m->n_layers * sizeof(float*));
-  kv.v = (float**)malloc((size_t)m->n_layers * sizeof(float*));
-  for (int l = 0; l < m->n_layers; l++) {
-    kv.k[l] = (float*)malloc((size_t)m->max_seq * kv.kv_dim * sizeof(float));
-    kv.v[l] = (float*)malloc((size_t)m->max_seq * kv.kv_dim * sizeof(float));
-  }
+  int *w = (int*)malloc((size_t)m->n_layers * sizeof(int));
+  for (int l = 0; l < m->n_layers; l++) w[l] = m->blocks[l].window;
+  LlamaKV kv = kv_create_ex(m->n_layers, m->max_seq, m->n_kv * m->head_dim, w);
+  free(w);
   return kv;
 }
 
 void q_llama_decode_step(const QLlamaModel *m, LlamaKV *kv, int token, Tensor *logits) {
   const int dm = m->d_model, hd = m->head_dim, dff = m->d_ff;
   const int qd = m->n_heads * hd, kvd = m->n_kv * hd;
-  const int pos = kv->len, group = m->n_heads / m->n_kv;
-  const float scale = 1.0f / sqrtf((float)hd);
+  const int pos = kv->len;
 
   Tensor x = mat(1, dm);
   { const signed char *qr = &m->wte.q[(size_t)token * dm]; const float *sq = m->wte.scale;
@@ -652,32 +723,11 @@ void q_llama_decode_step(const QLlamaModel *m, LlamaKV *kv, int token, Tensor *l
     }
     rope_heads_pos(&q, m->n_heads, m->rope_base, pos);
     rope_heads_pos(&k, m->n_kv, m->rope_base, pos);
-    memcpy(&kv->k[l][pos * kvd], k.data, (size_t)kvd * sizeof(float));
-    memcpy(&kv->v[l][pos * kvd], v.data, (size_t)kvd * sizeof(float));
-
-    for (int head = 0; head < m->n_heads; head++) {
-      const int kvh = head / group;
-      const float *qh = &q.data[head * hd];
-      float maxs = -INFINITY;
-      for (int jj = 0; jj <= pos; jj++) {
-        const float *kj = &kv->k[l][jj * kvd + kvh * hd];
-        float dot = 0.0f;
-        for (int d = 0; d < hd; d++) dot += qh[d] * kj[d];
-        float s = dot * scale;
-        sc[jj] = s;
-        if (s > maxs) maxs = s;
-      }
-      float sum = 0.0f;
-      for (int jj = 0; jj <= pos; jj++) { float e = expf(sc[jj] - maxs); sc[jj] = e; sum += e; }
-      float inv = 1.0f / sum;
-      float *oh = &o.data[head * hd];
-      for (int d = 0; d < hd; d++) oh[d] = 0.0f;
-      for (int jj = 0; jj <= pos; jj++) {
-        float w = sc[jj] * inv;
-        const float *vj = &kv->v[l][jj * kvd + kvh * hd];
-        for (int d = 0; d < hd; d++) oh[d] += w * vj[d];
-      }
-    }
+    const size_t slot = (size_t)(pos % kv->cap[l]) * kvd;   // ring slot (== pos if full)
+    memcpy(&kv->k[l][slot], k.data, (size_t)kvd * sizeof(float));   // append to cache
+    memcpy(&kv->v[l][slot], v.data, (size_t)kvd * sizeof(float));
+    decode_attention(q.data, kv->k[l], kv->v[l], kv->cap[l], b->window, pos,
+                     m->n_heads, m->n_kv, hd, sc, o.data);
     qmatmul(&o, &b->Wo, &ao);
     for (int j = 0; j < dm; j++) x.data[j] += ao.data[j];
 
@@ -727,9 +777,16 @@ int q_llama_model_load(const char *path, QLlamaModel *out) {
     fprintf(stderr, "Error: '%s' has an invalid/unsupported config\n", path);
     fclose(f); return 1;
   }
+  int32_t *win = (int32_t*)malloc((size_t)cfg[2] * sizeof(int32_t));
+  if (!win || !read_windows(f, header[1], flags, cfg[2], win)) {
+    fprintf(stderr, "Error: '%s' has a truncated/invalid sliding-window block\n", path);
+    free(win); fclose(f); return 1;
+  }
 
   *out = q_model_alloc(cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], cfg[7], fcfg[0], fcfg[1]);
   out->qk_norm = (flags & LLMA_FLAG_QK_NORM) != 0;
+  for (int l = 0; l < out->n_layers; l++) out->blocks[l].window = win[l];
+  free(win);
   const size_t dmb = (size_t)out->d_model, hdn = (size_t)out->head_dim;
 
   int ok = q_read(f, &out->wte);

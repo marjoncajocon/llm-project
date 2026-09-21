@@ -42,16 +42,39 @@ GrpoConfig grpo_default_config(void) {
   c.lora_r = 8;
   c.lora_alpha = 16.0f;
   c.clip_eps = 0.2f;
+  c.clip_eps_high = -1.0f;   // symmetric
   c.kl_beta = 0.0f;
+  c.std_norm = 1;
+  c.loss_agg = GRPO_AGG_SEQ;
+  c.resample = 0;
   c.seed = 1;
   c.verbose = 0;
   return c;
 }
 
+void grpo_preset_dapo(GrpoConfig *c) {
+  c->clip_eps_high = 0.28f;  // the DAPO paper's value, with clip_eps 0.2 below
+  c->loss_agg = GRPO_AGG_TOKEN;
+  c->resample = 2;
+}
+
+void grpo_preset_dr_grpo(GrpoConfig *c) {
+  c->std_norm = 0;
+  c->loss_agg = GRPO_AGG_CONST;
+}
+
+float grpo_loss_norm(const GrpoConfig *cfg, int G, int len, int step_tokens) {
+  switch (cfg->loss_agg) {
+    case GRPO_AGG_TOKEN: return (float)(step_tokens > 0 ? step_tokens : 1);
+    case GRPO_AGG_CONST: return (float)G * (float)(cfg->max_new > 0 ? cfg->max_new : 1);
+    default:             return (float)G * (float)(len > 0 ? len : 1);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The objective (pure arithmetic — the part the self-test gradient-checks)
 // ---------------------------------------------------------------------------
-int grpo_advantages(const float *rewards, int G, float *adv_out) {
+int grpo_advantages(const float *rewards, int G, const GrpoConfig *cfg, float *adv_out) {
   if (G <= 0) return 0;
   for (int i = 0; i < G; i++) adv_out[i] = 0.0f;
 
@@ -70,16 +93,18 @@ int grpo_advantages(const float *rewards, int G, float *adv_out) {
   // the group's own mean baseline cancels it exactly. Report it and skip.
   if (sd < 1e-6) return 0;
 
+  const double scale = cfg->std_norm ? 1.0 / (sd + 1e-4) : 1.0;
   for (int i = 0; i < G; i++)
-    adv_out[i] = (float)((rewards[i] - mean) / (sd + 1e-4));
+    adv_out[i] = (float)((rewards[i] - mean) * scale);
   return 1;
 }
 
-void grpo_token_coeffs(float adv, int G, int len, const float *logp_new,
+void grpo_token_coeffs(float adv, float norm, int len, const float *logp_new,
                        const float *logp_old, const float *logp_ref,
                        const GrpoConfig *cfg, float *coeff_out) {
   if (len <= 0) return;
-  const float inv = 1.0f / ((float)G * (float)len);
+  const float inv = 1.0f / (norm > 0.0f ? norm : 1.0f);
+  const float eps_high = cfg->clip_eps_high >= 0.0f ? cfg->clip_eps_high : cfg->clip_eps;
   for (int t = 0; t < len; t++) {
     // Importance ratio. Even at inner_epochs == 1 this is not exactly 1: the
     // rollout came from the KV-cache decode path and the update runs the
@@ -92,7 +117,8 @@ void grpo_token_coeffs(float adv, int G, int len, const float *logp_new,
     if (cfg->clip_eps > 0.0f) {
       // The clip is one-sided per token: it only removes gradient that would push
       // a token further in the direction it has ALREADY moved too far.
-      if (adv > 0.0f && rho > 1.0f + cfg->clip_eps) clipped = 1;
+      // The upper bound may be wider (clip-higher): see GrpoConfig.clip_eps_high.
+      if (adv > 0.0f && rho > 1.0f + eps_high) clipped = 1;
       if (adv < 0.0f && rho < 1.0f - cfg->clip_eps) clipped = 1;
     }
     const float pg = clipped ? 0.0f : adv * rho;
@@ -121,13 +147,15 @@ int grpo_group_coeffs(const float *rewards, int G, const int *lens,
 
   float *adv = (float*)malloc((size_t)G * sizeof(float));
   if (!adv) return 0;
-  const int live = grpo_advantages(rewards, G, adv);
+  const int live = grpo_advantages(rewards, G, cfg, adv);
   if (adv_out) memcpy(adv_out, adv, (size_t)G * sizeof(float));
   if (!live) { free(adv); return 0; }
 
+  // A lone group: its own tokens are the whole step's tokens.
   int off = 0;
   for (int i = 0; i < G; i++) {
-    grpo_token_coeffs(adv[i], G, lens[i], &logp_new[off], &logp_old[off],
+    const float norm = grpo_loss_norm(cfg, G, lens[i], total);
+    grpo_token_coeffs(adv[i], norm, lens[i], &logp_new[off], &logp_old[off],
                       logp_ref ? &logp_ref[off] : NULL, cfg, &coeff_out[off]);
     off += lens[i];
   }
@@ -346,6 +374,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     hftok_free(&tok); tasks_free(tasks, n_tasks);
     return 1;
   }
+  llama_model_copy_window(&model, &loaded);   // keep its sliding-window config
   llama_model_free(&loaded);
 
   srand(cfg->seed);
@@ -436,10 +465,17 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
          cfg->model, V, model.d_model, model.n_layers, cfg->hf_tok);
   printf("  sampling: temp %.2f top-k %d top-p %.2f max-new %d | max seq %d\n",
          (double)cfg->temperature, cfg->top_k, (double)cfg->top_p, cfg->max_new, maxL);
-  printf("  objective: clip-eps %.2f | kl-beta %.3g%s | lr %g | clip %.2g\n",
-         (double)cfg->clip_eps, (double)cfg->kl_beta,
+  printf("  objective: clip-eps %.2f/%.2f | kl-beta %.3g%s | lr %g | clip %.2g\n",
+         (double)cfg->clip_eps,
+         (double)(cfg->clip_eps_high >= 0.0f ? cfg->clip_eps_high : cfg->clip_eps),
+         (double)cfg->kl_beta,
          cfg->kl_beta > 0.0f ? " (reference = adapters off)" : " (off)",
          (double)cfg->lr, (double)cfg->grad_clip);
+  printf("  advantage %s | loss-agg %s | resample flat groups up to %d time%s\n",
+         cfg->std_norm ? "(r-mean)/std" : "r-mean (no std)",
+         cfg->loss_agg == GRPO_AGG_TOKEN ? "token" :
+         (cfg->loss_agg == GRPO_AGG_CONST ? "const" : "seq"),
+         cfg->resample, cfg->resample == 1 ? "" : "s");
   if (use_lora)
     printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo, base FROZEN (%d adapter tensors)\n",
            cfg->lora_r, (double)(cfg->lora_alpha > 0.0f ? cfg->lora_alpha : (float)cfg->lora_r),
@@ -447,7 +483,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   fflush(stdout);
 
   double run_reward = 0.0;
-  int run_groups = 0, skipped = 0, capped = 0, rollouts = 0;
+  int run_groups = 0, skipped = 0, resampled = 0, capped = 0, rollouts = 0;
   const int report = cfg->steps < 10 ? 1 : cfg->steps / 10;
   int rc = 0;
 
@@ -459,17 +495,17 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     int step_groups = 0;
     const clock_t t0 = clock();
 
-    // Choose this step's tasks up front so every inner epoch reuses the same
-    // rollouts (that reuse is the whole point of mu > 1).
+    // --- Sample and score every group ONCE (the expensive half of a step) ---
+    // Every inner epoch reuses these rollouts (that reuse is the whole point of
+    // mu > 1). A task is drawn per group; with --resample, a group that comes back
+    // FLAT is thrown away and a fresh task drawn in its place (DAPO's dynamic
+    // sampling), so the step's gradient is not diluted by groups that have none.
+    // With resample == 0 the rand() sequence is exactly the original one.
     for (int g = 0; g < cfg->groups_per_step; g++) {
+     for (int attempt = 0; attempt <= cfg->resample; attempt++) {
       int ti;
       do { ti = rand() % n_tasks; } while (plen[ti] == 0);
       task_of_group[g] = ti;
-    }
-
-    // --- Sample and score every group ONCE (the expensive half of a step) ---
-    for (int g = 0; g < cfg->groups_per_step; g++) {
-      const int ti = task_of_group[g];
       const int T = plen[ti];
       int off = 0;
       for (int i = 0; i < G; i++) {
@@ -493,6 +529,8 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
         }
         off += rlen[gi];
       }
+      // A discarded flat group still counts toward the reported reward: it is what
+      // the policy actually scored, and leaving it out would flatter the number.
       double gm = 0.0;
       for (int i = 0; i < G; i++) gm += rrew[g * G + i];
       step_reward += gm / G;
@@ -501,9 +539,18 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
 
       // Advantages depend on the rewards alone, so they settle here — which is
       // what lets the update below take exactly one forward per rollout.
-      group_live[g] = grpo_advantages(&rrew[g * G], G, &radv[g * G]);
-      if (!group_live[g]) skipped++;
+      group_live[g] = grpo_advantages(&rrew[g * G], G, cfg, &radv[g * G]);
+      if (group_live[g]) break;
+      if (attempt < cfg->resample) resampled++;
+      else skipped++;
+     }
     }
+
+    // Token-level aggregation normalizes by every live response token in the step.
+    int step_tokens = 0;
+    for (int g = 0; g < cfg->groups_per_step; g++)
+      if (group_live[g])
+        for (int i = 0; i < G; i++) step_tokens += rlen[g * G + i];
 
     for (int ep = 0; ep < cfg->inner_epochs; ep++) {
       llama_zero_grad(&model);
@@ -552,7 +599,8 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
           for (int t = 0; t < R; t++)
             flat_new[gbase + off + t] = logprob_of(&probs, T - 1 + t, rid[gi][t]);
 
-          grpo_token_coeffs(radv[gi], G, R, &flat_new[gbase + off],
+          grpo_token_coeffs(radv[gi], grpo_loss_norm(cfg, G, R, step_tokens), R,
+                            &flat_new[gbase + off],
                             &flat_old[gbase + off],
                             cfg->kl_beta > 0.0f ? &flat_ref[gbase + off] : NULL,
                             cfg, &coeff_row[T - 1]);
@@ -566,7 +614,10 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
       }
 
       if (live_groups > 0) {
-        if (live_groups > 1) scale_grads(params, n_params, 1.0f / (float)live_groups);
+        // Token-level loss is already averaged over the whole step's tokens; the
+        // other two are per-group, so average the groups.
+        if (live_groups > 1 && cfg->loss_agg != GRPO_AGG_TOKEN)
+          scale_grads(params, n_params, 1.0f / (float)live_groups);
         if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
         float lr = cfg->lr;
         if (cfg->warmup > 0 || cfg->lr_min >= 0.0f)
@@ -580,11 +631,13 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     if (step_groups > 0) { run_reward += step_reward / step_groups; run_groups++; }
     if (s % report == 0 || s == cfg->steps - 1) {
       const double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
-      printf("  step %5d/%d  reward %.4f  (running %.4f, %d flat group%s skipped)  %.1fs\n",
+      printf("  step %5d/%d  reward %.4f  (running %.4f, %d flat group%s skipped",
              s, cfg->steps,
              step_groups > 0 ? step_reward / step_groups : 0.0,
              run_groups > 0 ? run_reward / run_groups : 0.0,
-             skipped, skipped == 1 ? "" : "s", secs);
+             skipped, skipped == 1 ? "" : "s");
+      if (cfg->resample > 0) printf(", %d resampled", resampled);
+      printf(")  %.1fs\n", secs);
       fflush(stdout);
     }
   }
@@ -592,6 +645,9 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   if (run_groups > 0) {
     printf("  mean reward over the run: %.4f | %d group%s carried no signal\n",
            run_reward / run_groups, skipped, skipped == 1 ? "" : "s");
+    if (cfg->resample > 0)
+      printf("  dynamic sampling: %d flat group%s replaced by a fresh task\n",
+             resampled, resampled == 1 ? "" : "s");
     if (skipped > 0)
       printf("  NOTE: a skipped group means all %d rollouts scored identically — GRPO\n"
              "        learns from spread, so raise --temperature to explore more.\n", G);
