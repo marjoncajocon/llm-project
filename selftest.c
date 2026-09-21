@@ -35,6 +35,7 @@
 #include "reward.h"
 #include "grpo.h"
 #include "gpu.h"
+#include "moe.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -189,6 +190,96 @@ static float gpt_loss(GPT *m, GPTActs *a, const int *ids, int seq_len,
                       const int *targets, Tensor *logits, Tensor *probs) {
   gpt_forward_train(m, ids, seq_len, a, logits);
   return cross_entropy_forward(logits, targets, probs);
+}
+
+// ---- MoE helpers for part [31] -------------------------------------------
+
+// Deterministic fill (independent of rand() state): a scrambled sawtooth in
+// [-scale, scale). `mul` and `off` decorrelate tensors from each other.
+static void moe_fill(Tensor *T, int mul, int off, float scale) {
+  for (size_t i = 0; i < T->size; i++)
+    T->data[i] = ((float)(((int)i * mul + off) % 97) / 48.5f - 1.0f) * scale;
+}
+
+// L = sum(w * y) + aux_coef * aux. Also reports whether the routing (the chosen
+// expert ids of every token) differs from `ref_sel` -- a finite-difference probe
+// that flips a top-k choice measures a jump, not a derivative.
+static float moe_scalar_loss(const MoeLayer *m, const Tensor *x, MoeCache *c, Tensor *y,
+                             const float *w, float aux_coef, const int *ref_sel,
+                             int *flipped) {
+  float aux = moe_forward(m, x, c, y);
+  float l = aux_coef * aux;
+  for (size_t i = 0; i < y->size; i++) l += w[i] * y->data[i];
+  if (ref_sel && memcmp(ref_sel, c->sel, (size_t)c->n * c->top_k * sizeof(int)) != 0)
+    *flipped = 1;
+  return l;
+}
+
+// Full numerical gradient check of one MoE configuration over x and EVERY
+// parameter. The routing is NOT frozen: the real forward (softmax + top-k) runs
+// at every probe, and each probe's selection is compared against the base one.
+// The inputs are chosen so the k-th / (k+1)-th probability gap (`margin`) is
+// far larger than anything an h=1e-3 nudge can close, and the test then
+// PROVES that no probe flipped (`flips` must be 0) rather than assuming it.
+// use_task=0 zeroes w, isolating the aux-loss gradient.
+static float moe_gradcheck(int E, int k, int renorm, int shared, int use_task,
+                           float aux_coef, int *flips, float *margin, int *checked) {
+  const int n = 5, dm = 4, df = 5;
+  MoeLayer m = moe_create(dm, df, E, k, renorm, shared);
+  int np = moe_n_params(&m);
+  Tensor **ps = (Tensor**)malloc((np + 1) * sizeof(Tensor*));
+  moe_params(&m, ps);
+  for (int i = 0; i < np; i++) moe_fill(ps[i], 13 + 6 * i, 7 * i, 0.5f);
+  moe_fill(&m.W_router, 29, 3, 2.0f);   // a decisive router: wide top-k margins
+  int xs[2] = {n, dm};
+  Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+  moe_fill(&x, 31, 11, 1.0f);
+  ps[np] = &x;
+  MoeCache c = moe_cache_create(&m, n);
+  float *w = (float*)malloc(n * dm * sizeof(float));
+  for (int i = 0; i < n * dm; i++) w[i] = use_task ? ((i * 23 % 100) / 50.0f) - 1.0f : 0.0f;
+
+  // Analytic: forward, dL/dy = w, backward with the aux term.
+  moe_forward(&m, &x, &c, &y);
+  for (int i = 0; i <= np; i++) tensor_zero_grad(ps[i]);
+  memcpy(y.grad, w, n * dm * sizeof(float));
+  moe_backward(&m, &x, &c, &y, aux_coef);
+
+  int *ref = (int*)malloc((size_t)n * k * sizeof(int));
+  memcpy(ref, c.sel, (size_t)n * k * sizeof(int));
+  *margin = 1.0f;
+  if (k < E)
+    for (int t = 0; t < n; t++) {
+      const float *p = c.probs.data + (size_t)t * E;
+      float kth = p[ref[t * k + k - 1]], best_out = 0.0f;
+      for (int e = 0; e < E; e++) {
+        int in = 0;
+        for (int j = 0; j < k; j++) if (ref[t * k + j] == e) in = 1;
+        if (!in && p[e] > best_out) best_out = p[e];
+      }
+      if (kth - best_out < *margin) *margin = kth - best_out;
+    }
+
+  const float h = 1e-3f;
+  float max_rel = 0.0f;
+  *flips = 0; *checked = 0;
+  for (int pi = 0; pi <= np; pi++) {
+    Tensor *T = ps[pi];
+    for (size_t q = 0; q < T->size; q++) {
+      float s = T->data[q];
+      int fl = 0;
+      T->data[q] = s + h; float lp = moe_scalar_loss(&m, &x, &c, &y, w, aux_coef, ref, &fl);
+      T->data[q] = s - h; float lm = moe_scalar_loss(&m, &x, &c, &y, w, aux_coef, ref, &fl);
+      T->data[q] = s;
+      *flips += fl;
+      float num = (lp - lm) / (2.0f * h), g = T->grad[q];
+      float rel = fabsf(num - g) / (fabsf(g) + 1e-3f);
+      if (fabsf(g) > 1e-2f) { (*checked)++; if (rel > max_rel) max_rel = rel; }
+    }
+  }
+  free(ref); free(w); free(ps);
+  moe_cache_free(&c); tensor_free(&x); tensor_free(&y); moe_free(&m);
+  return max_rel;
 }
 
 int run_selftest(void) {
@@ -2284,6 +2375,165 @@ int run_selftest(void) {
       all_ok &= g_ok;
       gpu_set_enabled(1);
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 31: Mixture-of-Experts FFN (moe.h) -- the FFN of DeepSeek-V3, Qwen3-MoE,
+  // Kimi, GLM. A router picks top-k of E SwiGLU experts per token. Four gates:
+  //   (a) numerical gradient check of x and EVERY parameter (router, all
+  //       experts, shared expert) through the real softmax + top-k forward.
+  //       Routing is not frozen; instead each probe's selection is compared to
+  //       the base selection and the gate REQUIRES zero flips (a flip would make
+  //       the finite difference measure a jump). Three configs: k=2 renormalized
+  //       gates + shared expert; k=1 raw-probability gates (Switch); aux-only.
+  //   (b) the aux loss has its defining values: 1 for a uniform router, ~E for
+  //       a router collapsed onto one expert.
+  //   (c) compute scales with k, not E: measured expert FLOPs per token are
+  //       6*k*d*d_ff for every E, and unchosen experts are never run -- filled
+  //       with NaN, they leave the output bit-identical and the backward finite.
+  //   (d) the aux gradient does its job: Adam on the aux loss alone takes a
+  //       router that sends most tokens to one expert and balances it.
+  // --------------------------------------------------------------------------
+  {
+    printf("[31] Mixture-of-Experts FFN: router + top-k SwiGLU experts + aux loss\n");
+
+    // (a) gradient checks.
+    int moe_ok = 1;
+    {
+      struct { int E, k, renorm, shared, task; float aux; const char *name; } cf[3] = {
+        {4, 2, 1, 1, 1, 0.1f, "k=2 renorm + shared, task+aux"},
+        {4, 1, 0, 0, 1, 0.1f, "k=1 raw gate (Switch), task+aux"},
+        {4, 2, 1, 0, 0, 1.0f, "k=2, aux loss ONLY"},
+      };
+      for (int i = 0; i < 3; i++) {
+        int flips, checked; float margin;
+        float rel = moe_gradcheck(cf[i].E, cf[i].k, cf[i].renorm, cf[i].shared,
+                                  cf[i].task, cf[i].aux, &flips, &margin, &checked);
+        int ok = rel < 1e-2f && flips == 0 && checked > 0;
+        printf("    grad check %-31s: max rel %.2e over %3d entries | top-k margin %.3f,"
+               " routing flips %d -> %s\n", cf[i].name, rel, checked, margin, flips,
+               ok ? "OK" : "FAIL");
+        moe_ok &= ok;
+      }
+    }
+
+    // (b) aux-loss values at the two ends.
+    {
+      const int n = 16, dm = 4, E = 4;
+      int xs[2] = {n, dm};
+      Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+      moe_fill(&x, 31, 5, 1.0f);
+      MoeLayer m = moe_create(dm, 6, E, 1, 0, 0);
+      MoeCache c = moe_cache_create(&m, n);
+      memset(m.W_router.data, 0, m.W_router.size * sizeof(float));
+      float aux_uniform = moe_forward(&m, &x, &c, &y);
+      for (int t = 0; t < n; t++) x.data[t * dm] = 1.0f;          // a constant feature...
+      m.W_router.data[0 * E + 0] = 20.0f;                          // ...that says "expert 0"
+      float aux_collapsed = moe_forward(&m, &x, &c, &y);
+      int ok = fabsf(aux_uniform - 1.0f) < 1e-5f && aux_collapsed > 0.95f * E;
+      printf("    aux loss: uniform router %.4f (expect 1) | collapsed router %.3f"
+             " (expect ~E=%d) -> %s\n", aux_uniform, aux_collapsed, E, ok ? "OK" : "FAIL");
+      moe_ok &= ok;
+      moe_cache_free(&c); moe_free(&m); tensor_free(&x); tensor_free(&y);
+    }
+
+    // (c) compute scales with k, not E.
+    {
+      const int n = 16, dm = 8, df = 16;
+      int xs[2] = {n, dm};
+      Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+      moe_fill(&x, 37, 1, 1.0f);
+      int scale_ok = 1;
+      printf("    expert FLOPs/token, measured:  E=4    E=16   (expect 6*k*d*d_ff)\n");
+      for (int k = 1; k <= 4; k *= 2) {
+        double per_tok[2]; long long rows[2]; int Es[2] = {4, 16};
+        for (int ei = 0; ei < 2; ei++) {
+          MoeLayer m = moe_create(dm, df, Es[ei], k, 1, 0);
+          MoeCache c = moe_cache_create(&m, n);
+          moe_forward(&m, &x, &c, &y);
+          per_tok[ei] = c.flops_experts / n; rows[ei] = c.expert_rows;
+          moe_cache_free(&c); moe_free(&m);
+        }
+        double want = 6.0 * k * dm * df;
+        int ok = per_tok[0] == want && per_tok[1] == want &&
+                 rows[0] == (long long)n * k && rows[1] == (long long)n * k;
+        printf("      k=%d                          %-6.0f %-6.0f (%.0f) -> %s\n",
+               k, per_tok[0], per_tok[1], want, ok ? "OK" : "FAIL");
+        scale_ok &= ok;
+      }
+      moe_ok &= scale_ok;
+
+      // NaN poisoning: route 3 tokens through E=8, k=2 (at most 6 of 8 experts
+      // used), then fill every unused expert with NaN. If the implementation ran
+      // an unchosen expert at all -- even to multiply it by a zero gate -- NaN*0
+      // is NaN and the output would change.
+      const int n2 = 3, E2 = 8, k2 = 2;
+      int xs2[2] = {n2, dm};
+      Tensor x2 = tensor_create(xs2, 2), y2 = tensor_create(xs2, 2);
+      moe_fill(&x2, 41, 9, 1.0f);
+      MoeLayer m = moe_create(dm, df, E2, k2, 1, 1);
+      MoeCache c = moe_cache_create(&m, n2);
+      moe_forward(&m, &x2, &c, &y2);
+      float ref[3 * 8];
+      memcpy(ref, y2.data, sizeof ref);
+      int used[8] = {0}, n_unused = 0;
+      for (int a = 0; a < n2 * k2; a++) used[c.sel[a]] = 1;
+      for (int e = 0; e < E2; e++) if (!used[e]) {
+        n_unused++;
+        for (size_t i = 0; i < m.W_gate[e].size; i++) m.W_gate[e].data[i] = NAN;
+        for (size_t i = 0; i < m.W_up[e].size; i++)   m.W_up[e].data[i] = NAN;
+        for (size_t i = 0; i < m.W_down[e].size; i++) m.W_down[e].data[i] = NAN;
+      }
+      moe_forward(&m, &x2, &c, &y2);
+      int same = memcmp(ref, y2.data, sizeof ref) == 0;
+      tensor_zero_grad(&x2);
+      for (size_t i = 0; i < y2.size; i++) y2.grad[i] = 1.0f;
+      moe_backward(&m, &x2, &c, &y2, 0.01f);
+      int finite = 1;
+      for (size_t i = 0; i < x2.size; i++) if (!isfinite(x2.grad[i])) finite = 0;
+      int ok = same && finite && n_unused > 0;
+      printf("    %d of %d experts unchosen, filled with NaN: output bit-identical %s,"
+             " backward finite %s -> %s\n", n_unused, E2, same ? "yes" : "NO",
+             finite ? "yes" : "NO", ok ? "OK" : "FAIL");
+      moe_ok &= ok;
+      moe_cache_free(&c); moe_free(&m);
+      tensor_free(&x); tensor_free(&y); tensor_free(&x2); tensor_free(&y2);
+    }
+
+    // (d) the aux gradient balances a lopsided router (router trained alone).
+    {
+      const int n = 32, dm = 8, E = 4;
+      int xs[2] = {n, dm};
+      Tensor x = tensor_create(xs, 2), y = tensor_create(xs, 2);
+      moe_fill(&x, 43, 2, 1.0f);
+      for (int t = 0; t < n; t++) x.data[t * dm] = 1.0f;   // shared feature = bias
+      MoeLayer m = moe_create(dm, 8, E, 1, 0, 0);
+      moe_fill(&m.W_router, 47, 4, 0.5f);
+      m.W_router.data[0 * E + 0] = 3.0f;                    // most tokens -> expert 0
+      MoeCache c = moe_cache_create(&m, n);
+      Tensor *rp[1] = {&m.W_router};
+      Adam opt = adam_create(rp, 1, 0.05f);
+      memset(y.grad, 0, y.size * sizeof(float));            // no task loss
+      float aux0 = moe_forward(&m, &x, &c, &y);
+      int max0 = 0;
+      for (int e = 0; e < E; e++) if (c.count[e] > max0) max0 = c.count[e];
+      for (int step = 0; step < 150; step++) {
+        moe_forward(&m, &x, &c, &y);
+        tensor_zero_grad(&m.W_router); tensor_zero_grad(&x);
+        moe_backward(&m, &x, &c, &y, 1.0f);
+        adam_step(&opt, rp, 1);
+      }
+      float auxN = moe_forward(&m, &x, &c, &y);
+      int maxN = 0;
+      for (int e = 0; e < E; e++) if (c.count[e] > maxN) maxN = c.count[e];
+      int ok = auxN < aux0 && maxN < max0 && maxN <= n / 2;
+      printf("    Adam on aux only (150 steps): aux %.3f -> %.3f, busiest expert %d/%d"
+             " -> %d/%d tokens -> %s\n\n", aux0, auxN, max0, n, maxN, n, ok ? "OK" : "FAIL");
+      moe_ok &= ok;
+      adam_free(&opt); moe_cache_free(&c); moe_free(&m);
+      tensor_free(&x); tensor_free(&y);
+    }
+    all_ok &= moe_ok;
   }
 
   // --------------------------------------------------------------------------

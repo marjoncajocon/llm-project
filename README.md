@@ -61,6 +61,7 @@ defined in the matching `.c`.
 | `rmsnorm.h` / `rmsnorm.c`         | `rmsnorm` (LLaMA-family; RMS-only norm, no mean/bias) + backward |
 | `rope.h` / `rope.c`               | `rope` (LLaMA-family rotary position embeddings) + backward     |
 | `swiglu.h` / `swiglu.c`           | `swiglu` (LLaMA-family gated FFN: SiLU gate) + backward         |
+| `moe.h` / `moe.c`                 | Mixture-of-Experts FFN: top-k router over SwiGLU experts (+ optional shared expert), load-balancing aux loss, full backward; unchosen experts are never run |
 | `gqa.h` / `gqa.c`                 | `gqa` (LLaMA-family grouped-query causal attention) + backward |
 | `quant.h` / `quant.c`             | int8 per-channel weight quantize/dequantize (for the LLMQ checkpoint) |
 | `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode |
