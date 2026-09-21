@@ -467,6 +467,28 @@ download, 3.0 s once cached). `model/qwen/*.bin` git-ignored.
 Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
 Block/model forward-only (add backward to fine-tune).
 
+## Modern architecture — step 15: QK-norm (Qwen3 support) — DONE (2026-09-21, branch `qknorm`)
+
+Qwen3 applies an RMSNorm per head to q and k (learned `q_norm`/`k_norm`, head_dim each, shared
+across heads) after the projection and BEFORE RoPE. Unlike the step-14 biases this is an
+**optional per-model feature** (`LlamaModel.qk_norm`, mirrored in every block; set with
+`llama_model_set_qk_norm` — BEFORE collecting params / building acts, since it changes the
+parameter set to 3 + 14/layer). `rmsnorm_heads[_backward]` (rmsnorm.c) = plain rmsnorm over the
+(rows·heads, head_dim) view. Applied in `llama_block_forward`, `llama_decode_step_lora` (after the
+adapters, before RoPE), `q_llama_decode_step`, and `llamatrain.c` (raw q/k cached in new `qp`/`kp`
+acts, NULL without QK-norm; backward = `rmsnorm_heads_backward` between RoPE and bias/matmul).
+`grpo.c`/`train.c` carry the flag over when rebuilding a trainable model from a checkpoint.
+**Checkpoint:** v3 = v2 + a u32 flags word after the config (bit 0 = QK-norm; gains stored per
+layer right after `b_v`). A model without features is still written as **v2, byte-identical**;
+v2 files load unchanged; unknown versions / flag bits are rejected. `convert_llama.py` detects
+`self_attn.q_norm.weight`, writes v3, and gained `--max-seq` (Qwen3's 40960 ctx would make the
+up-front KV cache ~9 GB for Qwen3-0.6B) and `--tiny --qk-norm`.
+Verified: selftest `[31]` (live, train==inference 0.00, grad check incl. every gain entry and
+LoRA-through-norm, KV decode 0.00 plain + LoRA, v3 round-trip 0.00, int8 path) and `[1]`-`[30]`
+byte-identical to before. A `--tiny --qk-norm` file matches an independent float64 numpy
+reference (written from HF's Qwen3Attention) to 1.7e-07. **Not yet run:** real Qwen3-0.6B vs HF
+(no torch on this box and ~0.8 GB free RAM during the overnight job).
+
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
 `imggen`/`audgen` now have a **dataset mode** in addition to the original single-example

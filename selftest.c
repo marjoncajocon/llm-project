@@ -63,6 +63,44 @@ static float llama_ce_loss(LlamaModel *m, LlamaActs *a, const int *ids, int seq_
   return cross_entropy_forward(logits, targets, probs);
 }
 
+// Central-difference gradient check of params[0..n) against their .grad, for the
+// LLaMA-family CE loss with optional adapters (lo == NULL: the plain model) —
+// used by [31]. Tensors of at most `full` entries are checked at EVERY entry,
+// larger ones at two. Writes the max rel error over all entries and over the
+// entries clearing the float32 noise floor (|grad| > 1e-2, the rule of [2] and
+// [22]); returns how many entries cleared it (0 = a vacuous check).
+static int llama_grad_check(LlamaModel *m, LlamaActs *a, const LlamaLora *lo,
+                            LlamaLoraActs *la, const int *ids, int seq, const int *targets,
+                            Tensor *logits, Tensor *probs, Tensor **params, int n,
+                            size_t full, float *max_all, float *max_cond) {
+  const float eps = 1e-2f;
+  int judged = 0;
+  *max_all = 0.0f; *max_cond = 0.0f;
+  for (int p = 0; p < n; p++) {
+    Tensor *param = params[p];
+    size_t step = (param->size <= full) ? 1 : (param->size > 2 ? param->size / 2 : 1);
+    for (size_t k = 0; k < param->size; k += step) {
+      float base = param->data[k];
+      param->data[k] = base + eps;
+      llama_forward_train_lora(m, ids, seq, a, logits, lo, la);
+      float lp = cross_entropy_forward(logits, targets, probs);
+      param->data[k] = base - eps;
+      llama_forward_train_lora(m, ids, seq, a, logits, lo, la);
+      float lmn = cross_entropy_forward(logits, targets, probs);
+      param->data[k] = base;
+      float numeric = (lp - lmn) / (2.0f * eps);
+      float analytic = param->grad[k];
+      float rel = fabsf(analytic - numeric) / (fabsf(analytic) + fabsf(numeric) + 1e-8f);
+      if (rel > *max_all) *max_all = rel;
+      if (fabsf(analytic) > 1e-2f) {
+        judged++;
+        if (rel > *max_cond) *max_cond = rel;
+      }
+    }
+  }
+  return judged;
+}
+
 // Portable "make directory if absent" (ignores already-exists).
 #if defined(_WIN32)
 #include <direct.h>
@@ -2230,6 +2268,214 @@ int run_selftest(void) {
       all_ok &= g_ok;
       gpu_set_enabled(1);
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 31: QK-norm (Qwen3) — a per-head RMSNorm on q and k, with one learned
+  // head_dim gain each shared across heads, applied after the projection (+bias,
+  // +LoRA) and BEFORE RoPE. It is an optional per-model feature, so this part
+  // turns it on and re-runs every gate the plain path has, on the new path:
+  //   (a) it is live: the same weights without it give different logits,
+  //   (b) training forward == inference forward, bit for bit,
+  //   (c) end-to-end gradient check over every parameter (q_norm/k_norm at
+  //       every entry), and over LoRA adapters that now feed through the norm,
+  //   (d) KV-cache decode == full forward, bit for bit (plain and with LoRA),
+  //   (e) LLMA v3 checkpoint round-trip (flag + gains survive; a model without
+  //       the feature is still written as v2), and the int8 decode path.
+  // --------------------------------------------------------------------------
+  {
+    const int vocab = 24, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 4, dff = 16, seq = 5;
+    printf("[31] QK-norm (Qwen3): per-head q/k RMSNorm before RoPE\n");
+    srand(41);
+    LlamaModel qm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64,
+                                             10000.0f, 1e-5f);
+    llama_model_set_qk_norm(&qm, 1);          // BEFORE randomize: gains get drawn too
+    llama_model_randomize(&qm);
+    // The gains only steer the attention PATTERN; at randomize's small scale the
+    // attended values barely differ and the head is tiny, so the gains' gradients
+    // sit below the 1e-2 judging floor and (c) would be vacuous. Amplify the
+    // value path (Wv, Wo) and the output head.
+    for (int l = 0; l < nl; l++) {
+      for (size_t i = 0; i < qm.blocks[l].Wv.size; i++) qm.blocks[l].Wv.data[i] *= 4.0f;
+      for (size_t i = 0; i < qm.blocks[l].Wo.size; i++) qm.blocks[l].Wo.data[i] *= 4.0f;
+    }
+    for (size_t i = 0; i < qm.lm_head.size; i++) qm.lm_head.data[i] *= 8.0f;
+    LlamaActs qa = llama_acts_create(&qm, seq);
+    int ids[5]     = {2, 9, 4, 1, 7};
+    int targets[5] = {9, 4, 1, 7, 3};
+    int ls[2] = {seq, vocab};
+    Tensor logits = tensor_create(ls, 2), probs = tensor_create(ls, 2);
+    Tensor ref = tensor_create(ls, 2), off = tensor_create(ls, 2);
+
+    // (a) Flip only the per-block switch (gains untouched) to get the same
+    //     weights WITHOUT QK-norm; the logits must move.
+    llama_model_forward(&qm, ids, seq, &ref);
+    for (int l = 0; l < nl; l++) qm.blocks[l].qk_norm = 0;
+    llama_model_forward(&qm, ids, seq, &off);
+    for (int l = 0; l < nl; l++) qm.blocks[l].qk_norm = 1;
+    float live = 0.0f;
+    for (int i = 0; i < seq * vocab; i++) {
+      float d = fabsf(ref.data[i] - off.data[i]);
+      if (d > live) live = d;
+    }
+    int live_ok = (live > 1e-3f);
+    printf("    QK-norm is live: max |logit diff| vs same weights without it = %.2e -> %s\n",
+           live, live_ok ? "OK" : "FAIL");
+    all_ok &= live_ok;
+
+    // (b) training forward == inference forward.
+    llama_forward_train(&qm, ids, seq, &qa, &logits);
+    float fwd_diff = 0.0f;
+    for (int i = 0; i < seq * vocab; i++) {
+      float d = fabsf(logits.data[i] - ref.data[i]);
+      if (d > fwd_diff) fwd_diff = d;
+    }
+    int fwd_ok = (fwd_diff == 0.0f);
+    printf("    train forward == inference forward: max |diff| = %.2e -> %s\n",
+           fwd_diff, fwd_ok ? "OK" : "FAIL");
+    all_ok &= fwd_ok;
+
+    // (c) gradient check: every parameter tensor, then the gains at every entry.
+    const int n_qp = llama_param_count(&qm);
+    Tensor **qp = (Tensor**)malloc((size_t)n_qp * sizeof(Tensor*));
+    llama_collect_params(&qm, qp);
+    Tensor **gains = (Tensor**)malloc((size_t)(2 * nl) * sizeof(Tensor*));
+    for (int l = 0; l < nl; l++) {
+      gains[2 * l] = &qm.blocks[l].q_norm;
+      gains[2 * l + 1] = &qm.blocks[l].k_norm;
+    }
+    llama_ce_loss(&qm, &qa, ids, seq, targets, &logits, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward(&qm, ids, seq, &qa, &logits);
+    float g_all, g_cond, n_all, n_cond;
+    llama_grad_check(&qm, &qa, NULL, NULL, ids, seq, targets, &logits, &probs,
+                     qp, n_qp, 0, &g_all, &g_cond);
+    int n_judged = llama_grad_check(&qm, &qa, NULL, NULL, ids, seq, targets, &logits, &probs,
+                                    gains, 2 * nl, (size_t)hd, &n_all, &n_cond);
+    int qgrad_ok = (g_cond < 1e-2f) && (n_cond < 1e-2f) && (n_judged > 0);
+    printf("    gradient check (%d param tensors = 3 + 14/layer): max rel error %.2e (all) | %.2e (|grad|>1e-2)\n",
+           n_qp, g_all, g_cond);
+    printf("    q_norm/k_norm gains, all %d entries: max rel error %.2e (all) | %.2e (%d with |grad|>1e-2) -> %s\n",
+           2 * nl * hd, n_all, n_cond, n_judged, qgrad_ok ? "OK" : "FAIL");
+    all_ok &= qgrad_ok;
+
+    // LoRA through QK-norm: adapters land BEFORE the norm, so their gradient
+    // must pass back through it. Nonzero B first (at B == 0 dA is identically 0).
+    LlamaLora lo = llama_lora_create(&qm, 4, 8.0f);
+    llama_lora_init(&lo);
+    LlamaLoraActs la = llama_lora_acts_create(&qm, &lo, seq);
+    const int n_lp = llama_lora_param_count(&lo);
+    Tensor **lp = (Tensor**)malloc((size_t)n_lp * sizeof(Tensor*));
+    llama_lora_collect_params(&lo, lp);
+    for (int p = 0; p < n_lp; p++)
+      for (size_t k = 0; k < lp[p]->size; k++)
+        lp[p]->data[k] += 0.05f * (float)((int)((k * 29 + (size_t)p * 7) % 11) - 5);
+    llama_forward_train_lora(&qm, ids, seq, &qa, &logits, &lo, &la);
+    cross_entropy_forward(&logits, targets, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, targets, &logits);
+    llama_backward_lora(&qm, ids, seq, &qa, &logits, &lo, &la);
+    float l_all, l_cond;
+    llama_grad_check(&qm, &qa, &lo, &la, ids, seq, targets, &logits, &probs,
+                     lp, n_lp, 0, &l_all, &l_cond);
+    int lgrad_ok = (l_cond < 1e-2f);
+    printf("    LoRA gradient check through QK-norm (%d adapter tensors): %.2e (all) | %.2e (|grad|>1e-2) -> %s\n",
+           n_lp, l_all, l_cond, lgrad_ok ? "OK" : "FAIL");
+    all_ok &= lgrad_ok;
+
+    // (d) KV-cache decode vs full forward, plain and with the adapters above.
+    int ds[2] = {1, vocab};
+    Tensor Ld = tensor_create(ds, 2);
+    LlamaKV kv = llama_kv_create(&qm);
+    float kv_diff = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step(&qm, &kv, ids[i], &Ld);
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(Ld.data[j] - ref.data[i * vocab + j]);
+        if (d > kv_diff) kv_diff = d;
+      }
+    }
+    llama_forward_train_lora(&qm, ids, seq, &qa, &logits, &lo, &la);
+    LlamaDecodeLora dv = llama_lora_decode_view(&lo);
+    LlamaKV kv2 = llama_kv_create(&qm);
+    float lkv_diff = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step_lora(&qm, &kv2, ids[i], &Ld, &dv);
+      for (int j = 0; j < vocab; j++) {
+        float d = fabsf(Ld.data[j] - logits.data[i * vocab + j]);
+        if (d > lkv_diff) lkv_diff = d;
+      }
+    }
+    int kv_ok = (kv_diff == 0.0f), lkv_ok = (lkv_diff < 1e-3f);
+    printf("    KV-cache decode == full forward: max |logit diff| = %.2e -> %s\n",
+           kv_diff, kv_ok ? "OK" : "FAIL");
+    printf("    LoRA KV-cache decode == LoRA training forward: max |logit diff| = %.2e -> %s\n",
+           lkv_diff, lkv_ok ? "OK" : "FAIL");
+    all_ok &= kv_ok & lkv_ok;
+
+    // (e) checkpoint: QK-norm model -> v3 with flag bit 0; reload must keep the
+    //     flag and give bit-identical logits. A plain model must still be v2.
+    int rt_ok = 0;
+    uint32_t hq[3] = {0, 0, 0}, hp[2] = {0, 0};
+    if (llama_model_save("qknorm_ckpt.tmp", &qm) == 0) {
+      FILE *hf = fopen("qknorm_ckpt.tmp", "rb");
+      if (hf) {
+        if (fread(hq, sizeof(uint32_t), 2, hf) == 2 && fseek(hf, 8 + 32 + 8, SEEK_SET) == 0 &&
+            fread(&hq[2], sizeof(uint32_t), 1, hf) == 1) { /* header read */ }
+        fclose(hf);
+      }
+      LlamaModel qm2;
+      if (llama_model_load("qknorm_ckpt.tmp", &qm2) == 0) {
+        Tensor L2 = tensor_create(ls, 2);
+        llama_model_forward(&qm2, ids, seq, &L2);
+        float md = 0.0f;
+        for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L2.data[i] - ref.data[i]); if (d > md) md = d; }
+        rt_ok = (md == 0.0f) && qm2.qk_norm && qm2.blocks[nl - 1].qk_norm &&
+                hq[1] == 3u && hq[2] == 1u;
+        printf("    LLMA v%u (flags 0x%x) round-trip: qk_norm=%d, max |logit diff| = %.2e",
+               hq[1], hq[2], qm2.qk_norm, md);
+        tensor_free(&L2);
+
+        // int8: quantize the QK-norm model; its decode must track the f32 forward.
+        QLlamaModel q8 = q_llama_quantize_from(&qm2);
+        LlamaKV kv8 = q_llama_kv_create(&q8);
+        float num = 0.0f, den = 0.0f;
+        for (int i = 0; i < seq; i++) {
+          q_llama_decode_step(&q8, &kv8, ids[i], &Ld);
+          for (int j = 0; j < vocab; j++) {
+            float d = Ld.data[j] - ref.data[i * vocab + j];
+            num += d * d;
+            den += ref.data[i * vocab + j] * ref.data[i * vocab + j];
+          }
+        }
+        float rel8 = sqrtf(num / den);
+        int q8_ok = (rel8 < 0.15f);          // same tiny-dims tolerance as [21]
+        rt_ok &= q8_ok;
+        printf(" | int8 decode L2 rel %.2e", rel8);
+        llama_kv_free(&kv8); q_llama_model_free(&q8);
+        llama_model_free(&qm2);
+      }
+    }
+    remove("qknorm_ckpt.tmp");
+    LlamaModel pm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    if (llama_model_save("plain_ckpt.tmp", &pm) == 0) {
+      FILE *hf = fopen("plain_ckpt.tmp", "rb");
+      if (hf) { if (fread(hp, sizeof(uint32_t), 2, hf) != 2) hp[1] = 0; fclose(hf); }
+    }
+    remove("plain_ckpt.tmp");
+    llama_model_free(&pm);
+    rt_ok &= (hp[1] == 2u);
+    printf(" | plain model still v%u -> %s\n\n", hp[1], rt_ok ? "OK" : "FAIL");
+    all_ok &= rt_ok;
+
+    free(qp); free(gains); free(lp);
+    llama_kv_free(&kv); llama_kv_free(&kv2);
+    llama_lora_acts_free(&la); llama_lora_free(&lo);
+    tensor_free(&logits); tensor_free(&probs); tensor_free(&ref); tensor_free(&off);
+    tensor_free(&Ld);
+    llama_acts_free(&qa);
+    llama_model_free(&qm);
   }
 
   // --------------------------------------------------------------------------

@@ -13,11 +13,16 @@ Notes:
     x @ W with W (in, out). So every linear weight is TRANSPOSED here. Norm gains
     and the token embedding are copied as-is. Tied models (no lm_head.weight) use
     lm_head = embed_tokens.weight^T.
-  * No attention biases: LlamaBlock has none (fine for LLaMA/SmolLM). Models with
-    q/k/v biases (e.g. Qwen2) would need bias support first — the converter warns.
+  * q/k/v biases (Qwen2) are read when present, else written as zeros.
+  * QK-norm (Qwen3): a per-head RMSNorm on q and k before RoPE, with learned
+    gains self_attn.q_norm / k_norm (head_dim each). Detected from the weights;
+    when present the file is written as v3 with feature flag bit 0 set and the
+    two gains stored per layer right after b_v. Models without it stay v2.
+  * --max-seq caps the context length. The C KV cache is allocated for the full
+    max_seq up front, and Qwen3's 40960 would need ~9 GB for Qwen3-0.6B.
 
 `--tiny PATH` writes a small deterministic checkpoint (no download) to test the
-LLMA byte format against the C loader.
+LLMA byte format against the C loader (`--tiny PATH --qk-norm` for a v3 one).
 """
 import argparse
 import json
@@ -29,6 +34,8 @@ import numpy as np
 MAGIC = 0x414D4C4C    # 'LLMA' little-endian bytes L,L,M,A (f32 weights)
 MAGIC_Q = 0x514D4C4C  # 'LLMQ' little-endian bytes L,L,M,Q (int8 weights)
 VERSION = 2           # v2 adds q/k/v attention biases (zero for LLaMA/SmolLM, real for Qwen2)
+VERSION_FLAGS = 3     # v3 = v2 + a u32 feature-flags word after the config
+FLAG_QK_NORM = 1      # bit 0: per-head q/k RMSNorm (Qwen3), gains stored after b_v
 
 
 def f32(a):
@@ -69,12 +76,15 @@ def load_safetensors_f32(path):
 # n_layers, n_heads, n_kv, head_dim, d_ff, max_seq); `floats` = (rope_base, eps);
 # `tensors` = arrays in the canonical order llama_collect() expects. With
 # int8=True, 2D weights are stored per-column int8 (scales f32 then int8 bytes)
-# -> the 'LLMQ' format, ~4x smaller; 1D norms stay f32.
-def write_llma(path, ints, floats, tensors, int8=False):
+# -> the 'LLMQ' format, ~4x smaller; 1D norms stay f32. `flags` != 0 writes v3
+# (with the flags word); a model with no optional feature stays v2.
+def write_llma(path, ints, floats, tensors, int8=False, flags=0):
     with open(path, "wb") as f:
-        f.write(struct.pack("<II", MAGIC_Q if int8 else MAGIC, VERSION))
+        f.write(struct.pack("<II", MAGIC_Q if int8 else MAGIC, VERSION_FLAGS if flags else VERSION))
         f.write(struct.pack("<8i", *ints))
         f.write(struct.pack("<2f", *floats))
+        if flags:
+            f.write(struct.pack("<I", flags))
         for a in tensors:
             a = np.asarray(a)
             if int8 and a.ndim == 2:
@@ -87,17 +97,21 @@ def write_llma(path, ints, floats, tensors, int8=False):
                 f.write(f32(a).tobytes())
 
 
+# Canonical order (must match llama_collect in llama.c). q_norm/k_norm are only
+# present — and only written — for QK-norm (Qwen3) models.
 def build_order(wte, layers, final_norm, lm_head):
     order = [wte]
     for L in layers:
         order += [L["attn_norm"], L["Wq"], L["Wk"], L["Wv"],
-                  L["b_q"], L["b_k"], L["b_v"], L["Wo"],
-                  L["ffn_norm"], L["Wgate"], L["Wup"], L["Wdown"]]
+                  L["b_q"], L["b_k"], L["b_v"]]
+        if "q_norm" in L:
+            order += [L["q_norm"], L["k_norm"]]
+        order += [L["Wo"], L["ffn_norm"], L["Wgate"], L["Wup"], L["Wdown"]]
     order += [final_norm, lm_head]
     return order
 
 
-def convert_hf(model, out, int8=False):
+def convert_hf(model, out, int8=False, max_seq_cap=None):
     from huggingface_hub import hf_hub_download
 
     cfg = json.load(open(hf_hub_download(model, "config.json")))
@@ -109,6 +123,8 @@ def convert_hf(model, out, int8=False):
     head_dim = cfg.get("head_dim", d_model // n_heads)
     d_ff = cfg["intermediate_size"]
     max_seq = cfg.get("max_position_embeddings", 2048)
+    if max_seq_cap:
+        max_seq = min(max_seq, max_seq_cap)
     rope_base = float(cfg.get("rope_theta", 10000.0))
     eps = float(cfg.get("rms_norm_eps", 1e-5))
     tied = cfg.get("tie_word_embeddings", True)
@@ -124,6 +140,11 @@ def convert_hf(model, out, int8=False):
     # q/k/v biases: present in Qwen2, absent (-> zero) in LLaMA/SmolLM. o_proj has none.
     def bias(name, dim):
         return f32(st[name]) if name in st else np.zeros(dim, "<f4")
+
+    # QK-norm (Qwen3): per-head q/k RMSNorm gains. All-or-nothing across layers.
+    qk_norm = "model.layers.0.self_attn.q_norm.weight" in st
+    if qk_norm and st["model.layers.0.self_attn.q_norm.weight"].shape != (head_dim,):
+        sys.exit(f"q_norm shape {st['model.layers.0.self_attn.q_norm.weight'].shape} != ({head_dim},)")
 
     qd, kvd = n_heads * head_dim, n_kv * head_dim
     layers = []
@@ -143,18 +164,26 @@ def convert_hf(model, out, int8=False):
             "Wup": g(p + "mlp.up_proj.weight").T,
             "Wdown": g(p + "mlp.down_proj.weight").T,
         })
+        if qk_norm:
+            layers[-1]["q_norm"] = g(p + "self_attn.q_norm.weight")
+            layers[-1]["k_norm"] = g(p + "self_attn.k_norm.weight")
     wte = g("model.embed_tokens.weight")
     final_norm = g("model.norm.weight")
     lm_head = f32(wte.T) if (tied or "lm_head.weight" not in st) else g("lm_head.weight").T
 
     ints = (vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq)
-    write_llma(out, ints, (rope_base, eps), build_order(wte, layers, final_norm, lm_head), int8=int8)
+    write_llma(out, ints, (rope_base, eps), build_order(wte, layers, final_norm, lm_head), int8=int8,
+               flags=FLAG_QK_NORM if qk_norm else 0)
     print(f"wrote {out} ({'int8/LLMQ' if int8 else 'f32/LLMA'}): vocab={vocab} d_model={d_model} "
           f"layers={n_layers} heads={n_heads} kv={n_kv} head_dim={head_dim} d_ff={d_ff} ctx={max_seq} "
-          f"rope_base={rope_base} eps={eps} tied={tied}")
+          f"rope_base={rope_base} eps={eps} tied={tied} qk_norm={qk_norm}")
+    kv_gb = 2 * n_layers * max_seq * kvd * 4 / 1e9
+    if kv_gb > 2:
+        print(f"warning: the C KV cache for ctx={max_seq} is ~{kv_gb:.1f} GB; "
+              f"consider re-running with --max-seq 4096")
 
 
-def write_tiny(out):
+def write_tiny(out, qk_norm=False):
     rng = np.random.default_rng(0)
     vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq = 32, 8, 2, 4, 2, 2, 16, 64
     qd, kvd = n_heads * head_dim, n_kv * head_dim
@@ -172,11 +201,15 @@ def write_tiny(out):
             "ffn_norm": np.ones(d_model, "<f4"),
             "Wgate": r(d_model, d_ff), "Wup": r(d_model, d_ff), "Wdown": r(d_ff, d_model),
         })
+        if qk_norm:   # gains ~1 but not exactly, so a wrong slot/order shows up
+            layers[-1]["q_norm"] = (1.0 + r(head_dim) * 3).astype("<f4")
+            layers[-1]["k_norm"] = (1.0 + r(head_dim) * 3).astype("<f4")
     wte = r(vocab, d_model)
     ints = (vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq)
-    write_llma(out, ints, (10000.0, 1e-5), build_order(wte, layers, np.ones(d_model, "<f4"), r(d_model, vocab)))
+    write_llma(out, ints, (10000.0, 1e-5), build_order(wte, layers, np.ones(d_model, "<f4"), r(d_model, vocab)),
+               flags=FLAG_QK_NORM if qk_norm else 0)
     print(f"wrote tiny {out}: vocab={vocab} d_model={d_model} layers={n_layers} "
-          f"heads={n_heads} kv={n_kv} head_dim={head_dim}")
+          f"heads={n_heads} kv={n_kv} head_dim={head_dim} qk_norm={qk_norm}")
 
 
 def main():
@@ -184,12 +217,15 @@ def main():
     ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M", help="HF repo id")
     ap.add_argument("--out", default="model.bin", help="output LLMA checkpoint")
     ap.add_argument("--int8", action="store_true", help="int8-quantize 2D weights (LLMQ, ~4x smaller)")
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="cap the context length (the C KV cache is sized for all of it)")
     ap.add_argument("--tiny", metavar="PATH", help="write a small deterministic checkpoint (no download) and exit")
+    ap.add_argument("--qk-norm", action="store_true", help="with --tiny: include Qwen3 QK-norm gains (v3 file)")
     args = ap.parse_args()
     if args.tiny:
-        write_tiny(args.tiny)
+        write_tiny(args.tiny, qk_norm=args.qk_norm)
     else:
-        convert_hf(args.model, args.out, int8=args.int8)
+        convert_hf(args.model, args.out, int8=args.int8, max_seq_cap=args.max_seq)
 
 
 if __name__ == "__main__":

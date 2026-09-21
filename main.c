@@ -754,8 +754,8 @@ static int run_llama(int argc, char **argv) {
   if (is_q) {
     QLlamaModel m;
     if (q_llama_model_load(argv[2], &m) != 0) return 1;
-    fprintf(stderr, "loaded LLMQ (int8, in-memory): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
-            m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+    fprintf(stderr, "loaded LLMQ (int8, in-memory): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d qk_norm %d\n",
+            m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff, m.qk_norm);
     LlamaKV kv = q_llama_kv_create(&m);
     int lv[2] = {1, m.vocab};
     Tensor logits = tensor_create(lv, 2);
@@ -777,8 +777,8 @@ static int run_llama(int argc, char **argv) {
   } else {
     LlamaModel m;
     if (llama_model_load(argv[2], &m) != 0) return 1;
-    fprintf(stderr, "loaded LLMA (f32): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d\n",
-            m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff);
+    fprintf(stderr, "loaded LLMA (f32): vocab %d d_model %d layers %d heads %d kv %d head_dim %d d_ff %d qk_norm %d\n",
+            m.vocab, m.d_model, m.n_layers, m.n_heads, m.n_kv, m.head_dim, m.d_ff, m.qk_norm);
     if (tok_path) {
       int rc = llama_text_chat(&m, tok_path, n_new, temperature, top_k, top_p, &rng);
       llama_model_free(&m);

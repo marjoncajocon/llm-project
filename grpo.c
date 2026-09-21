@@ -339,6 +339,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
                                               loaded.n_heads, loaded.n_kv, loaded.head_dim,
                                               loaded.d_ff, loaded.max_seq, loaded.rope_base,
                                               loaded.eps);
+  llama_model_set_qk_norm(&model, loaded.qk_norm);   // same parameter set as the file
   if (!copy_weights(&model, &loaded)) {
     fprintf(stderr, "error: checkpoint geometry did not survive the trainable rebuild\n");
     llama_model_free(&loaded); llama_model_free(&model);

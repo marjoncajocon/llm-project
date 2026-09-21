@@ -58,13 +58,13 @@ defined in the matching `.c`.
 | `matrix.h` / `matrix.c`           | `matmul`, `matadd`, `matscale`                                |
 | `activation.h` / `activation.c`   | `softmax_rowwise`, `gelu`                                      |
 | `layernorm.h` / `layernorm.c`     | `layernorm`                                                    |
-| `rmsnorm.h` / `rmsnorm.c`         | `rmsnorm` (LLaMA-family; RMS-only norm, no mean/bias) + backward |
+| `rmsnorm.h` / `rmsnorm.c`         | `rmsnorm` (LLaMA-family; RMS-only norm, no mean/bias) + backward; `rmsnorm_heads` per-head variant (Qwen3 QK-norm) |
 | `rope.h` / `rope.c`               | `rope` (LLaMA-family rotary position embeddings) + backward     |
 | `swiglu.h` / `swiglu.c`           | `swiglu` (LLaMA-family gated FFN: SiLU gate) + backward         |
 | `gqa.h` / `gqa.c`                 | `gqa` (LLaMA-family grouped-query causal attention) + backward |
 | `quant.h` / `quant.c`             | int8 per-channel weight quantize/dequantize (for the LLMQ checkpoint) |
-| `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode |
-| `llamatrain.h` / `llamatrain.c`   | **Training** the LLaMA-family model: cached-activation forward + full backward |
+| `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode. Optional per-model features: q/k/v biases (Qwen2), QK-norm (Qwen3: per-head q/k RMSNorm before RoPE, `llama_model_set_qk_norm`; LLMA v3 flag bit 0 — v2 files still load) |
+| `llamatrain.h` / `llamatrain.c`   | **Training** the LLaMA-family model: cached-activation forward + full backward (incl. QK-norm gains) |
 | `lora.h` / `lora.c`               | LoRA low-rank adapters (`y += scale·(x·A)·B`) for fine-tuning a frozen base |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |

@@ -18,4 +18,13 @@ void rmsnorm(const Tensor *input, const Tensor *gamma, Tensor *output, float eps
 void rmsnorm_backward(const Tensor *input, const Tensor *gamma, const Tensor *output,
                       Tensor *gamma_grad, float epsilon);
 
+// Per-head RMSNorm (Qwen3 "QK-norm"): x is (rows, n_heads * head_dim) and every
+// head_dim-wide slice of every row is normalized on its own, all heads sharing
+// one gamma of length head_dim (head_dim = gamma->shape[0]). This is exactly
+// rmsnorm over x viewed as (rows * n_heads, head_dim), so it reuses the two
+// functions above. output may alias input (safe in place, like rmsnorm).
+void rmsnorm_heads(const Tensor *input, const Tensor *gamma, Tensor *output, float epsilon);
+void rmsnorm_heads_backward(const Tensor *input, const Tensor *gamma, const Tensor *output,
+                            Tensor *gamma_grad, float epsilon);
+
 #endif // RMSNORM_H

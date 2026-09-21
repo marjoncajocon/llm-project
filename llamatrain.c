@@ -35,6 +35,8 @@ LlamaActs llama_acts_create(const LlamaModel *m, int seq_len) {
   a.xn = layer_acts(L, seq_len, dm);
   a.q = layer_acts(L, seq_len, qd);
   a.k = layer_acts(L, seq_len, kvd);
+  a.qp = m->qk_norm ? layer_acts(L, seq_len, qd) : NULL;
+  a.kp = m->qk_norm ? layer_acts(L, seq_len, kvd) : NULL;
   a.v = layer_acts(L, seq_len, kvd);
   a.o = layer_acts(L, seq_len, qd);
   a.ao = layer_acts(L, seq_len, dm);
@@ -68,6 +70,7 @@ void llama_acts_set_len(LlamaActs *a, int seq_len) {
     set_rows(&a->xn[l], seq_len);
     set_rows(&a->q[l], seq_len);
     set_rows(&a->k[l], seq_len);
+    if (a->qp) { set_rows(&a->qp[l], seq_len); set_rows(&a->kp[l], seq_len); }
     set_rows(&a->v[l], seq_len);
     set_rows(&a->o[l], seq_len);
     set_rows(&a->ao[l], seq_len);
@@ -98,6 +101,8 @@ void llama_acts_free(LlamaActs *a) {
   free_layer_acts(a->xn, a->n_layers);
   free_layer_acts(a->q, a->n_layers);
   free_layer_acts(a->k, a->n_layers);
+  if (a->qp) { free_layer_acts(a->qp, a->n_layers); free_layer_acts(a->kp, a->n_layers); }
+  a->qp = a->kp = NULL;
   free_layer_acts(a->v, a->n_layers);
   free_layer_acts(a->o, a->n_layers);
   free_layer_acts(a->ao, a->n_layers);
@@ -120,6 +125,7 @@ static void llama_acts_zero_grad(LlamaActs *a) {
     tensor_zero_grad(&a->xn[l]);
     tensor_zero_grad(&a->q[l]);
     tensor_zero_grad(&a->k[l]);
+    if (a->qp) { tensor_zero_grad(&a->qp[l]); tensor_zero_grad(&a->kp[l]); }
     tensor_zero_grad(&a->v[l]);
     tensor_zero_grad(&a->o[l]);
     tensor_zero_grad(&a->ao[l]);
@@ -149,14 +155,22 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
     const Tensor *x = (l == 0) ? &a->emb : &a->block_out[l - 1];
 
     // --- Attention sub-layer ---
+    // With QK-norm the raw q/k projections go to qp/kp (the norm's cached
+    // input) and the normalized result to q/k; without it they are one tensor.
+    Tensor *qr = b->qk_norm ? &a->qp[l] : &a->q[l];
+    Tensor *kr = b->qk_norm ? &a->kp[l] : &a->k[l];
     rmsnorm(x, &b->attn_norm, &a->xn[l], b->eps);
-    matmul(&a->xn[l], &b->Wq, &a->q[l]); bias_add(&a->q[l], &b->b_q, &a->q[l]);
-    matmul(&a->xn[l], &b->Wk, &a->k[l]); bias_add(&a->k[l], &b->b_k, &a->k[l]);
+    matmul(&a->xn[l], &b->Wq, qr); bias_add(qr, &b->b_q, qr);
+    matmul(&a->xn[l], &b->Wk, kr); bias_add(kr, &b->b_k, kr);
     matmul(&a->xn[l], &b->Wv, &a->v[l]); bias_add(&a->v[l], &b->b_v, &a->v[l]);
     if (lo) {                                         // low-rank corrections on q/k/v
-      lora_forward(&lo->q[l], &a->xn[l], &a->q[l], &la->q[l]);
-      lora_forward(&lo->k[l], &a->xn[l], &a->k[l], &la->k[l]);
+      lora_forward(&lo->q[l], &a->xn[l], qr, &la->q[l]);
+      lora_forward(&lo->k[l], &a->xn[l], kr, &la->k[l]);
       lora_forward(&lo->v[l], &a->xn[l], &a->v[l], &la->v[l]);
+    }
+    if (b->qk_norm) {                                 // Qwen3 QK-norm, before RoPE
+      rmsnorm_heads(qr, &b->q_norm, &a->q[l], b->eps);
+      rmsnorm_heads(kr, &b->k_norm, &a->k[l], b->eps);
     }
     rope_heads(&a->q[l], b->n_heads, b->rope_base);   // in place: q/k become POST-RoPE
     rope_heads(&a->k[l], b->n_kv, b->rope_base);
@@ -231,21 +245,29 @@ static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
     // RoPE is in place, so this REPLACES q/k grads with their pre-rotation form.
     rope_heads_backward(&a->q[l], b->n_heads, b->rope_base);
     rope_heads_backward(&a->k[l], b->n_kv, b->rope_base);
-    bias_add_backward(&a->q[l], &b->b_q);
-    bias_add_backward(&a->k[l], &b->b_k);
+    // QK-norm: q/k grads (now pre-rotation) flow back through the per-head
+    // RMSNorm into the raw projections qr/kr, and into the q_norm/k_norm gains.
+    Tensor *qr = b->qk_norm ? &a->qp[l] : &a->q[l];
+    Tensor *kr = b->qk_norm ? &a->kp[l] : &a->k[l];
+    if (b->qk_norm) {
+      rmsnorm_heads_backward(qr, &b->q_norm, &a->q[l], &b->q_norm, b->eps);
+      rmsnorm_heads_backward(kr, &b->k_norm, &a->k[l], &b->k_norm, b->eps);
+    }
+    bias_add_backward(qr, &b->b_q);
+    bias_add_backward(kr, &b->b_k);
     bias_add_backward(&a->v[l], &b->b_v);
     if (frozen) {
-      matmul_backward_dx(&a->xn[l], &b->Wq, &a->q[l]);
-      matmul_backward_dx(&a->xn[l], &b->Wk, &a->k[l]);
+      matmul_backward_dx(&a->xn[l], &b->Wq, qr);
+      matmul_backward_dx(&a->xn[l], &b->Wk, kr);
       matmul_backward_dx(&a->xn[l], &b->Wv, &a->v[l]);
     } else {
-      matmul_backward(&a->xn[l], &b->Wq, &a->q[l]);
-      matmul_backward(&a->xn[l], &b->Wk, &a->k[l]);
+      matmul_backward(&a->xn[l], &b->Wq, qr);
+      matmul_backward(&a->xn[l], &b->Wk, kr);
       matmul_backward(&a->xn[l], &b->Wv, &a->v[l]);
     }
     if (lo) {   // q/k/v adapters saw the SAME xn, and add into its gradient too
-      lora_backward(&lo->q[l], &a->xn[l], &a->q[l], &la->q[l]);
-      lora_backward(&lo->k[l], &a->xn[l], &a->k[l], &la->k[l]);
+      lora_backward(&lo->q[l], &a->xn[l], qr, &la->q[l]);
+      lora_backward(&lo->k[l], &a->xn[l], kr, &la->k[l]);
       lora_backward(&lo->v[l], &a->xn[l], &a->v[l], &la->v[l]);
     }
     rmsnorm_backward(x, &b->attn_norm, &a->xn[l], &b->attn_norm, b->eps);
@@ -281,7 +303,8 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
 // ---------------------------------------------------------------------------
 
 int llama_param_count(const LlamaModel *m) {
-  return 3 + 12 * m->n_layers;   // wte, final_norm, lm_head + 12 per layer
+  // wte, final_norm, lm_head + 12 per layer (+ q_norm, k_norm with QK-norm)
+  return 3 + (m->qk_norm ? 14 : 12) * m->n_layers;
 }
 
 int llama_collect_params(LlamaModel *m, Tensor **list) {
@@ -296,6 +319,10 @@ int llama_collect_params(LlamaModel *m, Tensor **list) {
     list[n++] = &b->b_q;
     list[n++] = &b->b_k;
     list[n++] = &b->b_v;
+    if (m->qk_norm) {            // same slot as the LLMA checkpoint order
+      list[n++] = &b->q_norm;
+      list[n++] = &b->k_norm;
+    }
     list[n++] = &b->Wo;
     list[n++] = &b->ffn_norm;
     list[n++] = &b->Wgate;

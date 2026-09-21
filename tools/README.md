@@ -68,6 +68,7 @@ python tools/convert_llama.py --model HuggingFaceTB/SmolLM2-135M --out model/smo
 echo "1 2 3 4 5" | transformer llama model/smollm/model.bin      # token-in -> next-token argmax
 python tools/convert_llama.py --model HuggingFaceTB/SmolLM2-135M --out model/smollm/m8.bin --int8
 python tools/convert_llama.py --tiny t.bin                        # small format-test file (no download)
+python tools/convert_llama.py --model Qwen/Qwen3-0.6B --out model/qwen3/model.bin --max-seq 4096
 ```
 
 - **`--int8`** writes the **LLMQ** format: 2D weights are per-output-channel int8-quantized (scales +
@@ -83,6 +84,12 @@ python tools/convert_llama.py --tiny t.bin                        # small format
 - **q/k/v attention biases** are supported (LLMA/LLMQ v2): zero for LLaMA/SmolLM, read from
   `q/k/v_proj.bias` for Qwen2/Qwen2.5. (`o_proj` and the MLP have no bias.) So both
   `HuggingFaceTB/SmolLM2-*` and `Qwen/Qwen2.5-0.5B` convert and run.
+- **QK-norm (Qwen3)** is supported: when `self_attn.q_norm`/`k_norm` weights are present they are
+  written per layer (after `b_v`) into a **v3** file with feature flag bit 0; models without it are
+  still written as v2 (byte-identical to before). Qwen3's `max_position_embeddings` is 40960, and the
+  C KV cache is allocated for all of it up front — pass **`--max-seq 4096`** (any cap) to keep it
+  small. The C side is verified against an independent numpy reference on a `--tiny --qk-norm`
+  file; a full Qwen3-0.6B vs HF comparison has NOT been run yet.
 
 Requires Python 3 + NumPy + safetensors + huggingface_hub, and internet for the download.
 

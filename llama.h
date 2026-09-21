@@ -3,6 +3,7 @@
 //
 //   xn  = RMSNorm(x, attn_norm)
 //   q,k,v = xn @ {Wq, Wk, Wv}          (RoPE applied per-head to q and k)
+//   [QK-norm, Qwen3: q,k = RMSNorm per head (q_norm/k_norm) BEFORE RoPE]
 //   h   = x + GQA(q, k, v) @ Wo        (residual)
 //   hn  = RMSNorm(h, ffn_norm)
 //   out = h + SwiGLU(hn, Wgate, Wup, Wdown)   (residual)
@@ -20,6 +21,7 @@
 typedef struct {
   int d_model, n_heads, n_kv, head_dim, d_ff;
   float rope_base, eps;
+  int qk_norm;        // 1 = Qwen3 QK-norm on (q_norm/k_norm used); 0 = LLaMA/Qwen2
   // Attention
   Tensor attn_norm;   // (d_model)
   Tensor Wq;          // (d_model, n_heads*head_dim)
@@ -28,6 +30,8 @@ typedef struct {
   Tensor b_q;         // (n_heads*head_dim)  q/k/v biases (zero for LLaMA/SmolLM;
   Tensor b_k;         // (n_kv*head_dim)      nonzero for Qwen2). o_proj has none.
   Tensor b_v;         // (n_kv*head_dim)
+  Tensor q_norm;      // (head_dim)  QK-norm gains, shared by every head; applied
+  Tensor k_norm;      // (head_dim)  only when qk_norm (always allocated: tiny)
   Tensor Wo;          // (n_heads*head_dim, d_model)
   // Feed-forward (SwiGLU)
   Tensor ffn_norm;    // (d_model)
@@ -60,6 +64,7 @@ void llama_block_forward(const LlamaBlock *b, const Tensor *x, Tensor *out);
 typedef struct {
   int vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq;
   float rope_base, eps;
+  int qk_norm;         // per-head q/k RMSNorm (Qwen3); mirrored in every block
   Tensor wte;          // (vocab, d_model)   token embedding
   LlamaBlock *blocks;  // n_layers
   Tensor final_norm;   // (d_model)          RMSNorm before the head
@@ -77,11 +82,20 @@ LlamaModel llama_model_create_train(int vocab, int d_model, int n_layers, int n_
 void llama_model_free(LlamaModel *m);
 void llama_model_randomize(LlamaModel *m);
 
+// Turn QK-norm on/off for the model and every block. Models are created with it
+// OFF (the LLaMA/Qwen2 behavior); turning it on resets every q_norm/k_norm gain
+// to 1 — load/copy the real gains afterwards. It also changes the parameter set
+// (llama_param_count), so set it BEFORE collecting params or building acts.
+void llama_model_set_qk_norm(LlamaModel *m, int on);
+
 // Forward: token ids (length seq_len) -> logits (seq_len, vocab). Causal.
 void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tensor *logits);
 
 // Checkpoint I/O: flat binary 'LLMA' format (magic + version + config + every
 // weight's float32 in a fixed canonical order shared by save and load).
+// v3 adds a u32 feature-flags word after the config (bit 0 = QK-norm, whose
+// q_norm/k_norm are stored per layer right after b_v); a model with no features
+// is still written as v2, and v2 files load unchanged (flags = 0).
 // llama_model_load builds a matching model, then reads the weights into it.
 // Return 0 on success, nonzero on error.
 int llama_model_save(const char *path, const LlamaModel *m);
@@ -120,9 +134,9 @@ typedef struct {
 // affordable; see grpo.h). Passing lo == NULL is exactly llama_decode_step.
 //
 // The adapters must be applied in the same places and the same order as the
-// training forward — after the q/k/v bias but BEFORE RoPE, and onto the output
-// projection's result — or the two paths disagree and the importance ratio a
-// policy-gradient update computes is meaningless.
+// training forward — after the q/k/v bias but BEFORE QK-norm and RoPE, and onto
+// the output projection's result — or the two paths disagree and the importance
+// ratio a policy-gradient update computes is meaningless.
 void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
                             Tensor *logits, const LlamaDecodeLora *lo);
 
@@ -135,12 +149,14 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
 typedef struct {
   Tensor attn_norm, ffn_norm;                      // f32
   Tensor b_q, b_k, b_v;                            // f32 q/k/v biases (small; kept f32)
+  Tensor q_norm, k_norm;                           // f32 QK-norm gains (head_dim)
   QTensor Wq, Wk, Wv, Wo, Wgate, Wup, Wdown;       // int8
 } QLlamaBlock;
 
 typedef struct {
   int vocab, d_model, n_layers, n_heads, n_kv, head_dim, d_ff, max_seq;
   float rope_base, eps;
+  int qk_norm;          // Qwen3 per-head q/k RMSNorm (see LlamaModel)
   QTensor wte;          // int8 (dequantized one row per token at embed time)
   QLlamaBlock *blocks;
   Tensor final_norm;    // f32

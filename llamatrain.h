@@ -37,6 +37,9 @@ typedef struct {
   Tensor *xn;         // (n, d_model)          attention RMSNorm output
   Tensor *q;          // (n, n_heads*head_dim) POST-RoPE queries
   Tensor *k;          // (n, n_kv*head_dim)    POST-RoPE keys
+  Tensor *qp;         // (n, n_heads*head_dim) PRE-QK-norm q (projection + bias + LoRA)
+  Tensor *kp;         // (n, n_kv*head_dim)    PRE-QK-norm k. Both NULL unless the
+                      //   model has QK-norm (without it q/k ARE the raw projections)
   Tensor *v;          // (n, n_kv*head_dim)
   Tensor *o;          // (n, n_heads*head_dim) attention output (pre-Wo)
   Tensor *ao;         // (n, d_model)          o @ Wo
@@ -69,8 +72,8 @@ void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
 void llama_backward(LlamaModel *m, const int *ids, int seq_len,
                     LlamaActs *a, Tensor *logits);
 
-// Number of learnable parameter tensors (== 3 + 12*n_layers). Use this to size
-// the buffer passed to llama_collect_params.
+// Number of learnable parameter tensors (== 3 + 12*n_layers, or 3 + 14*n_layers
+// with QK-norm). Use this to size the buffer passed to llama_collect_params.
 int llama_param_count(const LlamaModel *m);
 
 // Fill list[] with pointers to all learnable parameter tensors, in canonical

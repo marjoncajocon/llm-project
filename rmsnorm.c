@@ -50,3 +50,29 @@ void rmsnorm_backward(const Tensor *input, const Tensor *gamma, const Tensor *ou
     }
   }
 }
+
+// A (rows * cols / head_dim, head_dim) view of t sharing its data and grad, so a
+// per-head norm is just the plain row norm over more, shorter rows.
+static Tensor heads_view(const Tensor *t, int head_dim, int *shape) {
+  Tensor v = *t;
+  shape[0] = (int)(t->size / (size_t)head_dim);
+  shape[1] = head_dim;
+  v.shape = shape;
+  v.ndim = 2;
+  return v;
+}
+
+void rmsnorm_heads(const Tensor *input, const Tensor *gamma, Tensor *output, float epsilon) {
+  const int hd = gamma->shape[0];
+  int si[2], so[2];
+  Tensor vi = heads_view(input, hd, si), vo = heads_view(output, hd, so);
+  rmsnorm(&vi, gamma, &vo, epsilon);
+}
+
+void rmsnorm_heads_backward(const Tensor *input, const Tensor *gamma, const Tensor *output,
+                            Tensor *gamma_grad, float epsilon) {
+  const int hd = gamma->shape[0];
+  int si[2], so[2];
+  Tensor vi = heads_view(input, hd, si), vo = heads_view(output, hd, so);
+  rmsnorm_backward(&vi, gamma, &vo, gamma_grad, epsilon);
+}
