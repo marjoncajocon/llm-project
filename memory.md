@@ -14,6 +14,30 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > *local* constraint only; a Colab/GPU box has none. It also makes timings incomparable to
 > older all-core numbers, so always state the thread count when reporting a benchmark.
 
+> **▶▶ DRIVE E FOR BUILDS/RUNS (user request, 2026-09-21):** source stays in this repo on D:, but
+> build output, executables, test logs, models and run checkpoints go under **`E:\llm-test`**
+> (D: "has some problem in writing more data"; E: has ~800 GB free). Runtime layout there:
+> `model/`, `data/`, `logs/`, `transformer_v*.exe`, queue scripts `overnight*.sh`, `runner.sh`.
+
+> **▶▶ LONG QUEUES MUST RUN DETACHED (2026-09-22):** the Claude harness kills its tracked
+> background tasks when free RAM drops below ~1 GB (a 135M GRPO run uses ~3 GB; `--lora-mlp` ~3.3 GB
+> of 11.7 GB). Launch multi-hour queues with `Start-Process bash.exe -ArgumentList '-l','-c','"bash
+> /e/llm-test/runner.sh <pid>"' -WindowStyle Hidden`, make queue scripts idempotent (skip finished
+> jobs), run ONE heavy job at a time, and check for orphaned queue bash processes before relaunching.
+
+> **▶▶ 2026-09-21/22 OVERNIGHT — RESUME HERE.** agent-1 @ d9717b2 (+docs), all pushed. Merged + verified:
+> DAPO/Dr.GRPO, reward v2, `--prio/--diag`, `--eval-only` + `tools/evalcard.py`, shared prefill,
+> batched rollouts, MoE, sliding window, QK-norm, tied head, Qwen2 + exact-SmolLM2 pretokenizers,
+> Muon, `--lora-mlp/--lora-plus`, train/decode speedups, AVX2, agent safety (workspace, ASK default,
+> risk classifier — BREAKING agent CLI), constrained decoding, data-v2 generators. Full table in
+> notes.md "2026-09-21/22 — overnight session". **Measured (200 paired tasks, greedy):** base 22%
+> in-dist / 17% held-out; **DAPO beats GRPO seed-for-seed** (in-dist +5/+6.5, held-out +5/+10.5;
+> GRPO barely generalizes); all-layer LoRA +15..+21 in-dist (replicated) but NOT on held-out;
+> reward v2 and constrained decoding: no measurable change; diverse RL data alone did not help
+> (model answers `<done>` on unfamiliar formats). **NEXT:** SFT on the data-v2 train set, THEN DAPO,
+> judged on the held-out set. Use lr 1e-4 (not 1e-5) for LoRA GRPO. **NOTHING PROMOTED**;
+> candidates in `E:\llm-test\model\runs\v3_*.bin`.
+
 > **▶▶ GRPO RAN AT LAST — and the task file was the problem — ✅ (2026-09-05, `efae068`):**
 > GRPO (`1b17c2e`) was built and verified in September but never run at scale. Run as-is on
 > `data/grpo_tasks.txt` it produced **5 of 5 flat groups at a mean reward of exactly 1.0000** —

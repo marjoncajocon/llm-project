@@ -3347,6 +3347,95 @@ lexical 0% (files/contents/commands); control (same recipe, no holdout): skeleto
 51–78% lexical. Row-13gram stays 50–70% either way (tool markup, canned run output, fixed rationale
 wording) — informational only. NOTHING TRAINED OR MEASURED ON A MODEL.
 
+### 2026-09-21/22 — overnight session: 2026 upgrades merged + the first GRPO that measurably works
+
+Branch `agent-1`, 489bc28 → d9717b2 (+ this docs commit), all pushed. Every merge was re-verified
+by the lead session before pushing: full selftest green with every pre-existing part
+byte-identical to the previous head (CRs stripped), a tiny-model (`tiny49k`: vocab 49152, real
+SmolLM2 tokenizer) `grpo` end-to-end log identical to the previous binary, plus feature checks.
+Builds, runs and logs live on **E:\llm-test** (user request — D: has write problems).
+
+**Features merged** (all opt-in unless noted; defaults bit-identical):
+
+| area | what | flag / API | selftest |
+|---|---|---|---|
+| RL objective | DAPO clip-higher / token loss / dynamic sampling; Dr. GRPO | `--dapo`, `--dr-grpo`, `--clip-high`, `--loss-agg`, `--no-std`, `--resample` | [28] |
+| RL reward | reward v2 (format gate × (0.3 grd + 0.7 match); capped → 0) + reward-hacking monitor | `--reward v2` | [27] |
+| RL sampling | difficulty-aware task sampling (Kimi k1.5 / GRESO) + entropy/clip diagnostics | `--prio`, `--diag` | [44] |
+| RL eval | deterministic paired eval + `tools/evalcard.py` (paired bootstrap CI, exact McNemar) | `grpo --eval-only --dump` | [39] |
+| RL speed | shared prompt prefill (default); batched lockstep rollouts | `--batch-rollouts` | [37], [48] |
+| arch | MoE FFN module; sliding window (LLMA v3); QK-norm (v4); tied embeddings (v4 bit 2) | `moe.c`, `--window` … | [31]–[33], [45] |
+| training | Muon; LoRA on MLP + LoRA+; compact lm_head rows + threaded attention/row ops + frozen LoRA base (−651 MB) | `--optim muon`, `--lora-mlp`, `--lora-plus F` | [35], [41], [43] |
+| speed | AVX2/FMA matmul (runtime dispatch); column-threaded decode; candidate-only top-p sort | default | [34], [38] |
+| agent safety | ./workspace confinement, ASK default, path hardening, injection-proof observations, process limits, webchat loopback+Origin; SAFE/REVIEW/BLOCK command classifier; BLOCK commands out of generated data | `--auto`, `--workspace`, `--timeout`, `transformer risk` | [36], [42] |
+| generation | keep newest tokens (no fake `<done>No response.</done>`), stop-at-tag, N samples from one prefill, transcript budget | `hfgen --stop-tags --samples N` | [40] |
+| decoding | constrained tool-call decoding (eval only) | `--constrain`, `--constrain-cmd` | [47] |
+| tokenizer | Qwen2 pretokenizer; exact SmolLM2 pretokenizer kind 2 (0 HF mismatches / 53,686 texts) + heap-overflow fix | `.tok` v3 kind byte | [45], [46] |
+| data | held-out lexicon split, world-state observations, unscripted errors, goal grammar, overlap/decontam | `--holdout-lexicon`, `--vfs`, … | — |
+
+BREAKING (agent CLI only): `transformer agent` asks by default (`--auto` to opt in), tool paths
+resolve inside `./workspace`, webchat binds 127.0.0.1.
+
+**The GRPO experiment.** `reason_e2.bin`, `data/grpo_hard.txt`, 100 steps, G=8, LoRA r8 α16,
+**lr 1e-4** (warmup 5), TF_THREADS=3, binary agent-1 @ 669c681 (55fc937 for `--lora-mlp` arms —
+defaults identical). The old lr 1e-5 moves a zero-init LoRA-B by ~1e-4 of the weight scale in
+100 steps — why the 09-05 eval was bit-identical before/after. Eval = `grpo --eval-only --temp 0`
+on 200 tasks of **in-dist** `grpo_hard_eval.txt` (shares 100% of goal templates with training)
+and 200 **held-out** tasks from the data-v2 eval-only lexicon/phrasing split
+(`E:\llm-test\data\grpo_heldout_eval.txt`, 0% template/argument overlap). Exact-match = the
+action equals the reference. Stats: `tools/evalcard.py` (paired over tasks).
+
+| run | recipe | seed | flat skipped / resampled | in-dist exact | held-out exact |
+|---|---|---|---|---|---|
+| base | reason_e2.bin | – | – | 22.0% | 17.0% |
+| G1 | GRPO | 1 | 47 / 0 | 38.0% | 20.5% |
+| G2 | GRPO | 2 | 45 / 0 | 31.0% | 19.0% |
+| D1 | DAPO | 1 | 12 / 66 | 43.0% | 25.5% |
+| D2 | DAPO | 2 | 12 / 89 | 37.5% | 29.5% |
+| D3 | DAPO + `--lora-mlp --lora-plus 16` | 1 | 35 / 119 | **58.5%** | **31.0%** |
+| D4 | DAPO + `--lora-mlp --lora-plus 16` | 2 | 13 / 88 | **58.5%** | 25.5% |
+| R1 | DAPO + `--reward v2` | 1 | 7 / 59 | 42.5% | 22.5% |
+| D5 | DAPO on diverse data (`grpo_diverse.txt`) | 1 | 5 / 55 | 22.0% | 19.0% |
+
+Findings (paired, 95% CI over tasks):
+1. **RL finally moves the model at lr 1e-4.** Every run beats base in-distribution (+9 … +36.5 pts);
+   GRPO/DAPO runs fix 20–42 tasks while breaking 0–3.
+2. **DAPO > original GRPO, seed for seed.** In-dist: +5.0 (s1, p=.002) and +6.5 (s2, p=.004).
+   Held-out: +5.0 (s1, p=.04) and +10.5 (s2, p=.0002). Original GRPO barely generalizes (held-out
+   +3.5 / +2.0 vs base, n.s.); DAPO does (+8.5 / +12.5). GRPO wastes ~46% of its groups on flat
+   groups; DAPO replaces them (at ~1.7× the rollouts).
+3. **All-layer LoRA (+MLP, LoRA+) is a big in-distribution win that does NOT transfer.** D3/D4 vs
+   D1/D2: +15.5 / +21 in-dist (replicated, p≤1e-5) but held-out +5.5 / −4.0 (n.s.; averages 28.3%
+   vs 27.5%). The extra capacity fits the training templates; D4 even regressed on held-out `done`.
+4. **Reward v2 changes nothing measurable here** (R1 vs D1: −0.5 in-dist, −3.0 held-out, n.s.) —
+   the v1 free floor (a RANDOM model scores 0.5/rollout!) is real but this model almost never
+   emits prose/truncated output. Keep v2 as the safer default for new task families.
+5. **Constrained decoding: 0 exact-match change** on base and D1 (6.8k picks, 0 dead ends); path
+   slips are already rare (base 2/200, trained 0). `--constrain-cmd` makes delete arguments
+   grounded (+0.067 reward) but still the wrong file. A safety net, not a lever.
+6. **Diverse RL data alone did NOT help** (D5: in-dist 22.0% = base; held-out 19.0%, −6.5 vs D1, p=.024): on the unfamiliar
+   formats the model answered `<done>` 51% of the time (mean match 0.10) — RL can only amplify
+   behaviours the SFT model already has. **Next:** SFT on the data-v2 train set first (build recipe
+   in the data-v2 entry above), then DAPO, and judge on the held-out set.
+7. Held-out is the metric that matters: in-dist gains overstate transferable skill 2–4×.
+
+Speed (real 135M model): GRPO step ~36 s vs ~123–154 s before (shared prefill + threaded decode +
+SIMD); SFT/LoRA step ~2× faster at 3 threads (bit-exact). RAM: a `--lora-mlp` GRPO run uses ~3.3 GB.
+
+**NOTHING PROMOTED** — `reason_e2.bin` is still the live model. Candidates:
+`E:\llm-test\model\runs\v3_*.bin` (best held-out: D3 31.0%, D2 29.5%). Gate any promotion on
+`tools/remeasure.py` + `probe3.py` as usual. The live `model/smollm/tok.hf` is still kind 0
+(adopt the exact SmolLM2 tokenizer with `python tools/export_tokenizer.py HuggingFaceTB/SmolLM2-135M
+model/smollm/tok.hf` after rebuilding; 2–3% of prompt lines tokenize differently). Known,
+not fixed: `--kl` + `--lora-r 0` reads uninitialized `flat_ref` (grpo.c); wasm selftest crashes in
+[37] (pre-existing); tied-head many-row forward ~3.7× slower than the AVX2 GEMM.
+
+Reproduce (from `E:\llm-test`, TF_THREADS=3): train `transformer grpo data/grpo_hard.txt --model
+model/smollm/reason_e2.bin --hf-tok model/smollm/tok.hf --out model/runs/X.bin --steps 100 --lr 1e-4
+--warmup 5 --dapo [--lora-mlp --lora-plus 16] --seed S`; eval `transformer grpo <eval.txt> --model X.bin
+--hf-tok … --eval-only --temp 0 --dump X.jsonl`; compare `python tools/evalcard.py A.jsonl B.jsonl`.
+Queue scripts: `E:\llm-test\overnight3.sh … overnight9.sh`; logs + dumps: `E:\llm-test\logs\v3\`.
+
 #-------------------------------#
 #for checking#
 Raw Coding (HumanEval+)
