@@ -35,6 +35,7 @@
 #ifndef GRPO_H
 #define GRPO_H
 
+#include "constrain.h"
 #include "llama.h"
 #include "sampler.h"
 
@@ -109,6 +110,10 @@ typedef struct {
   int eval_k;               // rollouts per task (default 1; with temp 0 that is greedy)
   int eval_limit;           // evaluate only the first N tasks of the file (0 => all)
   const char *eval_dump;    // JSONL path: one line per rollout (NULL => no dump)
+  int constrain;            // 1 => constrained decoding of the action (constrain.h), the
+                            // task's prompt as the grounding text. EVAL ONLY: a masked
+                            // sampler is not the policy whose ratio GRPO trains on.
+  ConstrainOpts con;        // its options (constrain_default_opts())
 
   // --- Run control ---
   unsigned seed;

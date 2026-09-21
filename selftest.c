@@ -42,6 +42,8 @@
 #include "agent.h"
 #include "toolexec.h"
 #include "gen.h"
+#include "constrain.h"
+#include "toolcall.h"
 #include "hftok.h"
 #include "risk.h"
 #include "approval.h"
@@ -1314,6 +1316,360 @@ static float st43_step(LlamaModel *m, LlamaLora *lo, LlamaLoraActs *la, LlamaAct
   tensor_free(&logits); tensor_free(&probs);
   free(rows); free(tc); free(cc);
   return loss;
+}
+
+// ---- constrained decoding of the action, part [47] --------------------------
+// The prompt every [47] check is grounded in: a novel gibberish filename (the
+// lever-#4 slip case), a command argument, a filename after '"', and a closing tag.
+static const char ST47_PROMPT[] =
+  "GOAL: read ctngh4.log then run rm r4n4 | OBSERVATION: wrote 5 bytes to notes.txt,"
+  " see </tool> \"q.md\"";
+
+// A tiny vocab: the 95 printable ASCII bytes (ids 0..94), '\n' (95), then BPE-like
+// pieces, several of which cross the closing quote.
+static const char *const ST47_PIECES[] = {
+  "<think>", "</think>", "<tool name=\"", "read_file\" path=\"", "write_file\" path=\"",
+  "run_command\" command=\"", "<done>", "</done>", "</tool>", "\"></tool>", "\">",
+  "ctngh4", "cngh4", "tngh4", "ngh4", ".log", ".log\"></tool>", ".log\">", "4.log\"",
+  "notes", ".txt", "read it", "rm ", "hello", " world", "ct"
+};
+#define ST47_NP ((int)(sizeof(ST47_PIECES) / sizeof(ST47_PIECES[0])))
+#define ST47_V (96 + ST47_NP)
+
+static void st47_piece(int id, char *out) {
+  if (id < 95) { out[0] = (char)(0x20 + id); out[1] = '\0'; }
+  else if (id == 95) { out[0] = '\n'; out[1] = '\0'; }
+  else strcpy(out, ST47_PIECES[id - 96]);
+}
+
+static int st47_write_tok(const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return 1;
+  uint32_t ver = 1, n = ST47_V;
+  int32_t eos = -1;
+  fwrite("HFTK", 1, 4, f); fwrite(&ver, 4, 1, f); fwrite(&n, 4, 1, f); fwrite(&eos, 4, 1, f);
+  char pc[64];
+  for (int i = 0; i < ST47_V; i++) {
+    st47_piece(i, pc);
+    uint16_t len = (uint16_t)strlen(pc);
+    fwrite(&len, 2, 1, f); fwrite(pc, 1, len, f);
+  }
+  return fclose(f) != 0;
+}
+
+// A scripted "model": logits are a function of the text so far. It prefers the
+// char-slipped action (cngh4.log) and ranks the correct one second -- the shape of
+// the real 135M failure: the right copy is there, just not on top.
+static const char ST47_SLIP[] = "<think>read it</think><tool name=\"read_file\" path=\"cngh4.log\"></tool>";
+static const char ST47_GOOD[] = "<think>read it</think><tool name=\"read_file\" path=\"ctngh4.log\"></tool>";
+
+static void st47_logits(const char *text, float *l) {
+  const size_t tl = strlen(text);
+  char pc[64], buf[256];
+  for (int id = 0; id < ST47_V; id++) {
+    st47_piece(id, pc);
+    const size_t pl = strlen(pc);
+    l[id] = -1.0f - 0.001f * (float)id;
+    if (tl + pl >= sizeof(buf)) continue;
+    memcpy(buf, text, tl); memcpy(buf + tl, pc, pl + 1);
+    if (strncmp(ST47_SLIP, buf, tl + pl) == 0) l[id] = 10.0f + (float)pl;
+    else if (strncmp(ST47_GOOD, buf, tl + pl) == 0) l[id] = 5.0f + (float)pl;
+  }
+}
+
+// Greedy decode with the scripted model; con == NULL => plain sample_token (argmax).
+// Stops when the action block closes (hfgen_cut_at_tag) or after 40 tokens.
+static int st47_decode(const Constrain *con, const ConVocab *cv, char *text, int *rejected_top) {
+  int dims[2] = {1, ST47_V};
+  Tensor lg = tensor_create(dims, 2);
+  ConState s;
+  if (con) constrain_init(con, &s);
+  text[0] = '\0';
+  int n = 0, rc = 0;
+  *rejected_top = 0;
+  Rng rng = rng_create(47);
+  for (; n < 40; n++) {
+    st47_logits(text, lg.data);
+    const int top = sample_argmax(&lg, 0);
+    int id;
+    if (con) {
+      id = constrain_pick(con, cv, &s, lg.data, 0.0f, 0, 1.0f, &rng, 40 - n, NULL);
+      if (id < 0) { rc = -1; break; }
+      *rejected_top += id != top;
+    } else {
+      id = sample_token(&lg, 0, 0.0f, 0, 1.0f, &rng);
+    }
+    char pc[64];
+    st47_piece(id, pc);
+    strcat(text, pc);
+    char tmp[512];
+    strcpy(tmp, text);
+    if (hfgen_cut_at_tag(tmp) || (con && constrain_complete(&s))) { n++; break; }
+  }
+  tensor_free(&lg);
+  return rc < 0 ? rc : n;
+}
+
+static int st47_run(void) {
+  int ok_all = 1;
+  printf("[47] Constrained decoding of the action: grammar, prompt-span paths, BPE pieces across"
+         " the quote, never a dead end, default off\n");
+
+  // (a) acceptance / rejection table: 2 = complete action, 1 = valid prefix, 0 = rejected.
+  ConstrainOpts od = constrain_default_opts();
+  ConstrainOpts oc = od; oc.ground_cmd = 1;
+  ConstrainOpts ob = od; ob.ground_body = 1;
+  Constrain *cd = constrain_create(ST47_PROMPT, &od);
+  Constrain *cc = constrain_create(ST47_PROMPT, &oc);
+  Constrain *cb = constrain_create(ST47_PROMPT, &ob);
+  char think_long[400];
+  strcpy(think_long, "<think>");
+  memset(think_long + 7, 'x', 300); think_long[307] = '\0';
+  struct { const char *t; int mode, want; const char *why; } tab[] = {
+    {"<tool name=\"read_file\" path=\"ctngh4.log\"></tool>", 0, 2, "read, grounded path"},
+    {"<think>check it</think><tool name=\"read_file\" path=\"notes.txt\"></tool>", 0, 2, "think + read"},
+    {"<done>all set</done>", 0, 2, "done"},
+    {"<tool name=\"write_file\" path=\"notes.txt\">hello world</tool>", 0, 2, "write, new body"},
+    {"<tool name=\"run_command\" command=\"rm r4n4\"></tool>", 0, 2, "run"},
+    {"<tool name=\"read_file\" path=\"ctngh4\"></tool>", 0, 2, "whole token before '.'"},
+    {"<tool name=\"read_file\" path=\"q.md\"></tool>", 0, 2, "span after '\"'"},
+    {"<tool name=\"read_file\" path=\"ctngh4.lo", 0, 1, "partial path"},
+    {"<tool name=\"read_file\" path=\"cngh4.log\"></tool>", 0, 0, "char slip"},
+    {"<tool name=\"read_file\" path=\"ctngh\"", 0, 0, "close inside a word"},
+    {"<tool name=\"read_file\" path=\"tngh4.log\"></tool>", 0, 0, "starts inside a word"},
+    {"<tool name=\"read_file\" path=\"/tool\"></tool>", 0, 0, "'/tool' of a tag"},
+    {"<tool name=\"read_file\" path=\"CTNGH4.log\"></tool>", 0, 0, "case differs"},
+    {"<tool name=\"read_file\" path=\"\"></tool>", 0, 0, "empty path"},
+    {"<tool name=\"write_file\" path=\"notes.txt\"> </tool>", 0, 0, "blank body"},
+    {"<tool name=\"write_file\" path=\"notes.txt\">a<tool x</tool>", 0, 0, "opener in body"},
+    {"<tool name=\"read_file\" path=\"ctngh4.log\">x</tool>", 0, 0, "read with a body"},
+    {"<tool name=\"run_command\" command=\"ls > o\"></tool>", 0, 0, "'>' in command"},
+    {"<tool name=\"delete_file\" path=\"a\"></tool>", 0, 0, "unknown tool"},
+    {"<think>a <b</think>", 0, 0, "'<' in think"},
+    {" <done>x</done>", 0, 0, "leading space"},
+    {"<done>x</done> ", 0, 0, "trailing byte"},
+    {"<done>ok</tool></done>", 0, 0, "</tool> in done"},
+    {"<done>a <think>b</done>", 0, 0, "<think> in done"},
+    {"<tool name=\"write_file\" path=\"notes.txt\">a</think></tool>", 0, 0, "</think> in body"},
+    {think_long, 0, 0, "think over 256 bytes"},
+    {"<tool name=\"run_command\" command=\"rm rm4n4\"></tool>", 0, 2, "cmd free by default"},
+    {"<tool name=\"run_command\" command=\"rm rm4n4\"></tool>", 1, 0, "cmd arg slip (cmd mode)"},
+    {"<tool name=\"run_command\" command=\"rm -f r4n4 | wc -l\"></tool>", 1, 2, "verbs, flags, pipe"},
+    {"<tool name=\"write_file\" path=\"notes.txt\">hello world</tool>", 2, 0, "new body (body mode)"},
+    {"<tool name=\"write_file\" path=\"notes.txt\">read ctngh4.log then run</tool>", 2, 2, "prompt body"},
+  };
+  const int ntab = (int)(sizeof(tab) / sizeof(tab[0]));
+  int tab_ok = 0, n_acc = 0, n_rej = 0;
+  for (int i = 0; i < ntab; i++) {
+    const Constrain *c = tab[i].mode == 1 ? cc : (tab[i].mode == 2 ? cb : cd);
+    const int got = constrain_check(c, tab[i].t);
+    if (got == tab[i].want) tab_ok++;
+    else printf("    MISMATCH case %d (%s): got %d want %d\n", i, tab[i].why, got, tab[i].want);
+    n_acc += tab[i].want == 2; n_rej += tab[i].want == 0;
+    // every complete action is also what the agent parses and what the reward
+    // calls well-formed and path-grounded
+    if (got == 2) {
+      RewardParts rp;
+      ToolCall tc;
+      reward_score(ST47_PROMPT, tab[i].t, NULL, &rp);
+      const char *a = strstr(tab[i].t, "</think>");
+      toolcall_parse(a ? a + 8 : tab[i].t, &tc);
+      if (rp.format <= 0.0f || tc.kind == TOOL_NONE || (tc.path[0] && !reward_grounded_in(ST47_PROMPT, tc.path))) {
+        tab_ok--;
+        printf("    case %d accepted but not a well-formed grounded action\n", i);
+      }
+    }
+  }
+  const int t_ok = tab_ok == ntab;
+  printf("    grammar table: %d/%d as expected (%d complete actions -- all parse, format-OK and"
+         " path-grounded by reward.c; %d rejected: char slip, mid-word start/end, tag fragment,"
+         " case, empty path/body, nested opener, '>' in command, unknown tool, '<' in think,"
+         " leading/trailing bytes, think cap, tags inside done/body text; cmd/body modes) -> %s\n",
+         tab_ok, ntab, n_acc, n_rej, t_ok ? "OK" : "FAIL");
+  ok_all &= t_ok;
+
+  // (b) BPE pieces across the quote, fed piece by piece from `path="`.
+  const char *pre = "<tool name=\"read_file\" path=\"";
+  struct { const char *a, *b; int want; } pz[] = {
+    {"ctngh4.log\"></tool>", NULL, 2}, {"ct", "ngh4.log\"></tool>", 2}, {"ctngh4", ".log\"></tool>", 2},
+    {"ctngh4", ".log\">", 1}, {"ctngh4", "\"></tool>", 2}, {"ctngh4.l", "og\"", 1},
+    {"cngh4", NULL, 0}, {"ct", "ngh\"", 0}, {"ctngh4", ".txt\"", 0}, {"notes", ".txt\"></tool>", 2},
+    {"q.md\"", "></tool>", 2}, {"ctngh4.log\">", "x", 0},
+  };
+  const int npz = (int)(sizeof(pz) / sizeof(pz[0]));
+  int pz_ok = 0;
+  for (int i = 0; i < npz; i++) {
+    ConState s;
+    constrain_init(cd, &s);
+    int r = constrain_feed(cd, &s, (const unsigned char*)pre, (int)strlen(pre));
+    ConState s2 = s;
+    r = r && constrain_feed(cd, &s2, (const unsigned char*)pz[i].a, (int)strlen(pz[i].a));
+    if (r && pz[i].b) r = constrain_feed(cd, &s2, (const unsigned char*)pz[i].b, (int)strlen(pz[i].b));
+    const int got = !r ? 0 : (constrain_complete(&s2) ? 2 : 1);
+    if (got == pz[i].want) pz_ok++;
+    else printf("    MISMATCH piece case %d ('%s' + '%s'): got %d want %d\n", i, pz[i].a,
+                pz[i].b ? pz[i].b : "", got, pz[i].want);
+  }
+  printf("    BPE pieces after path=\": 'ctngh4.log\"></tool>' completes, 'ct'+'ngh4.log\"></tool>',"
+         " 'ctngh4'+'.log\">' (valid prefix), 'q.md\"'+'></tool>' | 'cngh4', 'ct'+'ngh\"' (close"
+         " mid-word), 'ctngh4'+'.txt\"' rejected: %d/%d -> %s\n", pz_ok, npz, pz_ok == npz ? "OK" : "FAIL");
+  ok_all &= pz_ok == npz;
+
+  // (c) greedy decode with the scripted model: unconstrained slips, constrained does not.
+  const char *tokpath = "st47_vocab.tok.tmp";
+  HFTok tok;
+  const int tok_ok = st47_write_tok(tokpath) == 0 && hftok_load(&tok, tokpath) == 0;
+  remove(tokpath);
+  int dec_ok = 0;
+  ConVocab cv;
+  memset(&cv, 0, sizeof(cv));
+  if (tok_ok && convocab_from_hftok(&cv, &tok) == 0) {
+    char tu[512], tcn[512];
+    int rej_u = 0, rej_c = 0;
+    const int nu = st47_decode(NULL, &cv, tu, &rej_u);
+    const int nc = st47_decode(cd, &cv, tcn, &rej_c);
+    ToolCall a, b;
+    toolcall_parse(strstr(tu, "</think>") ? strstr(tu, "</think>") + 8 : tu, &a);
+    toolcall_parse(strstr(tcn, "</think>") ? strstr(tcn, "</think>") + 8 : tcn, &b);
+    RewardParts ru, rc;
+    reward_score(ST47_PROMPT, tu, NULL, &ru);
+    reward_score(ST47_PROMPT, tcn, NULL, &rc);
+    dec_ok = nu > 0 && nc > 0 && strcmp(tu, ST47_SLIP) == 0 && strcmp(tcn, ST47_GOOD) == 0 &&
+             !reward_grounded_in(ST47_PROMPT, a.path) && reward_grounded_in(ST47_PROMPT, b.path) &&
+             ru.grounded == 0.0f && rc.grounded > 0.0f && rc.format > 0.0f && rej_c > 0;
+    printf("    scripted model (slip on top, right copy second), greedy: unconstrained -> path"
+           " \"%s\" (%s, reward grounded %.2f) | constrained -> path \"%s\" (%s, grounded %.2f),"
+           " %d tokens, top-1 overridden at %d step(s) -> %s\n",
+           a.path, reward_grounded_in(ST47_PROMPT, a.path) ? "grounded" : "UNGROUNDED",
+           (double)ru.grounded, b.path, reward_grounded_in(ST47_PROMPT, b.path) ? "grounded" : "UNGROUNDED",
+           (double)rc.grounded, nc, rej_c, dec_ok ? "OK" : "FAIL");
+  } else {
+    printf("    scripted model: could not build the test vocab -> FAIL\n");
+  }
+  ok_all &= dec_ok;
+
+  // (d) never a dead end: random logits, greedy and sampled, tight budgets. Every
+  //     run must end in a complete action within its budget, parse, be format-OK,
+  //     and carry a grounded path. Then a vocab that cannot spell any action must
+  //     return -1 (the explicit error), not loop.
+  int runs = 0, good = 0, mix[5] = {0}, full = 0;
+  if (tok_ok && cv.ban) {
+    unsigned long long st = 0x47474747ULL;
+    float lg[ST47_V];
+    for (int r = 0; r < 240; r++) {
+      const int budget = (r % 3 == 0) ? 28 : 40;        // 28: barely room for a read
+      const float temp = (r % 2 == 0) ? 0.0f : 1.0f;
+      const Constrain *c = (r % 4 == 1) ? cc : cd;
+      ConState s;
+      constrain_init(c, &s);
+      Rng rng = rng_create(1000 + (unsigned long long)r);
+      char text[1024];
+      text[0] = '\0';
+      int n = 0, fail = 0;
+      for (; n < budget && !constrain_complete(&s); n++) {
+        for (int i = 0; i < ST47_V; i++) {
+          st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+          lg[i] = (float)((st >> 11) % 2000) / 100.0f;
+        }
+        int fs = 0;
+        const int id = constrain_pick(c, &cv, &s, lg, temp, 8, 0.9f, &rng, budget - n, &fs);
+        full += fs;
+        if (id < 0) { fail = 1; break; }
+        char pc[64];
+        st47_piece(id, pc);
+        strcat(text, pc);
+      }
+      runs++;
+      if (fail || !constrain_complete(&s)) continue;
+      RewardParts rp;
+      ToolCall tc;
+      reward_score(ST47_PROMPT, text, NULL, &rp);
+      const char *a = strstr(text, "</think>");
+      toolcall_parse(a ? a + 8 : text, &tc);
+      if (rp.format <= 0.0f || tc.kind == TOOL_NONE) continue;
+      if (tc.path[0] && !reward_grounded_in(ST47_PROMPT, tc.path)) continue;
+      good++;
+      mix[tc.kind == TOOL_READ_FILE ? 0 : tc.kind == TOOL_WRITE_FILE ? 1 :
+          tc.kind == TOOL_RUN_COMMAND ? 2 : 3]++;
+    }
+  }
+  // A vocab of just "x" and "y": nothing spells '<'.
+  ConVocab bad;
+  unsigned char bx[1] = {'x'}, by[1] = {'y'};
+  unsigned char *bb[2] = {bx, by};
+  int bl[2] = {1, 1};
+  unsigned char bban[2] = {0, 0};
+  bad.V = 2; bad.len = bl; bad.bytes = bb; bad.ban = bban;
+  ConState sb;
+  constrain_init(cd, &sb);
+  const ConState sb0 = sb;
+  float blg[2] = {1.0f, 0.5f};
+  Rng brng = rng_create(1);
+  const int bid = constrain_pick(cd, &bad, &sb, blg, 0.0f, 0, 1.0f, &brng, 0, NULL);
+  const int dead_ok = bid == -1 && memcmp(&sb, &sb0, sizeof(sb)) == 0;
+  const int rnd_ok = runs == 240 && good == runs && mix[0] > 0 && mix[1] + mix[2] + mix[3] > 0 && dead_ok;
+  printf("    random logits x 240 (greedy / temp 1 top-k 8 top-p 0.9, budgets 28 and 40 tokens,"
+         " cmd mode on 1/4): %d/%d complete, parsed, format-OK, grounded (read %d write %d run %d"
+         " done %d; %d full-vocab scans) | vocab that cannot spell '<' -> -1, state untouched %s -> %s\n",
+         good, runs, mix[0], mix[1], mix[2], mix[3], full, dead_ok ? "yes" : "NO", rnd_ok ? "OK" : "FAIL");
+  ok_all &= rnd_ok;
+
+  // (e) through hfgen (gen.c) on a random llama model: default off == the plain
+  //     sample_token loop, token for token; --constrain gives one complete,
+  //     grounded action.
+  int id_ok = 0, hc_ok = 0, n_off = 0, n_ref = 0, n_on = 0;
+  char on_text[1024] = "";
+  if (tok_ok) {
+    const int dm = 16, nl = 2, nh = 4, nkv = 2, hd = 4, dff = 32, msq = 160;
+    srand(47);
+    LlamaModel m = llama_model_create_train(ST47_V, dm, nl, nh, nkv, hd, dff, msq, 10000.0f, 1e-5f);
+    llama_model_randomize(&m);
+    int pids[160];
+    const int np = hftok_encode(&tok, ST47_PROMPT, pids, 160);
+    enum { NN = 48 };
+    int off[NN], ref[NN], on[NN];
+    HFGenOpts o = hfgen_default_opts();
+    o.emit = 0; o.n_new = NN; o.temp = 0.9f; o.top_k = 20; o.top_p = 0.95f; o.seed = 4747;
+    o.out_ids = off; o.out_len = &n_off;
+    hfgen_llama(&m, &tok, pids, np, &o);
+    // the reference: prefill + sample_token, no constraint code involved
+    LlamaKV kv = llama_kv_create(&m);
+    int dims[2] = {1, ST47_V};
+    Tensor lg = tensor_create(dims, 2);
+    for (int i = 0; i < np; i++) llama_decode_step(&m, &kv, pids[i], &lg);
+    Rng rng = rng_create(4747);
+    for (int s = 0; s < NN && np + s < msq; s++) {
+      const int t = sample_token(&lg, 0, o.temp, o.top_k, o.top_p, &rng);
+      ref[n_ref++] = t;
+      llama_decode_step(&m, &kv, t, &lg);
+    }
+    tensor_free(&lg);
+    llama_kv_free(&kv);
+    id_ok = n_off == n_ref && memcmp(off, ref, (size_t)n_off * sizeof(int)) == 0 && !o.constrain;
+    o.constrain = 1; o.out_ids = on; o.out_len = &n_on;
+    const int rc = hfgen_llama(&m, &tok, pids, np, &o);
+    hftok_decode(&tok, on, n_on, on_text, sizeof(on_text));
+    ToolCall tc;
+    const char *a = strstr(on_text, "</think>");
+    toolcall_parse(a ? a + 8 : on_text, &tc);
+    RewardParts rp;
+    reward_score(ST47_PROMPT, on_text, NULL, &rp);
+    hc_ok = rc == 0 && n_on <= NN && constrain_check(cd, on_text) == 2 && rp.format > 0.0f &&
+            tc.kind != TOOL_NONE && (!tc.path[0] || reward_grounded_in(ST47_PROMPT, tc.path));
+    llama_model_free(&m);
+  }
+  const char *act = strstr(on_text, "<tool name=\"") ? "tool call" : "<done>";
+  printf("    hfgen on a random model: default (constrain off) == plain prefill + sample_token loop,"
+         " %d/%d tokens identical %s | --constrain -> one complete %s in %d tokens, format-OK%s -> %s\n",
+         n_off, n_ref, id_ok ? "yes" : "NO", act, n_on,
+         strstr(on_text, "path=\"") ? ", path grounded" : "", id_ok && hc_ok ? "OK" : "FAIL");
+  ok_all &= id_ok && hc_ok;
+
+  convocab_free(&cv);
+  if (tok_ok) hftok_free(&tok);
+  constrain_free(cd); constrain_free(cc); constrain_free(cb);
+  printf("    -> %s\n\n", ok_all ? "OK" : "FAIL");
+  return ok_all;
 }
 
 int run_selftest(void) {
@@ -6447,6 +6803,13 @@ int run_selftest(void) {
     printf("    -> %s\n\n", ok46 ? "OK" : "FAIL");
     all_ok &= ok46;
   }
+
+  // [47] Constrained decoding of the agent's action (constrain.c; hfgen/grpo
+  // --constrain): the grammar table, prompt-span paths fed as BPE pieces that
+  // cross the closing quote, a scripted greedy decode where the unconstrained
+  // model char-slips and the constrained one copies the prompt, random logits
+  // that must never dead-end, and the default-off path unchanged.
+  all_ok &= st47_run();
 
   // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");

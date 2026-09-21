@@ -516,6 +516,16 @@ static void grpo_usage(void) {
     "  --dump F.jsonl    one JSON line per rollout (task, k, family, reward terms,\n"
     "                    exact, action, stop, tokens, response); compare two dumps\n"
     "                    with: python tools/evalcard.py A.jsonl B.jsonl\n"
+    "  --constrain       constrained decoding (eval only): every rollout is ONE valid\n"
+    "                    action block -- [<think>..</think>] then read_file / write_file\n"
+    "                    / run_command / <done> in canonical form -- and path=\"...\" is\n"
+    "                    a whole-token span of the task prompt (byte-exact). A token is\n"
+    "                    allowed iff its bytes keep the output a valid prefix; the top\n"
+    "                    candidates are walked in logit order, then the whole vocab.\n"
+    "  --constrain-body  also: a write_file body must be one prompt span (implies --constrain)\n"
+    "  --constrain-cmd   also: run_command arguments other than verbs and -flags must be\n"
+    "                    prompt spans (implies --constrain)\n"
+    "  --constrain-think N  <think> bytes before </think> is forced (default 256; 0 = no cap)\n"
     "\n"
     "The run saves ONCE, at the end: mid-run saving would mean merging the\n"
     "adapters, which resets B to zero and stalls training.\n");
@@ -587,6 +597,10 @@ static int run_grpo(int argc, char **argv) {
     else if (strcmp(f, "--k") == 0)       { NEED_VAL(); cfg.eval_k = atoi(argv[++i]); }
     else if (strcmp(f, "--limit") == 0)   { NEED_VAL(); cfg.eval_limit = atoi(argv[++i]); }
     else if (strcmp(f, "--dump") == 0)    { NEED_VAL(); cfg.eval_dump = argv[++i]; }
+    else if (strcmp(f, "--constrain") == 0) { cfg.constrain = 1; }
+    else if (strcmp(f, "--constrain-body") == 0) { cfg.constrain = 1; cfg.con.ground_body = 1; }
+    else if (strcmp(f, "--constrain-cmd") == 0)  { cfg.constrain = 1; cfg.con.ground_cmd = 1; }
+    else if (strcmp(f, "--constrain-think") == 0) { NEED_VAL(); cfg.con.think_max = atoi(argv[++i]); }
     else { fprintf(stderr, "unknown flag: %s\n", f); grpo_usage(); return 2; }
 #undef NEED_VAL
   }
@@ -599,6 +613,11 @@ static int run_grpo(int argc, char **argv) {
     if (cfg.eval_k < 1) { fprintf(stderr, "--k must be >= 1\n"); return 2; }
     if (!temp_set) cfg.temperature = 0.0f;     // greedy unless asked otherwise
     return grpo_eval_run(tasks, &cfg);
+  }
+  if (cfg.constrain) {
+    fprintf(stderr, "error: --constrain is for --eval-only: a masked sampler is not the policy\n"
+                    "       whose probability ratio GRPO trains on\n");
+    return 2;
   }
   if (cfg.eval_k != 1 || cfg.eval_limit != 0 || cfg.eval_dump)
     fprintf(stderr, "note: --k / --limit / --dump only apply with --eval-only\n");
@@ -1008,21 +1027,27 @@ static int run_llama(int argc, char **argv) {
 // token's decoded text as a JSON delta {"d":"piece"} then {"done":true}. The
 // generation core (prompt fitting, stop-at-tag, multi-sample) is gen.c.
 //   transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]
-//                     [--stop-tags] [--samples N]
+//                     [--stop-tags] [--samples N] [--constrain[-body|-cmd]]
+//                     [--constrain-think N]
 // ============================================================================
 static int run_hfgen(int argc, char **argv) {
   // Flags may appear anywhere after <tok.hf>; the rest stay positional.
   const char *pos[8];
-  int npos = 0, stop_tags = 0, n_samples = 1, bad = 0;
+  int npos = 0, stop_tags = 0, n_samples = 1, bad = 0, constrain = 0;
+  ConstrainOpts con = constrain_default_opts();
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--stop-tags") == 0) stop_tags = 1;
     else if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) n_samples = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--constrain") == 0) constrain = 1;
+    else if (strcmp(argv[i], "--constrain-body") == 0) { constrain = 1; con.ground_body = 1; }
+    else if (strcmp(argv[i], "--constrain-cmd") == 0) { constrain = 1; con.ground_cmd = 1; }
+    else if (strcmp(argv[i], "--constrain-think") == 0 && i + 1 < argc) con.think_max = atoi(argv[++i]);
     else if (strncmp(argv[i], "--", 2) == 0) bad = 1;
     else if (npos < 8) pos[npos++] = argv[i];
   }
   if (npos < 2 || bad || n_samples < 1 || n_samples > 64) {
     fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]"
-                    " [--stop-tags] [--samples N]\n"
+                    " [--stop-tags] [--samples N] [--constrain]\n"
                     "  temp defaults to 0.8; use a low value (e.g. 0.1) for an\n"
                     "  instruction-tuned model that should answer deterministically.\n"
                     "  seed defaults to 1234; vary it for different samples at temp>0.\n"
@@ -1031,6 +1056,13 @@ static int run_hfgen(int argc, char **argv) {
                     "  --samples N  N samples (1..64) from ONE model load and ONE prompt\n"
                     "               prefill, sample i seeded seed+i; each framed by\n"
                     "               {\"sample\":i,\"seed\":S} ... {\"end\":i}.\n"
+                    "  --constrain  constrained decoding: the reply is ONE valid action block\n"
+                    "               ([<think>..</think>] + read_file/write_file/run_command/\n"
+                    "               <done>) whose path=\"...\" is a whole-token span of the\n"
+                    "               prompt; stops when the block is complete. Options:\n"
+                    "               --constrain-body (write body = prompt span), --constrain-cmd\n"
+                    "               (command args = prompt spans), --constrain-think N (think\n"
+                    "               bytes before </think> is forced; default 256, 0 = no cap).\n"
                     "  A prompt longer than the context keeps its most recent tokens (with a\n"
                     "  warning on stderr); if nothing can be generated it prints\n"
                     "  {\"error\":...} and exits nonzero.\n");
@@ -1042,6 +1074,8 @@ static int run_hfgen(int argc, char **argv) {
   o.seed = (npos > 4) ? strtoull(pos[4], NULL, 10) : 1234ull;
   o.stop_tags = stop_tags;
   o.n_samples = n_samples;
+  o.constrain = constrain;
+  o.con = con;
   HFTok tok;
   if (hftok_load(&tok, pos[1]) != 0) return 1;
 
@@ -1058,8 +1092,9 @@ static int run_hfgen(int argc, char **argv) {
   int cap = (int)plen + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, prompt, pids, cap);
-  free(prompt);
+  o.con_prompt = prompt;                     // grounding text for --constrain
   int rc = hfgen_file(&tok, pos[0], pids, np, &o);
+  free(prompt);
   free(pids); hftok_free(&tok);
   return rc;
 }

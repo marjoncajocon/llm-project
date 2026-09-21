@@ -99,8 +99,12 @@ def parse_hfgen(stdout):
 
 
 def run_hfgen(engine, model, tok, prompt, temp, seed, n_new=64, n_samples=1,
-              stop_tags=True, log=None):
+              stop_tags=True, log=None, constrain=None):
     """Run the engine once; return a list of n_samples completions.
+
+    `constrain` (None/"" = off, the default) adds hfgen's constrained decoding:
+    "path" (or "1") = --constrain, "cmd" / "body" add --constrain-cmd /
+    --constrain-body, "all" = both; several may be joined with ','.
 
     Engine warnings (e.g. an over-long prompt that had to lose its oldest
     tokens) are forwarded to `log` (default: stderr). Raises GenerationError
@@ -112,6 +116,7 @@ def run_hfgen(engine, model, tok, prompt, temp, seed, n_new=64, n_samples=1,
         cmd.append("--stop-tags")
     if n_samples > 1:
         cmd += ["--samples", str(n_samples)]
+    cmd += constrain_flags(constrain)
     proc = subprocess.run(cmd, input=prompt.encode("utf-8"),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for ln in proc.stderr.decode("utf-8", "replace").splitlines():
@@ -124,10 +129,24 @@ def run_hfgen(engine, model, tok, prompt, temp, seed, n_new=64, n_samples=1,
     return samples[:n_samples]
 
 
-def propose(engine, model, tok, prompt, n, temp, seed=1, n_new=64, stop_tags=True, log=None):
+def constrain_flags(spec):
+    """hfgen flags for a constrain spec (see run_hfgen); [] when off."""
+    parts = {p.strip().lower() for p in str(spec or "").split(",")} - {"", "0", "off", "no"}
+    if not parts:
+        return []
+    flags = ["--constrain"]
+    if parts & {"cmd", "all"}:
+        flags.append("--constrain-cmd")
+    if parts & {"body", "all"}:
+        flags.append("--constrain-body")
+    return flags
+
+
+def propose(engine, model, tok, prompt, n, temp, seed=1, n_new=64, stop_tags=True, log=None,
+            constrain=None):
     """N candidate completions (seeds seed..seed+n-1) from ONE load + ONE prefill."""
     return run_hfgen(engine, model, tok, prompt, temp, seed, n_new=n_new, n_samples=n,
-                     stop_tags=stop_tags, log=log)
+                     stop_tags=stop_tags, log=log, constrain=constrain)
 
 
 # --- critic ----------------------------------------------------------------------
