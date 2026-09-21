@@ -373,6 +373,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     hftok_free(&tok); tasks_free(tasks, n_tasks);
     return 1;
   }
+  llama_model_copy_window(&model, &loaded);   // keep its sliding-window config
   llama_model_free(&loaded);
 
   srand(cfg->seed);

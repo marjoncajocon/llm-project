@@ -160,7 +160,8 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
     }
     rope_heads(&a->q[l], b->n_heads, b->rope_base);   // in place: q/k become POST-RoPE
     rope_heads(&a->k[l], b->n_kv, b->rope_base);
-    gqa_forward(&a->q[l], &a->k[l], &a->v[l], &a->gc[l], &a->o[l]);
+    a->gc[l].window = b->window;                     // sliding window; the backward
+    gqa_forward(&a->q[l], &a->k[l], &a->v[l], &a->gc[l], &a->o[l]);   // reads it from gc too
     matmul(&a->o[l], &b->Wo, &a->ao[l]);
     if (lo) lora_forward(&lo->o[l], &a->o[l], &a->ao[l], &la->o[l]);
     matadd(x, &a->ao[l], &a->h[l]);                   // residual

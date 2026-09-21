@@ -20,6 +20,8 @@
 typedef struct {
   int d_model, n_heads, n_kv, head_dim, d_ff;
   float rope_base, eps;
+  int window;         // sliding-window attention size W (gqa.h); <= 0 = full causal.
+                      // 0 after create; set per model via llama_model_set_window.
   // Attention
   Tensor attn_norm;   // (d_model)
   Tensor Wq;          // (d_model, n_heads*head_dim)
@@ -77,12 +79,34 @@ LlamaModel llama_model_create_train(int vocab, int d_model, int n_layers, int n_
 void llama_model_free(LlamaModel *m);
 void llama_model_randomize(LlamaModel *m);
 
+// Sliding-window attention, per layer. The REPRESENTATION is one int per layer
+// (LlamaBlock.window: W > 0 = that layer attends only to its W most recent
+// positions, <= 0 = full causal attention), because real models disagree about
+// the pattern — Mistral windows every layer, Gemma 2 / gpt-oss alternate
+// local/global, Gemma 3 runs 5 local : 1 global, Qwen2 windows only the upper
+// layers — and a per-layer value covers all of them. This helper builds the
+// common "every Nth layer is global" pattern:
+//   window <= 0          -> every layer full attention (the default; turns it off)
+//   global_every <= 0    -> every layer windowed (Mistral)
+//   global_every = N > 0 -> layer l is GLOBAL when (l + 1) % N == 0, else windowed
+//                           (N = 2: local,global,local,...  = Gemma 2 / gpt-oss;
+//                            N = 6: 5 local then 1 global    = Gemma 3)
+// Any other pattern: set m->blocks[l].window directly.
+void llama_model_set_window(LlamaModel *m, int window, int global_every);
+
+// Copy the per-layer windows of src onto dst (same n_layers). The trainers rebuild
+// a loaded checkpoint as a trainable model; this keeps its window config.
+void llama_model_copy_window(LlamaModel *dst, const LlamaModel *src);
+
 // Forward: token ids (length seq_len) -> logits (seq_len, vocab). Causal.
 void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tensor *logits);
 
 // Checkpoint I/O: flat binary 'LLMA' format (magic + version + config + every
 // weight's float32 in a fixed canonical order shared by save and load).
 // llama_model_load builds a matching model, then reads the weights into it.
+// Version 3 adds n_layers int32 windows right after the float config; a model
+// with NO window anywhere is still written as v2 (byte-identical to before, so
+// older builds and tools keep reading it). Both v2 and v3 load; v2 = no window.
 // Return 0 on success, nonzero on error.
 int llama_model_save(const char *path, const LlamaModel *m);
 int llama_model_load(const char *path, LlamaModel *out);
@@ -92,10 +116,19 @@ int llama_model_load(const char *path, LlamaModel *out);
 // for every layer, so each new token computes only its own Q/K/V and attends
 // over the cache instead of re-running the whole prefix. O(n) per token.
 // ---------------------------------------------------------------------------
+//
+// A sliding-window layer only ever reads its last W positions, so its cache is
+// a RING BUFFER of cap = min(W, max_seq) slots (position p lives in slot p % cap)
+// — memory for that layer is bounded by W, not max_seq. Full-attention layers
+// keep cap = max_seq (slot p % max_seq == p). Decode visits positions in the same
+// order as the full forward, so it stays bit-exact with or without the window.
 typedef struct {
   int n_layers, max_seq, kv_dim;   // kv_dim = n_kv * head_dim
-  int len;                         // number of positions currently cached
-  float **k;                       // n_layers x (max_seq * kv_dim)
+  int len;                         // number of positions currently cached (the
+                                   // next token's absolute position; reset to 0
+                                   // to start a new sequence)
+  int *cap;                        // n_layers: slots in that layer's cache
+  float **k;                       // n_layers x (cap[l] * kv_dim)
   float **v;
 } LlamaKV;
 
@@ -133,6 +166,7 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
 // Loads the 'LLMQ' checkpoint WITHOUT dequantizing. Decode-only (for generation).
 // ---------------------------------------------------------------------------
 typedef struct {
+  int window;                                      // sliding window (as LlamaBlock)
   Tensor attn_norm, ffn_norm;                      // f32
   Tensor b_q, b_k, b_v;                            // f32 q/k/v biases (small; kept f32)
   QTensor Wq, Wk, Wv, Wo, Wgate, Wup, Wdown;       // int8
