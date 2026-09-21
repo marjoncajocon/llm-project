@@ -50,6 +50,11 @@ GrpoConfig grpo_default_config(void) {
   c.std_norm = 1;
   c.loss_agg = GRPO_AGG_SEQ;
   c.resample = 0;
+  c.prio = 0;              // uniform rand() task draw unless --prio
+  c.prio_alpha = 0.3f;
+  c.prio_wmin = 0.05f;
+  c.prio_hi = 0.9f;
+  c.diag = 0;              // report lines exactly as before unless --diag / --prio
   c.reward_version = 1;    // the original reward; v2 is opt-in (--reward v2)
   c.eval_only = 0;
   c.eval_k = 1;
@@ -110,6 +115,12 @@ int grpo_advantages(const float *rewards, int G, const GrpoConfig *cfg, float *a
 void grpo_token_coeffs(float adv, float norm, int len, const float *logp_new,
                        const float *logp_old, const float *logp_ref,
                        const GrpoConfig *cfg, float *coeff_out) {
+  grpo_token_coeffs_ex(adv, norm, len, logp_new, logp_old, logp_ref, cfg, coeff_out, NULL);
+}
+
+void grpo_token_coeffs_ex(float adv, float norm, int len, const float *logp_new,
+                          const float *logp_old, const float *logp_ref,
+                          const GrpoConfig *cfg, float *coeff_out, int *n_clipped) {
   if (len <= 0) return;
   const float inv = 1.0f / (norm > 0.0f ? norm : 1.0f);
   const float eps_high = cfg->clip_eps_high >= 0.0f ? cfg->clip_eps_high : cfg->clip_eps;
@@ -129,6 +140,7 @@ void grpo_token_coeffs(float adv, float norm, int len, const float *logp_new,
       if (adv > 0.0f && rho > 1.0f + eps_high) clipped = 1;
       if (adv < 0.0f && rho < 1.0f - cfg->clip_eps) clipped = 1;
     }
+    if (clipped && n_clipped) (*n_clipped)++;
     const float pg = clipped ? 0.0f : adv * rho;
 
     float kl = 0.0f;
@@ -169,6 +181,121 @@ int grpo_group_coeffs(const float *rewards, int G, const int *lens,
   }
   free(adv);
   return 1;
+}
+
+double grpo_row_entropy(const float *p, int V) {
+  double h = 0.0;
+  for (int v = 0; v < V; v++) {
+    const double q = p[v];
+    if (q > 0.0) h -= q * log(q);
+  }
+  return h;
+}
+
+// ---------------------------------------------------------------------------
+// Difficulty-aware task sampling (--prio; the formula is documented in grpo.h)
+// ---------------------------------------------------------------------------
+static unsigned long long splitmix64(unsigned long long x);
+
+GrpoPrio grpo_prio_create(int n_tasks, const GrpoConfig *cfg) {
+  GrpoPrio p;
+  memset(&p, 0, sizeof(p));
+  p.n = n_tasks > 0 ? n_tasks : 0;
+  p.st = (GrpoTaskStat*)calloc((size_t)(p.n > 0 ? p.n : 1), sizeof(GrpoTaskStat));
+  // A stream of its own, so turning --prio on never shifts rand() or the rollout
+  // RNG, and the same --seed always gives the same draws. The xor keeps it apart
+  // from the eval-mode per-rollout seeds, which hash the same --seed.
+  p.rng = splitmix64(0x7072696FULL ^ (unsigned long long)cfg->seed);
+  p.alpha = (cfg->prio_alpha > 0.0f && cfg->prio_alpha <= 1.0f) ? cfg->prio_alpha : 0.3f;
+  p.w_min = cfg->prio_wmin;
+  if (!(p.w_min >= GRPO_PRIO_W_FLOOR)) p.w_min = GRPO_PRIO_W_FLOOR;
+  if (p.w_min > 1.0f) p.w_min = 1.0f;
+  p.hi = cfg->prio_hi;
+  return p;
+}
+
+void grpo_prio_free(GrpoPrio *p) {
+  free(p->st);
+  p->st = NULL;
+  p->n = 0;
+}
+
+float grpo_prio_weight(const GrpoPrio *p, int i) {
+  const GrpoTaskStat *t = &p->st[i];
+  if (t->seen == 0) return GRPO_PRIO_W_UNSEEN;
+  float w = 1.0f - t->succ;                      // Kimi k1.5: weight ~ (1 - success)
+  if (w < p->w_min) w = p->w_min;
+  if (w > 1.0f) w = 1.0f;
+  // GRESO-style: a streak of flat groups predicts another flat group. Mastered
+  // (all correct) fades fast; too hard (all equally wrong) is retried, rarely.
+  const int hs = t->streak_hi < GRPO_PRIO_STREAK_CAP ? t->streak_hi : GRPO_PRIO_STREAK_CAP;
+  const int ls = t->streak_lo < GRPO_PRIO_STREAK_CAP ? t->streak_lo : GRPO_PRIO_STREAK_CAP;
+  for (int k = 0; k < hs; k++) w *= GRPO_PRIO_DECAY_HI;
+  for (int k = 0; k < ls; k++) w *= GRPO_PRIO_DECAY_LO;
+  if (w < GRPO_PRIO_W_FLOOR) w = GRPO_PRIO_W_FLOOR;
+  return w;
+}
+
+void grpo_prio_update(GrpoPrio *p, int i, float mean_reward, int flat) {
+  if (i < 0 || i >= p->n) return;
+  GrpoTaskStat *t = &p->st[i];
+  float r = mean_reward;
+  if (!(r >= 0.0f)) r = 0.0f;                    // also maps NaN to 0
+  if (r > 1.0f) r = 1.0f;
+  const float f = flat ? 1.0f : 0.0f;
+  if (t->seen == 0) {
+    t->succ = r;
+    t->flat = f;
+  } else {
+    t->succ += p->alpha * (r - t->succ);
+    t->flat += p->alpha * (f - t->flat);
+  }
+  t->seen++;
+  if (flat && r >= p->hi)  { t->streak_hi++; t->streak_lo = 0; }   // all correct
+  else if (flat)           { t->streak_lo++; t->streak_hi = 0; }   // all equally wrong
+  else                     { t->streak_hi = 0; t->streak_lo = 0; } // spread: learnable
+}
+
+int grpo_draw_task(GrpoPrio *p, const int *plen, int n_tasks) {
+  if (!p) {
+    // The original draw, unchanged: the default run's rand() stream (and so its
+    // task sequence and log) is exactly what it was before --prio existed.
+    int ti;
+    do { ti = rand() % n_tasks; } while (plen[ti] == 0);
+    return ti;
+  }
+  double total = 0.0;
+  int last = -1;
+  for (int i = 0; i < n_tasks; i++)
+    if (plen[i] != 0) { total += grpo_prio_weight(p, i); last = i; }
+  const unsigned long long r = splitmix64(p->rng);
+  p->rng += 0x9E3779B97F4A7C15ULL;
+  p->draws++;
+  if (last < 0) return 0;                        // grpo_run guarantees usable > 0
+  const double u = (double)(r >> 11) * (1.0 / 9007199254740992.0);   // [0, 1)
+  double target = u * total, acc = 0.0;
+  for (int i = 0; i < n_tasks; i++) {
+    if (plen[i] == 0) continue;
+    acc += grpo_prio_weight(p, i);
+    if (target < acc) return i;
+  }
+  return last;                                   // float round-off at the very top
+}
+
+void grpo_prio_summary(const GrpoPrio *p, const int *plen, int *seen, int *mastered,
+                       int *too_hard) {
+  int s = 0, m = 0, h = 0;
+  for (int i = 0; i < p->n; i++) {
+    if (plen && plen[i] == 0) continue;
+    const GrpoTaskStat *t = &p->st[i];
+    if (t->seen == 0) continue;
+    s++;
+    if (t->streak_hi > 0) m++;
+    if (t->streak_lo > 0) h++;
+  }
+  if (seen) *seen = s;
+  if (mastered) *mastered = m;
+  if (too_hard) *too_hard = h;
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +592,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
       loaded.vocab, loaded.d_model, loaded.n_layers, loaded.n_heads, loaded.n_kv,
       loaded.head_dim, loaded.d_ff, loaded.max_seq, loaded.rope_base, loaded.eps);
   llama_model_set_qk_norm(&model, loaded.qk_norm);   // same parameter set as the file
+  llama_model_set_tied(&model, loaded.tied);        // tied head: wte only, as in the file
   if (!copy_weights(&model, &loaded)) {
     fprintf(stderr, "error: checkpoint geometry did not survive the trainable rebuild\n");
     llama_model_free(&loaded); llama_model_free(&model);
@@ -479,6 +607,12 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
 
   const int G = cfg->group;
   const int V = model.vocab;
+  // --prio draws from the per-task statistics; --diag (implied by --prio) only
+  // keeps them for the coverage summary. Neither touches rand() or `rng`.
+  const int diag = cfg->diag || cfg->prio;
+  GrpoPrio prio;
+  memset(&prio, 0, sizeof(prio));
+  if (diag) prio = grpo_prio_create(n_tasks, cfg);
 
   // Tokenize the prompts once. Tasks whose prompt leaves no room for a rollout
   // are dropped here rather than silently producing empty responses.
@@ -590,6 +724,14 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
          cfg->loss_agg == GRPO_AGG_TOKEN ? "token" :
          (cfg->loss_agg == GRPO_AGG_CONST ? "const" : "seq"),
          cfg->resample, cfg->resample == 1 ? "" : "s");
+  if (cfg->prio)
+    printf("  prio: w = max(%.2f, clamp(1 - succ_ema, %.2f, 1) x %.1f^mastered_streak x %.1f^too_hard_streak),"
+           " unseen %.1f | ema %.2f | mastered = flat at >= %.2f\n",
+           (double)GRPO_PRIO_W_FLOOR, (double)prio.w_min, (double)GRPO_PRIO_DECAY_HI,
+           (double)GRPO_PRIO_DECAY_LO, (double)GRPO_PRIO_W_UNSEEN, (double)prio.alpha,
+           (double)prio.hi);
+  else if (diag)
+    printf("  diagnostics: on (task draw: uniform, as default)\n");
   if (use_lora) {
     printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo%s, base FROZEN (%d adapter tensors)\n",
            cfg->lora_r, (double)(cfg->lora_alpha > 0.0f ? cfg->lora_alpha : (float)cfg->lora_r),
@@ -609,6 +751,13 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   int run_groups = 0, skipped = 0, resampled = 0, capped = 0, rollouts = 0;
   const int report = cfg->steps < 10 ? 1 : cfg->steps / 10;
   int rc = 0;
+  // Diagnostics (--diag / --prio): window = since the last report line.
+  double win_ent = 0.0, run_ent = 0.0;          // summed per-token entropy (nats)
+  long win_ent_tok = 0, run_ent_tok = 0;
+  long win_clip = 0, win_ctok = 0, run_clip = 0, run_ctok = 0;
+  int win_sampled = 0, win_live = 0, run_sampled = 0, run_live = 0;
+  int win_slots = 0, win_slots_live = 0;
+  long adam_updates = 0;
 
   for (int s = 0; s < cfg->steps; s++) {
     // Collect groups_per_step task groups, then take inner_epochs updates on them.
@@ -627,7 +776,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     for (int g = 0; g < cfg->groups_per_step; g++) {
      for (int attempt = 0; attempt <= cfg->resample; attempt++) {
       int ti;
-      do { ti = rand() % n_tasks; } while (plen[ti] == 0);
+      ti = grpo_draw_task(cfg->prio ? &prio : NULL, plen, n_tasks);
       task_of_group[g] = ti;
       const int T = plen[ti];
       // The adapters only change in the update phase below, so one prefill serves
@@ -669,6 +818,11 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
       // Advantages depend on the rewards alone, so they settle here — which is
       // what lets the update below take exactly one forward per rollout.
       group_live[g] = grpo_advantages(&rrew[g * G], G, cfg, &radv[g * G]);
+      if (diag) {
+        grpo_prio_update(&prio, ti, (float)(gm / G), !group_live[g]);
+        win_sampled++;
+        win_live += group_live[g];
+      }
       if (group_live[g]) break;
       if (attempt < cfg->resample) resampled++;
       else skipped++;
@@ -729,12 +883,24 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
           softmax_rowwise(&logits, &probs);
           for (int t = 0; t < R; t++)
             flat_new[gbase + off + t] = logprob_of(&probs, t, rid[gi][t]);
+          // Policy entropy over the sampled response tokens, read off the softmax
+          // this forward already built (no extra forward). First epoch only, so
+          // mu > 1 does not count the same tokens twice. (Compact rows: probs row t
+          // IS response token t -- the same row values as the all-rows path.)
+          if (diag && ep == 0) {
+            for (int t = 0; t < R; t++)
+              win_ent += grpo_row_entropy(&probs.data[(size_t)t * V], V);
+            win_ent_tok += R;
+          }
 
-          grpo_token_coeffs(radv[gi], grpo_loss_norm(cfg, G, R, step_tokens), R,
-                            &flat_new[gbase + off],
-                            &flat_old[gbase + off],
-                            cfg->kl_beta > 0.0f ? &flat_ref[gbase + off] : NULL,
-                            cfg, coeff_row);
+          int nclip = 0;
+          grpo_token_coeffs_ex(radv[gi], grpo_loss_norm(cfg, G, R, step_tokens), R,
+                               &flat_new[gbase + off],
+                               &flat_old[gbase + off],
+                               cfg->kl_beta > 0.0f ? &flat_ref[gbase + off] : NULL,
+                               cfg, coeff_row, &nclip);
+          win_clip += nclip;
+          win_ctok += R;
 
           tensor_zero_grad(&logits);
           pg_backward(&probs, tgt, coeff_row, &logits);
@@ -756,10 +922,13 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
                                 s, cfg->warmup, cfg->steps);
         adam_set_lr(&opt, lr);
         adam_step(&opt, params, n_params);
+        adam_updates++;
       }
     }
 
     if (step_groups > 0) { run_reward += step_reward / step_groups; run_groups++; }
+    win_slots += cfg->groups_per_step;
+    for (int g = 0; g < cfg->groups_per_step; g++) win_slots_live += group_live[g];
     if (s % report == 0 || s == cfg->steps - 1) {
       const double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
       printf("  step %5d/%d  reward %.4f  (running %.4f, %d flat group%s skipped",
@@ -771,6 +940,37 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
       printf(")  %.1fs\n", secs);
       mon_print("           ", &mon_win);
       memset(&mon_win, 0, sizeof(mon_win));
+      if (diag) {
+        printf("           diag: entropy ");
+        if (win_ent_tok > 0) printf("%.4f nats/tok (%ld tok)", win_ent / win_ent_tok, win_ent_tok);
+        else printf("n/a (no live group)");
+        printf(" | live groups %d/%d sampled (%.0f%%), %d/%d step slots"
+               " | clip frac %.4f (%ld/%ld tok) | adam updates %ld\n",
+               win_live, win_sampled, win_sampled > 0 ? 100.0 * win_live / win_sampled : 0.0,
+               win_slots_live, win_slots,
+               win_ctok > 0 ? (double)win_clip / (double)win_ctok : 0.0, win_clip, win_ctok,
+               adam_updates);
+        int seen = 0, mast = 0, hard = 0;
+        grpo_prio_summary(&prio, plen, &seen, &mast, &hard);
+        printf("           tasks: seen %d/%d | mastered %d | too-hard %d", seen, usable, mast, hard);
+        if (cfg->prio) {
+          double wmin = 2.0, wmax = 0.0, wsum = 0.0;
+          for (int i = 0; i < n_tasks; i++) {
+            if (plen[i] == 0) continue;
+            const double w = grpo_prio_weight(&prio, i);
+            if (w < wmin) wmin = w;
+            if (w > wmax) wmax = w;
+            wsum += w;
+          }
+          printf(" | prio weight min %.3f mean %.3f max %.3f", wmin, wsum / usable, wmax);
+        }
+        printf("\n");
+        run_ent += win_ent; run_ent_tok += win_ent_tok;
+        run_clip += win_clip; run_ctok += win_ctok;
+        run_sampled += win_sampled; run_live += win_live;
+        win_ent = 0.0; win_ent_tok = 0; win_clip = 0; win_ctok = 0;
+        win_sampled = 0; win_live = 0; win_slots = 0; win_slots_live = 0;
+      }
       fflush(stdout);
     }
   }
@@ -792,6 +992,21 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
              "        not the policy's. Raise --max-new.\n",
              capped, rollouts, 100.0 * capped / rollouts, cfg->max_new);
   }
+  if (diag) {
+    int seen = 0, mast = 0, hard = 0;
+    grpo_prio_summary(&prio, plen, &seen, &mast, &hard);
+    printf("  task coverage: %d distinct of %d usable tasks seen | mastered %d (last group flat,"
+           " all >= %.2f) | too hard %d (last group flat below %.2f)\n",
+           seen, usable, mast, (double)prio.hi, hard, (double)prio.hi);
+    printf("  diagnostics over the run: live groups %d/%d sampled (%.0f%%) | adam updates %ld"
+           " | clip frac %.4f (%ld/%ld tok) | mean entropy ",
+           run_live, run_sampled, run_sampled > 0 ? 100.0 * run_live / run_sampled : 0.0,
+           adam_updates, run_ctok > 0 ? (double)run_clip / (double)run_ctok : 0.0,
+           run_clip, run_ctok);
+    if (run_ent_tok > 0) printf("%.4f nats/tok\n", run_ent / run_ent_tok);
+    else printf("n/a\n");
+    if (cfg->prio) printf("  prio: %ld weighted task draws\n", prio.draws);
+  }
 
   if (use_lora) {
     llama_lora_merge(&model, &lora);
@@ -807,6 +1022,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   free(text); free(line); free(coeff_row); free(seq); free(tgt); free(lm_rows);
   free(flat_new); free(flat_old); free(flat_ref);
   free(task_of_group); free(group_live);
+  if (diag) grpo_prio_free(&prio);
   free(rlen); free(rrew); free(radv);
   for (int i = 0; i < NR; i++) free(rid[i]);
   free(rid);

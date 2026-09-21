@@ -218,7 +218,7 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
                               const LlamaLora *lo, LlamaLoraActs *la) {
   forward_trunk(m, ids, seq_len, a, lo, la);
   a->n_lm_rows = -1;                                  // every row has logits
-  matmul(&a->final_hn, &m->lm_head, logits);          // (seq_len, vocab)
+  llama_head_forward(m, &a->final_hn, logits);        // (seq_len, vocab); tied: @ wte^T
 }
 
 void llama_forward_train_rows(LlamaModel *m, const int *ids, int seq_len,
@@ -240,7 +240,7 @@ void llama_forward_train_rows(LlamaModel *m, const int *ids, int seq_len,
     memcpy(&a->hc.data[(size_t)r * dm], &a->final_hn.data[(size_t)rows[r] * dm],
            (size_t)dm * sizeof(float));
   }
-  if (n_rows > 0) matmul(&a->hc, &m->lm_head, logits);   // (n_rows, vocab)
+  if (n_rows > 0) llama_head_forward(m, &a->hc, logits);   // (n_rows, vocab); tied: @ wte^T
 }
 
 int llama_target_rows(const int *targets, int seq_len, int *rows) {
@@ -262,36 +262,42 @@ static Tensor row_view(const Tensor *t, int r0, int r1, int *shape) {
   return v;
 }
 
-// logits = final_hn @ lm_head (or hc @ lm_head after the compact forward):
-// dfinal_hn (and, unfrozen, dlm_head) from logits->grad.
+// The head's backward for the rows in `h`: dh += dlogits @ head^T and, unless
+// frozen, the head's weight gradient -- lm_head.grad, or wte.grad when tied
+// (the embedding scatter adds to it afterwards).
+static void head_backward(LlamaModel *m, const Tensor *h, const Tensor *logits, int frozen) {
+  if (m->tied)     matmul_nt_backward(h, &m->wte, logits, !frozen);
+  else if (frozen) matmul_backward_dx(h, &m->lm_head, logits);
+  else             matmul_backward(h, &m->lm_head, logits);
+}
+
+// logits = final_hn @ head (or hc @ head after the compact forward):
+// dfinal_hn (and, unfrozen, the head's weight gradient) from logits->grad.
 static void lm_head_backward(LlamaModel *m, LlamaActs *a, const Tensor *logits, int frozen) {
   if (a->n_lm_rows < 0) {                             // plain forward: every row
-    if (frozen) matmul_backward_dx(&a->final_hn, &m->lm_head, logits);
-    else        matmul_backward(&a->final_hn, &m->lm_head, logits);
+    head_backward(m, &a->final_hn, logits, frozen);
     return;
   }
   const int n = a->n_lm_rows, dm = m->d_model;
   if (n == 0) return;                                 // no logits: dfinal_hn stays 0
   tensor_zero_grad(&a->hc);
-  if (frozen) {
-    matmul_backward_dx(&a->hc, &m->lm_head, logits);
+  // dx is per row, so any row grouping gives the same bits. The weight gradient
+  // sums over rows: the full path's zero rows add exactly nothing, but the AVX2
+  // dW kernel (used by matmul_backward and, tied, matmul_nt_backward) sums rows
+  // in blocks of `blk` and adds each block to dW, so the compact rows are fed one
+  // ORIGINAL block at a time: same partial sums, same order, same bits. The
+  // portable kernel (blk == 0) is one sum over all rows.
+  const int blk = frozen ? 0 : matmul_backward_dw_block();
+  if (blk <= 0) {
+    head_backward(m, &a->hc, logits, frozen);
   } else {
-    // dW sums over rows. The full path's zero rows add exactly nothing, but the
-    // AVX2 kernel sums rows in blocks of `blk` (then adds each block to dW), so
-    // the compact rows are fed one ORIGINAL block at a time: same partial sums,
-    // same order, same bits. The portable kernel (blk == 0) is one sum.
-    const int blk = matmul_backward_dw_block();
-    if (blk <= 0) {
-      matmul_backward(&a->hc, &m->lm_head, logits);
-    } else {
-      for (int s0 = 0; s0 < n;) {
-        int s1 = s0 + 1;
-        while (s1 < n && a->lm_rows[s1] / blk == a->lm_rows[s0] / blk) s1++;
-        int sh[2], sl[2];
-        Tensor hv = row_view(&a->hc, s0, s1, sh), lv = row_view(logits, s0, s1, sl);
-        matmul_backward(&hv, &m->lm_head, &lv);
-        s0 = s1;
-      }
+    for (int s0 = 0; s0 < n;) {
+      int s1 = s0 + 1;
+      while (s1 < n && a->lm_rows[s1] / blk == a->lm_rows[s0] / blk) s1++;
+      int sh[2], sl[2];
+      Tensor hv = row_view(&a->hc, s0, s1, sh), lv = row_view(logits, s0, s1, sl);
+      head_backward(m, &hv, &lv, frozen);
+      s0 = s1;
     }
   }
   for (int r = 0; r < n; r++) {                       // scatter dx back to its rows
@@ -328,8 +334,9 @@ static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
   // Under LoRA the base is frozen, so every base weight gradient is dead work:
   // take the input-gradient-only path for each big projection (roughly halves
   // the backward) and skip the embedding scatter entirely. A base built without
-  // matrix gradients (llama_model_create_train_frozen) is frozen by definition.
-  const int frozen = (lo != NULL) || (m->lm_head.grad == NULL);
+  // matrix gradients (llama_model_create_train_frozen) is frozen by definition
+  // (tested on Wq: lm_head is empty when the head is tied).
+  const int frozen = (lo != NULL) || (m->n_layers > 0 && m->blocks[0].Wq.grad == NULL);
 
   // logits = final_hn @ lm_head (all rows, or the compact rows' hc)
   lm_head_backward(m, a, logits, frozen);
@@ -416,8 +423,9 @@ void llama_backward(LlamaModel *m, const int *ids, int seq_len,
 // ---------------------------------------------------------------------------
 
 int llama_param_count(const LlamaModel *m) {
-  // wte, final_norm, lm_head + 12 per layer (+ q_norm, k_norm with QK-norm)
-  return 3 + (m->qk_norm ? 14 : 12) * m->n_layers;
+  // wte, final_norm, lm_head + 12 per layer (+ q_norm, k_norm with QK-norm).
+  // A tied head is wte itself: listed ONCE, so no optimizer steps it twice.
+  return (m->tied ? 2 : 3) + (m->qk_norm ? 14 : 12) * m->n_layers;
 }
 
 int llama_collect_params(LlamaModel *m, Tensor **list) {
@@ -443,7 +451,7 @@ int llama_collect_params(LlamaModel *m, Tensor **list) {
     list[n++] = &b->Wdown;
   }
   list[n++] = &m->final_norm;
-  list[n++] = &m->lm_head;
+  if (!m->tied) list[n++] = &m->lm_head;
   return n;
 }
 

@@ -147,6 +147,7 @@ static LlamaModel model_create_ex(int vocab, int d_model, int n_layers, int n_he
   m.n_heads = n_heads; m.n_kv = n_kv; m.head_dim = head_dim; m.d_ff = d_ff;
   m.max_seq = max_seq; m.rope_base = rope_base; m.eps = eps;
   m.qk_norm = 0;
+  m.tied = 0;
   m.wte = mat_of(vocab, d_model, grad);
   m.blocks = (LlamaBlock*)malloc((size_t)n_layers * sizeof(LlamaBlock));
   for (int l = 0; l < n_layers; l++)
@@ -194,11 +195,31 @@ void llama_model_set_qk_norm(LlamaModel *m, int on) {
   }
 }
 
+void llama_model_set_tied(LlamaModel *m, int on) {
+  if (on && !m->tied) {
+    tensor_free(&m->lm_head);
+    memset(&m->lm_head, 0, sizeof(m->lm_head));   // empty: data/grad/shape NULL, size 0
+    m->tied = 1;
+  } else if (!on && m->tied) {
+    const int V = m->vocab, D = m->d_model;
+    m->lm_head = mat_of(D, V, m->wte.grad != NULL);
+    for (int v = 0; v < V; v++)
+      for (int j = 0; j < D; j++)
+        m->lm_head.data[(size_t)j * V + v] = m->wte.data[(size_t)v * D + j];
+    m->tied = 0;
+  }
+}
+
+void llama_head_forward(const LlamaModel *m, const Tensor *hn, Tensor *logits) {
+  if (m->tied) matmul_nt(hn, &m->wte, logits);   // hn @ wte^T, no transposed copy
+  else         matmul(hn, &m->lm_head, logits);
+}
+
 void llama_model_randomize(LlamaModel *m) {
   fill_rand(&m->wte, 0.05f);
   for (int l = 0; l < m->n_layers; l++) llama_block_randomize(&m->blocks[l]);
   for (int j = 0; j < m->d_model; j++) m->final_norm.data[j] = 1.0f;
-  fill_rand(&m->lm_head, 0.05f);
+  if (!m->tied) fill_rand(&m->lm_head, 0.05f);    // tied: the head IS wte
 }
 
 void llama_model_set_window(LlamaModel *m, int window, int global_every) {
@@ -229,7 +250,7 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
   }
 
   rmsnorm(cur, &m->final_norm, &hn, m->eps);
-  matmul(&hn, &m->lm_head, logits);            // (seq_len, vocab)
+  llama_head_forward(m, &hn, logits);          // (seq_len, vocab)
 
   tensor_free(&a); tensor_free(&b); tensor_free(&hn);
 }
@@ -247,13 +268,15 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
                                   // config, then the windows iff LLMA_FLAG_WINDOWS
 #define LLMA_FLAG_QK_NORM 1u      // bit 0: per-head q/k RMSNorm (Qwen3) — q_norm, k_norm
 #define LLMA_FLAG_WINDOWS 2u      // bit 1: the n_layers int32 window block is present
-#define LLMA_KNOWN_FLAGS  (LLMA_FLAG_QK_NORM | LLMA_FLAG_WINDOWS)
+#define LLMA_FLAG_TIED    4u      // bit 2: tied head -- lm_head not stored, it is wte^T
+#define LLMA_KNOWN_FLAGS  (LLMA_FLAG_QK_NORM | LLMA_FLAG_WINDOWS | LLMA_FLAG_TIED)
 #define TENSORS_PER_LAYER 14      // attn_norm, Wq,Wk,Wv, b_q,b_k,b_v, [q_norm,k_norm], Wo,
                                   // ffn_norm, Wgate,Wup,Wdown  (the [..] only if QK-norm)
 
 // Every weight tensor in a fixed canonical order shared by save and load, so the
 // two can never drift. 1 (wte) + 12 per layer (+2 with QK-norm) + 2 (final_norm,
-// lm_head). TENSORS_PER_LAYER is the upper bound, for sizing the list.
+// lm_head; just final_norm when tied). TENSORS_PER_LAYER is the upper bound, for
+// sizing the list.
 static int llama_collect(const LlamaModel *m, const Tensor **list) {
   int n = 0;
   list[n++] = &m->wte;
@@ -277,7 +300,7 @@ static int llama_collect(const LlamaModel *m, const Tensor **list) {
     list[n++] = &b->Wdown;
   }
   list[n++] = &m->final_norm;
-  list[n++] = &m->lm_head;
+  if (!m->tied) list[n++] = &m->lm_head;   // tied: the head is wte, stored once
   return n;
 }
 
@@ -301,10 +324,12 @@ int llama_model_save(const char *path, const LlamaModel *m) {
 
   // The lowest version that can hold the model, so older builds keep reading
   // what they can: no feature -> v2 (byte-identical to a pre-feature file);
-  // windows only -> v3 (unchanged); QK-norm -> v4, windows then via flag bit 1.
+  // windows only -> v3 (unchanged); QK-norm and/or a tied head -> v4, windows
+  // then via flag bit 1.
   int windowed = 0;
   for (int l = 0; l < m->n_layers; l++) if (m->blocks[l].window > 0) windowed = 1;
-  const uint32_t flags = m->qk_norm ? (LLMA_FLAG_QK_NORM | (windowed ? LLMA_FLAG_WINDOWS : 0u)) : 0u;
+  const uint32_t feat = (m->qk_norm ? LLMA_FLAG_QK_NORM : 0u) | (m->tied ? LLMA_FLAG_TIED : 0u);
+  const uint32_t flags = feat ? (feat | (windowed ? LLMA_FLAG_WINDOWS : 0u)) : 0u;
   uint32_t header[2] = {LLMA_MAGIC, flags ? LLMA_VERSION_FLAGS
                                           : windowed ? LLMA_VERSION_WINDOW : LLMA_VERSION};
   int32_t cfg[8] = {m->vocab, m->d_model, m->n_layers, m->n_heads,
@@ -532,7 +557,7 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
 
   if (logits) {                              // NULL: prefill, no logits needed
     rmsnorm(&x, &m->final_norm, &hn, m->eps);
-    matmul(&hn, &m->lm_head, logits);        // (1, vocab)
+    llama_head_forward(m, &hn, logits);      // (1, vocab)
   }
   kv->len = pos + 1;
 
@@ -641,6 +666,7 @@ int llama_model_load(const char *path, LlamaModel *out) {
                             cfg[6], cfg[7], fcfg[0], fcfg[1]);
   // Before llama_collect: the flag decides which tensors the file holds.
   llama_model_set_qk_norm(out, (flags & LLMA_FLAG_QK_NORM) != 0);
+  llama_model_set_tied(out, (flags & LLMA_FLAG_TIED) != 0);   // no lm_head in the file
   for (int l = 0; l < out->n_layers; l++) out->blocks[l].window = win[l];
   free(win);
 
@@ -748,7 +774,24 @@ QLlamaModel q_llama_quantize_from(const LlamaModel *s) {
     qtensor_quantize(&b->Wdown, a->Wdown.data);
   }
   memcpy(m.final_norm.data, s->final_norm.data, dmb);
-  qtensor_quantize(&m.lm_head, s->lm_head.data);
+  if (!s->tied) {
+    qtensor_quantize(&m.lm_head, s->lm_head.data);
+  } else {
+    // Tied: quantize wte^T. Per-column int8 is independent per column (= per
+    // vocab entry), so build it in column blocks: never a full f32 transpose.
+    const int V = s->vocab, D = s->d_model, CB = 1024;
+    float *blk = (float*)malloc((size_t)D * CB * sizeof(float));
+    signed char *qb = (signed char*)malloc((size_t)D * CB);
+    for (int v0 = 0; v0 < V; v0 += CB) {
+      const int nc = (V - v0 < CB) ? V - v0 : CB;
+      for (int j = 0; j < D; j++)
+        for (int c = 0; c < nc; c++) blk[(size_t)j * nc + c] = s->wte.data[(size_t)(v0 + c) * D + j];
+      quantize_int8_percol(blk, D, nc, qb, &m.lm_head.scale[v0]);
+      for (int j = 0; j < D; j++)
+        memcpy(&m.lm_head.q[(size_t)j * V + v0], &qb[(size_t)j * nc], (size_t)nc);
+    }
+    free(blk); free(qb);
+  }
   return m;
 }
 
@@ -834,6 +877,14 @@ int q_llama_model_load(const char *path, QLlamaModel *out) {
   if (read_header(f, path, header, cfg, fcfg, &flags) != 0) { fclose(f); return 1; }
   if (header[0] != LLMQ_MAGIC) {
     fprintf(stderr, "Error: '%s' is not an int8 LLMQ checkpoint\n", path);
+    fclose(f); return 1;
+  }
+  if (flags & LLMA_FLAG_TIED) {
+    // The int8 decode path needs lm_head as its own (d_model, vocab) QTensor, and
+    // rebuilding it from the int8 wte would quantize twice. The converter writes
+    // int8 files untied; a tied LLMQ still loads through llama_model_load (f32).
+    fprintf(stderr, "Error: '%s' is a tied-head LLMQ checkpoint; the int8 in-memory path "
+                    "needs an untied one (convert_llama.py --int8 writes that)\n", path);
     fclose(f); return 1;
   }
   if (!llama_config_valid(cfg)) {

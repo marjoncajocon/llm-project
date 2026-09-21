@@ -70,7 +70,11 @@ typedef struct {
   Tensor wte;          // (vocab, d_model)   token embedding
   LlamaBlock *blocks;  // n_layers
   Tensor final_norm;   // (d_model)          RMSNorm before the head
-  Tensor lm_head;      // (d_model, vocab)    output projection (tie = wte^T)
+  Tensor lm_head;      // (d_model, vocab)    output projection. EMPTY (data == NULL,
+                       //                     ndim 0) when tied: the head is wte^T
+  int tied;            // 1 = lm_head ALIASES wte (tie_word_embeddings): no second
+                       // copy, logits = hn @ wte^T (matmul_nt), and the head's
+                       // gradient accumulates into wte.grad. 0 after create.
 } LlamaModel;
 
 LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
@@ -99,6 +103,18 @@ void llama_model_randomize(LlamaModel *m);
 // to 1 — load/copy the real gains afterwards. It also changes the parameter set
 // (llama_param_count), so set it BEFORE collecting params or building acts.
 void llama_model_set_qk_norm(LlamaModel *m, int on);
+
+// Tie / untie the output head to the embedding. on: frees lm_head (saves
+// vocab x d_model floats, 136M for Qwen2.5's 151936 x 896) -- the head is wte^T
+// from then on. off: allocates lm_head again (with a grad array iff wte has one)
+// and fills it with a copy of wte^T, so the model computes the same function,
+// untied. Like QK-norm this changes the parameter set (llama_param_count): set it
+// BEFORE collecting params, building optimizers or copying weights between models.
+void llama_model_set_tied(LlamaModel *m, int on);
+
+// The output head: logits (n, vocab) = hn (n, d_model) @ lm_head, or @ wte^T
+// when tied. Every forward/decode path goes through this.
+void llama_head_forward(const LlamaModel *m, const Tensor *hn, Tensor *logits);
 
 // Sliding-window attention, per layer. The REPRESENTATION is one int per layer
 // (LlamaBlock.window: W > 0 = that layer attends only to its W most recent
@@ -131,8 +147,9 @@ void llama_model_forward(const LlamaModel *m, const int *ids, int seq_len, Tenso
 //   v3  = v2 + n_layers int32 sliding windows right after the float config;
 //   v4  = v2 + a u32 feature-flags word after the float config (bit 0 = QK-norm,
 //       bit 1 = per-layer windows present), then the n_layers int32 windows iff
-//       bit 1; with bit 0 each layer stores q_norm, k_norm right after b_v.
-//       Written whenever QK-norm is on.
+//       bit 1; with bit 0 each layer stores q_norm, k_norm right after b_v;
+//       bit 2 = TIED head: lm_head is NOT stored (the file ends at final_norm)
+//       and loads as wte^T. Written whenever QK-norm or tying is on.
 // v2/v3/v4 all load; unknown versions or flag bits are rejected.
 // Return 0 on success, nonzero on error.
 int llama_model_save(const char *path, const LlamaModel *m);

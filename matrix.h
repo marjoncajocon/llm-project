@@ -90,6 +90,19 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C);
 // LoRA fine-tuning) — it skips half the backward's work.
 void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C);
 
+// C = A @ B^T with B stored (N, K): A (M,K), B (N,K), C (M,N). For a TIED output
+// head (logits = hn @ wte^T, wte (vocab, d_model)) -- no transposed copy of B.
+// Each output element is one dot product computed identically for any row/column
+// split, so it is bit-exact across thread counts and across M (decode vs a full
+// forward) -- within one kernel family: an AVX2+FMA kernel when available, else
+// portable C (they differ by ~1e-7 relative, like matmul's). No GPU offload.
+void matmul_nt(const Tensor *A, const Tensor *B, Tensor *C);
+
+// Backward of C = A @ B^T: dA += dC @ B, and (want_dB) dB += dC^T @ A, where dB
+// is B->grad -- for a tied head that is wte.grad, so the head's contribution adds
+// to the embedding's. want_dB = 0 is the frozen-base (LoRA) path.
+void matmul_nt_backward(const Tensor *A, const Tensor *B, const Tensor *C, int want_dB);
+
 // Backward of C = A + B: dA += dC, dB += dC (reads C->grad).
 void matadd_backward(const Tensor *C, const Tensor *A, const Tensor *B);
 
