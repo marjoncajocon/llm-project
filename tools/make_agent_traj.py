@@ -26,6 +26,10 @@ import argparse
 import os
 import random
 import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from risk_filter import drop_block  # noqa: E402
 
 SEP = " | "          # transcript turn separator (must match agent_local.py)
 EXTS = [".txt", ".md", ".log", ".json", ".csv"]
@@ -66,14 +70,21 @@ def slugs_from_wiki(wiki_dir, limit=300):
 
 
 def commands_from(path, limit=300):
-    cmds = []
+    """Up to `limit` real shell commands for run_command steps.
+
+    BLOCK-level commands -- as rated by the agent's own run_command classifier
+    (risk.c, via tools/risk_filter.py): rm -rf, git reset --hard, git clean -f,
+    git push --force, absolute / '~' / '..' paths, ... -- are dropped BEFORE the
+    limit is applied, so the pool keeps its size and the model is never trained
+    to emit, as a routine step, a command the agent's gate refuses. The data file
+    itself is not modified."""
+    cands = []
     if path and os.path.isfile(path):
         for line in open(path, encoding="utf-8"):
             c = line.strip()
             if c and 3 <= len(c) <= 40 and '"' not in c:
-                cmds.append(c)
-            if len(cmds) >= limit:
-                break
+                cands.append(c)
+    cmds = drop_block(cands, label="pool commands (%s)" % path)[:limit] if cands else []
     return cmds or ["ls", "git status", "pwd", "make test"]
 
 
