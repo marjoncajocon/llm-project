@@ -123,7 +123,7 @@ response is exactly one block that `toolcall.c` can parse:
 ```
 
 - **`agent_mock.py`** — offline, no-key demo: drives write→read→done deterministically
-  (counts `OBSERVATION:` lines). Use it to test the plumbing.
+  (counts lines that start with `OBSERVATION:`). Use it to test the plumbing.
 - **`agent_llm.py`** — real LLM backend (makes the agent genuinely act). Constrains the model
   to emit exactly one of the blocks above. Provider: **Claude via the Anthropic API**
   (`claude-opus-4-8`, adaptive thinking) by default, or **OpenAI** if only `OPENAI_API_KEY` is
@@ -133,9 +133,16 @@ response is exactly one block that `toolcall.c` can parse:
 ```sh
 # offline demo
 transformer agent --cmd "python tools/agent_mock.py" --goal "..."
-# real LLM (needs ANTHROPIC_API_KEY or OPENAI_API_KEY); keep --ask as the safety gate
-transformer agent --cmd "python tools/agent_llm.py" --goal "refactor X" --ask
+# real LLM (needs ANTHROPIC_API_KEY or OPENAI_API_KEY); the y/N gate is the default
+transformer agent --cmd "python tools/agent_llm.py" --goal "refactor X"
 ```
+
+Every tool path is confined to the agent's workspace (`--workspace DIR`, default
+`./workspace`), and each observation reaches the backend framed as
+`OBSERVATION: [[obs:NONCE]]` ... `[[/obs:NONCE]]` with control characters stripped and
+role-marker lines (`MODEL:`, `GOAL:`, ...) inside it prefixed with `> ` -- backends should
+treat that text as data, not instructions (`agent_llm.py`'s system prompt says so, and
+`agent_local.py` unwraps the frame to the plain format its SFT data uses).
 
 ### `webchat/` — browser testing frontend (Go + WebSocket)
 

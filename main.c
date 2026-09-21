@@ -19,6 +19,7 @@
 #include "train.h"
 #include "grpo.h"
 #include "agent.h"
+#include "toolexec.h"
 #include "caption.h"
 #include "text2media.h"
 #include "t2i.h"
@@ -182,22 +183,51 @@ static int run_generate(int argc, char **argv) {
 //   transformer agent --cmd "<prog>"  -> run <prog> as the model; its stdout is
 //                                        each response (the transcript is passed
 //                                        as a file arg). Plug in a real LLM here.
-//   --ask   approve each tool action interactively   --goal "..."  set the goal
+//   --goal "..."      set the goal
+//   --workspace DIR   root for every tool path and the cwd of run_command
+//                     (default: ./workspace, created if missing)
+//   --auto            auto-approve write_file/read_file (default: ask y/N for
+//                     every action). run_command ALWAYS asks, even with --auto,
+//                     and auto-approved writes refuse .git/, tools/ and
+//                     executable/script extensions.
+//   --ask             accepted for compatibility (it is the default)
+//   --timeout SEC     wall-clock limit per run_command (default 60)
 // ============================================================================
 static int run_agent(int argc, char **argv) {
   const char *goal = "Create a note file, then read it back to verify.";
   const char *cmd = NULL;
-  ApprovalMode mode = APPROVAL_AUTO;
+  const char *wsdir = "workspace";
+  AgentConfig cfg = agent_default_config();       // APPROVAL_ASK
   for (int i = 2; i < argc; i++) {
-    if (strcmp(argv[i], "--ask") == 0) mode = APPROVAL_ASK;
+    if (strcmp(argv[i], "--ask") == 0) cfg.mode = APPROVAL_ASK;
+    else if (strcmp(argv[i], "--auto") == 0) cfg.mode = APPROVAL_AUTO;
     else if (strcmp(argv[i], "--cmd") == 0 && i + 1 < argc) cmd = argv[++i];
     else if (strcmp(argv[i], "--goal") == 0 && i + 1 < argc) goal = argv[++i];
+    else if (strcmp(argv[i], "--workspace") == 0 && i + 1 < argc) wsdir = argv[++i];
+    else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) cfg.timeout_s = atoi(argv[++i]);
+    else {
+      fprintf(stderr, "agent: unknown option '%s'\n"
+              "usage: transformer agent [--goal \"...\"] [--cmd \"<prog>\"] [--workspace DIR]\n"
+              "                         [--auto] [--timeout SEC]\n", argv[i]);
+      return 1;
+    }
   }
+  char ws[1024];
+  if (toolexec_workspace_init(wsdir, ws, sizeof(ws)) != 0) {
+    fprintf(stderr, "agent: cannot create/open workspace '%s'\n", wsdir);
+    return 1;
+  }
+  cfg.workspace = ws;
+  if (strcmp(wsdir, ".") == 0 || strcmp(wsdir, "./") == 0)
+    fprintf(stderr, "agent: warning: the workspace is the current directory; the model can "
+                    "write any file under it\n");
+  printf("[%s mode] tools are confined to %s\n",
+         cfg.mode == APPROVAL_AUTO ? "auto-approve" : "ask", ws);
 
   int rc;
   if (cmd) {
     CommandBackend b = command_backend(cmd);
-    rc = agent_run(goal, &b.base, mode);
+    rc = agent_run(goal, &b.base, &cfg);
   } else {
     // Built-in scripted "model" (the toy GPT can't emit tool calls).
     const char *responses[] = {
@@ -208,9 +238,11 @@ static int run_agent(int argc, char **argv) {
       "<done>Created agent_demo.txt and verified its contents.</done>"
     };
     ScriptedBackend b = scripted_backend(responses, 3);
-    rc = agent_run(goal, &b.base, mode);
+    rc = agent_run(goal, &b.base, &cfg);
   }
-  remove("agent_demo.txt");  // clean up the demo artifact
+  char demo[1100];
+  snprintf(demo, sizeof(demo), "%s/agent_demo.txt", ws);
+  remove(demo);  // clean up the demo artifact
   return rc;
 }
 

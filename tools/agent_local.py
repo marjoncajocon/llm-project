@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Model backend that runs THIS PROJECT'S OWN engine — no API, no network.
 
-    transformer agent --cmd "python tools/agent_local.py <model.bin> <tok.hf>"
+    transformer agent --cmd "python tools/agent_local.py <model.bin> <tok.hf>" [--auto]
 
 The C agent (agent.c) writes the running transcript to a temp file and passes its
 path as the last argument; this program's STDOUT becomes the model's next action.
@@ -9,8 +9,12 @@ The transcript looks like:
 
     GOAL: <goal>
     MODEL: <action>
-    OBSERVATION: <obs>
+    OBSERVATION: [[obs:NONCE]]
+    <obs>
+    [[/obs:NONCE]]
     ...
+
+(unwrapped to "OBSERVATION: <obs>" below, the format the SFT data uses).
 
 For MULTI-STEP planning the model must see the WHOLE transcript, not just the last
 line. We flatten it to the SAME " | "-joined single line that the trajectory SFT
@@ -58,6 +62,18 @@ def trace(prompt, response):
     pass                                  # tracing must never break a live run
 
 
+# agent.c frames every observation as
+#   OBSERVATION: [[obs:NONCE]]\n<text>\n[[/obs:NONCE]]
+# (a per-run nonce, so tool output cannot fake the end of an observation). The
+# SFT data (make_agent_traj.py) uses plain "OBSERVATION: <text>", so unwrap the
+# frame here; role-marker lines inside <text> were already neutralized ("> ").
+OBS_FRAME = re.compile(r"OBSERVATION: \[\[obs:([0-9a-f]+)\]\]\n(.*?)\n\[\[/obs:\1\]\]", re.DOTALL)
+
+
+def unwrap(transcript):
+    return OBS_FRAME.sub(lambda m: "OBSERVATION: " + m.group(2), transcript)
+
+
 def flatten(transcript):
     """Real-newline transcript -> single line joined by SEP (matches training)."""
     lines = [ln.rstrip() for ln in transcript.splitlines() if ln.strip()]
@@ -72,6 +88,15 @@ def decode_deltas(stdout):
             body = line[len('{"d":"'):-2]
             text.append(body.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\"))
     return "".join(text)
+
+
+# Model text echoed to the terminal (stderr) must not carry terminal control
+# sequences: drop C0 (except \n, \t), DEL, C1 and bidi overrides.
+_CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def printable(s):
+    return _CTRL.sub("", s)
 
 
 def split_reason_action(text):
@@ -102,7 +127,7 @@ def main():
     transcript = ""
     if len(sys.argv) > 3 and os.path.exists(sys.argv[3]):
         with open(sys.argv[3], encoding="utf-8", errors="replace") as f:
-            transcript = f.read()
+            transcript = unwrap(f.read())
 
     prompt = flatten(transcript)
     if not prompt:
@@ -117,7 +142,7 @@ def main():
         cands = [gen(model, tok, prompt, PROPOSE_TEMP, seed) for seed in range(1, BEST_OF + 1)]
         choice, log = critique(cands, prompt, taken, last_obs, last_action)
         for line in log:
-            sys.stderr.write("  " + line + "\n")
+            sys.stderr.write("  " + printable(line) + "\n")
         if choice is None:                       # every candidate rejected
             sys.stderr.write("  critic: falling back to greedy\n")
             _, choice = split_reason_action(gen(model, tok, prompt, GREEDY_TEMP, 1234))
@@ -131,7 +156,7 @@ def main():
     if reason:
         # stderr is shown to the user by the agent but not captured as the model's
         # response, so the recorded transcript turn stays a bare tool call.
-        sys.stderr.write("  thought: %s\n" % reason)
+        sys.stderr.write("  thought: %s\n" % printable(reason))
         sys.stderr.flush()
     trace(prompt, action or "<done>No response.</done>")
     print(action or "<done>No response.</done>")
