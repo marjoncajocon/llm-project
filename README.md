@@ -302,7 +302,7 @@ node --experimental-wasi-unstable-preview1 run.js transformer.wasm   # Node's bu
 
 > WASM note: WebAssembly has no process model, so the agent's `run_command` tool is disabled
 > under WASM (it returns "not supported"); `write_file`/`read_file`, training, and generation
-> all work.
+> all work. Workspace confinement is lexical-only there (no symlink resolution).
 
 ---
 
@@ -662,7 +662,7 @@ Passing a tokenizer switches to **text-in/text-out**. Defaults: 40 new tokens, t
 0.8, top-k 40, top-p 0.95 (edit `run_generate` in `main.c`). Pair with `train` above to
 generate from a model trained on your own data.
 
-### `transformer agent [--ask]` (agent loop demo)
+### `transformer agent [--auto] [--workspace DIR]` (agent loop demo)
 
 Demonstrates the coding-agent loop in pure C: **parse → approve → execute → observe**.
 The model emits tool blocks; each approved call runs and its result is fed back:
@@ -677,11 +677,37 @@ The model emits tool blocks; each approved call runs and its result is fed back:
 The **model backend is pluggable** (`AgentBackend` interface in `agent.h`):
 
 ```sh
-transformer agent                                   # built-in scripted demo (auto-approve)
-transformer agent --ask                             # approve each tool action interactively
+transformer agent                                   # built-in scripted demo (asks y/N per action)
+transformer agent --auto                            # auto-approve file reads/writes
 transformer agent --cmd "python tools/agent_mock.py"  # external program IS the model
 transformer agent --cmd "python tools/agent_mock.py" --goal "make hello.txt"
+transformer agent --workspace scratch/ --timeout 30   # tool root + run_command time limit
 ```
+
+**Safety model** (the model's output and everything it reads are untrusted):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--workspace DIR` | `./workspace` (created) | Every tool path resolves inside DIR, and `run_command` runs with DIR as its cwd. |
+| `--auto` | off (ask) | Auto-approve `write_file`/`read_file`. `run_command` **always** asks y/N. Auto-approved writes also refuse `.git/`, a top-level `tools/`, and executable/script extensions (`.py .ps1 .bat .cmd .sh .exe .dll .so` ...). |
+| `--ask` | (default) | Accepted for compatibility; asking is the default. |
+| `--timeout SEC` | 60 | Wall-clock limit per `run_command` (Windows Job Object / POSIX process group; killed on expiry). |
+
+- Paths: relative only; `..`, `:` (drive-relative `C:x`, NTFS streams `a:b`), control/wildcard
+  characters, Windows device names (`CON`, `nul.txt`, `COM1` ...) and components ending in `.`
+  or space are refused; the opened file's canonical path (after symlinks/junctions) must be
+  inside the canonical workspace, and hard-linked files are refused.
+- Output: tool output is drained to EOF and capped (`[truncated N bytes]`), a failing command
+  reports `[exit status N]`, stdin is the null device, stderr is captured.
+- Injection: model text and observations are stripped of terminal control sequences (C0/C1,
+  ESC, bidi overrides) before printing or storing; each observation is framed as
+  `OBSERVATION: [[obs:NONCE]]` ... `[[/obs:NONCE]]` with a per-run random nonce, and role-marker
+  lines (`MODEL:`, `GOAL:`, `USER:` ...) inside it are prefixed with `> `. A transcript overflow
+  stops the run with an error rather than truncating it.
+
+Breaking change (Sep 2026): the default used to be auto-approve with tool paths relative to the
+current directory (the repo root). Pass `--auto` for unattended runs and `--workspace .` only if
+you really want the agent loose in the current directory. Selftest part [36] covers all of this.
 
 With `--cmd`, the agent writes the running transcript to a temp file, passes its path to the
 program, and uses the program's **stdout** as the model's next response — so you can plug in a
@@ -700,7 +726,7 @@ transformer llama-train data/sft.txt --sft --resume model/smollm/model.bin \
 
 # 2. drive the agent with it
 transformer agent --cmd "python tools/agent_local.py smol_sft.bin model/smollm/tok.hf" \
-  --goal "write hello to notes.txt"
+  --goal "write hello to notes.txt" --auto
 #   tool requested: write_file 'notes.txt' (5 bytes)
 #   [auto-approved] write_file 'notes.txt' (5 bytes)
 #   observation: wrote 5 bytes to notes.txt

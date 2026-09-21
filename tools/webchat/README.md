@@ -25,7 +25,7 @@ Then just run the server — it **auto-detects** the repo root and the engine
 (whether started from the repo root or from `tools/webchat/`):
 
 ```sh
-./tools/webchat/webchat               # open http://localhost:8080
+./tools/webchat/webchat               # open http://127.0.0.1:8080
 ```
 
 Both binaries are git-ignored (`*.exe` / `tools/webchat/webchat`).
@@ -37,10 +37,16 @@ make                                  # build the engine (repo root)
 cd tools/webchat && go run .          # start the server (auto-detects root)
 ```
 
-Flags (all optional): `-addr` (listen address, default `:8080`), `-root` (repo
+Flags (all optional): `-addr` (listen address, default `127.0.0.1:8080` -- loopback only;
+pass e.g. `-addr :8080` to expose it on the network, which lets anyone who can reach the port
+drive the engine), `-root` (repo
 root holding `transformer` + `model/`; auto-detected if omitted), `-exe`
 (override the engine path — searched next to the server, then in root),
 `-python` (interpreter for the tokenizer bridges, default `python`).
+
+Access control: the WebSocket only accepts connections whose `Origin` matches the server's own
+host (so another web page open in your browser cannot drive it), and when bound to loopback,
+requests whose `Host` is not a loopback name are refused (DNS-rebinding guard).
 
 ## Panels
 

@@ -53,8 +53,9 @@ data/*
 !data/sft_agent.txt
 !data/so_commands.txt
 
-# Agent demo artifact
+# Agent demo artifact + the agent's default tool workspace (transformer agent)
 agent_demo.txt
+/workspace/
 
 # Training / evaluation run logs (detached Start-Process stdout+stderr)
 train_*.log

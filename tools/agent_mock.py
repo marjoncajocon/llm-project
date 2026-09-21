@@ -14,7 +14,9 @@ transcript = ""
 if len(sys.argv) > 1:
     transcript = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 
-steps_done = transcript.count("OBSERVATION:")
+# One OBSERVATION turn per executed step (a line that STARTS with the marker;
+# the agent neutralizes marker lines inside tool output).
+steps_done = sum(1 for ln in transcript.splitlines() if ln.startswith("OBSERVATION:"))
 
 if steps_done == 0:
     print('<tool name="write_file" path="agent_demo.txt">Hello from the command backend!</tool>')

@@ -330,7 +330,7 @@ func secCommands(d *doc) {
 
 	d.h2("agent")
 	d.code(
-		"transformer agent [--goal \"...\"] [--cmd \"<command>\"] [--ask]",
+		"transformer agent [--goal \"...\"] [--cmd \"<command>\"] [--workspace DIR] [--auto] [--timeout SEC]",
 		"",
 		"# drive it with a local model:",
 		"transformer agent --goal \"create notes.txt containing hello and read it back\" \\",
@@ -339,11 +339,14 @@ func secCommands(d *doc) {
 	d.table([]string{"Flag", "Default", "Meaning"}, []float64{26, 24, 124}, [][]string{
 		{"--goal", "a demo goal", "The task given to the model."},
 		{"--cmd", "built-in script", "A pluggable backend: the engine writes the transcript to this command's stdin and reads its next action from stdout. Without it a scripted demo runs, because the toy GPT cannot emit tool calls."},
-		{"--ask", "off (auto)", "Prompt for approval before each tool call. run_command NEVER auto-approves regardless of this flag."},
+		{"--workspace", "./workspace", "Root for every tool path and the cwd of run_command (created if missing)."},
+		{"--auto", "off (ask)", "Auto-approve file reads/writes. run_command NEVER auto-approves; auto-approved writes refuse .git/, tools/ and script/executable extensions. (--ask is accepted and is the default.)"},
+		{"--timeout", "60", "Seconds before a run_command is killed."},
 	})
-	d.warn("The tool executor is sandboxed to the current working directory: absolute paths, '..', " +
-		"drive letters and UNC paths are all rejected. Run the agent from a scratch directory " +
-		"anyway - it writes real files and runs real commands.")
+	d.warn("The tool executor is confined to the workspace: absolute paths, '..', ':' (drive letters, " +
+		"NTFS streams), device names like CON or nul.txt, and anything whose real path (after " +
+		"symlinks/junctions) leaves the workspace are rejected. Tool output is stripped of terminal " +
+		"control codes and framed as data. It still writes real files and runs real commands.")
 
 	d.h2("gpu-info and gpu-bench")
 	d.code(

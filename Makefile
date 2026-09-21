@@ -88,8 +88,8 @@ text2media.o: text2media.h tensor.h image.h imagegen.h audio.h audiogen.h model.
 t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h checkpoint.h
 vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 hftok.o:      hftok.h
-selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h moe.h
-main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h
+selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h moe.h agent.h approval.h toolcall.h toolexec.h
+main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h toolexec.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.
 # Requires `zig` and a POSIX shell (Linux/macOS/WSL). No per-OS toolchain needed.
