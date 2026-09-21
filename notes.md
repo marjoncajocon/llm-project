@@ -3200,6 +3200,53 @@ PRE-EXISTING, not from this change: the wasm32-wasi build (run under Node WASI) 
 gradient check (1.47e-02 vs the 1e-2 gate) -- identical output at HEAD `489bc28` without these
 changes; wasm has no AVX2 path, so it runs the untouched portable kernels ([34] self-skips).
 
+### 2026-09-21 — decode fast paths: column-threaded M=1 matmul, candidate-only sampler sort (branch `fast-decode`)
+
+- [x] **fp32 matmul threads over COLUMNS when rows are few.** `parallel_for(M, …)` ran every
+      M=1 decode matmul on ONE thread. Now, when `M < 4 × threads` (and ≥ ~130k MACs, N ≥ 128),
+      the pool splits N into 64-column units (like int8 `qacc_columns`); each thread runs the
+      same AXPY / tile kernel on its column range (B and C are just offset). Each output element
+      is still one FMA chain in k order, produced by one thread ⇒ bit-identical to 1 thread.
+- [x] **L1 column blocking of the decode AXPY: measured, rejected.** lm_head 1×576×49152 at 1
+      thread: 512/1024/2048/4096-column blocks 10.4/8.7/8.2/8.2 ms vs 7.7 ms unblocked. It is
+      DRAM-bound (113 MB at ~15 GB/s); blocking chops each B row's long stream into strided runs.
+- [x] **`sample_token` sorts only the candidates.** One pass buckets p by float exponent; the
+      largest threshold 2^e whose mass exceeds top_p + 1e-3 (or whose count covers top_k) picks
+      the candidates p ≥ 2^e, and only those are qsorted. The comparator is now a TOTAL order
+      (p desc, then id asc), so the sorted candidates ARE the head of the full sort element for
+      element: cut-off sum, renormalizer z and the CDF walk see the same floats in the same
+      order ⇒ same token for the same RNG draw. If top-p is not reached inside the candidates
+      (flat rows), it falls back to the full sort. Behaviour change: only equal-probability ties,
+      which agent-1 left to the C library's (unspecified, non-stable) qsort.
+- [x] **Prefill without logits.** `llama_decode_step_lora(…, logits = NULL, …)` stops after the
+      last layer's K/V are cached (skips its attention + FFN, final norm, lm_head); grpo.c
+      `prefill_prompt` passes NULL for all but the last prompt token.
+- [x] **Selftest [38]**: M=1..8 × 9 shapes (K96×N49152, 576×1536, 1536×576, 576×576, 576×192,
+      130×3001, 577×1000, 64×129, 33×70) × {AVX2, portable}: pool / forced 3 / 7 column pieces
+      == one serial call bit-exact (432 comparisons) and a hash of the pool results that is the
+      same at TF_THREADS=1 and 3; sampler == full-sort reference 192/192 (peaked / flat / tie
+      rows × 8 settings × 8 draws), == agent-1's comparator on tie-free rows 128/128, fast path
+      used 120/192; NULL-logits prefill leaves a bit-identical KV cache. All other selftest output
+      byte-identical to agent-1 at TF_THREADS=1 and 3.
+
+**Numbers** — synthetic 30-layer SmolLM2-135M-shaped model (4 distinct random blocks cycled, 53 MB
+of layer weights ≫ L3, + 113 MB lm_head), median ms per token over 24 tokens, median of 3 runs,
+i5-14400, overnight 3-thread GRPO job sharing the CPU:
+
+    TF_THREADS                    1: agent-1 -> fast-decode    3: agent-1 -> fast-decode
+    decode step (with logits)          32.4 -> 33.2                33.1 -> 23.3  (1.42x)
+    decode step, logits = NULL          --  -> 23.7                 --  -> 18.4
+    lm_head 1x576x49152                 7.3 -> 7.6                  7.5 -> 4.5
+    gate 1x576x1536                   0.077 -> 0.087              0.084 -> 0.020
+    sample_token top-p .95, T=1 (1 thread): random-model row 5.7 -> 5.5 (flat: falls back,
+      sorted 48934) | Gaussian logits sd 2 / 3 / 4: 5.3 / 5.1 / 5.1 -> 2.9 / 1.1 / 0.5 ms
+      (sorted 21666 / 6583 / 717 of 49152)
+
+CAVEATS: 1-thread decode is unchanged (DRAM-bound; differences are noise). The sampler gain
+depends on how peaked the real logits are (random weights give flat rows — no gain); on the real
+135M model it was not measured (not enough free RAM). Threading threshold 2^17 vs 2^19 at 3
+threads: 23.3 vs 24.9 ms/token.
+
 #-------------------------------#
 #for checking#
 Raw Coding (HumanEval+)

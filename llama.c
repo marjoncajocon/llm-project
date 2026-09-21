@@ -494,6 +494,9 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
     const size_t slot = (size_t)(pos % kv->cap[l]) * kvd;   // ring slot (== pos if full)
     memcpy(&kv->k[l][slot], k.data, (size_t)kvd * sizeof(float));   // append to cache
     memcpy(&kv->v[l][slot], v.data, (size_t)kvd * sizeof(float));
+    // No logits wanted (prefill): the last layer's K/V are now cached, and
+    // nothing after them -- its attention and FFN, the final norm, lm_head -- is.
+    if (!logits && l == m->n_layers - 1) break;
     decode_attention(q.data, kv->k[l], kv->v[l], kv->cap[l], b->window, pos,
                      m->n_heads, m->n_kv, hd, sc, o.data);
     matmul(&o, &b->Wo, &ao);
@@ -506,8 +509,10 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
     for (int j = 0; j < dm; j++) x.data[j] += f.data[j];        // residual
   }
 
-  rmsnorm(&x, &m->final_norm, &hn, m->eps);
-  matmul(&hn, &m->lm_head, logits);          // (1, vocab)
+  if (logits) {                              // NULL: prefill, no logits needed
+    rmsnorm(&x, &m->final_norm, &hn, m->eps);
+    matmul(&hn, &m->lm_head, logits);        // (1, vocab)
+  }
   kv->len = pos + 1;
 
   free(sc); swiglu_cache_free(&sc_ff);

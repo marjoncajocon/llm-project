@@ -16,7 +16,9 @@
 //
 // matmul / matmul_backward parallelize over OUTPUT ROWS (or dB rows), so every
 // output element is produced by exactly one thread in the same summation order
-// as the single-threaded kernel -> results are bit-identical. Small matmuls stay
+// as the single-threaded kernel -> results are bit-identical. A few-row forward
+// (decode, M = 1) would leave all but one thread idle that way, so it splits the
+// OUTPUT COLUMNS instead -- same argument, still bit-identical. Small matmuls stay
 // single-threaded (below MM_THREAD_THRESHOLD), so the demo/tests are unchanged.
 // WebAssembly has no threads -> parallel_for runs inline.
 // Thread count: $TF_THREADS, else the CPU count (capped).
@@ -34,11 +36,32 @@
 #define POOL_MAX_THREADS 64
 #define MM_THREAD_THRESHOLD (1L << 19)   // ~500k MACs; below this, run single-threaded
 
+// Few-row (decode) forward matmuls -- see matmul(): with M < MM_COL_ROWS x the
+// thread count, the pool splits the OUTPUT COLUMNS into MM_COL_UNIT-wide pieces
+// instead of the rows (M = 1 would otherwise run on one thread).
+#define MM_COL_ROWS 4
+#define MM_COL_UNIT 64
+#ifndef MM_COL_THRESHOLD
+// ~130k MACs, so decode's 576x576 q/o projections are threaded too (1 x 576 x
+// 576 at 3 threads: 0.007 ms vs 0.015 ms serial; the k/v 576x192 stay serial).
+#define MM_COL_THRESHOLD (1L << 17)
+#endif
+
 typedef void (*range_fn)(int lo, int hi, void *ctx);
+
+// Chunk idx of n contiguous chunks of [0, total): how parallel_for splits work.
+static void chunk_of(int total, int idx, int n, int *lo, int *hi) {
+  int per = (total + n - 1) / n;
+  int l = idx * per, h = l + per;
+  if (l > total) l = total;
+  if (h > total) h = total;
+  *lo = l; *hi = h;
+}
 
 #if defined(POOL_DISABLED)
 
 static void parallel_for(int total, range_fn fn, void *ctx) { fn(0, total, ctx); }
+static int pool_threads(void) { return 1; }
 
 #else
 
@@ -75,14 +98,6 @@ static void    *P_ctx = NULL;
 static int      P_total = 0;
 static pthr     P_threads[POOL_MAX_THREADS];
 static int      P_ids[POOL_MAX_THREADS];
-
-static void chunk_of(int total, int idx, int n, int *lo, int *hi) {
-  int per = (total + n - 1) / n;
-  int l = idx * per, h = l + per;
-  if (l > total) l = total;
-  if (h > total) h = total;
-  *lo = l; *hi = h;
-}
 
 static void pool_body(int id) {
   int last = 0;
@@ -148,6 +163,12 @@ static void pool_init(void) {
   }
   atexit(pool_shutdown);
   P_started = 1;
+}
+
+// Threads parallel_for will use (starts the pool on first call).
+static int pool_threads(void) {
+  if (!P_started) pool_init();
+  return P_nthreads;
 }
 
 static void parallel_for(int total, range_fn fn, void *ctx) {
@@ -402,6 +423,11 @@ SIMD_FN static int gemm_rows(int r0, int r1, int ncols, int P,
                              float *c, size_t ldc, int accum) {
   if (r1 <= r0 || ncols <= 0) return 1;
   if (!accum && b_cs == 1 && r1 - r0 < 4) {          // decode-shaped forward
+    // NOT column-blocked for L1, on purpose: measured on lm_head (1 x 576 x
+    // 49152, 1 thread), 512/1024/2048/4096-column blocks ran 10.4/8.7/8.2/8.2 ms
+    // vs 7.7 ms unblocked. The product is DRAM-bound (113 MB of b at ~15 GB/s);
+    // blocking turns each b row's one long stream into K short strided runs,
+    // which costs more than re-reading the output row from L2 saves.
     for (int r = r0; r < r1; r++)
       axpy_row(a + (size_t)r * a_rs, a_ps, b, b_ps, c + (size_t)r * ldc, P, ncols);
     return 1;
@@ -485,31 +511,66 @@ const char *matmul_simd_name(void) { return simd_on() ? "avx2+fma" : "portable C
 // ===========================================================================
 // Matrix multiply (forward) - C = A @ B, A:(M,K) B:(K,N) C:(M,N)
 // ===========================================================================
-typedef struct { const float *A, *B; float *C; int K, N; } MMFwd;
+typedef struct { const float *A, *B; float *C; int M, K, N; } MMFwd;
 
-// ikj kernel for output rows [i0, i1): cache-friendly, auto-vectorizable.
-static void mm_fwd_rows(int i0, int i1, void *ctx) {
-  const MMFwd *t = (const MMFwd*)ctx;
+static int S_split = 0;   // matmul_debug_split (tests only)
+void matmul_debug_split(int mode) { S_split = (mode < 0) ? 0 : mode; }
+
+// ikj kernel for output rows [i0, i1) x columns [j0, j1): cache-friendly,
+// auto-vectorizable. Each element is C = 0, then C += a*b for k ascending,
+// whatever the row/column range -- so splitting rows or columns across threads
+// changes no bits.
+static void mm_fwd_block(const MMFwd *t, int i0, int i1, int j0, int j1) {
   const int K = t->K, N = t->N;
   for (int i = i0; i < i1; i++) {
     float *Ci = &t->C[(size_t)i * N];
-    for (int j = 0; j < N; j++) Ci[j] = 0.0f;
+    for (int j = j0; j < j1; j++) Ci[j] = 0.0f;
     const float *Ai = &t->A[(size_t)i * K];
     for (int k = 0; k < K; k++) {
       const float a = Ai[k];
       const float *Bk = &t->B[(size_t)k * N];
-      for (int j = 0; j < N; j++) Ci[j] += a * Bk[j];
+      for (int j = j0; j < j1; j++) Ci[j] += a * Bk[j];
     }
   }
 }
 
+// Column units [u0, u1) (MM_COL_UNIT columns each) -> column range [j0, j1).
+static void col_range(const MMFwd *t, int u0, int u1, int *j0, int *j1) {
+  const long lo = (long)u0 * MM_COL_UNIT, hi = (long)u1 * MM_COL_UNIT;
+  *j0 = (lo < t->N) ? (int)lo : t->N;
+  *j1 = (hi < t->N) ? (int)hi : t->N;
+}
+
+static void mm_fwd_rows(int i0, int i1, void *ctx) {
+  const MMFwd *t = (const MMFwd*)ctx;
+  mm_fwd_block(t, i0, i1, 0, t->N);
+}
+
+static void mm_fwd_cols(int u0, int u1, void *ctx) {
+  const MMFwd *t = (const MMFwd*)ctx;
+  int j0, j1; col_range(t, u0, u1, &j0, &j1);
+  mm_fwd_block(t, 0, t->M, j0, j1);
+}
+
 #if defined(MM_X86_SIMD)
-// AVX2 forward for output rows [i0, i1): C rows = A rows @ B, from 0.
+// AVX2 forward for output rows [i0, i1) x columns [j0, j1), from 0: the column
+// range is just an offset into B and C (row strides stay N).
+SIMD_FN static void mm_fwd_block_avx2(const MMFwd *t, int i0, int i1, int j0, int j1) {
+  if (j1 <= j0 || i1 <= i0) return;
+  if (!gemm_rows(i0, i1, j1 - j0, t->K, t->A, (size_t)t->K, 1, t->B + j0, (size_t)t->N, 1,
+                 t->C + j0, (size_t)t->N, 0))
+    mm_fwd_block(t, i0, i1, j0, j1);              // OOM: portable kernel instead
+}
+
 SIMD_FN static void mm_fwd_rows_avx2(int i0, int i1, void *ctx) {
   const MMFwd *t = (const MMFwd*)ctx;
-  if (!gemm_rows(i0, i1, t->N, t->K, t->A, (size_t)t->K, 1, t->B, (size_t)t->N, 1,
-                 t->C, (size_t)t->N, 0))
-    mm_fwd_rows(i0, i1, ctx);                     // OOM: portable kernel instead
+  mm_fwd_block_avx2(t, i0, i1, 0, t->N);
+}
+
+SIMD_FN static void mm_fwd_cols_avx2(int u0, int u1, void *ctx) {
+  const MMFwd *t = (const MMFwd*)ctx;
+  int j0, j1; col_range(t, u0, u1, &j0, &j1);
+  mm_fwd_block_avx2(t, 0, t->M, j0, j1);
 }
 #endif
 
@@ -520,12 +581,33 @@ void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   // when no device was found, when --no-gpu is in force, or when the problem is
   // too small to be worth the dispatch; the CPU path below is then unchanged.
   if (gpu_matmul(A->data, B->data, C->data, M, K, N)) return;
-  MMFwd t = { A->data, B->data, C->data, K, N };
-  range_fn fn = mm_fwd_rows;
+  MMFwd t = { A->data, B->data, C->data, M, K, N };
+  range_fn fn = mm_fwd_rows, fc = mm_fwd_cols;
 #if defined(MM_X86_SIMD)
-  if (simd_on()) fn = mm_fwd_rows_avx2;
+  if (simd_on()) { fn = mm_fwd_rows_avx2; fc = mm_fwd_cols_avx2; }
 #endif
-  if ((size_t)M * N * K < MM_THREAD_THRESHOLD) { fn(0, M, &t); return; }
+  const size_t macs = (size_t)M * N * K;
+  if (S_split == 1) { fn(0, M, &t); return; }     // test hook: one serial call
+  if (S_split >= 2) {                             // test hook: column pieces, serially
+    const int units = (N + MM_COL_UNIT - 1) / MM_COL_UNIT;
+    for (int i = 0; i < S_split; i++) {
+      int lo, hi; chunk_of(units, i, S_split, &lo, &hi);
+      fc(lo, hi, &t);
+    }
+    return;
+  }
+  // Few rows (decode: M = 1): splitting the rows would leave threads idle, so
+  // split the columns into 64-wide units instead -- the int8 qacc_columns does
+  // the same. Every output element is still produced by ONE thread with the same
+  // FMA chain, so the result is bit-identical to one thread (selftest [38]).
+  if (macs >= MM_COL_THRESHOLD && N >= 2 * MM_COL_UNIT) {
+    const int nt = pool_threads();
+    if (nt > 1 && M < MM_COL_ROWS * nt) {
+      parallel_for((N + MM_COL_UNIT - 1) / MM_COL_UNIT, fc, &t);
+      return;
+    }
+  }
+  if (macs < MM_THREAD_THRESHOLD) { fn(0, M, &t); return; }
   parallel_for(M, fn, &t);
 }
 
