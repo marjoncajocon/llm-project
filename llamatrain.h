@@ -49,6 +49,12 @@ typedef struct {
   Tensor *block_out;  // (n, d_model)          h + f    (input to the next layer)
   GqaCache *gc;       // per layer: cached softmax weights
   SwigluCache *sc;    // per layer: cached g, u, a, h
+  // Compact lm_head (llama_forward_train_rows): the final_hn rows that get
+  // logits, gathered into hc (n_lm_rows, d_model). n_lm_rows < 0 = every row
+  // (the plain forward); the backward reads which one ran from here.
+  Tensor hc;          // (<= seq_len, d_model)
+  int *lm_rows;       // seq_len capacity
+  int n_lm_rows;
 } LlamaActs;
 
 LlamaActs llama_acts_create(const LlamaModel *m, int seq_len);
@@ -97,10 +103,13 @@ void llama_zero_grad(LlamaModel *m);
 //   llama_backward_lora(&m, ids, n, &acts, &logits, &lo, &la);
 //   adam_step(&opt, lora_params, n_lora);   // ONLY the adapters are optimized
 //
-// Freezing is achieved by handing Adam only the adapter tensors. The backward
-// still fills the base gradients (matmul_backward computes dx and dW together,
-// so dx cannot be had without dW), but nothing consumes them — so the saving is
-// the Adam moments, which dominate optimizer memory, not the gradient buffers.
+// Freezing is achieved by handing Adam only the adapter tensors, and the backward
+// takes the input-gradient-only path (matmul_backward_dx) through every frozen
+// matrix, so no base weight-matrix gradient is ever computed. Build the base
+// with llama_model_create_train_frozen (llama.h) and those gradient arrays are
+// not even allocated -- ~650 MB for SmolLM-135M -- and llama_zero_grad no longer
+// clears them every step. A model without matrix gradients is ALWAYS run
+// through the frozen (dx-only) backward, adapters or not.
 // ---------------------------------------------------------------------------
 typedef struct {
   int n_layers, r;
@@ -167,6 +176,33 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
 void llama_backward_lora(LlamaModel *m, const int *ids, int seq_len,
                          LlamaActs *a, Tensor *logits,
                          const LlamaLora *lo, LlamaLoraActs *la);
+
+// ---------------------------------------------------------------------------
+// Compact lm_head: logits for SOME rows only.
+//
+// Rows whose target is -1 (the prompt in SFT, ~60% of rows; the prompt in GRPO,
+// ~2/3) never contribute loss or gradient, yet the plain forward computes their
+// lm_head logits (a rows x 576 x 49152 GEMM), the caller softmaxes them over the
+// whole vocab, and the backward multiplies their all-zero dlogits back through
+// lm_head. This forward runs the same trunk, then gathers only rows[0..n_rows)
+// (STRICTLY ASCENDING, each in [0, seq_len)) of the final hidden state and
+// writes logits of shape (n_rows, vocab): logits row r is position rows[r]. The
+// caller shapes `logits` (and its probs) to n_rows rows and compacts its
+// targets / coefficients the same way; llama_backward_* then sees which rows
+// ran (it is recorded in the acts) and scatters dx back. Every retained value is
+// bit-identical to the full path: a matmul row does not depend on the other
+// rows, the dropped rows' dx is exactly 0 in the full path, and a full
+// fine-tune's lm_head dW is reduced in the same row blocks (selftest [43]).
+// n_rows == 0 is allowed (no logits, no lm_head gradient).
+// ---------------------------------------------------------------------------
+void llama_forward_train_rows(LlamaModel *m, const int *ids, int seq_len,
+                              LlamaActs *a, Tensor *logits,
+                              const LlamaLora *lo, LlamaLoraActs *la,
+                              const int *rows, int n_rows);
+
+// Fill rows[] with the positions whose target is >= 0 (ascending); returns the
+// count. The row list for llama_forward_train_rows under masked targets.
+int llama_target_rows(const int *targets, int seq_len, int *rows);
 
 // Same, but does NOT zero the parameter gradients first, so B micro-batches
 // accumulate into one effective batch of B. Zero once up front (llama_zero_grad,

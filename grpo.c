@@ -459,10 +459,11 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
 
   // The loaded model has no gradient arrays; rebuild it as a trainable one and
   // copy the weights across (the same two-step the SFT trainer's --resume does).
-  LlamaModel model = llama_model_create_train(loaded.vocab, loaded.d_model, loaded.n_layers,
-                                              loaded.n_heads, loaded.n_kv, loaded.head_dim,
-                                              loaded.d_ff, loaded.max_seq, loaded.rope_base,
-                                              loaded.eps);
+  // Under LoRA the base is frozen: it gets gradient arrays only on its 1-D
+  // gains/biases (llama_model_create_train_frozen), not ~650 MB of matrices.
+  LlamaModel model = (cfg->lora_r > 0 ? llama_model_create_train_frozen : llama_model_create_train)(
+      loaded.vocab, loaded.d_model, loaded.n_layers, loaded.n_heads, loaded.n_kv,
+      loaded.head_dim, loaded.d_ff, loaded.max_seq, loaded.rope_base, loaded.eps);
   llama_model_set_qk_norm(&model, loaded.qk_norm);   // same parameter set as the file
   if (!copy_weights(&model, &loaded)) {
     fprintf(stderr, "error: checkpoint geometry did not survive the trainable rebuild\n");
@@ -508,8 +509,11 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   }
 
   LlamaActs acts = llama_acts_create(&model, maxL);
-  int lshape[2] = {maxL, V};
-  Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
+  // The update takes logits for the RESPONSE rows only (compact lm_head, see
+  // llama_forward_train_rows), and a response is at most max_new tokens -- so
+  // the logits buffers hold that many rows, not max-seq. probs needs no grad.
+  int lshape[2] = {cfg->max_new < maxL ? cfg->max_new : maxL, V};
+  Tensor logits = tensor_create(lshape, 2), probs = tensor_create_nograd(lshape, 2);
   int dshape[2] = {1, V};
   Tensor dlogits = tensor_create(dshape, 2), dprobs = tensor_create(dshape, 2);
 
@@ -563,7 +567,8 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   int *task_of_group = (int*)malloc((size_t)cfg->groups_per_step * sizeof(int));
   int *group_live = (int*)malloc((size_t)cfg->groups_per_step * sizeof(int));
   int *seq = (int*)malloc((size_t)maxL * sizeof(int));
-  int *tgt = (int*)malloc((size_t)maxL * sizeof(int));
+  int *tgt = (int*)malloc((size_t)maxL * sizeof(int));        // compact: one per response row
+  int *lm_rows = (int*)malloc((size_t)maxL * sizeof(int));
   float *coeff_row = (float*)malloc((size_t)maxL * sizeof(float));
   char *text = (char*)malloc(TEXT_CAP);
   char *line = (char*)malloc(LINE_CAP);
@@ -696,38 +701,40 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
           const int L = T + R;
           memcpy(seq, pids[ti], (size_t)T * sizeof(int));
           memcpy(&seq[T], rid[gi], (size_t)R * sizeof(int));
-          for (int j = 0; j < L; j++) { tgt[j] = -1; coeff_row[j] = 0.0f; }
           // Row j predicts token j+1, so the rows that produced the RESPONSE are
-          // T-1 .. L-2. Everything else stays masked: the prompt is context, not
-          // something the policy chose.
-          for (int j = T - 1; j <= L - 2; j++) tgt[j] = seq[j + 1];
+          // T-1 .. L-2. Everything else is masked -- the prompt is context, not
+          // something the policy chose -- so only those R rows get logits at all
+          // (compact lm_head): logits/probs row t is position T-1+t, and tgt /
+          // coeff_row are indexed the same way. Bit-identical to computing every
+          // row and masking (selftest [43]).
+          for (int t = 0; t < R; t++) { lm_rows[t] = T - 1 + t; tgt[t] = seq[T + t]; }
 
           llama_acts_set_len(&acts, L);
           if (use_lora) llama_lora_acts_set_len(&lacts, L);
-          set_rows(&logits, L, V);
-          set_rows(&probs, L, V);
+          set_rows(&logits, R, V);
+          set_rows(&probs, R, V);
 
           // The reference policy — the frozen base, i.e. the same weights with the
           // adapters switched off — is evaluated FIRST, because the policy forward
           // that follows is the one whose activation cache the backward consumes.
           if (cfg->kl_beta > 0.0f && use_lora) {
-            llama_forward_train_lora(&model, seq, L, &acts, &logits, NULL, NULL);
+            llama_forward_train_rows(&model, seq, L, &acts, &logits, NULL, NULL, lm_rows, R);
             softmax_rowwise(&logits, &probs);
             for (int t = 0; t < R; t++)
-              flat_ref[gbase + off + t] = logprob_of(&probs, T - 1 + t, rid[gi][t]);
+              flat_ref[gbase + off + t] = logprob_of(&probs, t, rid[gi][t]);
           }
 
-          llama_forward_train_lora(&model, seq, L, &acts, &logits,
-                                   use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
+          llama_forward_train_rows(&model, seq, L, &acts, &logits,
+                                   use_lora ? &lora : NULL, use_lora ? &lacts : NULL, lm_rows, R);
           softmax_rowwise(&logits, &probs);
           for (int t = 0; t < R; t++)
-            flat_new[gbase + off + t] = logprob_of(&probs, T - 1 + t, rid[gi][t]);
+            flat_new[gbase + off + t] = logprob_of(&probs, t, rid[gi][t]);
 
           grpo_token_coeffs(radv[gi], grpo_loss_norm(cfg, G, R, step_tokens), R,
                             &flat_new[gbase + off],
                             &flat_old[gbase + off],
                             cfg->kl_beta > 0.0f ? &flat_ref[gbase + off] : NULL,
-                            cfg, &coeff_row[T - 1]);
+                            cfg, coeff_row);
 
           tensor_zero_grad(&logits);
           pg_backward(&probs, tgt, coeff_row, &logits);
@@ -797,7 +804,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     printf("saved GRPO model -> %s (tokenizer: %s, unchanged)\n", cfg->out_model, cfg->hf_tok);
   }
 
-  free(text); free(line); free(coeff_row); free(seq); free(tgt);
+  free(text); free(line); free(coeff_row); free(seq); free(tgt); free(lm_rows);
   free(flat_new); free(flat_old); free(flat_ref);
   free(task_of_group); free(group_live);
   free(rlen); free(rrew); free(radv);

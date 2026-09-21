@@ -23,9 +23,12 @@ static Tensor vec_of(int n, int grad) {
   int s[1] = {n};
   return grad ? tensor_create(s, 1) : tensor_create_nograd(s, 1);
 }
+// grad == 2 (the frozen-base LoRA model): the 1-D gains/biases keep their grad
+// arrays -- the dx-only backward still writes those (a few KB) -- but no weight
+// matrix gets one.
 static Tensor mat_of(int r, int c, int grad) {
   int s[2] = {r, c};
-  return grad ? tensor_create(s, 2) : tensor_create_nograd(s, 2);
+  return grad == 1 ? tensor_create(s, 2) : tensor_create_nograd(s, 2);
 }
 static Tensor vec(int n) { return vec_of(n, 0); }
 static Tensor mat(int r, int c) { return mat_of(r, c, 0); }
@@ -165,6 +168,13 @@ LlamaModel llama_model_create_train(int vocab, int d_model, int n_layers, int n_
                                     float rope_base, float eps) {
   return model_create_ex(vocab, d_model, n_layers, n_heads, n_kv, head_dim,
                          d_ff, max_seq, rope_base, eps, 1);
+}
+
+LlamaModel llama_model_create_train_frozen(int vocab, int d_model, int n_layers, int n_heads,
+                                           int n_kv, int head_dim, int d_ff, int max_seq,
+                                           float rope_base, float eps) {
+  return model_create_ex(vocab, d_model, n_layers, n_heads, n_kv, head_dim,
+                         d_ff, max_seq, rope_base, eps, 2);
 }
 
 void llama_model_free(LlamaModel *m) {

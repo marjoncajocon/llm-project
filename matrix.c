@@ -7,7 +7,7 @@
 #include "gpu.h"
 
 // ===========================================================================
-// Persistent thread pool (internal to matrix.c).
+// Persistent thread pool (also exported as tf_parallel_for, see matrix.h).
 //
 // A fork-join pool: N-1 worker threads are created once (lazily) and reused for
 // every parallel region — no per-call thread spawning (that was measured slower).
@@ -47,7 +47,7 @@
 #define MM_COL_THRESHOLD (1L << 17)
 #endif
 
-typedef void (*range_fn)(int lo, int hi, void *ctx);
+typedef tf_range_fn range_fn;
 
 // Chunk idx of n contiguous chunks of [0, total): how parallel_for splits work.
 static void chunk_of(int total, int idx, int n, int *lo, int *hi) {
@@ -190,6 +190,22 @@ static void parallel_for(int total, range_fn fn, void *ctx) {
 }
 
 #endif  // POOL_DISABLED
+
+// Exported view of the pool for the non-GEMM training ops (see matrix.h).
+static int P_debug_chunks = 0;   // tf_parallel_debug_chunks (tests only)
+void tf_parallel_debug_chunks(int n) { P_debug_chunks = (n < 1) ? 0 : n; }
+
+void tf_parallel_for(int total, tf_range_fn fn, void *ctx) {
+  if (P_debug_chunks >= 1) {       // test hook: n pieces, one after another, here
+    for (int i = 0; i < P_debug_chunks; i++) {
+      int lo, hi; chunk_of(total, i, P_debug_chunks, &lo, &hi);
+      fn(lo, hi, ctx);
+    }
+    return;
+  }
+  parallel_for(total, fn, ctx);
+}
+int tf_threads(void) { return pool_threads(); }
 
 // ===========================================================================
 // AVX2 + FMA kernels (roadmap B4), with RUNTIME dispatch.
@@ -759,6 +775,13 @@ void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
   }
   parallel_for(M, fa, &t);
   parallel_for(K, fb, &t);
+}
+
+int matmul_backward_dw_block(void) {
+#if defined(MM_X86_SIMD)
+  if (simd_on()) return MM_KC;     // mm_bwd_dB_avx2: gemm_rows over P = M, MM_KC deep
+#endif
+  return 0;                        // mm_bwd_dB: one ascending sum over all M rows
 }
 
 // Input-gradient half only: dA += dC @ B^T, leaving B->grad untouched. For a

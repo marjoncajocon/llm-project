@@ -16,6 +16,37 @@ static float silu_prime(float z) {
   return s * (1.0f + z * (1.0f - s));
 }
 
+// The elementwise gate (SiLU(g) * u) and its backward are independent per
+// element, so a large one is cut into contiguous element ranges on the thread
+// pool. Each element runs exactly the serial arithmetic (the backward's two
+// loops fused per element: dg[i] only reads da[i], written just before), so the
+// result is the same for every thread count.
+static void silu_fwd_range(int i0, int i1, void *ctx) {
+  SwigluCache *c = (SwigluCache*)ctx;
+  for (int i = i0; i < i1; i++) {
+    c->a.data[i] = silu(c->g.data[i]);       // a = SiLU(g)
+    c->h.data[i] = c->a.data[i] * c->u.data[i];  // h = a (*) u
+  }
+}
+
+static void silu_bwd_range(int i0, int i1, void *ctx) {
+  SwigluCache *c = (SwigluCache*)ctx;
+  for (int i = i0; i < i1; i++) {
+    float dh = c->h.grad[i];
+    c->a.grad[i] += dh * c->u.data[i];        // da += dh * u
+    c->u.grad[i] += dh * c->a.data[i];        // du += dh * a
+  }
+  for (int i = i0; i < i1; i++)
+    c->g.grad[i] += c->a.grad[i] * silu_prime(c->g.data[i]);  // dg += da * SiLU'(g)
+}
+
+#define SWIGLU_THREAD_MIN (1 << 14)   // elements; below this, one thread
+
+static void ew_run(int nf, void (*fn)(int, int, void*), SwigluCache *c) {
+  if (nf < SWIGLU_THREAD_MIN) fn(0, nf, c);
+  else tf_parallel_for(nf, fn, c);
+}
+
 SwigluCache swiglu_cache_create(int n, int d_ff) {
   SwigluCache c;
   int sh[2] = {n, d_ff};
@@ -38,10 +69,7 @@ void swiglu_forward_lora(const Tensor *x, const Tensor *W_gate, const Tensor *W_
   if (sl && sl->gate) lora_forward(sl->gate, x, &c->g, sl->cg);   // before SiLU
   matmul(x, W_up, &c->u);                    // u = x @ W_up
   if (sl && sl->up) lora_forward(sl->up, x, &c->u, sl->cu);
-  for (int i = 0; i < nf; i++) {
-    c->a.data[i] = silu(c->g.data[i]);       // a = SiLU(g)
-    c->h.data[i] = c->a.data[i] * c->u.data[i];  // h = a (*) u
-  }
+  ew_run(nf, silu_fwd_range, c);            // a = SiLU(g), h = a (*) u
   matmul(&c->h, W_down, y);                   // y = h @ W_down
   if (sl && sl->down) lora_forward(sl->down, &c->h, y, sl->cd);
 }
@@ -67,13 +95,7 @@ static void swiglu_backward_impl(const Tensor *x, const Tensor *W_gate, const Te
   // The down-adapter saw h too: its dh must be in h->grad BEFORE the elementwise
   // gate backward below reads it.
   if (sl && sl->down) lora_backward(sl->down, &c->h, y, sl->cd);
-  for (int i = 0; i < nf; i++) {
-    float dh = c->h.grad[i];
-    c->a.grad[i] += dh * c->u.data[i];        // da += dh * u
-    c->u.grad[i] += dh * c->a.data[i];        // du += dh * a
-  }
-  for (int i = 0; i < nf; i++)
-    c->g.grad[i] += c->a.grad[i] * silu_prime(c->g.data[i]);  // dg += da * SiLU'(g)
+  ew_run(nf, silu_bwd_range, c);            // da, du, then dg = da * SiLU'(g)
 
   if (frozen) {
     matmul_backward_dx(x, W_gate, &c->g);     // dx += dg @ W_gate^T

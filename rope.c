@@ -2,6 +2,9 @@
 #include "rope.h"
 
 #include <math.h>
+#include <stdlib.h>
+
+#include "matrix.h"   // tf_parallel_for
 
 // y = rotation(pos) applied to each row. Half-split convention (see rope.h).
 void rope(const Tensor *input, Tensor *output, float base) {
@@ -45,26 +48,68 @@ void rope_backward(const Tensor *input, const Tensor *output, float base) {
 
 // In-place, per-head. x: (seq, n_heads*head_dim); row i uses position pos0+i.
 // Rotating (x1,x2) into locals before writing makes the in-place update safe.
-void rope_heads_pos(Tensor *x, int n_heads, float base, int pos0) {
-  const int rows = x->shape[0];
-  const int cols = x->shape[1];
-  const int hd = cols / n_heads;   // per-head dim
-  const int h = hd / 2;
+//
+// The angle of pair k at position pos is the same for every head, so each row
+// computes its cos/sin table ONCE (the identical powf/cosf/sinf expressions, so
+// the identical values) and all heads reuse it -- n_heads x fewer
+// transcendental calls. Rows are independent, so they are split across the
+// thread pool; every element is still produced by the same arithmetic.
+typedef struct { Tensor *x; int n_heads; float base; int pos0, backward; } RopeJob;
 
-  for (int i = 0; i < rows; i++) {
-    const int pos = pos0 + i;
-    for (int head = 0; head < n_heads; head++) {
-      float *xh = &x->data[i * cols + head * hd];
-      for (int k = 0; k < h; k++) {
-        float inv_freq = powf(base, -2.0f * (float)k / (float)hd);
-        float ang = (float)pos * inv_freq;
-        float c = cosf(ang), s = sinf(ang);
-        float x1 = xh[k], x2 = xh[k + h];
-        xh[k]     = x1 * c - x2 * s;
-        xh[k + h] = x2 * c + x1 * s;
+#define ROPE_MAX_HALF 256          // head_dim/2 above this uses a heap table
+
+static void rope_rows(int r0, int r1, void *ctx) {
+  const RopeJob *t = (const RopeJob*)ctx;
+  const int cols = t->x->shape[1];
+  const int hd = cols / t->n_heads;   // per-head dim
+  const int h = hd / 2;
+  float stack_cs[2 * ROPE_MAX_HALF];
+  float *cs = (h <= ROPE_MAX_HALF) ? stack_cs : (float*)malloc((size_t)2 * h * sizeof(float));
+  if (!cs) return;
+  float *cc = cs, *ss = cs + h;
+
+  for (int i = r0; i < r1; i++) {
+    const int pos = t->pos0 + i;
+    for (int k = 0; k < h; k++) {
+      float inv_freq = powf(t->base, -2.0f * (float)k / (float)hd);
+      float ang = (float)pos * inv_freq;
+      cc[k] = cosf(ang); ss[k] = sinf(ang);
+    }
+    for (int head = 0; head < t->n_heads; head++) {
+      if (!t->backward) {
+        float *xh = &t->x->data[(size_t)i * cols + head * hd];
+        for (int k = 0; k < h; k++) {
+          float c = cc[k], s = ss[k];
+          float x1 = xh[k], x2 = xh[k + h];
+          xh[k]     = x1 * c - x2 * s;
+          xh[k + h] = x2 * c + x1 * s;
+        }
+      } else {
+        float *gh = &t->x->grad[(size_t)i * cols + head * hd];
+        for (int k = 0; k < h; k++) {
+          float c = cc[k], s = ss[k];
+          float g1 = gh[k], g2 = gh[k + h];
+          gh[k]     =  g1 * c + g2 * s;
+          gh[k + h] = -g1 * s + g2 * c;
+        }
       }
     }
   }
+  if (cs != stack_cs) free(cs);
+}
+
+// Below this many elements a row split is not worth the pool hand-off.
+#define ROPE_THREAD_MIN (1L << 14)
+
+static void rope_run(Tensor *x, int n_heads, float base, int pos0, int backward) {
+  RopeJob t = { x, n_heads, base, pos0, backward };
+  const int rows = x->shape[0];
+  if ((size_t)rows * (size_t)x->shape[1] < (size_t)ROPE_THREAD_MIN) rope_rows(0, rows, &t);
+  else tf_parallel_for(rows, rope_rows, &t);
+}
+
+void rope_heads_pos(Tensor *x, int n_heads, float base, int pos0) {
+  rope_run(x, n_heads, base, pos0, 0);
 }
 
 void rope_heads(Tensor *x, int n_heads, float base) {
@@ -75,25 +120,7 @@ void rope_heads(Tensor *x, int n_heads, float base) {
 // backward is the transposed (inverse) rotation of the same angle. Applied in
 // place, for the same reason the forward is.
 void rope_heads_backward_pos(Tensor *x, int n_heads, float base, int pos0) {
-  const int rows = x->shape[0];
-  const int cols = x->shape[1];
-  const int hd = cols / n_heads;   // per-head dim
-  const int h = hd / 2;
-
-  for (int i = 0; i < rows; i++) {
-    const int pos = pos0 + i;
-    for (int head = 0; head < n_heads; head++) {
-      float *gh = &x->grad[i * cols + head * hd];
-      for (int k = 0; k < h; k++) {
-        float inv_freq = powf(base, -2.0f * (float)k / (float)hd);
-        float ang = (float)pos * inv_freq;
-        float c = cosf(ang), s = sinf(ang);
-        float g1 = gh[k], g2 = gh[k + h];
-        gh[k]     =  g1 * c + g2 * s;
-        gh[k + h] = -g1 * s + g2 * c;
-      }
-    }
-  }
+  rope_run(x, n_heads, base, pos0, 1);
 }
 
 void rope_heads_backward(Tensor *x, int n_heads, float base) {

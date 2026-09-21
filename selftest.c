@@ -1145,6 +1145,171 @@ static int st40_run(void) {
   return ok_all;
 }
 
+// ---- training fast paths, part [43] -----------------------------------------
+// The pre-optimization GQA, kept verbatim as the reference: scalar q.k dots,
+// d-outer / j-inner output loop, one thread. gqa.c's transposed-K / AXPY /
+// threaded version must reproduce it bit for bit.
+static void st43_gqa_forward_ref(const Tensor *Q, const Tensor *K, const Tensor *V,
+                                 GqaCache *c, Tensor *O) {
+  const int n = c->n, H = c->n_heads, KV = c->n_kv, hd = c->head_dim;
+  const int group = H / KV, qd = H * hd, kd = KV * hd;
+  const float scale = 1.0f / sqrtf((float)hd);
+  for (int h = 0; h < H; h++) {
+    const int kv = h / group;
+    const int qoff = h * hd, koff = kv * hd;
+    for (int i = 0; i < n; i++) {
+      float *att = &c->att[((size_t)h * n + i) * n];
+      const int lo = gqa_window_lo(i, c->window);
+      for (int j = 0; j < lo; j++) att[j] = 0.0f;
+      float maxs = -INFINITY;
+      for (int j = lo; j <= i; j++) {
+        float dot = 0.0f;
+        for (int d = 0; d < hd; d++) dot += Q->data[i * qd + qoff + d] * K->data[j * kd + koff + d];
+        float s = dot * scale;
+        att[j] = s;
+        if (s > maxs) maxs = s;
+      }
+      float sum = 0.0f;
+      for (int j = lo; j <= i; j++) { float e = expf(att[j] - maxs); att[j] = e; sum += e; }
+      float inv = 1.0f / sum;
+      for (int j = lo; j <= i; j++) att[j] *= inv;
+      for (int j = i + 1; j < n; j++) att[j] = 0.0f;
+      for (int d = 0; d < hd; d++) {
+        float o = 0.0f;
+        for (int j = lo; j <= i; j++) o += att[j] * V->data[j * kd + koff + d];
+        O->data[i * qd + qoff + d] = o;
+      }
+    }
+  }
+}
+
+static void st43_gqa_backward_ref(const Tensor *Q, const Tensor *K, const Tensor *V,
+                                  const GqaCache *c, const Tensor *O) {
+  const int n = c->n, H = c->n_heads, KV = c->n_kv, hd = c->head_dim;
+  const int group = H / KV, qd = H * hd, kd = KV * hd;
+  const float scale = 1.0f / sqrtf((float)hd);
+  float *datt = (float*)malloc((size_t)n * sizeof(float));
+  for (int h = 0; h < H; h++) {
+    const int kv = h / group;
+    const int qoff = h * hd, koff = kv * hd;
+    for (int i = 0; i < n; i++) {
+      const float *att = &c->att[((size_t)h * n + i) * n];
+      const float *dO = &O->grad[i * qd + qoff];
+      const int lo = gqa_window_lo(i, c->window);
+      float dot_ad = 0.0f;
+      for (int j = lo; j <= i; j++) {
+        float dj = 0.0f;
+        for (int d = 0; d < hd; d++) {
+          dj += dO[d] * V->data[j * kd + koff + d];
+          V->grad[j * kd + koff + d] += att[j] * dO[d];
+        }
+        datt[j] = dj;
+        dot_ad += att[j] * dj;
+      }
+      for (int j = lo; j <= i; j++) {
+        float ds = att[j] * (datt[j] - dot_ad);
+        float dss = ds * scale;
+        for (int d = 0; d < hd; d++) {
+          Q->grad[i * qd + qoff + d] += dss * K->data[j * kd + koff + d];
+          K->grad[j * kd + koff + d] += dss * Q->data[i * qd + qoff + d];
+        }
+      }
+    }
+  }
+  free(datt);
+}
+
+// The pre-optimization in-place RoPE (per-element powf/cosf/sinf), reference.
+static void st43_rope_ref(Tensor *x, int n_heads, float base, int pos0, int backward) {
+  const int rows = x->shape[0], cols = x->shape[1];
+  const int hd = cols / n_heads, h = hd / 2;
+  for (int i = 0; i < rows; i++) {
+    const int pos = pos0 + i;
+    for (int head = 0; head < n_heads; head++) {
+      float *xh = backward ? &x->grad[i * cols + head * hd] : &x->data[i * cols + head * hd];
+      for (int k = 0; k < h; k++) {
+        float inv_freq = powf(base, -2.0f * (float)k / (float)hd);
+        float ang = (float)pos * inv_freq;
+        float c = cosf(ang), s = sinf(ang);
+        float x1 = xh[k], x2 = xh[k + h];
+        if (!backward) { xh[k] = x1 * c - x2 * s; xh[k + h] = x2 * c + x1 * s; }
+        else           { xh[k] = x1 * c + x2 * s; xh[k + h] = -x1 * s + x2 * c; }
+      }
+    }
+  }
+}
+
+static unsigned long long st43_lcg = 43;
+static float st43_rnd(void) {
+  st43_lcg = st43_lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+  return (float)(st43_lcg >> 40) / 8388608.0f - 1.0f;
+}
+static void st43_fill(Tensor *t, float scale) {
+  for (size_t i = 0; i < t->size; i++) t->data[i] = scale * st43_rnd();
+}
+
+// Append every gradient the step produced (model params with a grad array, then
+// the adapters) and the loss to one float vector, so two steps compare with one
+// memcmp. Returns the float count.
+static size_t st43_snapshot(LlamaModel *m, LlamaLora *lo, float loss, float *out, size_t cap) {
+  size_t n = 0;
+  Tensor *list[512];
+  int np = llama_collect_params(m, list);
+  if (lo) np += llama_lora_collect_params(lo, list + np);
+  for (int i = 0; i < np; i++) {
+    if (!list[i]->grad) continue;
+    if (n + list[i]->size > cap) return 0;
+    memcpy(out + n, list[i]->grad, list[i]->size * sizeof(float));
+    n += list[i]->size;
+  }
+  if (n < cap) out[n++] = loss;
+  return n;
+}
+
+// One training step, full-row path (compact = 0) or compact lm_head (1).
+// coeff == NULL: masked CE (SFT). Else pg_backward with per-row coefficients
+// (GRPO), and the returned "loss" is the sum of the rows' log-probs.
+static float st43_step(LlamaModel *m, LlamaLora *lo, LlamaLoraActs *la, LlamaActs *a,
+                       const int *ids, const int *tgt, const float *coeff, int L,
+                       int compact) {
+  const int V = m->vocab;
+  int ls[2] = {L, V};
+  Tensor logits = tensor_create(ls, 2), probs = tensor_create_nograd(ls, 2);
+  int *rows = (int*)malloc((size_t)L * sizeof(int)), *tc = (int*)malloc((size_t)L * sizeof(int));
+  float *cc = (float*)malloc((size_t)L * sizeof(float));
+  llama_acts_set_len(a, L);
+  if (lo) llama_lora_acts_set_len(la, L);
+  const int *tg = tgt;
+  const float *cf = coeff;
+  int nr = L;
+  if (compact) {
+    nr = llama_target_rows(tgt, L, rows);
+    for (int r = 0; r < nr; r++) { tc[r] = tgt[rows[r]]; cc[r] = coeff ? coeff[rows[r]] : 0.0f; }
+    logits.shape[0] = probs.shape[0] = nr;
+    logits.size = probs.size = (size_t)nr * V;
+    llama_forward_train_rows(m, ids, L, a, &logits, lo, la, rows, nr);
+    tg = tc;
+    cf = coeff ? cc : NULL;
+  } else {
+    llama_forward_train_lora(m, ids, L, a, &logits, lo, la);
+  }
+  float loss = 0.0f;
+  if (!coeff) {
+    loss = cross_entropy_forward(&logits, tg, &probs);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, tg, &logits);
+  } else {
+    softmax_rowwise(&logits, &probs);
+    for (int r = 0; r < nr; r++) if (tg[r] >= 0) loss += logprob_of(&probs, r, tg[r]);
+    tensor_zero_grad(&logits);
+    pg_backward(&probs, tg, cf, &logits);
+  }
+  llama_backward_lora(m, ids, L, a, &logits, lo, la);
+  tensor_free(&logits); tensor_free(&probs);
+  free(rows); free(tc); free(cc);
+  return loss;
+}
+
 int run_selftest(void) {
   printf("=== Minimal GPT-2 Style Transformer Demo ===\n\n");
   int all_ok = 1;
@@ -5375,6 +5540,287 @@ int run_selftest(void) {
     const int ok42 = miss == 0 && fb == 0 && oth == 0 && ans_ok && e2e_ok;
     printf("    -> %s\n\n", ok42 ? "OK" : "FAIL");
     all_ok &= ok42;
+  }
+
+  // --------------------------------------------------------------------------
+  // [43] Training-step fast paths, all required to be BIT-EXACT:
+  // (a) the threaded / re-laid-out kernels -- GQA forward+backward (transposed-K
+  //     scores, AXPY output, heads / KV-groups on the pool), RoPE (per-row angle
+  //     table), softmax / CE / pg rows, RMSNorm forward+backward (rows, then gamma
+  //     by columns), the SwiGLU gate -- against the pre-change scalar code (GQA,
+  //     RoPE) or one serial call, with the real pool and with the range forced
+  //     into 1 / 2 / 5 serial pieces (so chunk edges are hit even at 1 thread);
+  // (b) the compact lm_head (logits only for rows with a target) against the
+  //     all-rows path: loss and EVERY gradient memcmp-equal, for a full fine-tune
+  //     (SFT mask straddling the AVX2 kernel's 256-row dW block, a sparse mask,
+  //     no supervised rows), LoRA+MLP, and the GRPO pg loss -- on both kernels;
+  // (c) a frozen LoRA base built WITHOUT matrix gradient arrays gives the same
+  //     adapter gradients as a base with them, and an Adam step on the adapters
+  //     leaves every base weight untouched.
+  // --------------------------------------------------------------------------
+  {
+    printf("[43] Training fast paths: compact lm_head rows, threaded attention/row ops, frozen LoRA base\n");
+    const int gpu_was = gpu_is_enabled();
+    gpu_set_enabled(0);
+    const int was_simd = matmul_simd_enabled();
+    const int chunk_modes[4] = {0, 1, 2, 5};         // pool, then 1 / 2 / 5 serial pieces
+
+    // ---- (a) kernels ----
+    int k_ok = 1, k_cmp = 0;
+    {
+      const int n = 70, H = 6, KV = 3, hd = 16, qd = H * hd, kd = KV * hd;
+      int sq[2] = {n, qd}, sk[2] = {n, kd};
+      Tensor Q = tensor_create(sq, 2), K = tensor_create(sk, 2), V = tensor_create(sk, 2);
+      Tensor Or = tensor_create(sq, 2), On = tensor_create(sq, 2);
+      st43_fill(&Q, 1.0f); st43_fill(&K, 1.0f); st43_fill(&V, 1.0f);
+      for (size_t i = 0; i < Or.size; i++) Or.grad[i] = On.grad[i] = st43_rnd();
+      const size_t gsz = (Q.size + 2 * K.size) * sizeof(float);
+      float *ref_g = (float*)malloc(gsz), *new_g = (float*)malloc(gsz);
+      for (int w = 0; w < 2; w++) {
+        GqaCache cr = gqa_cache_create(n, H, KV, hd), cn = gqa_cache_create(n, H, KV, hd);
+        cr.window = cn.window = w ? 17 : 0;
+        st43_gqa_forward_ref(&Q, &K, &V, &cr, &Or);
+        tensor_zero_grad(&Q); tensor_zero_grad(&K); tensor_zero_grad(&V);
+        st43_gqa_backward_ref(&Q, &K, &V, &cr, &Or);
+        memcpy(ref_g, Q.grad, Q.size * sizeof(float));
+        memcpy(ref_g + Q.size, K.grad, K.size * sizeof(float));
+        memcpy(ref_g + Q.size + K.size, V.grad, V.size * sizeof(float));
+        for (int cm = 0; cm < 4; cm++) {
+          tf_parallel_debug_chunks(chunk_modes[cm]);
+          gqa_forward(&Q, &K, &V, &cn, &On);
+          tensor_zero_grad(&Q); tensor_zero_grad(&K); tensor_zero_grad(&V);
+          gqa_backward(&Q, &K, &V, &cn, &On);
+          tf_parallel_debug_chunks(0);
+          memcpy(new_g, Q.grad, Q.size * sizeof(float));
+          memcpy(new_g + Q.size, K.grad, K.size * sizeof(float));
+          memcpy(new_g + Q.size + K.size, V.grad, V.size * sizeof(float));
+          k_ok &= memcmp(Or.data, On.data, Or.size * sizeof(float)) == 0 &&
+                  memcmp(cr.att, cn.att, (size_t)H * n * n * sizeof(float)) == 0 &&
+                  memcmp(ref_g, new_g, gsz) == 0;
+          k_cmp++;
+        }
+        gqa_cache_free(&cr); gqa_cache_free(&cn);
+      }
+      // RoPE forward (on data) and backward (on grad), pos0 = 5 like a decode offset
+      Tensor Rr = tensor_create(sq, 2), Rn = tensor_create(sq, 2);
+      st43_fill(&Rr, 1.0f);
+      for (size_t i = 0; i < Rr.size; i++) Rr.grad[i] = st43_rnd();
+      Tensor R0 = tensor_create(sq, 2);
+      memcpy(R0.data, Rr.data, Rr.size * sizeof(float));
+      memcpy(R0.grad, Rr.grad, Rr.size * sizeof(float));
+      st43_rope_ref(&Rr, H, 10000.0f, 5, 0);
+      st43_rope_ref(&Rr, H, 10000.0f, 5, 1);
+      for (int cm = 0; cm < 4; cm++) {
+        memcpy(Rn.data, R0.data, R0.size * sizeof(float));
+        memcpy(Rn.grad, R0.grad, R0.size * sizeof(float));
+        tf_parallel_debug_chunks(chunk_modes[cm]);
+        rope_heads_pos(&Rn, H, 10000.0f, 5);
+        rope_heads_backward_pos(&Rn, H, 10000.0f, 5);
+        tf_parallel_debug_chunks(0);
+        k_ok &= memcmp(Rr.data, Rn.data, Rr.size * sizeof(float)) == 0 &&
+                memcmp(Rr.grad, Rn.grad, Rr.size * sizeof(float)) == 0;
+        k_cmp++;
+      }
+      tensor_free(&Rr); tensor_free(&Rn); tensor_free(&R0);
+      free(ref_g); free(new_g);
+      tensor_free(&Q); tensor_free(&K); tensor_free(&V); tensor_free(&Or); tensor_free(&On);
+    }
+    {
+      // softmax + CE backward + pg backward rows (40 x 1000), RMSNorm (80 x 512),
+      // SwiGLU gate (40 x 512): every chunking must equal the single serial call.
+      const int NR = 40, NV = 1000, RN = 80, RC = 512, SD = 24, SF = 512;
+      int sl[2] = {NR, NV}, sr[2] = {RN, RC}, sg[1] = {RC};
+      int sx[2] = {NR, SD}, sw1[2] = {SD, SF}, sw2[2] = {SF, SD};
+      Tensor lg = tensor_create(sl, 2), pr = tensor_create_nograd(sl, 2);
+      Tensor rx = tensor_create(sr, 2), ry = tensor_create(sr, 2), gam = tensor_create(sg, 1);
+      Tensor sx_ = tensor_create(sx, 2), sy = tensor_create(sx, 2);
+      Tensor wg = tensor_create(sw1, 2), wu = tensor_create(sw1, 2), wd = tensor_create(sw2, 2);
+      SwigluCache sc = swiglu_cache_create(NR, SF);
+      st43_fill(&lg, 4.0f); st43_fill(&rx, 1.0f); st43_fill(&gam, 1.0f);
+      st43_fill(&sx_, 1.0f); st43_fill(&wg, 0.3f); st43_fill(&wu, 0.3f); st43_fill(&wd, 0.3f);
+      for (size_t i = 0; i < ry.size; i++) ry.grad[i] = st43_rnd();
+      for (size_t i = 0; i < sy.size; i++) sy.grad[i] = st43_rnd();
+      int tg[40]; float cf[40];
+      for (int i = 0; i < NR; i++) {
+        tg[i] = (i % 3 == 0) ? -1 : (int)((st43_rnd() + 1.0f) * 499.0f);
+        cf[i] = (i % 5 == 0) ? 0.0f : st43_rnd();
+      }
+      const size_t tot = pr.size * 3 + rx.size * 2 + gam.size + sc.h.size + sy.size + sx_.size +
+                         wg.size * 2 + wd.size;
+      float *ref = (float*)malloc(tot * sizeof(float)), *cur = (float*)malloc(tot * sizeof(float));
+      for (int cm = 1; cm >= 0; cm--) {                // cm index 1 = one serial piece = reference
+        for (int pass = 0; pass < (cm == 1 ? 1 : 4); pass++) {
+          const int mode = (cm == 1) ? 1 : chunk_modes[pass];
+          tf_parallel_debug_chunks(mode);
+          size_t o = 0;
+          float *dst = (cm == 1) ? ref : cur;
+          softmax_rowwise(&lg, &pr);
+          memcpy(dst + o, pr.data, pr.size * sizeof(float)); o += pr.size;
+          tensor_zero_grad(&lg);
+          cross_entropy_backward(&pr, tg, &lg);
+          memcpy(dst + o, lg.grad, lg.size * sizeof(float)); o += lg.size;
+          tensor_zero_grad(&lg);
+          pg_backward(&pr, tg, cf, &lg);
+          memcpy(dst + o, lg.grad, lg.size * sizeof(float)); o += lg.size;
+          rmsnorm(&rx, &gam, &ry, 1e-5f);
+          tensor_zero_grad(&rx); tensor_zero_grad(&gam);
+          rmsnorm_backward(&rx, &gam, &ry, &gam, 1e-5f);
+          memcpy(dst + o, ry.data, ry.size * sizeof(float)); o += ry.size;
+          memcpy(dst + o, rx.grad, rx.size * sizeof(float)); o += rx.size;
+          memcpy(dst + o, gam.grad, gam.size * sizeof(float)); o += gam.size;
+          swiglu_forward(&sx_, &wg, &wu, &wd, &sc, &sy);
+          tensor_zero_grad(&sx_); tensor_zero_grad(&wg); tensor_zero_grad(&wu); tensor_zero_grad(&wd);
+          swiglu_backward(&sx_, &wg, &wu, &wd, &sc, &sy);
+          memcpy(dst + o, sc.h.data, sc.h.size * sizeof(float)); o += sc.h.size;
+          memcpy(dst + o, sy.data, sy.size * sizeof(float)); o += sy.size;
+          memcpy(dst + o, sx_.grad, sx_.size * sizeof(float)); o += sx_.size;
+          memcpy(dst + o, wg.grad, wg.size * sizeof(float)); o += wg.size;
+          memcpy(dst + o, wu.grad, wu.size * sizeof(float)); o += wu.size;
+          memcpy(dst + o, wd.grad, wd.size * sizeof(float)); o += wd.size;
+          tf_parallel_debug_chunks(0);
+          if (cm == 0) { k_ok &= (o == tot) && memcmp(ref, cur, tot * sizeof(float)) == 0; k_cmp++; }
+        }
+      }
+      free(ref); free(cur);
+      swiglu_cache_free(&sc);
+      tensor_free(&lg); tensor_free(&pr); tensor_free(&rx); tensor_free(&ry); tensor_free(&gam);
+      tensor_free(&sx_); tensor_free(&sy); tensor_free(&wg); tensor_free(&wu); tensor_free(&wd);
+    }
+    printf("    kernels (pool + 1/2/5 serial pieces): GQA fwd+bwd window 0/17 and RoPE vs the scalar"
+           " originals; softmax, CE/pg rows, RMSNorm fwd+bwd, SwiGLU vs one serial call:"
+           " %d/%d bit-exact\n", k_ok ? k_cmp : 0, k_cmp);
+
+    // ---- (b) compact lm_head == all rows ----
+    const int V43 = 300, DM = 24, NL = 2, NH = 4, NKV = 2, HD = 6, DFF = 40, L43 = 300;
+    int *ids = (int*)malloc(L43 * sizeof(int));
+    int *tsft = (int*)malloc(L43 * sizeof(int)), *tsp = (int*)malloc(L43 * sizeof(int));
+    int *tnone = (int*)malloc(L43 * sizeof(int));
+    float *coef = (float*)malloc(L43 * sizeof(float));
+    for (int i = 0; i < L43; i++) ids[i] = (int)((st43_rnd() + 1.0f) * 0.5f * (V43 - 1));
+    for (int i = 0; i < L43; i++) {
+      tsft[i] = (i >= 179 && i <= L43 - 2) ? ids[i + 1] : -1;     // straddles row 256
+      tsp[i] = (i < L43 - 1 && st43_rnd() > 0.0f) ? ids[i + 1] : -1;
+      tnone[i] = -1;
+      coef[i] = (i % 7 == 0) ? 0.0f : 0.05f * st43_rnd();
+    }
+    const size_t CAP = 400000;
+    float *sa = (float*)malloc(CAP * sizeof(float)), *sb = (float*)malloc(CAP * sizeof(float));
+    int c_ok = 1, c_cmp = 0, c_modes = 0;
+    for (int mode = 1; mode >= 0; mode--) {
+      if (mode == 1 && !matmul_simd_available()) continue;
+      matmul_set_simd(mode);
+      c_modes++;
+      srand(4301);
+      LlamaModel m = llama_model_create_train(V43, DM, NL, NH, NKV, HD, DFF, 320, 10000.0f, 1e-5f);
+      llama_model_randomize(&m);
+      llama_model_set_qk_norm(&m, 1);
+      llama_model_set_window(&m, 50, 2);             // layer 0 windowed, layer 1 global
+      for (int l = 0; l < NL; l++) {
+        st43_fill(&m.blocks[l].b_q, 0.1f); st43_fill(&m.blocks[l].b_k, 0.1f);
+        st43_fill(&m.blocks[l].b_v, 0.1f);
+        st43_fill(&m.blocks[l].q_norm, 0.2f); st43_fill(&m.blocks[l].k_norm, 0.2f);
+        for (int j = 0; j < HD; j++) { m.blocks[l].q_norm.data[j] += 1.0f; m.blocks[l].k_norm.data[j] += 1.0f; }
+      }
+      LlamaActs a = llama_acts_create(&m, L43);
+      LlamaLora lo = llama_lora_create_ex(&m, 3, 6.0f, 1);
+      llama_lora_init(&lo);
+      Tensor *lp[64];
+      const int nlp = llama_lora_collect_params(&lo, lp);
+      for (int i = 0; i < nlp; i++) st43_fill(lp[i], 0.1f);   // B != 0: adapters live
+      LlamaLoraActs la = llama_lora_acts_create(&m, &lo, L43);
+      struct { const int *tgt; const float *cf; int lora; } cases[] = {
+        {tsft, NULL, 0}, {tsp, NULL, 0}, {tnone, NULL, 0},    // full fine-tune, CE
+        {tsft, NULL, 1}, {tsp, coef, 1},                      // LoRA+MLP: CE, pg
+        {tsp, coef, 0},                                       // full fine-tune, pg
+      };
+      for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        LlamaLora *lop = cases[c].lora ? &lo : NULL;
+        const float lf = st43_step(&m, lop, &la, &a, ids, cases[c].tgt, cases[c].cf, L43, 0);
+        const size_t na = st43_snapshot(&m, lop, lf, sa, CAP);
+        for (int cm = 0; cm < 2; cm++) {             // compact: pool, then 3 serial pieces
+          tf_parallel_debug_chunks(cm ? 3 : 0);
+          const float lc = st43_step(&m, lop, &la, &a, ids, cases[c].tgt, cases[c].cf, L43, 1);
+          tf_parallel_debug_chunks(0);
+          const size_t nb = st43_snapshot(&m, lop, lc, sb, CAP);
+          c_ok &= na > 0 && na == nb && memcmp(sa, sb, na * sizeof(float)) == 0;
+          c_cmp++;
+        }
+      }
+      llama_lora_acts_free(&la); llama_lora_free(&lo);
+      llama_acts_free(&a); llama_model_free(&m);
+    }
+    matmul_set_simd(was_simd);
+    printf("    compact lm_head == all rows (loss + every gradient, memcmp): full FT CE (SFT mask"
+           " across the 256-row dW block, sparse mask, no rows), LoRA+MLP CE and pg, full FT pg,"
+           " pool + 3 pieces, %d kernel set%s: %d/%d\n", c_modes, c_modes == 1 ? "" : "s",
+           c_ok ? c_cmp : 0, c_cmp);
+
+    // ---- (c) frozen base without matrix gradients ----
+    srand(4302);
+    LlamaModel mt = llama_model_create_train(V43, DM, NL, NH, NKV, HD, DFF, 320, 10000.0f, 1e-5f);
+    LlamaModel mf = llama_model_create_train_frozen(V43, DM, NL, NH, NKV, HD, DFF, 320, 10000.0f, 1e-5f);
+    llama_model_randomize(&mt);
+    Tensor *pt[64], *pf[64];
+    const int np = llama_collect_params(&mt, pt);
+    llama_collect_params(&mf, pf);
+    size_t base_f = 0, nograd_f = 0;
+    for (int i = 0; i < np; i++) {
+      memcpy(pf[i]->data, pt[i]->data, pt[i]->size * sizeof(float));
+      base_f += pf[i]->size;
+      if (!pf[i]->grad) nograd_f += pf[i]->size;
+    }
+    float *base_copy = (float*)malloc(base_f * sizeof(float));
+    for (size_t i = 0, o = 0; i < (size_t)np; o += pf[i]->size, i++)
+      memcpy(base_copy + o, pf[i]->data, pf[i]->size * sizeof(float));
+    LlamaLora lt = llama_lora_create_ex(&mt, 3, 6.0f, 1), lf = llama_lora_create_ex(&mf, 3, 6.0f, 1);
+    Tensor *at[64], *af[64];
+    const int na = llama_lora_collect_params(&lt, at);
+    llama_lora_collect_params(&lf, af);
+    for (int i = 0; i < na; i++) {
+      st43_fill(at[i], 0.1f);
+      memcpy(af[i]->data, at[i]->data, at[i]->size * sizeof(float));
+    }
+    LlamaActs act = llama_acts_create(&mt, L43), acf = llama_acts_create(&mf, L43);
+    LlamaLoraActs lat = llama_lora_acts_create(&mt, &lt, L43), laf = llama_lora_acts_create(&mf, &lf, L43);
+    const float l_t = st43_step(&mt, &lt, &lat, &act, ids, tsft, NULL, L43, 1);
+    const float l_f = st43_step(&mf, &lf, &laf, &acf, ids, tsft, NULL, L43, 1);
+    int g_same = memcmp(&l_t, &l_f, sizeof(float)) == 0;
+    for (int i = 0; i < na; i++)
+      g_same &= memcmp(at[i]->grad, af[i]->grad, at[i]->size * sizeof(float)) == 0;
+    for (int i = 0; i < np; i++)                        // the 1-D gains/biases kept theirs
+      if (pf[i]->grad) g_same &= memcmp(pt[i]->grad, pf[i]->grad, pt[i]->size * sizeof(float)) == 0;
+    Adam ot = adamw_create(at, na, 1e-2f, 0.01f), of = adamw_create(af, na, 1e-2f, 0.01f);
+    adam_step(&ot, at, na);
+    adam_step(&of, af, na);
+    int untouched = 1, a_same = 1;
+    for (size_t i = 0, o = 0; i < (size_t)np; o += pf[i]->size, i++)
+      untouched &= memcmp(base_copy + o, pf[i]->data, pf[i]->size * sizeof(float)) == 0;
+    for (int i = 0; i < na; i++)
+      a_same &= memcmp(at[i]->data, af[i]->data, at[i]->size * sizeof(float)) == 0;
+    int moved = 0;                                      // and the step did something
+    for (int i = 0; i < na && !moved; i++) moved = at[i]->grad[0] != 0.0f || at[i]->grad[1] != 0.0f;
+    // SmolLM-135M geometry (d 576, 30 layers, 9/3 heads x 64, d_ff 1536, vocab 49152):
+    // every weight matrix, i.e. the gradient floats a frozen base no longer allocates.
+    const double smol = 2.0 * 49152 * 576 +
+                        30.0 * (576.0 * 576 + 2.0 * 576 * 192 + 576.0 * 576 + 3.0 * 576 * 1536);
+    printf("    frozen LoRA base: %zu of %zu base floats carry no gradient array (SmolLM-135M"
+           " geometry: %.0f MB not allocated) | adapter + gain/bias grads == with-grad base: %s |"
+           " base weights untouched by the Adam step: %s | adapters after the step identical: %s\n",
+           nograd_f, base_f, smol * 4.0 / 1e6, g_same && moved ? "yes" : "NO",
+           untouched ? "yes" : "NO", a_same ? "yes" : "NO");
+    adam_free(&ot); adam_free(&of);
+    llama_lora_acts_free(&lat); llama_lora_acts_free(&laf);
+    llama_acts_free(&act); llama_acts_free(&acf);
+    llama_lora_free(&lt); llama_lora_free(&lf);
+    llama_model_free(&mt); llama_model_free(&mf);
+    free(base_copy);
+    free(sa); free(sb); free(ids); free(tsft); free(tsp); free(tnone); free(coef);
+    gpu_set_enabled(gpu_was);
+
+    const int ok43 = k_ok && c_ok && g_same && moved && untouched && a_same &&
+                     nograd_f > 0 && nograd_f < base_f;
+    printf("    -> %s\n\n", ok43 ? "OK" : "FAIL");
+    all_ok &= ok43;
   }
 
   // --------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 // llamatrain.c - Training forward/backward for the LLaMA-family model (llama.h)
 #include "llamatrain.h"
 
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "matrix.h"
 #include "rmsnorm.h"
@@ -50,6 +52,9 @@ LlamaActs llama_acts_create(const LlamaModel *m, int seq_len) {
     a.gc[l] = gqa_cache_create(seq_len, m->n_heads, m->n_kv, m->head_dim);
     a.sc[l] = swiglu_cache_create(seq_len, m->d_ff);
   }
+  a.hc = act(seq_len, dm);
+  a.lm_rows = (int*)malloc((size_t)(seq_len > 0 ? seq_len : 1) * sizeof(int));
+  a.n_lm_rows = -1;
   return a;
 }
 
@@ -131,6 +136,8 @@ void llama_acts_free(LlamaActs *a) {
   }
   free(a->gc); free(a->sc);
   a->gc = NULL; a->sc = NULL;
+  tensor_free(&a->hc);
+  free(a->lm_rows); a->lm_rows = NULL;
 }
 
 static void llama_acts_zero_grad(LlamaActs *a) {
@@ -155,9 +162,9 @@ static void llama_acts_zero_grad(LlamaActs *a) {
 // Forward (caching)
 // ---------------------------------------------------------------------------
 
-void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
-                              LlamaActs *a, Tensor *logits,
-                              const LlamaLora *lo, LlamaLoraActs *la) {
+// Everything up to and including the final RMSNorm (a->final_hn).
+static void forward_trunk(LlamaModel *m, const int *ids, int seq_len, LlamaActs *a,
+                          const LlamaLora *lo, LlamaLoraActs *la) {
   const int dm = m->d_model;
 
   // Token embedding. No positional term — RoPE carries position inside attention.
@@ -204,7 +211,94 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
   }
 
   rmsnorm(&a->block_out[m->n_layers - 1], &m->final_norm, &a->final_hn, m->eps);
+}
+
+void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
+                              LlamaActs *a, Tensor *logits,
+                              const LlamaLora *lo, LlamaLoraActs *la) {
+  forward_trunk(m, ids, seq_len, a, lo, la);
+  a->n_lm_rows = -1;                                  // every row has logits
   matmul(&a->final_hn, &m->lm_head, logits);          // (seq_len, vocab)
+}
+
+void llama_forward_train_rows(LlamaModel *m, const int *ids, int seq_len,
+                              LlamaActs *a, Tensor *logits,
+                              const LlamaLora *lo, LlamaLoraActs *la,
+                              const int *rows, int n_rows) {
+  const int dm = m->d_model;
+  for (int r = 0; r < n_rows; r++)
+    if (rows[r] < 0 || rows[r] >= seq_len || (r > 0 && rows[r] <= rows[r - 1])) {
+      fprintf(stderr, "llama_forward_train_rows: rows must be strictly ascending in "
+                      "[0, %d) (row %d = %d)\n", seq_len, r, rows[r]);
+      exit(EXIT_FAILURE);
+    }
+  forward_trunk(m, ids, seq_len, a, lo, la);
+  a->n_lm_rows = n_rows;
+  set_rows(&a->hc, n_rows);
+  for (int r = 0; r < n_rows; r++) {
+    a->lm_rows[r] = rows[r];
+    memcpy(&a->hc.data[(size_t)r * dm], &a->final_hn.data[(size_t)rows[r] * dm],
+           (size_t)dm * sizeof(float));
+  }
+  if (n_rows > 0) matmul(&a->hc, &m->lm_head, logits);   // (n_rows, vocab)
+}
+
+int llama_target_rows(const int *targets, int seq_len, int *rows) {
+  int n = 0;
+  for (int i = 0; i < seq_len; i++) if (targets[i] >= 0) rows[n++] = i;
+  return n;
+}
+
+// Rows [r0, r1) of a 2-D tensor as a tensor of its own (sharing data and grad).
+static Tensor row_view(const Tensor *t, int r0, int r1, int *shape) {
+  Tensor v = *t;
+  const size_t cols = (size_t)t->shape[1];
+  shape[0] = r1 - r0;
+  shape[1] = t->shape[1];
+  v.shape = shape;
+  v.data = t->data + (size_t)r0 * cols;
+  v.grad = t->grad ? t->grad + (size_t)r0 * cols : NULL;
+  v.size = (size_t)(r1 - r0) * cols;
+  return v;
+}
+
+// logits = final_hn @ lm_head (or hc @ lm_head after the compact forward):
+// dfinal_hn (and, unfrozen, dlm_head) from logits->grad.
+static void lm_head_backward(LlamaModel *m, LlamaActs *a, const Tensor *logits, int frozen) {
+  if (a->n_lm_rows < 0) {                             // plain forward: every row
+    if (frozen) matmul_backward_dx(&a->final_hn, &m->lm_head, logits);
+    else        matmul_backward(&a->final_hn, &m->lm_head, logits);
+    return;
+  }
+  const int n = a->n_lm_rows, dm = m->d_model;
+  if (n == 0) return;                                 // no logits: dfinal_hn stays 0
+  tensor_zero_grad(&a->hc);
+  if (frozen) {
+    matmul_backward_dx(&a->hc, &m->lm_head, logits);
+  } else {
+    // dW sums over rows. The full path's zero rows add exactly nothing, but the
+    // AVX2 kernel sums rows in blocks of `blk` (then adds each block to dW), so
+    // the compact rows are fed one ORIGINAL block at a time: same partial sums,
+    // same order, same bits. The portable kernel (blk == 0) is one sum.
+    const int blk = matmul_backward_dw_block();
+    if (blk <= 0) {
+      matmul_backward(&a->hc, &m->lm_head, logits);
+    } else {
+      for (int s0 = 0; s0 < n;) {
+        int s1 = s0 + 1;
+        while (s1 < n && a->lm_rows[s1] / blk == a->lm_rows[s0] / blk) s1++;
+        int sh[2], sl[2];
+        Tensor hv = row_view(&a->hc, s0, s1, sh), lv = row_view(logits, s0, s1, sl);
+        matmul_backward(&hv, &m->lm_head, &lv);
+        s0 = s1;
+      }
+    }
+  }
+  for (int r = 0; r < n; r++) {                       // scatter dx back to its rows
+    float *dst = &a->final_hn.grad[(size_t)a->lm_rows[r] * dm];
+    const float *src = &a->hc.grad[(size_t)r * dm];
+    for (int j = 0; j < dm; j++) dst[j] += src[j];
+  }
 }
 
 void llama_forward_train(LlamaModel *m, const int *ids, int seq_len,
@@ -233,12 +327,12 @@ static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
 
   // Under LoRA the base is frozen, so every base weight gradient is dead work:
   // take the input-gradient-only path for each big projection (roughly halves
-  // the backward) and skip the embedding scatter entirely.
-  const int frozen = (lo != NULL);
+  // the backward) and skip the embedding scatter entirely. A base built without
+  // matrix gradients (llama_model_create_train_frozen) is frozen by definition.
+  const int frozen = (lo != NULL) || (m->lm_head.grad == NULL);
 
-  // logits = final_hn @ lm_head
-  if (frozen) matmul_backward_dx(&a->final_hn, &m->lm_head, logits);
-  else        matmul_backward(&a->final_hn, &m->lm_head, logits);
+  // logits = final_hn @ lm_head (all rows, or the compact rows' hc)
+  lm_head_backward(m, a, logits, frozen);
   // final_hn = RMSNorm(block_out[L-1], final_norm)
   rmsnorm_backward(&a->block_out[m->n_layers - 1], &m->final_norm, &a->final_hn,
                    &m->final_norm, m->eps);

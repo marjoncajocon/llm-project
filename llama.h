@@ -81,6 +81,16 @@ LlamaModel llama_model_create(int vocab, int d_model, int n_layers, int n_heads,
 LlamaModel llama_model_create_train(int vocab, int d_model, int n_layers, int n_heads,
                                     int n_kv, int head_dim, int d_ff, int max_seq,
                                     float rope_base, float eps);
+
+// A base for LoRA fine-tuning, whose weights stay FROZEN: gradient arrays only
+// on the 1-D gains/biases (the dx-only backward still accumulates into those),
+// none on wte, lm_head or any projection -- for SmolLM-135M that is ~650 MB of
+// gradient memory never allocated, and never re-zeroed by llama_zero_grad. The
+// llamatrain.h backward runs such a model through the dx-only path always.
+// Never hand its matrices to an optimizer or a full-model backward.
+LlamaModel llama_model_create_train_frozen(int vocab, int d_model, int n_layers, int n_heads,
+                                           int n_kv, int head_dim, int d_ff, int max_seq,
+                                           float rope_base, float eps);
 void llama_model_free(LlamaModel *m);
 void llama_model_randomize(LlamaModel *m);
 

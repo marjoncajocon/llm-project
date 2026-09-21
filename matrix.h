@@ -34,6 +34,32 @@ const char *matmul_simd_name(void);  // "avx2+fma" or "portable C"
 // column split is exercised even without a thread pool, e.g. on wasm).
 void matmul_debug_split(int mode);
 
+// ---------------------------------------------------------------------------
+// The persistent thread pool, exported for the non-GEMM training ops (attention,
+// softmax, SiLU, RMSNorm, the loss rows). tf_parallel_for(total, fn, ctx) splits
+// [0, total) into tf_threads() CONTIGUOUS chunks and calls fn(lo, hi, ctx) once
+// per chunk -- the workers take chunks 0..n-2, the caller the last -- then joins.
+// Callers keep results bit-identical to one thread by giving every output
+// element to exactly one chunk, computed in the same order as the serial loop.
+// Not re-entrant: fn must not call tf_parallel_for (or a threaded matmul). On
+// wasm (no threads) or with TF_THREADS=1 it is a plain call fn(0, total, ctx).
+// ---------------------------------------------------------------------------
+typedef void (*tf_range_fn)(int lo, int hi, void *ctx);
+void tf_parallel_for(int total, tf_range_fn fn, void *ctx);
+int tf_threads(void);
+// Test hook (selftest [43]): n >= 1 makes every tf_parallel_for run as n
+// contiguous pieces one after another in the calling thread (n = 1: one serial
+// call), so chunk boundaries are exercised even with TF_THREADS=1 or on wasm;
+// 0 = normal.
+void tf_parallel_debug_chunks(int n);
+
+// The lm_head weight-gradient reduction runs over the rows of A in blocks of
+// this many rows (each block summed from zero, then added to dB) -- MM_KC for
+// the AVX2 kernel, 0 = one unblocked sum for the portable one. A caller that
+// drops all-zero rows of dC (llamatrain.c's compact lm_head) calls
+// matmul_backward once per original block so the rounding is unchanged.
+int matmul_backward_dw_block(void);
+
 // Matrix Addition: C = A + B (element-wise)
 void matadd(const Tensor *A, const Tensor *B, Tensor *C);
 

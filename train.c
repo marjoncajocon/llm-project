@@ -653,9 +653,10 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     // so the vocab grows by one slot in that case (and only that case).
     const int want = anytok_model_vocab(&tok);
     const int vocab = (loaded.vocab > want) ? loaded.vocab : want;
-    model = llama_model_create_train(vocab, loaded.d_model, loaded.n_layers, loaded.n_heads,
-                                     loaded.n_kv, loaded.head_dim, loaded.d_ff,
-                                     loaded.max_seq, loaded.rope_base, loaded.eps);
+    // LoRA: the base stays frozen, so it gets no weight-matrix gradient arrays.
+    model = (cfg->lora_r > 0 ? llama_model_create_train_frozen : llama_model_create_train)(
+        vocab, loaded.d_model, loaded.n_layers, loaded.n_heads, loaded.n_kv, loaded.head_dim,
+        loaded.d_ff, loaded.max_seq, loaded.rope_base, loaded.eps);
     llama_model_set_qk_norm(&model, loaded.qk_norm);   // keep the base's QK-norm (Qwen3)
     llama_model_randomize(&model);          // any new row/column starts random
     copy_weights_grow(&model, &loaded);     // ...then every pretrained weight lands on top
@@ -665,9 +666,9 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
            nex, anytok_vocab(&tok), vocab, maxL, model.d_model, model.n_layers,
            model.n_heads, model.n_kv, EOS, cfg->lr);
   } else {
-    model = llama_model_create_train(anytok_model_vocab(&tok), cfg->d_model, cfg->n_layers,
-                                     cfg->n_heads, n_kv, head_dim, d_ff, maxL,
-                                     cfg->rope_base, 1e-5f);
+    model = (cfg->lora_r > 0 ? llama_model_create_train_frozen : llama_model_create_train)(
+        anytok_model_vocab(&tok), cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, head_dim,
+        d_ff, maxL, cfg->rope_base, 1e-5f);
     llama_model_randomize(&model);
     llama_model_set_window(&model, cfg->window, cfg->global_every);
     printf("LLaMA SFT: %d examples | vocab %d (+EOS) | seq len (padded) %d | d_model=%d layers=%d heads=%d kv=%d lr=%g\n",
@@ -675,8 +676,16 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   }
 
   LlamaActs acts = llama_acts_create(&model, maxL);
-  int lshape[2] = {maxL, model.vocab};
-  Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
+  // Only the supervised rows (response + EOS: RL+1 of them) get logits -- the
+  // compact lm_head of llama_forward_train_rows -- so the logits buffers are
+  // sized for the longest RESPONSE, not the longest sequence. probs never needs
+  // a gradient array.
+  int maxR = 1;
+  for (int e = 0; e < nex; e++) if (RL[e] + 1 > maxR) maxR = RL[e] + 1;
+  int lshape[2] = {maxR, model.vocab};
+  Tensor logits = tensor_create(lshape, 2), probs = tensor_create_nograd(lshape, 2);
+  int *rows = (int*)malloc((size_t)maxL * sizeof(int));
+  int *tgt_c = (int*)malloc((size_t)maxL * sizeof(int));
 
   // LoRA: freeze the base and hand Adam only the adapters.
   const int use_lora = (cfg->lora_r > 0);
@@ -720,13 +729,17 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
       const int L = PL[e] + RL[e] + 1;          // prompt ++ response ++ EOS (no padding)
       llama_acts_set_len(&acts, L);
       if (use_lora) llama_lora_acts_set_len(&lacts, L);
-      set_logits_len(&logits, L, model.vocab);
-      set_logits_len(&probs, L, model.vocab);
-      llama_forward_train_lora(&model, seq[e], L, &acts, &logits,
-                               use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
-      loss += cross_entropy_forward(&logits, tgt[e], &probs);
+      // Logits for the supervised rows only (bit-identical loss and grads: the
+      // masked rows' logits never reached either).
+      const int nr = llama_target_rows(tgt[e], L, rows);
+      for (int r = 0; r < nr; r++) tgt_c[r] = tgt[e][rows[r]];
+      set_logits_len(&logits, nr, model.vocab);
+      set_logits_len(&probs, nr, model.vocab);
+      llama_forward_train_rows(&model, seq[e], L, &acts, &logits,
+                               use_lora ? &lora : NULL, use_lora ? &lacts : NULL, rows, nr);
+      loss += cross_entropy_forward(&logits, tgt_c, &probs);
       tensor_zero_grad(&logits);
-      cross_entropy_backward(&probs, tgt[e], &logits);
+      cross_entropy_backward(&probs, tgt_c, &logits);
       llama_backward_accum(&model, seq[e], L, &acts, &logits,
                            use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     }
@@ -763,6 +776,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
 
   for (int e = 0; e < nex; e++) { free(P[e]); free(R[e]); free(seq[e]); free(tgt[e]); }
   free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
+  free(rows); free(tgt_c);
   free(params);
   if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
   llama_opt_free(&opt); tensor_free(&logits); tensor_free(&probs);
@@ -805,9 +819,9 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
     }
     // A checkpoint loaded for INFERENCE has no gradient arrays, so it cannot be
     // trained: rebuild a trainable model and copy the weights across.
-    LlamaModel t = llama_model_create_train(model.vocab, model.d_model, model.n_layers,
-                                            model.n_heads, model.n_kv, model.head_dim,
-                                            model.d_ff, model.max_seq, model.rope_base, model.eps);
+    LlamaModel t = (cfg->lora_r > 0 ? llama_model_create_train_frozen : llama_model_create_train)(
+        model.vocab, model.d_model, model.n_layers, model.n_heads, model.n_kv, model.head_dim,
+        model.d_ff, model.max_seq, model.rope_base, model.eps);   // LoRA: no base grads
     llama_model_set_qk_norm(&t, model.qk_norm);        // keep the checkpoint's QK-norm
     copy_weights_grow(&t, &model);
     llama_model_copy_window(&t, &model);
@@ -818,9 +832,9 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
   } else {
     tok = tokenizer_create_bytelevel();
     tokenizer_train(&tok, text, cfg->num_merges);
-    model = llama_model_create_train(tok.vocab_size, cfg->d_model, cfg->n_layers,
-                                     cfg->n_heads, n_kv, head_dim, d_ff, cfg->ctx,
-                                     cfg->rope_base, 1e-5f);
+    model = (cfg->lora_r > 0 ? llama_model_create_train_frozen : llama_model_create_train)(
+        tok.vocab_size, cfg->d_model, cfg->n_layers, cfg->n_heads, n_kv, head_dim, d_ff,
+        cfg->ctx, cfg->rope_base, 1e-5f);
     llama_model_randomize(&model);
     llama_model_set_window(&model, cfg->window, cfg->global_every);
     printf("LLaMA model: d_model=%d heads=%d kv=%d head_dim=%d layers=%d d_ff=%d ctx=%d rope_base=%g lr=%g\n",
@@ -850,7 +864,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
 
   LlamaActs acts = llama_acts_create(&model, ctx);
   int lshape[2] = {ctx, model.vocab};
-  Tensor logits = tensor_create(lshape, 2), probs = tensor_create(lshape, 2);
+  Tensor logits = tensor_create(lshape, 2), probs = tensor_create_nograd(lshape, 2);
 
   // LoRA: freeze the base and optimize only the adapters.
   const int use_lora = (cfg->lora_r > 0);
