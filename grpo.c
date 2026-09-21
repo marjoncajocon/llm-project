@@ -47,6 +47,7 @@ GrpoConfig grpo_default_config(void) {
   c.std_norm = 1;
   c.loss_agg = GRPO_AGG_SEQ;
   c.resample = 0;
+  c.reward_version = 1;    // the original reward; v2 is opt-in (--reward v2)
   c.seed = 1;
   c.verbose = 0;
   return c;
@@ -333,6 +334,35 @@ static void one_line(const char *s, char *out, int cap) {
   out[n] = '\0';
 }
 
+// The reward-hacking monitor: what KIND of action the rollouts took, and the mean
+// of each reward term. A policy that has found a cheap way to score (answer every
+// task with <done>, emit prose, ramble to the cap) shows up here as a share that
+// climbs while the match term stays flat — long before the total looks wrong.
+// Pure bookkeeping: it never feeds back into training.
+typedef struct {
+  int n, capped;
+  int act[REWARD_ACT_COUNT];
+  double fmt, grd, mat;
+} RewardMonitor;
+
+static void mon_add(RewardMonitor *m, const RewardParts *p, int capped) {
+  m->n++;
+  m->capped += capped;
+  if (p->action >= 0 && p->action < REWARD_ACT_COUNT) m->act[p->action]++;
+  m->fmt += p->format;
+  m->grd += p->grounded;
+  m->mat += p->match;
+}
+
+static void mon_print(const char *lead, const RewardMonitor *m) {
+  if (m->n == 0) return;
+  printf("%sactions:", lead);
+  for (int a = 0; a < REWARD_ACT_COUNT; a++)
+    printf(" %s %.0f%%", reward_action_name(a), 100.0 * m->act[a] / m->n);
+  printf(" | capped %.0f%% | mean fmt %.3f grd %.3f mat %.3f (%d rollouts)\n",
+         100.0 * m->capped / m->n, m->fmt / m->n, m->grd / m->n, m->mat / m->n, m->n);
+}
+
 int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   if (!cfg->model || !cfg->hf_tok) {
     fprintf(stderr, "error: grpo needs --model <LLMA checkpoint> and --hf-tok <vocab.hf>\n");
@@ -482,6 +512,12 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
            n_params);
   fflush(stdout);
 
+  if (cfg->reward_version == 2)
+    printf("  reward: v2 = format * (0.30 grounded + 0.70 match), capped rollout => 0\n");
+  RewardMonitor mon_win, mon_run;               // since the last report / whole run
+  memset(&mon_win, 0, sizeof(mon_win));
+  memset(&mon_run, 0, sizeof(mon_run));
+
   double run_reward = 0.0;
   int run_groups = 0, skipped = 0, resampled = 0, capped = 0, rollouts = 0;
   const int report = cfg->steps < 10 ? 1 : cfg->steps / 10;
@@ -517,7 +553,10 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
                            text, TEXT_CAP, &stop);
         if (stop == STOP_CAP) capped++;
         RewardParts parts;
-        rrew[gi] = reward_score(tasks[ti].prompt, text, tasks[ti].reference, &parts);
+        rrew[gi] = reward_score_version(cfg->reward_version, tasks[ti].prompt, text,
+                                        tasks[ti].reference, stop == STOP_CAP, &parts);
+        mon_add(&mon_win, &parts, stop == STOP_CAP);
+        mon_add(&mon_run, &parts, stop == STOP_CAP);
         if (cfg->verbose && i == 0) {
           one_line(text, line, LINE_CAP);
           printf("      sample r=%.2f (fmt %.2f grd %.2f mat %.2f) [%s %d tok] %s\n"
@@ -638,6 +677,8 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
              skipped, skipped == 1 ? "" : "s");
       if (cfg->resample > 0) printf(", %d resampled", resampled);
       printf(")  %.1fs\n", secs);
+      mon_print("           ", &mon_win);
+      memset(&mon_win, 0, sizeof(mon_win));
       fflush(stdout);
     }
   }
@@ -645,6 +686,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   if (run_groups > 0) {
     printf("  mean reward over the run: %.4f | %d group%s carried no signal\n",
            run_reward / run_groups, skipped, skipped == 1 ? "" : "s");
+    mon_print("  run mix: ", &mon_run);
     if (cfg->resample > 0)
       printf("  dynamic sampling: %d flat group%s replaced by a fresh task\n",
              resampled, resampled == 1 ? "" : "s");
