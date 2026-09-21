@@ -259,7 +259,12 @@ static void train_usage(void) {
     "  --lora-alpha F    LoRA scaling (scale = alpha / r; default alpha = r)\n"
     "  --hf-tok F        fine-tune with a REAL model's own vocabulary (.hf, see\n"
     "                    tools/export_tokenizer.py) instead of training a byte BPE.\n"
-    "                    Its real EOS token is used, so no vocab slot is added.\n");
+    "                    Its real EOS token is used, so no vocab slot is added.\n"
+    "  --optim adam|muon optimizer (default adam). muon = Muon (Newton-Schulz\n"
+    "                    orthogonalized momentum, Moonshot RMS-matched so the\n"
+    "                    same --lr/--weight-decay apply) on the hidden weight\n"
+    "                    matrices; embedding, lm_head, norms and biases stay\n"
+    "                    on AdamW. With --lora-r every adapter uses Muon.\n");
 }
 
 // Shared by `train` (GPT) and `llama-train` (modern LLaMA-family) — the flags are
@@ -303,6 +308,12 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
     else if (strcmp(f, "--hf-tok") == 0 && llama) { NEED_VAL(); cfg.hf_tok = argv[++i]; }
+    else if (strcmp(f, "--optim") == 0 && llama) {
+      NEED_VAL(); const char *o = argv[++i];
+      if (strcmp(o, "adam") == 0) cfg.muon = 0;
+      else if (strcmp(o, "muon") == 0) cfg.muon = 1;
+      else { fprintf(stderr, "--optim must be adam or muon (got %s)\n", o); return 2; }
+    }
     else { fprintf(stderr, "unknown flag: %s\n", f); train_usage(); return 2; }
 #undef NEED_VAL
   }

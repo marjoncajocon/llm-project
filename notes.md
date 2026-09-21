@@ -537,6 +537,28 @@ window + QK-norm model: v4 flags 0x3 round-trip exact, decode == forward with wr
 reference (written from HF's Qwen3Attention) to 1.7e-07. **Not yet run:** real Qwen3-0.6B vs HF
 (no torch on this box and ~0.8 GB free RAM during the overnight job).
 
+## Training — Muon optimizer (`llama-train --optim muon`) — DONE (2026-09-21, branch `muon`)
+
+New module `muon.c/.h` (its own file rather than optim.c: a different algorithm with its own
+state, and it COMPOSES an inner `Adam` for the non-matrix params rather than extending it).
+`muon_newton_schulz` = 5 quintic NS steps (3.4445, -4.7750, 2.0315) on G/||G||_F, on the smaller
+Gram side (transposes when rows > cols), 3 matmuls/step through the ordinary `matmul` (SIMD +
+threads). `muon_step`: M = 0.95·M + G, U = G + 0.95·M (Nesterov), O = NS(U),
+W = W·(1 - lr·wd) - lr·0.2·sqrt(max(r,c))·O (Moonshot RMS matching); params with mask 0 go to an
+inner AdamW (same lr/wd). `muon_route` = every 2-D tensor except an exclude list (wte, lm_head).
+`train.c`: a tiny static `LlamaOpt` wrapper used by both LLaMA loops (pretrain + SFT); its Adam
+branch makes exactly the old calls. LoRA + Muon: all 8/layer adapters on Muon (0 AdamW params —
+the inner Adam is then left unallocated). GPT `train` and `grpo` unchanged (flag is llama-only).
+Verified: selftest `[35]` — NS sigma(O) in [0.682, 1.131] (tol [0.6, 1.25]) measured by a double
+Jacobi eigensolve, cos vs exact polar factor >= 0.984, tall == wide^T bit-exact, zero -> zero;
+zero-grad step = exact (1 - lr·wd) decay; update RMS/lr = 0.186 (~0.2); [22]'s task, lr 0.02,
+200 steps: Adam 3.1764 -> 0.0012 vs Muon -> 0.0011 (both saturate; not a meaningful win); all-AdamW
+mask == adam_step bit-exact; `[1]`-`[34]` byte-identical to agent-1 @ 4b392bd; default-Adam
+`llama-train` CLI run gives a byte-identical model + log vs an agent-1 build. Mutants caught: no
+transpose-back (NS gate), wrong scale (RMS gate). Tiny CLI A/B (d64, 2 layers, 600 steps, 3 seeds)
+is a wash and Muon is ~2.2x slower per step at 32 tokens/step (NS cost does not shrink with the
+batch). **Not measured:** any run at a scale where Muon's reported gains appear.
+
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
 `imggen`/`audgen` now have a **dataset mode** in addition to the original single-example

@@ -37,6 +37,8 @@ typedef struct {
   int global_every;        // with window: every Nth layer stays global (0 => none);
                            // see llama_model_set_window. FRESH models only — a
                            // resumed checkpoint keeps the window it was saved with.
+  int muon;                // 1 => Muon on the hidden weight matrices (muon.h), AdamW
+                           // on the rest; 0 => Adam/AdamW everywhere (the default)
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).

@@ -24,7 +24,7 @@ endif
 
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
-          embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o rmsnorm.o rope.o swiglu.o moe.o gqa.o quant.o llama.o lora.o llamatrain.o \
+          embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o muon.o rmsnorm.o rope.o swiglu.o moe.o gqa.o quant.o llama.o lora.o llamatrain.o \
           toolcall.o toolexec.o approval.o agent.o corpus.o train.o reward.o grpo.o gpu.o \
           image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o selftest.o main.o
 

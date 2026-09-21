@@ -10,6 +10,7 @@
 #include "model.h"
 #include "loss.h"
 #include "optim.h"
+#include "muon.h"
 #include "checkpoint.h"
 #include "corpus.h"
 #include "llama.h"
@@ -53,6 +54,7 @@ TrainConfig train_default_config(void) {
   c.hf_tok = NULL;         // NULL => train/load our own byte-level BPE
   c.window = 0;            // 0 => full causal attention (no sliding window)
   c.global_every = 0;
+  c.muon = 0;              // Adam/AdamW unless --optim muon
   return c;
 }
 
@@ -460,6 +462,41 @@ static float llama_eval_split(LlamaModel *m, const int *toks, int lo, int hi, in
 }
 
 // LoRA scale convention: alpha defaults to r, i.e. scale 1.
+// ---------------------------------------------------------------------------
+// The LLaMA trainers' optimizer: Adam/AdamW (default) or Muon (--optim muon).
+// With Muon, the 2-D hidden matrices (Wq/Wk/Wv/Wo, Wgate/Wup/Wdown) are
+// orthogonalized and the embedding, lm_head and every 1-D gain/bias stay on
+// AdamW (see muon.h for why). Under LoRA every trainable tensor is an adapter
+// matrix A (d_in x r) or B (r x d_out) — each a genuine linear map — so all of
+// them go to Muon. The Adam branch makes exactly the calls the trainers made
+// before this wrapper existed, so the default path is bit-identical.
+// ---------------------------------------------------------------------------
+typedef struct { int muon; Adam adam; Muon mu; } LlamaOpt;
+
+static LlamaOpt llama_opt_create(const TrainConfig *cfg, LlamaModel *m, int lora,
+                                 Tensor **params, int n_params) {
+  LlamaOpt o;
+  o.muon = cfg->muon;
+  if (!o.muon) { o.adam = adamw_create(params, n_params, cfg->lr, cfg->weight_decay); return o; }
+  int *mask = (int*)malloc((size_t)n_params * sizeof(int));
+  Tensor *ex[2] = { &m->wte, &m->lm_head };
+  int nm = muon_route(params, n_params, ex, lora ? 0 : 2, mask);
+  o.mu = muon_create(params, n_params, mask, cfg->lr, cfg->weight_decay);
+  printf("  optimizer: Muon on %d hidden matrices (momentum %.2f Nesterov, %d NS steps), "
+         "AdamW on the other %d tensors\n", nm, o.mu.momentum, o.mu.ns_steps, n_params - nm);
+  free(mask);
+  return o;
+}
+
+static void llama_opt_step(LlamaOpt *o, Tensor **params, int n_params, float lr) {
+  if (o->muon) { muon_set_lr(&o->mu, lr); muon_step(&o->mu, params, n_params); }
+  else         { adam_set_lr(&o->adam, lr); adam_step(&o->adam, params, n_params); }
+}
+
+static void llama_opt_free(LlamaOpt *o) {
+  if (o->muon) muon_free(&o->mu); else adam_free(&o->adam);
+}
+
 static float lora_alpha_of(const TrainConfig *cfg) {
   return (cfg->lora_alpha > 0.0f) ? cfg->lora_alpha : (float)cfg->lora_r;
 }
@@ -642,7 +679,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
     n_params = llama_collect_params(&model, params);
   }
-  Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  LlamaOpt opt = llama_opt_create(cfg, &model, use_lora, params, n_params);
   print_recipe(cfg);
 
   // Variable-length training: run each example at its OWN length instead of padding
@@ -680,8 +717,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     loss /= (float)B;
     if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
-    adam_set_lr(&opt, sched_lr(cfg, s));
-    adam_step(&opt, params, n_params);
+    llama_opt_step(&opt, params, n_params, sched_lr(cfg, s));
     // flush: see train_sft -- a redirected long run must not buffer its loss curve.
     if (s % report == 0 || s == steps - 1) {
       printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
@@ -713,7 +749,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   free(P); free(PL); free(R); free(RL); free(seq); free(tgt);
   free(params);
   if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
-  adam_free(&opt); tensor_free(&logits); tensor_free(&probs);
+  llama_opt_free(&opt); tensor_free(&logits); tensor_free(&probs);
   llama_acts_free(&acts); llama_model_free(&model); anytok_free(&tok);
   return rc;
 }
@@ -818,7 +854,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
     params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
     n_params = llama_collect_params(&model, params);
   }
-  Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  LlamaOpt opt = llama_opt_create(cfg, &model, use_lora, params, n_params);
   print_recipe(cfg);
 
   int *inp = (int*)malloc(ctx * sizeof(int));
@@ -848,8 +884,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
     loss /= (float)B;
     if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
-    adam_set_lr(&opt, sched_lr(cfg, s));
-    adam_step(&opt, params, n_params);
+    llama_opt_step(&opt, params, n_params, sched_lr(cfg, s));
 
     if (s % report == 0 || s == steps - 1) {
       if (has_val) {
@@ -884,7 +919,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
   free(inp); free(tgt); free(toks);
   free(params);
   if (use_lora) { llama_lora_acts_free(&lacts); llama_lora_free(&lora); }
-  adam_free(&opt);
+  llama_opt_free(&opt);
   tensor_free(&logits); tensor_free(&probs);
   llama_acts_free(&acts);
   llama_model_free(&model);

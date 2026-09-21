@@ -36,6 +36,8 @@
 #include "grpo.h"
 #include "gpu.h"
 #include "moe.h"
+#include "muon.h"
+#include "train.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -318,6 +320,87 @@ static float moe_gradcheck(int E, int k, int renorm, int shared, int use_task,
   free(ref); free(w); free(ps);
   moe_cache_free(&c); tensor_free(&x); tensor_free(&y); moe_free(&m);
   return max_rel;
+}
+
+// ---- Muon helpers for part [35] ------------------------------------------
+
+// Cyclic Jacobi eigen-decomposition of a symmetric n x n matrix (double, in
+// place): on return S's diagonal holds the eigenvalues and V (n x n, row-major)
+// the eigenvectors as COLUMNS. Tiny n only — a reference, not a kernel.
+static void jacobi_eig(double *S, double *V, int n) {
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < n; j++) V[i * n + j] = (i == j);
+  for (int sweep = 0; sweep < 100; sweep++) {
+    double off = 0.0;
+    for (int p = 0; p < n; p++)
+      for (int q = p + 1; q < n; q++) off += S[p * n + q] * S[p * n + q];
+    if (off < 1e-26) break;
+    for (int p = 0; p < n; p++)
+      for (int q = p + 1; q < n; q++) {
+        double apq = S[p * n + q];
+        if (fabs(apq) < 1e-300) continue;
+        double th = (S[q * n + q] - S[p * n + p]) / (2.0 * apq);
+        double t = (th >= 0 ? 1.0 : -1.0) / (fabs(th) + sqrt(th * th + 1.0));
+        double c = 1.0 / sqrt(t * t + 1.0), s = t * c;
+        for (int k = 0; k < n; k++) {            // S <- S J  (columns p, q)
+          double skp = S[k * n + p], skq = S[k * n + q];
+          S[k * n + p] = c * skp - s * skq; S[k * n + q] = s * skp + c * skq;
+        }
+        for (int k = 0; k < n; k++) {            // S <- J^T S  (rows p, q)
+          double spk = S[p * n + k], sqk = S[q * n + k];
+          S[p * n + k] = c * spk - s * sqk; S[q * n + k] = s * spk + c * sqk;
+        }
+        for (int k = 0; k < n; k++) {            // V <- V J
+          double vkp = V[k * n + p], vkq = V[k * n + q];
+          V[k * n + p] = c * vkp - s * vkq; V[k * n + q] = s * vkp + c * vkq;
+        }
+      }
+  }
+}
+
+// For an r x c matrix M (float, row-major), k = min(r, c): the singular values
+// of M (via eigenvalues of the small-side Gram) into sv[k], max |Gram - I|, and
+// (if polar != NULL) the EXACT polar factor U V^T of M in double — the matrix
+// Newton-Schulz approximates — into polar[r*c].
+static double small_gram_svd(const float *M, int r, int c, double *sv, double *polar) {
+  const int tall = r > c, k = tall ? c : r;
+  double *S = (double*)malloc((size_t)k * k * sizeof(double));
+  double *V = (double*)malloc((size_t)k * k * sizeof(double));
+  for (int i = 0; i < k; i++)
+    for (int j = 0; j < k; j++) {
+      double acc = 0.0;
+      if (tall) for (int t = 0; t < r; t++) acc += (double)M[t * c + i] * M[t * c + j];  // M^T M
+      else      for (int t = 0; t < c; t++) acc += (double)M[i * c + t] * M[j * c + t];  // M M^T
+      S[i * k + j] = acc;
+    }
+  double dev = 0.0;
+  for (int i = 0; i < k; i++)
+    for (int j = 0; j < k; j++) {
+      double d = fabs(S[i * k + j] - (i == j));
+      if (d > dev) dev = d;
+    }
+  jacobi_eig(S, V, k);
+  for (int i = 0; i < k; i++) sv[i] = sqrt(S[i * k + i] > 0 ? S[i * k + i] : 0);
+  if (polar) {
+    // Gram^{-1/2} = V diag(1/sv) V^T; polar = M Gram^{-1/2} (tall) or Gram^{-1/2} M (wide).
+    double *P = (double*)malloc((size_t)k * k * sizeof(double));
+    for (int i = 0; i < k; i++)
+      for (int j = 0; j < k; j++) {
+        double acc = 0.0;
+        for (int t = 0; t < k; t++) acc += V[i * k + t] * V[j * k + t] / sv[t];
+        P[i * k + j] = acc;
+      }
+    for (int i = 0; i < r; i++)
+      for (int j = 0; j < c; j++) {
+        double acc = 0.0;
+        if (tall) for (int t = 0; t < k; t++) acc += (double)M[i * c + t] * P[t * k + j];
+        else      for (int t = 0; t < k; t++) acc += P[i * k + t] * (double)M[t * c + j];
+        polar[i * c + j] = acc;
+      }
+    free(P);
+  }
+  free(S); free(V);
+  return dev;
 }
 
 int run_selftest(void) {
@@ -3297,6 +3380,192 @@ int run_selftest(void) {
              q_exact ? "OK" : "FAIL");
       all_ok &= s_ok && rows_exact && q_exact;
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 35: Muon optimizer (muon.h) — Newton-Schulz orthogonalized momentum on
+  // the hidden weight matrices, AdamW on everything else.
+  //  (a) Newton-Schulz: for well-conditioned random matrices (tall, wide and
+  //      square) every singular value of the output lands in the documented
+  //      band around 1 — measured EXACTLY, from a double Jacobi eigensolve of
+  //      the small-side Gram O^T O (tall) / O O^T (wide) — and O points the
+  //      same way as the exact polar factor U V^T (cosine). Tall == wide
+  //      transposed, bit for bit; a zero matrix maps to zero.
+  //  (b) one Muon step: zero grad => weights scale by exactly (1 - lr*wd)
+  //      (decoupled decay); a random grad => update RMS / lr ~= 0.2 (Moonshot
+  //      RMS matching, what lets AdamW LRs transfer).
+  //  (c) the SAME toy next-token task, init, LR (0.02) and step count (200) as
+  //      part [22]: Adam vs Muon final loss, reported as measured. Muon is
+  //      gated only on training (loss halves, finite) — NOT on beating Adam.
+  //  (d) the default path is untouched: train_default_config() selects Adam,
+  //      the routing rule sends exactly the 14 hidden matrices to Muon, and an
+  //      all-AdamW mask makes muon_step bit-identical to adam_step.
+  // --------------------------------------------------------------------------
+  {
+    printf("[35] Muon optimizer (Newton-Schulz orthogonalized momentum)\n");
+    unsigned lcg = 777u;
+    #define RNDF() ((float)((lcg = lcg * 1103515245u + 12345u) >> 9 & 0xFFFF) / 32768.0f - 1.0f)
+
+    // (a) Newton-Schulz on tall / wide / square. A random tall r x c with r >> c
+    //     is well-conditioned (sigma_max/sigma_min ~ (sqrt r + sqrt c)/(sqrt r - sqrt c));
+    //     the square case is made so explicitly (I + 0.3 * noise).
+    const int NS_SH[][2] = { {48, 12}, {12, 48}, {16, 16}, {64, 32} };
+    const float sv_lo = 0.6f, sv_hi = 1.25f;       // the tolerance: sigma(O) in [0.6, 1.25]
+    double sv_min = 1e9, sv_max = 0.0, cos_min = 1.0, gram_dev = 0.0;
+    for (int s = 0; s < 4; s++) {
+      const int r = NS_SH[s][0], c = NS_SH[s][1], k = r < c ? r : c;
+      float *G = (float*)malloc((size_t)r * c * sizeof(float));
+      float *O = (float*)malloc((size_t)r * c * sizeof(float));
+      for (int i = 0; i < r * c; i++) G[i] = RNDF();
+      if (r == c) for (int i = 0; i < r; i++)
+        for (int j = 0; j < c; j++) G[i * c + j] = (i == j) + 0.3f * G[i * c + j];
+      double *sv = (double*)malloc((size_t)k * sizeof(double));
+      double *polar = (double*)malloc((size_t)r * c * sizeof(double));
+      small_gram_svd(G, r, c, sv, polar);          // exact polar factor of G
+      muon_newton_schulz(G, r, c, O, 5);
+      double dev = small_gram_svd(O, r, c, sv, NULL);
+      if (dev > gram_dev) gram_dev = dev;
+      for (int i = 0; i < k; i++) {
+        if (sv[i] < sv_min) sv_min = sv[i];
+        if (sv[i] > sv_max) sv_max = sv[i];
+      }
+      double dot = 0, no = 0, np = 0;
+      for (int i = 0; i < r * c; i++) {
+        dot += O[i] * polar[i]; no += (double)O[i] * O[i]; np += polar[i] * polar[i];
+      }
+      double cs = dot / sqrt(no * np + 1e-300);
+      if (cs < cos_min) cos_min = cs;
+      free(G); free(O); free(sv); free(polar);
+    }
+    // tall == transposed wide: NS(G^T)^T must equal NS(G) exactly.
+    int tr_exact = 1;
+    {
+      const int r = 40, c = 10;
+      float *G = (float*)malloc(r * c * sizeof(float)), *GT = (float*)malloc(r * c * sizeof(float));
+      float *O = (float*)malloc(r * c * sizeof(float)), *OT = (float*)malloc(r * c * sizeof(float));
+      for (int i = 0; i < r * c; i++) G[i] = RNDF();
+      for (int i = 0; i < r; i++) for (int j = 0; j < c; j++) GT[j * r + i] = G[i * c + j];
+      muon_newton_schulz(G, r, c, O, 5);
+      muon_newton_schulz(GT, c, r, OT, 5);
+      for (int i = 0; i < r; i++) for (int j = 0; j < c; j++)
+        if (O[i * c + j] != OT[j * r + i]) tr_exact = 0;
+      for (int i = 0; i < r * c; i++) G[i] = 0.0f;
+      muon_newton_schulz(G, r, c, O, 5);           // zero in => zero out, no NaN
+      for (int i = 0; i < r * c; i++) if (O[i] != 0.0f) tr_exact = 0;
+      free(G); free(GT); free(O); free(OT);
+    }
+    int ns_ok = (sv_min >= sv_lo) && (sv_max <= sv_hi) && (cos_min > 0.95) && tr_exact;
+    printf("    Newton-Schulz (5 steps; 48x12, 12x48, 16x16, 64x32): sigma(O) in [%.3f, %.3f]"
+           " (tol [%.2f, %.2f]) | max|O^T O - I| %.3f\n", sv_min, sv_max, sv_lo, sv_hi, gram_dev);
+    printf("    cos(O, exact polar U V^T) >= %.4f | tall == wide^T bit-exact, zero -> zero: %s -> %s\n",
+           cos_min, tr_exact ? "yes" : "NO", ns_ok ? "OK" : "FAIL");
+    all_ok &= ns_ok;
+
+    // (b) one step: decoupled decay, then the RMS matching.
+    int ws[2] = {48, 12};
+    Tensor W = tensor_create(ws, 2);
+    for (size_t i = 0; i < W.size; i++) W.data[i] = 1.0f;
+    tensor_zero_grad(&W);
+    Tensor *wp[1] = {&W};
+    int one = 1;
+    const float mlr = 0.1f, mwd = 0.5f;
+    Muon dm = muon_create(wp, 1, &one, mlr, mwd);
+    muon_step(&dm, wp, 1);
+    float want = 1.0f - mlr * mwd, wgot = W.data[0];
+    int dec_ok = 1;
+    for (size_t i = 0; i < W.size; i++) if (fabsf(W.data[i] - want) > 1e-6f) dec_ok = 0;
+    muon_free(&dm);
+    for (size_t i = 0; i < W.size; i++) { W.data[i] = 0.0f; W.grad[i] = RNDF(); }
+    const float rlr = 1e-3f;
+    Muon rm = muon_create(wp, 1, &one, rlr, 0.0f);
+    muon_step(&rm, wp, 1);
+    double ss = 0.0;
+    for (size_t i = 0; i < W.size; i++) ss += (double)W.data[i] * W.data[i];
+    float urms = (float)(sqrt(ss / (double)W.size) / rlr);
+    int rms_ok = (urms > 0.14f) && (urms < 0.26f);
+    muon_free(&rm);
+    tensor_free(&W);
+    printf("    step: zero grad -> w %.6f (want %.6f, decoupled decay) | update RMS / lr = %.4f"
+           " (want ~0.2) -> %s\n", wgot, want, urms, (dec_ok && rms_ok) ? "OK" : "FAIL");
+    all_ok &= dec_ok && rms_ok;
+    #undef RNDF
+
+    // (c) Adam vs Muon on part [22]'s task: same model, init (srand 23), data, LR, steps.
+    const int vocab = 24, dmod = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 5;
+    int ids[5]     = {2, 9, 4, 1, 7};
+    int targets[5] = {9, 4, 1, 7, 3};
+    float first[2] = {0}, mid[2] = {0}, last[2] = {0};
+    int nmuon = 0, ntot = 0, bit_same = 1;
+    for (int run = 0; run < 3; run++) {          // 0 Adam, 1 Muon, 2 Muon with all-AdamW mask
+      srand(23);
+      LlamaModel tm = llama_model_create_train(vocab, dmod, nl, nh, nkv, hd, dff, 64,
+                                               10000.0f, 1e-5f);
+      llama_model_randomize(&tm);
+      LlamaActs acts = llama_acts_create(&tm, seq);
+      int ls[2] = {seq, vocab};
+      Tensor logits = tensor_create(ls, 2), probs = tensor_create(ls, 2);
+      Tensor **lps = (Tensor**)malloc((size_t)llama_param_count(&tm) * sizeof(Tensor*));
+      int n_lp = llama_collect_params(&tm, lps);
+      ntot = n_lp;
+      int *mask = (int*)malloc((size_t)n_lp * sizeof(int));
+      Tensor *ex[2] = { &tm.wte, &tm.lm_head };
+      if (run == 1) nmuon = muon_route(lps, n_lp, ex, 2, mask);
+      else for (int i = 0; i < n_lp; i++) mask[i] = 0;
+      Adam aopt = adam_create(lps, n_lp, 0.02f);
+      Muon mopt = muon_create(lps, n_lp, mask, 0.02f, 0.0f);
+      const int steps = (run == 2) ? 20 : 200;
+      float l0 = 0.0f, l = 0.0f;
+      for (int s = 0; s < steps; s++) {
+        l = llama_ce_loss(&tm, &acts, ids, seq, targets, &logits, &probs);
+        if (s == 0) l0 = l;
+        if (s == 50 && run < 2) mid[run] = l;
+        tensor_zero_grad(&logits);
+        cross_entropy_backward(&probs, targets, &logits);
+        llama_backward(&tm, ids, seq, &acts, &logits);
+        if (run == 0) adam_step(&aopt, lps, n_lp);
+        else          muon_step(&mopt, lps, n_lp);
+      }
+      if (run < 2) { first[run] = l0; last[run] = l; }
+      if (run == 2) {
+        // Replay with plain Adam on a fresh copy of the same init: must match exactly.
+        srand(23);
+        LlamaModel am = llama_model_create_train(vocab, dmod, nl, nh, nkv, hd, dff, 64,
+                                                 10000.0f, 1e-5f);
+        llama_model_randomize(&am);
+        Tensor **aps = (Tensor**)malloc((size_t)n_lp * sizeof(Tensor*));
+        llama_collect_params(&am, aps);
+        Adam a2 = adam_create(aps, n_lp, 0.02f);
+        for (int s = 0; s < steps; s++) {
+          llama_ce_loss(&am, &acts, ids, seq, targets, &logits, &probs);
+          tensor_zero_grad(&logits);
+          cross_entropy_backward(&probs, targets, &logits);
+          llama_backward(&am, ids, seq, &acts, &logits);
+          adam_step(&a2, aps, n_lp);
+        }
+        for (int p = 0; p < n_lp; p++)
+          if (memcmp(lps[p]->data, aps[p]->data, lps[p]->size * sizeof(float)) != 0) bit_same = 0;
+        adam_free(&a2); free(aps); llama_model_free(&am);
+      }
+      adam_free(&aopt); muon_free(&mopt);
+      free(mask); free(lps);
+      tensor_free(&logits); tensor_free(&probs);
+      llama_acts_free(&acts); llama_model_free(&tm);
+    }
+    int mtrain_ok = (last[1] < first[1] * 0.5f) && isfinite(last[1]);
+    printf("    [22]'s task, lr 0.02, 200 steps, loss at step 0 / 50 / 199: Adam %.4f / %.4f / %.4f"
+           " | Muon %.4f / %.4f / %.4f\n", first[0], mid[0], last[0], first[1], mid[1], last[1]);
+    printf("    (reported as measured, NOT gated on Muon winning; gate: Muon halves the loss) -> %s\n",
+           mtrain_ok ? "OK" : "FAIL");
+    all_ok &= mtrain_ok;
+
+    // (d) default path untouched.
+    TrainConfig dc = train_default_config();
+    int def_ok = (dc.muon == 0) && (nmuon == 14) && bit_same;
+    printf("    default optim = %s | routing: %d/%d tensors to Muon (the 14 hidden matrices;"
+           " wte, lm_head, norms, biases -> AdamW) | all-AdamW mask == adam_step bit-exact: %s -> %s\n\n",
+           dc.muon ? "muon" : "adam", nmuon, ntot,
+           bit_same ? "yes" : "NO", def_ok ? "OK" : "FAIL");
+    all_ok &= def_ok;
   }
 
   // --------------------------------------------------------------------------

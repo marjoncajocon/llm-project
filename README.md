@@ -75,6 +75,7 @@ defined in the matching `.c`.
 | `checkpoint.h` / `checkpoint.c`   | Save/load model weights (`gpt_save` / `gpt_load`, GPTC format) |
 | `loss.h` / `loss.c`               | Softmax cross-entropy (forward + backward)                    |
 | `optim.h` / `optim.c`             | Adam optimizer                                                |
+| `muon.h` / `muon.c`               | Muon optimizer: Newton-Schulz orthogonalized momentum on hidden matrices, AdamW on the rest (`llama-train --optim muon`) |
 | `tokenizer.h` / `tokenizer.c`     | Byte-level BPE: encode/decode + merge-learning (train) + save/load |
 | `toolcall.h` / `toolcall.c`       | Parse `<tool …>`/`<done>` blocks from model output (agent)    |
 | `toolexec.h` / `toolexec.c`       | Execute a tool call: write_file / read_file / run_command     |
@@ -532,6 +533,30 @@ Fine-tuning reuses the base's tokenizer (a fresh one would assign different ids 
 making the pretrained embeddings meaningless) and grows the vocab by one for the SFT `EOS` slot.
 `--checkpoint-every` is ignored under LoRA — merging mid-run would zero `B` and desync Adam's
 moments for it, so adapters are folded in only at the end.
+
+#### Muon optimizer (`--optim muon`)
+
+`--optim muon` swaps Adam for **Muon** (Keller Jordan 2024; Moonshot's "Muon is Scalable for LLM
+Training" 2025, the optimizer behind Kimi K2) on the **hidden weight matrices** (`Wq/Wk/Wv/Wo`,
+`Wgate/Wup/Wdown`): Nesterov momentum (0.95), then 5 quintic Newton-Schulz iterations that push
+every singular value of the update to ~1 (orthogonalize it), then
+`W -= lr·(0.2·sqrt(max(rows, cols))·O + wd·W)`. The `0.2·sqrt(max)` factor is Moonshot's RMS
+matching — it makes Muon's update the same size as AdamW's — so the **same `--lr` and
+`--weight-decay`** apply. The token embedding, `lm_head`, norm gains and biases stay on **AdamW**
+(1-D tensors have no matrix to orthogonalize; embedding/output rows are per-token, and
+orthogonalizing across the vocab spreads updates onto tokens that were never seen). Under
+`--lora-r` every adapter `A`/`B` is a genuine linear map, so all of them use Muon. Default stays
+`adam`, and the Adam path is **bit-identical** to before (same model bytes, same log). Newton-Schulz
+runs through the ordinary matmul, so it gets the AVX2 kernels and the thread pool.
+
+Honest numbers (tiny synthetic corpus, `--d-model 64 --layers 2 --ctx 32 --steps 600 --lr 3e-3`,
+three seeds): final train loss Adam 1.20 / 1.21 / 1.41 vs Muon 1.20 / 1.16 / 1.41, val 1.44 / 1.46 /
+1.34 vs 1.47 / 1.53 / 1.34 — a **wash** at this scale, and Muon's steps took **~2.2× longer** (the
+Newton-Schulz cost is `O(r²c)` per matrix per step and does not shrink with the batch, so it
+dominates when a step sees only 32 tokens; at real batch sizes it is a small fraction). Muon's
+published wins are at scale (~2× compute efficiency for 1B+ models); none of that is measured
+here. Selftest part `[35]` gates the orthogonalization, the RMS matching, the decay, the routing
+and the unchanged Adam path.
 
 > **Honest scope.** The mechanism is verified in the smoke test (part `[24]`): zero-init
 > equivalence, a numerical gradient check on the adapters, a frozen-base byte-comparison, and
