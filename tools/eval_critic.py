@@ -15,11 +15,10 @@ Deterministic seeds; greedy = temp 0.1 seed 1234, proposals = temp 0.7 seeds 1..
 import os
 import random
 import re
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from agent_critic import critique, extract_action, parse_history  # noqa: E402
+from agent_critic import critique, extract_action, parse_history, propose, run_hfgen  # noqa: E402
 
 ENGINE = os.path.abspath("transformer.exe")
 if not os.path.exists(ENGINE):
@@ -33,15 +32,8 @@ rng = random.Random(4242)
 
 
 def gen(prompt, temp, seed, n_new=64):
-    p = subprocess.run([ENGINE, "hfgen", MODEL, TOK, str(n_new), str(temp), str(seed)],
-                       input=prompt.encode("utf-8"),
-                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    out = []
-    for line in p.stdout.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if line.startswith('{"d":"'):
-            out.append(line[len('{"d":"'):-2].replace('\\"', '"').replace("\\n", "\n"))
-    return "".join(out)
+    # Same stop-at-tag generation the live agent (agent_local.py) uses.
+    return run_hfgen(ENGINE, MODEL, TOK, prompt, temp, seed, n_new=n_new)[0]
 
 
 def greedy_action(prompt):
@@ -55,7 +47,8 @@ def single_prop_action(prompt):
 
 
 def critic_action(prompt, taken=None, last_obs="", last_action=""):
-    cands = [gen(prompt, PROP_TEMP, s) for s in range(1, BEST_OF + 1)]
+    # seeds 1..BEST_OF from ONE engine call (one load, one prefill)
+    cands = propose(ENGINE, MODEL, TOK, prompt, BEST_OF, PROP_TEMP, seed=1)
     choice, _ = critique(cands, prompt, taken or set(), last_obs, last_action)
     if choice is None:                       # all rejected -> greedy fallback
         choice = greedy_action(prompt)

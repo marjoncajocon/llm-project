@@ -26,15 +26,111 @@ not stop early -- attacking the two failure modes the lever-#3 live runs exposed
 If every candidate is rejected the caller falls back to its own greedy sample, so
 the critic can only help, never strand the agent.
 
+PROPOSING: propose() gets all N candidates from ONE engine call
+(`transformer hfgen ... --samples N --stop-tags`): the model is loaded once and the
+prompt prefilled once, then sampled N times with seeds seed..seed+N-1 -- the same
+candidates N separate `hfgen` calls with those seeds would give (selftest [40]),
+without reloading a 651 MB model per sample.
+
 This module is import-only (no CLI); tools/agent_local.py and tools/eval_critic.py
-use select().
+use select() / critique() and the engine helpers run_hfgen() / propose().
 """
 import re
+import subprocess
+import sys
 from collections import Counter
 
 # Canonical grounding logic lives in clean_sft (its main() is guarded, so importing
 # is side-effect-free). Reusing it means the critic and the data gate never drift.
 from clean_sft import verify, norm
+
+# --- engine interface ----------------------------------------------------------
+
+class GenerationError(RuntimeError):
+    """The engine could not produce a response (bad model, empty prompt, crash)."""
+
+
+_ESC = {ord('"'): b'"', ord('\\'): b'\\', ord('n'): b'\n', ord('r'): b'\r',
+        ord('t'): b'\t', ord('/'): b'/'}
+
+
+def _unescape(raw):
+    """Undo hf_emit_delta's escaping at the BYTE level (a token may end inside a
+    UTF-8 character, so pieces are joined as bytes and decoded once at the end)."""
+    out, i, n = bytearray(), 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == 0x5C and i + 1 < n:                       # backslash
+            e = raw[i + 1]
+            if e == ord('u') and i + 5 < n:
+                out.append(int(raw[i + 2:i + 6], 16) & 0xFF)   # only \u00XX is emitted
+                i += 6
+                continue
+            out += _ESC.get(e, bytes([e]))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return bytes(out)
+
+
+def parse_hfgen(stdout):
+    """Parse `transformer hfgen` stdout (bytes) -> (samples, error).
+
+    Single-sample output is {"d":...} lines then {"done":true}; with --samples N
+    each sample is framed {"sample":i,"seed":S} ... {"end":i}. `error` is the
+    text of an {"error":...} line, else None."""
+    samples, cur, error = [], None, None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith(b'{"d":"') and line.endswith(b'"}'):
+            if cur is None:
+                cur = bytearray()
+                samples.append(cur)
+            cur += _unescape(line[6:-2])
+        elif line.startswith(b'{"sample":'):
+            cur = bytearray()
+            samples.append(cur)
+        elif line.startswith(b'{"end":'):
+            cur = None
+        elif line.startswith(b'{"error":'):
+            error = line[len(b'{"error":"'):-2].decode("utf-8", "replace")
+    return [bytes(s).decode("utf-8", "replace") for s in samples], error
+
+
+def run_hfgen(engine, model, tok, prompt, temp, seed, n_new=64, n_samples=1,
+              stop_tags=True, log=None):
+    """Run the engine once; return a list of n_samples completions.
+
+    Engine warnings (e.g. an over-long prompt that had to lose its oldest
+    tokens) are forwarded to `log` (default: stderr). Raises GenerationError
+    when the engine reports an error or exits nonzero -- a failed generation
+    must never look like a model that chose to say nothing."""
+    log = log or sys.stderr
+    cmd = [engine, "hfgen", model, tok, str(n_new), str(temp), str(seed)]
+    if stop_tags:
+        cmd.append("--stop-tags")
+    if n_samples > 1:
+        cmd += ["--samples", str(n_samples)]
+    proc = subprocess.run(cmd, input=prompt.encode("utf-8"),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for ln in proc.stderr.decode("utf-8", "replace").splitlines():
+        if "warning" in ln or "error" in ln:
+            log.write("  engine: %s\n" % ln.strip())
+    samples, error = parse_hfgen(proc.stdout)
+    if error or proc.returncode != 0:
+        raise GenerationError(error or "engine exited with status %d" % proc.returncode)
+    samples += [""] * (n_samples - len(samples))       # a sample that stopped at once
+    return samples[:n_samples]
+
+
+def propose(engine, model, tok, prompt, n, temp, seed=1, n_new=64, stop_tags=True, log=None):
+    """N candidate completions (seeds seed..seed+n-1) from ONE load + ONE prefill."""
+    return run_hfgen(engine, model, tok, prompt, temp, seed, n_new=n_new, n_samples=n,
+                     stop_tags=stop_tags, log=log)
+
+
+# --- critic ----------------------------------------------------------------------
 
 ACTION_RE = re.compile(r'<tool\b[^>]*>.*?</tool>|<done>.*?</done>', re.DOTALL)
 NAME_RE = re.compile(r'name="(\w+)"')

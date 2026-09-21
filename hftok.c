@@ -309,13 +309,26 @@ int hftok_decode(const HFTok *t, const int *ids, int n, char *out, int max_out) 
 int run_hftok(int argc, char **argv) {
   if (argc < 4) {
     fprintf(stderr, "usage: transformer hftok <file.tok> encode \"<text>\"\n"
-                    "       transformer hftok <file.tok> decode <id> <id> ...\n");
+                    "       transformer hftok <file.tok> decode <id> <id> ...\n"
+                    "       transformer hftok <file.tok> count   (text on stdin; prints its token\n"
+                    "                                           count, tokenized as hfgen does)\n");
     return 2;
   }
   HFTok t;
   if (hftok_load(&t, argv[2]) != 0) return 1;
 
-  if (strcmp(argv[3], "encode") == 0) {
+  if (strcmp(argv[3], "count") == 0) {
+    size_t cap = 1 << 16, len = 0, r;
+    char *text = (char*)malloc(cap);
+    while ((r = fread(text + len, 1, cap - 1 - len, stdin)) > 0) {
+      len += r;
+      if (len == cap - 1) { cap *= 2; text = (char*)realloc(text, cap); }
+    }
+    text[len] = '\0';
+    int *ids = (int*)malloc((len + 16) * sizeof(int));
+    printf("%d\n", hftok_encode(&t, text, ids, (int)len + 16));
+    free(ids); free(text);
+  } else if (strcmp(argv[3], "encode") == 0) {
     const char *text = (argc > 4) ? argv[4] : "";
     int cap = (int)strlen(text) + 16;
     int *ids = (int*)malloc((size_t)cap * sizeof(int));
@@ -332,7 +345,7 @@ int run_hftok(int argc, char **argv) {
     printf("%s\n", out);
     free(ids);
   } else {
-    fprintf(stderr, "unknown op '%s' (encode|decode)\n", argv[3]);
+    fprintf(stderr, "unknown op '%s' (encode|decode|count)\n", argv[3]);
     hftok_free(&t); return 2;
   }
   hftok_free(&t);
