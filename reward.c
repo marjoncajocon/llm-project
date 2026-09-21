@@ -526,6 +526,10 @@ float reward_score_version(int version, const char *prompt, const char *response
   return reward_score(prompt, response, reference, parts);
 }
 
+float reward_match_max(int version) {
+  return version == 2 ? W2_MATCH : W_MATCH;
+}
+
 const char *reward_action_name(int action) {
   static const char *const names[REWARD_ACT_COUNT] =
     {"done", "prose", "read", "write", "run", "malformed"};

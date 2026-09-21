@@ -89,6 +89,12 @@ typedef struct {
                             // reference is the same kind, stricter command grounding
                             // (reward.h). Opt-in so v1 runs reproduce.
 
+  // --- Evaluation (grpo --eval-only; see grpo_eval_run) ---
+  int eval_only;            // 1 => grpo_eval_run: no optimizer, no LoRA, no backward
+  int eval_k;               // rollouts per task (default 1; with temp 0 that is greedy)
+  int eval_limit;           // evaluate only the first N tasks of the file (0 => all)
+  const char *eval_dump;    // JSONL path: one line per rollout (NULL => no dump)
+
   // --- Run control ---
   unsigned seed;
   int verbose;              // 1 => print a scored sample rollout per group
@@ -196,5 +202,40 @@ long grpo_debug_sample_group(const LlamaModel *m, const LlamaDecodeLora *lo,
                              const int *prompt_ids, int n_prompt, const GrpoConfig *cfg,
                              int shared_prefill, Rng *rng,
                              int *out_ids, float *out_logp, int *out_len);
+
+// ---------------------------------------------------------------------------
+// Evaluation: `transformer grpo <tasks> --eval-only ...`
+//
+// `grpo --lr 0` is NOT an evaluation: it draws tasks WITH replacement (40 draws
+// cover ~36 of 200 tasks), shares one sampling RNG across the run (after the
+// first rollout whose length differs between two checkpoints, every later draw
+// is unpaired noise), still runs the backward pass, and never logs per-task
+// rewards. grpo_eval_run instead:
+//   - loads the checkpoint for inference only (no gradient arrays, no LoRA, no
+//     optimizer, no backward, nothing saved);
+//   - visits the tasks in FILE ORDER (the first cfg->eval_limit, if > 0), each
+//     exactly once;
+//   - samples cfg->eval_k rollouts per task, rollout (i, k) drawing from its OWN
+//     Rng seeded by grpo_eval_rollout_seed(cfg->seed, i, k) — so the same draw
+//     is used for the same (task, k) by every checkpoint, whatever happened on
+//     other tasks (a paired design: sampling noise cancels in the difference);
+//   - prefills each task's prompt once and forks the KV cache per rollout (the
+//     same shared-prefill path grpo_run uses);
+//   - scores with cfg->reward_version and writes one JSON line per rollout to
+//     cfg->eval_dump (compare two dumps with tools/evalcard.py).
+// Returns 0 on success.
+int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg);
+
+// The per-rollout RNG seed: a SplitMix64 hash of (seed, task index, k). Never 0.
+unsigned long long grpo_eval_rollout_seed(unsigned seed, int task, int k);
+
+// Test hook (selftest [39]): evaluate ONE task exactly as grpo_eval_run does —
+// shared prefill, cfg->eval_k rollouts, rollout k drawing from
+// rng_create(grpo_eval_rollout_seed(cfg->seed, task, k)) — with no tokenizer (no
+// EOS / closing-tag stop). out_ids / out_logp are rollout-major with stride
+// cfg->max_new; out_len has eval_k entries.
+void grpo_debug_eval_task(const LlamaModel *m, const int *prompt_ids, int n_prompt,
+                          int task, const GrpoConfig *cfg,
+                          int *out_ids, float *out_logp, int *out_len);
 
 #endif // GRPO_H

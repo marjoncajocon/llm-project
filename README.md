@@ -640,6 +640,55 @@ Verified in the smoke test: `[26]` the LoRA decode matches the LoRA training for
 `pg_backward(1/N) == cross_entropy_backward` identity, and `[29]` a numerical gradient check of the
 surrogate plus a closed GRPO loop that drives a toy reward from chance (0.083) to 1.000.
 
+#### How to compare two checkpoints (`grpo --eval-only` + `tools/evalcard.py`)
+
+`grpo --lr 0` is **not** an evaluation: it draws tasks *with replacement* (40 draws cover ~36 of 200
+tasks), shares one sampling RNG across the run (once one rollout's length differs between two
+checkpoints, every later draw is unpaired noise), still runs the backward pass, and never logs
+per-task rewards. Use `--eval-only` instead: inference-only load (no LoRA, optimizer, backward or
+save), every task visited **once, in file order**, and rollout *(task i, draw k)* sampled from its
+**own** RNG seeded by `hash(--seed, i, k)` — so both checkpoints see the *same* noise on every
+task and the per-task difference is paired.
+
+```bash
+# primary: greedy (the --eval-only default is --temp 0, --k 1)
+transformer grpo data/grpo_tasks.txt --model model/A.bin --hf-tok model/smollm/tok.hf \
+  --eval-only --reward v2 --dump evalA.jsonl
+transformer grpo data/grpo_tasks.txt --model model/B.bin --hf-tok model/smollm/tok.hf \
+  --eval-only --reward v2 --dump evalB.jsonl
+python tools/evalcard.py evalA.jsonl evalB.jsonl
+
+# secondary: sampled, 4 draws per task (same --seed for both!)
+transformer grpo data/grpo_tasks.txt --model model/A.bin --hf-tok model/smollm/tok.hf \
+  --eval-only --reward v2 --temp 1 --k 4 --dump sampA.jsonl
+#   ... same for B -> sampB.jsonl
+python tools/evalcard.py sampA.jsonl sampB.jsonl
+```
+
+Each dump line is one rollout: `task`, `k`, `family` (the reference action's kind: write / read /
+run / delete / done / prose), `total`, `format`, `grounded`, `match`, `exact` (match term at its
+maximum), `action`, `stop` (`eos`/`tag`/`cap`), `tokens`, `task_hash`, `response`. `--limit N`
+evaluates only the first N tasks. `evalcard.py` pairs rollouts by (task, k) and prints, for B − A:
+mean total and exact-match with a **95% paired bootstrap CI over tasks** (10k resamples, fixed
+seed; the k draws are averaged within a task first, because tasks — not rollouts — are the
+independent units), an **exact McNemar test** on per-task exact match (k = 1, or the majority of k),
+a per-family breakdown, and the share of tasks whose response text changed — `0%` means *the policy
+did not move*, whatever the training log said. It refuses dumps whose `task_hash` disagree (different
+task files) and warns when reward version / temperature / seed differ. With one file it prints a
+summary with CIs.
+
+**Statistical recommendation.** Decide on the **primary** metric — greedy exact-match, McNemar
+p < 0.05 — and treat the **secondary** — `--temp 1 --k 4` mean total, paired bootstrap CI over
+tasks — as supporting evidence (it sees changes in the *distribution* that greedy decoding hides).
+Size the task set before the run: about **125 tasks to detect a 5-point** exact-match change and
+**~350 for 3 points** (80% power, α = 0.05, assuming the two checkpoints disagree on ~4% of tasks;
+if they disagree on more, you need proportionally more tasks). On 40 tasks only a very large effect
+is detectable — a CI that spans 0 there means "not measured", not "no effect".
+
+Verified by `[39]`: two eval runs are bit-identical; evaluating task 1 with a different model *and*
+a shorter budget leaves tasks 0 and 2 bit-identical (with the old shared RNG the same change shifts
+task 2); parameters are bit-identical and gradients zero afterwards.
+
 ### `transformer generate [model.bin] [tok.bin]`
 
 A generation loop driven by the KV cache (`gpt_decode_step`) + sampler (`sample_token`),

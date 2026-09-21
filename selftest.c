@@ -4073,6 +4073,176 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 39: GRPO evaluation mode (grpo --eval-only). An eval that compares two
+  // checkpoints must be (a) deterministic, (b) PAIRED — rollout (task j, draw k)
+  // samples with the same noise whatever the model did on any other task — and
+  // (c) read-only. The old "eval" (grpo --lr 0) shared one RNG across the run,
+  // so a checkpoint that stopped earlier on task i shifted every later draw.
+  // Checked through grpo_debug_eval_task, the per-task routine grpo_eval_run
+  // uses (shared prefill + per-rollout RNG seeded by hash(seed, task, k)).
+  // --------------------------------------------------------------------------
+  {
+    printf("[39] GRPO eval mode: deterministic, paired per-rollout RNG, read-only\n");
+    const int vocab = 24, dm = 16, nl = 2, nh = 4, nkv = 2, hd = 4, dff = 32, msq = 48;
+    const int NT = 3, K = 3, R = 12, T = 6;
+    srand(39);
+    LlamaModel em = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, msq,
+                                             10000.0f, 1e-5f);
+    llama_model_randomize(&em);
+    llama_zero_grad(&em);
+    const int np_ = llama_param_count(&em);
+    Tensor **ep = (Tensor**)malloc((size_t)np_ * sizeof(Tensor*));
+    llama_collect_params(&em, ep);
+    size_t ptot = 0;
+    for (int p = 0; p < np_; p++) ptot += ep[p]->size;
+    float *snap = (float*)malloc(ptot * sizeof(float));
+    for (size_t o = 0, p = 0; p < (size_t)np_; o += ep[p]->size, p++)
+      memcpy(&snap[o], ep[p]->data, ep[p]->size * sizeof(float));
+
+    int prompts[3][6] = {{3, 17, 1, 9, 22, 5}, {5, 14, 0, 8, 19, 2}, {11, 4, 4, 20, 7, 13}};
+    GrpoConfig ec = grpo_default_config();
+    ec.eval_only = 1; ec.eval_k = K; ec.max_new = R; ec.seed = 7;
+    ec.temperature = 1.0f; ec.top_k = 0; ec.top_p = 1.0f;
+
+    const size_t per = (size_t)K * R;
+    int *ids_a = (int*)malloc(NT * per * sizeof(int)), *ids_b = (int*)malloc(NT * per * sizeof(int));
+    int *ids_c = (int*)malloc(NT * per * sizeof(int));
+    float *lp_a = (float*)malloc(NT * per * sizeof(float)), *lp_b = (float*)malloc(NT * per * sizeof(float));
+    float *lp_c = (float*)malloc(NT * per * sizeof(float));
+    int len_a[9], len_b[9], len_c[9];
+
+    // (a) Determinism: the same three tasks, twice.
+    for (int t = 0; t < NT; t++)
+      grpo_debug_eval_task(&em, prompts[t], T, t, &ec, &ids_a[t * per], &lp_a[t * per], &len_a[t * K]);
+    for (int t = 0; t < NT; t++)
+      grpo_debug_eval_task(&em, prompts[t], T, t, &ec, &ids_b[t * per], &lp_b[t * per], &len_b[t * K]);
+    const int det_ok = memcmp(ids_a, ids_b, NT * per * sizeof(int)) == 0 &&
+                       memcmp(lp_a, lp_b, NT * per * sizeof(float)) == 0 &&
+                       memcmp(len_a, len_b, sizeof(int) * NT * K) == 0;
+    int n_distinct = 0;                        // the K draws of a task are different streams
+    for (int kk = 1; kk < K; kk++)
+      if (memcmp(&ids_a[(size_t)kk * R], &ids_a[0], (size_t)R * sizeof(int)) != 0) n_distinct++;
+
+    // (c) Read-only: every parameter bit-identical, every gradient still zero.
+    int ro_ok = 1;
+    for (size_t o = 0, p = 0; p < (size_t)np_; o += ep[p]->size, p++) {
+      if (memcmp(&snap[o], ep[p]->data, ep[p]->size * sizeof(float)) != 0) ro_ok = 0;
+      if (ep[p]->grad)
+        for (size_t q = 0; q < ep[p]->size; q++) if (ep[p]->grad[q] != 0.0f) ro_ok = 0;
+    }
+
+    // (b) Pairing: a DIFFERENT model on task 1 only — weights nudged AND a shorter
+    // budget, so its rollouts consume a different number of draws. Tasks 0 and 2
+    // must be bit-identical to the first run; task 1 must differ.
+    grpo_debug_eval_task(&em, prompts[0], T, 0, &ec, &ids_c[0], &lp_c[0], &len_c[0]);
+    float *lmh = em.lm_head.data;
+    const size_t lmn = em.lm_head.size;
+    float *lm_save = (float*)malloc(lmn * sizeof(float));
+    memcpy(lm_save, lmh, lmn * sizeof(float));
+    for (size_t q = 0; q < lmn; q++) lmh[q] += 0.4f * (float)((int)((q * 17) % 9) - 4) / 4.0f;
+    GrpoConfig short_cfg = ec;
+    short_cfg.max_new = R / 2;
+    int *tmp_ids = (int*)malloc(per * sizeof(int));
+    float *tmp_lp = (float*)malloc(per * sizeof(float));
+    for (size_t q = 0; q < per; q++) { tmp_ids[q] = -1; tmp_lp[q] = 0.0f; }
+    // stride stays R (the caller's buffer), so pass through a copy laid out at R/2
+    grpo_debug_eval_task(&em, prompts[1], T, 1, &short_cfg, tmp_ids, tmp_lp, &len_c[K]);
+    for (int kk = 0; kk < K; kk++)
+      for (int t = 0; t < R; t++) {
+        ids_c[per + (size_t)kk * R + t] = t < R / 2 ? tmp_ids[(size_t)kk * (R / 2) + t] : -1;
+        lp_c[per + (size_t)kk * R + t] = t < R / 2 ? tmp_lp[(size_t)kk * (R / 2) + t] : 0.0f;
+      }
+    memcpy(lmh, lm_save, lmn * sizeof(float));   // restore exactly
+    grpo_debug_eval_task(&em, prompts[2], T, 2, &ec, &ids_c[2 * per], &lp_c[2 * per], &len_c[2 * K]);
+    const int t0_same = memcmp(&ids_c[0], &ids_a[0], per * sizeof(int)) == 0 &&
+                        memcmp(&lp_c[0], &lp_a[0], per * sizeof(float)) == 0;
+    const int t2_same = memcmp(&ids_c[2 * per], &ids_a[2 * per], per * sizeof(int)) == 0 &&
+                        memcmp(&lp_c[2 * per], &lp_a[2 * per], per * sizeof(float)) == 0;
+    int t1_diff = 0;
+    for (int kk = 0; kk < K; kk++)
+      for (int t = 0; t < R / 2; t++)
+        if (lp_c[per + (size_t)kk * R + t] != lp_a[per + (size_t)kk * R + t]) t1_diff = 1;
+    t1_diff = t1_diff && (len_c[K] == R / 2) && (len_a[K] == R);
+
+    // The contrast: the OLD scheme, one RNG shared across tasks (grpo_run's
+    // sampler). The same task-1 change now shifts task 2's draws.
+    GrpoConfig gc = ec;
+    gc.group = K;
+    Rng sr1 = rng_create(7), sr2 = rng_create(7);
+    int *sh_a = (int*)malloc(NT * per * sizeof(int)), *sh_b = (int*)malloc(NT * per * sizeof(int));
+    float *sl_a = (float*)malloc(NT * per * sizeof(float)), *sl_b = (float*)malloc(NT * per * sizeof(float));
+    int sla[9], slb[9];
+    for (int t = 0; t < NT; t++)
+      grpo_debug_sample_group(&em, NULL, prompts[t], T, &gc, 1, &sr1, &sh_a[t * per], &sl_a[t * per], &sla[t * K]);
+    GrpoConfig gshort = gc;
+    gshort.max_new = R / 2;
+    grpo_debug_sample_group(&em, NULL, prompts[0], T, &gc, 1, &sr2, &sh_b[0], &sl_b[0], &slb[0]);
+    for (size_t q = 0; q < lmn; q++) lmh[q] += 0.4f * (float)((int)((q * 17) % 9) - 4) / 4.0f;
+    grpo_debug_sample_group(&em, NULL, prompts[1], T, &gshort, 1, &sr2, tmp_ids, tmp_lp, &slb[K]);
+    memcpy(lmh, lm_save, lmn * sizeof(float));
+    grpo_debug_sample_group(&em, NULL, prompts[2], T, &gc, 1, &sr2, &sh_b[2 * per], &sl_b[2 * per], &slb[2 * K]);
+    const int shared_t2_shifted = memcmp(&sh_b[2 * per], &sh_a[2 * per], per * sizeof(int)) != 0;
+
+    // Seeds: distinct over a (task, k) grid and never 0; greedy ignores them.
+    int seed_ok = 1;
+    {
+      const int GT = 200, GK = 8;
+      unsigned long long *sd = (unsigned long long*)malloc((size_t)GT * GK * sizeof(unsigned long long));
+      for (int t = 0; t < GT; t++)
+        for (int kk = 0; kk < GK; kk++) {
+          sd[t * GK + kk] = grpo_eval_rollout_seed(1, t, kk);
+          if (sd[t * GK + kk] == 0) seed_ok = 0;
+        }
+      for (int i = 0; i < GT * GK && seed_ok; i++)
+        for (int j = i + 1; j < GT * GK; j++) if (sd[i] == sd[j]) { seed_ok = 0; break; }
+      if (grpo_eval_rollout_seed(1, 3, 0) == grpo_eval_rollout_seed(2, 3, 0)) seed_ok = 0;
+      free(sd);
+    }
+    GrpoConfig gr = ec;
+    gr.temperature = 0.0f; gr.eval_k = 2;
+    int g1[24], g2[24], gl1[2], gl2[2];
+    float gp1[24], gp2[24];
+    grpo_debug_eval_task(&em, prompts[0], T, 0, &gr, g1, gp1, gl1);
+    gr.seed = 99;
+    grpo_debug_eval_task(&em, prompts[0], T, 0, &gr, g2, gp2, gl2);
+    const int greedy_ok = memcmp(g1, g1 + R, (size_t)R * sizeof(int)) == 0 &&
+                          memcmp(g1, g2, (size_t)2 * R * sizeof(int)) == 0;
+
+    // The exact-match threshold is the match term's maximum under each reward.
+    const char *pr = "GOAL: read notes.txt";
+    const char *rf = "<tool name=\"read_file\" path=\"notes.txt\"></tool>";
+    RewardParts rp1, rp2;
+    reward_score_version(1, pr, rf, rf, 0, &rp1);
+    reward_score_version(2, pr, rf, rf, 0, &rp2);
+    const int exact_ok = fabsf(rp1.match - reward_match_max(1)) < 1e-6f &&
+                         fabsf(rp2.match - reward_match_max(2)) < 1e-6f &&
+                         reward_match_max(1) == 0.50f && reward_match_max(2) == 0.70f;
+
+    const int ok39 = det_ok && n_distinct == K - 1 && ro_ok && t0_same && t2_same && t1_diff &&
+                     shared_t2_shifted && seed_ok && greedy_ok && exact_ok;
+    printf("    %d tasks x k=%d x %d tokens at temp 1: two runs %s (ids, logp bits, lengths) |"
+           " %d/%d draws of a task differ from draw 0\n",
+           NT, K, R, det_ok ? "IDENTICAL" : "DIFFER", n_distinct, K - 1);
+    printf("    task 1 evaluated by a different model (lm_head nudged, max-new %d -> %d): task 1 %s,"
+           " tasks 0 and 2 %s\n",
+           R, R / 2, t1_diff ? "changed" : "UNCHANGED", (t0_same && t2_same) ? "bit-identical" : "SHIFTED");
+    printf("    contrast, one shared RNG (the old grpo --lr 0 eval): the same change %s task 2's draws\n",
+           shared_t2_shifted ? "shifts" : "does NOT shift");
+    printf("    params bit-identical + grads zero after eval: %s | seeds hash(seed,task,k) distinct over"
+           " 200x8, never 0: %s | greedy ignores seed: %s\n",
+           ro_ok ? "yes" : "NO", seed_ok ? "yes" : "NO", greedy_ok ? "yes" : "NO");
+    printf("    exact-match threshold = max match term: v1 %.2f, v2 %.2f (reference action scores it) -> %s\n\n",
+           (double)reward_match_max(1), (double)reward_match_max(2), ok39 ? "OK" : "FAIL");
+    all_ok &= ok39;
+
+    free(sh_a); free(sh_b); free(sl_a); free(sl_b);
+    free(tmp_ids); free(tmp_lp); free(lm_save);
+    free(ids_a); free(ids_b); free(ids_c); free(lp_a); free(lp_b); free(lp_c);
+    free(snap); free(ep);
+    llama_model_free(&em);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;
