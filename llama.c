@@ -470,6 +470,16 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
     lcv = lora_cache_create(1, lo->v[0].r, kvd);
     lco = lora_cache_create(1, lo->o[0].r, dm);
   }
+  // MLP adapters (optional): one-row caches, and a per-layer SwiGLU view.
+  const int mlp = (lo && lo->gate);
+  LoraCache lcg, lcu, lcd;
+  SwigluLora slv;
+  if (mlp) {
+    lcg = lora_cache_create(1, lo->gate[0].r, m->d_ff);
+    lcu = lora_cache_create(1, lo->up[0].r, m->d_ff);
+    lcd = lora_cache_create(1, lo->down[0].r, dm);
+    slv.cg = &lcg; slv.cu = &lcu; slv.cd = &lcd;
+  }
 
   for (int l = 0; l < m->n_layers; l++) {
     const LlamaBlock *b = &m->blocks[l];
@@ -505,7 +515,8 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
 
     // Feed-forward
     rmsnorm(&x, &b->ffn_norm, &hn, m->eps);
-    swiglu_forward(&hn, &b->Wgate, &b->Wup, &b->Wdown, &sc_ff, &f);
+    if (mlp) { slv.gate = &lo->gate[l]; slv.up = &lo->up[l]; slv.down = &lo->down[l]; }
+    swiglu_forward_lora(&hn, &b->Wgate, &b->Wup, &b->Wdown, &sc_ff, &f, mlp ? &slv : NULL);
     for (int j = 0; j < dm; j++) x.data[j] += f.data[j];        // residual
   }
 
@@ -520,6 +531,7 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
     lora_cache_free(&lcq); lora_cache_free(&lck);
     lora_cache_free(&lcv); lora_cache_free(&lco);
   }
+  if (mlp) { lora_cache_free(&lcg); lora_cache_free(&lcu); lora_cache_free(&lcd); }
   tensor_free(&x); tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
   tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
 }

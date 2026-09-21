@@ -4732,6 +4732,421 @@ int run_selftest(void) {
   all_ok &= st40_run();
 
   // --------------------------------------------------------------------------
+  // [41] LoRA on the MLP (Wgate/Wup/Wdown) + LoRA+ (per-tensor LR multiplier).
+  // "LoRA Without Regret" (Thinking Machines, 2025): attention-only adapters
+  // clearly underperform; put LoRA on every layer, especially the MLP. LoRA+
+  // (Hayou et al., 2024): train B at ~16x A's learning rate. Gates:
+  //   (a) enabling MLP adapters leaves the attention adapters' init draws
+  //       unchanged, and at B = 0 the adapted forward is bit-identical to base;
+  //   (b) central-difference gradient check of EVERY entry of every adapter
+  //       tensor (MLP and attention), all B's nonzero — so the down-adapter's
+  //       dh reaching the SiLU-gate backward is exercised through gate/up grads;
+  //   (c) KV-cache decode == training forward BIT-EXACT with MLP adapters on
+  //       (QK-norm + a wrapping sliding window), incl. the logits == NULL
+  //       prefill path; the GRPO rollout's recorded log-probs (pi_old) equal the
+  //       training forward's log-probs bit for bit (importance ratio exactly 1);
+  //   (d) merge == adapted forward (relative), every B zeroed;
+  //   (e) Adam / Muon lr multiplier: all-ones == no multiplier bit-for-bit, and
+  //       a {1, 16} multiplier gives B a 16x first step (LoRA+);
+  //   (f) a tiny adaptation run: attention-only vs all-layer LoRA (and LoRA+),
+  //       same base, same attention init, same steps — reported, not gated on
+  //       which wins (only that each run trains).
+  // --------------------------------------------------------------------------
+  {
+    printf("[41] LoRA on the MLP (Wgate/Wup/Wdown) + LoRA+ per-tensor learning rate\n");
+    const int vocab = 20, dm = 8, nl = 2, nh = 2, nkv = 1, hd = 4, dff = 12, msq = 32;
+    const int seq = 6, W = 4, rank = 3;
+    int ok41 = 1;
+    srand(41);
+    LlamaModel mm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, msq,
+                                             10000.0f, 1e-5f);
+    llama_model_set_qk_norm(&mm, 1);
+    llama_model_randomize(&mm);
+    llama_model_set_window(&mm, W, 2);        // layer 0 windowed (W=4 < seq), layer 1 global
+
+    // (a) init invariance + B = 0 identity.
+    srand(4101);
+    LlamaLora att = llama_lora_create(&mm, rank, 6.0f);
+    llama_lora_init(&att);
+    srand(4101);
+    LlamaLora lo = llama_lora_create_ex(&mm, rank, 6.0f, 1);
+    llama_lora_init(&lo);
+    int init_same = (att.gate == NULL) && (lo.gate != NULL);
+    for (int l = 0; l < nl && init_same; l++) {
+      const LoraAdapter *pa[4] = {&att.q[l], &att.k[l], &att.v[l], &att.o[l]};
+      const LoraAdapter *pb[4] = {&lo.q[l], &lo.k[l], &lo.v[l], &lo.o[l]};
+      for (int j = 0; j < 4; j++)
+        if (memcmp(pa[j]->A.data, pb[j]->A.data, pa[j]->A.size * sizeof(float)) != 0) init_same = 0;
+    }
+    const int np_att = llama_lora_param_count(&att), np_all = llama_lora_param_count(&lo);
+    Tensor **lp = (Tensor**)malloc((size_t)np_all * sizeof(Tensor*));
+    int n_lp = llama_lora_collect_params(&lo, lp);
+    // Collect order: the attention prefix is the attention-only list, then MLP.
+    Tensor **ap = (Tensor**)malloc((size_t)np_att * sizeof(Tensor*));
+    llama_lora_collect_params(&att, ap);
+    int order_ok = (n_lp == 14 * nl) && (np_att == 8 * nl);
+    for (int p = 0; p < np_att && order_ok; p++)
+      if (ap[p]->size != lp[p]->size) order_ok = 0;
+    free(ap);
+
+    int ids[6] = {3, 11, 1, 17, 6, 9}, tg[6] = {11, 1, 17, 6, 9, 4};
+    int ls[2] = {seq, vocab};
+    Tensor lg = tensor_create(ls, 2), pr = tensor_create(ls, 2), lbase = tensor_create(ls, 2);
+    LlamaActs ac = llama_acts_create(&mm, seq);
+    LlamaLoraActs la = llama_lora_acts_create(&mm, &lo, seq);
+    llama_forward_train(&mm, ids, seq, &ac, &lbase);
+    llama_forward_train_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+    const int b0_same = memcmp(lg.data, lbase.data, (size_t)seq * vocab * sizeof(float)) == 0;
+    printf("    (a) %d adapter tensors (%d attention + %d MLP); attention init unchanged by --lora-mlp: %s |"
+           " B=0 => adapted == base bit-exact: %s\n",
+           n_lp, np_att, n_lp - np_att, (init_same && order_ok) ? "yes" : "NO", b0_same ? "yes" : "NO");
+    ok41 &= init_same && order_ok && b0_same;
+
+    // Make every adapter bite (B = 0 would make dA identically zero).
+    for (int p = 0; p < n_lp; p++)
+      for (size_t k = 0; k < lp[p]->size; k++)
+        lp[p]->data[k] += 0.08f * (float)((int)((k * 29 + (size_t)p * 7) % 11) - 5);
+
+    // (b) gradient check, every entry.
+    llama_forward_train_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+    cross_entropy_forward(&lg, tg, &pr);
+    tensor_zero_grad(&lg);
+    cross_entropy_backward(&pr, tg, &lg);
+    llama_backward_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+    const float ceps = 3e-2f;     // round-off, not truncation, limits float32 here
+    // [0] = attention adapters, [1] = MLP adapters.
+    float g_abs[2] = {0.0f, 0.0f}, g_rel[2] = {0.0f, 0.0f}, g_max[2] = {0.0f, 0.0f};
+    long g_n[2] = {0, 0}, g_big[2] = {0, 0};
+    for (int p = 0; p < n_lp; p++) {
+      Tensor *t = lp[p];
+      const int grp = (p >= np_att);
+      for (size_t k = 0; k < t->size; k++) {
+        const float base = t->data[k];
+        float dh[2];                          // central differences at h and h/2
+        for (int hh = 0; hh < 2; hh++) {
+          const float h = hh ? 0.5f * ceps : ceps;
+          t->data[k] = base + h;
+          llama_forward_train_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+          const float lpv = cross_entropy_forward(&lg, tg, &pr);
+          t->data[k] = base - h;
+          llama_forward_train_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+          const float lmv = cross_entropy_forward(&lg, tg, &pr);
+          dh[hh] = (lpv - lmv) / (2.0f * h);
+        }
+        t->data[k] = base;
+        // Richardson extrapolation cancels the O(h^2) truncation term.
+        const float num = (4.0f * dh[1] - dh[0]) / 3.0f, ana = t->grad[k];
+        const float ab = fabsf(ana - num);
+        if (ab > g_abs[grp]) g_abs[grp] = ab;
+        if (fabsf(ana) > g_max[grp]) g_max[grp] = fabsf(ana);
+        if (fabsf(ana) > 1e-2f) {             // relative error where it is meaningful
+          const float rel = ab / (fabsf(ana) + fabsf(num));
+          if (rel > g_rel[grp]) g_rel[grp] = rel;
+          g_big[grp]++;
+        }
+        g_n[grp]++;
+      }
+    }
+    // Every entry: the float32 loss difference carries ~1e-4 of round-off at
+    // this h, so each entry's absolute error is judged against the tensor
+    // group's gradient scale (a wrong term is O(|grad|) off, not 1e-3 of it);
+    // entries with |grad| > 1e-2 must also agree to 1% relative.
+    int grad_ok = 1;
+    for (int g = 0; g < 2; g++)
+      grad_ok &= (g_abs[g] < 2e-3f * g_max[g]) && (g_rel[g] < 1e-2f) && (g_big[g] > 0);
+    printf("    (b) gradient check, EVERY entry (Richardson central diff, h=%.0e):\n"
+           "        MLP %ld entries: max |err| %.2e = %.1e of max |grad| %.2e | %ld with |grad|>1e-2: max rel %.2e\n"
+           "        attention %ld entries: max |err| %.2e = %.1e of max |grad| %.2e | %ld with |grad|>1e-2: max rel %.2e -> %s\n",
+           (double)ceps,
+           g_n[1], g_abs[1], g_abs[1] / g_max[1], g_max[1], g_big[1], g_rel[1],
+           g_n[0], g_abs[0], g_abs[0] / g_max[0], g_max[0], g_big[0], g_rel[0],
+           grad_ok ? "OK" : "FAIL");
+    ok41 &= grad_ok;
+
+    // (c) decode == training forward, bit-exact.
+    llama_forward_train_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+    LlamaDecodeLora dv = llama_lora_decode_view(&lo);
+    int ds[2] = {1, vocab};
+    Tensor ld = tensor_create(ds, 2);
+    LlamaKV kv = llama_kv_create(&mm), kv2 = llama_kv_create(&mm), kv3 = llama_kv_create(&mm);
+    int dec_exact = 1;
+    float dec_max = 0.0f, attn_only_d = 0.0f;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step_lora(&mm, &kv, ids[i], &ld, &dv);
+      for (int j = 0; j < vocab; j++) {
+        const float d = fabsf(ld.data[j] - lg.data[i * vocab + j]);
+        if (ld.data[j] != lg.data[i * vocab + j]) dec_exact = 0;
+        if (d > dec_max) dec_max = d;
+      }
+    }
+    // logits == NULL prefill for positions 0..seq-2, logits only for the last.
+    for (int i = 0; i < seq - 1; i++) llama_decode_step_lora(&mm, &kv2, ids[i], NULL, &dv);
+    llama_decode_step_lora(&mm, &kv2, ids[seq - 1], &ld, &dv);
+    int pre_exact = memcmp(ld.data, &lg.data[(seq - 1) * vocab], (size_t)vocab * sizeof(float)) == 0 &&
+                    kv2.len == kv.len;
+    for (int l = 0; l < nl; l++) {
+      const int used = kv.len < kv.cap[l] ? kv.len : kv.cap[l];
+      const size_t bytes = (size_t)used * kv.kv_dim * sizeof(float);
+      if (memcmp(kv.k[l], kv2.k[l], bytes) != 0 || memcmp(kv.v[l], kv2.v[l], bytes) != 0) pre_exact = 0;
+    }
+    // The MLP adapters must actually matter to decode: drop them from the view.
+    LlamaDecodeLora dva = dv;
+    dva.gate = dva.up = dva.down = NULL;
+    for (int i = 0; i < seq; i++) {
+      llama_decode_step_lora(&mm, &kv3, ids[i], &ld, &dva);
+      for (int j = 0; j < vocab; j++) {
+        const float d = fabsf(ld.data[j] - lg.data[i * vocab + j]);
+        if (d > attn_only_d) attn_only_d = d;
+      }
+    }
+    const int dec_ok = dec_exact && pre_exact && attn_only_d > 1e-3f;
+    printf("    (c) decode vs training forward (QK-norm, window %d wraps, MLP adapters nonzero): %s"
+           " (max |diff| %.2e) | logits=NULL prefill: last logits + KV %s | view without MLP adapters"
+           " differs by %.2e -> %s\n",
+           W, dec_exact ? "bit-exact" : "DIFFER", dec_max, pre_exact ? "bit-exact" : "DIFFER",
+           attn_only_d, dec_ok ? "OK" : "FAIL");
+    ok41 &= dec_ok;
+
+    // GRPO: rollouts (shared prefill vs per-rollout) and pi_old vs pi_new.
+    {
+      const int T = 7, G = 3, R = 6, Lmax = T + R;
+      int prompt[7] = {2, 15, 7, 7, 0, 19, 4};
+      GrpoConfig cfg = grpo_default_config();
+      cfg.group = G; cfg.max_new = R;
+      cfg.temperature = 1.0f; cfg.top_k = 0; cfg.top_p = 1.0f;
+      int ids_a[18], ids_b[18], len_a[3], len_b[3];
+      float lp_a[18], lp_b[18];
+      Rng ra = rng_create(4141), rb = rng_create(4141);
+      grpo_debug_sample_group(&mm, &dv, prompt, T, &cfg, 0, &ra, ids_a, lp_a, len_a);
+      grpo_debug_sample_group(&mm, &dv, prompt, T, &cfg, 1, &rb, ids_b, lp_b, len_b);
+      int share_same = memcmp(len_a, len_b, sizeof(len_a)) == 0;
+      for (int i = 0; i < G && share_same; i++)
+        for (int t = 0; t < len_a[i]; t++)
+          if (ids_a[i * R + t] != ids_b[i * R + t] || lp_a[i * R + t] != lp_b[i * R + t]) share_same = 0;
+
+      LlamaActs gac = llama_acts_create(&mm, Lmax);
+      LlamaLoraActs gla = llama_lora_acts_create(&mm, &lo, Lmax);
+      int gs[2] = {Lmax, vocab};
+      Tensor glg = tensor_create(gs, 2), gpr = tensor_create(gs, 2);
+      int sq[13], n_cmp = 0, ratio_exact = 1;
+      float ratio_max = 0.0f;
+      for (int i = 0; i < G; i++) {
+        const int L = T + len_b[i];
+        if (len_b[i] == 0) continue;
+        memcpy(sq, prompt, (size_t)T * sizeof(int));
+        memcpy(&sq[T], &ids_b[i * R], (size_t)len_b[i] * sizeof(int));
+        llama_acts_set_len(&gac, L);
+        llama_lora_acts_set_len(&gla, L);
+        glg.shape[0] = L; glg.size = (size_t)L * vocab;
+        gpr.shape[0] = L; gpr.size = (size_t)L * vocab;
+        llama_forward_train_lora(&mm, sq, L, &gac, &glg, &lo, &gla);
+        softmax_rowwise(&glg, &gpr);
+        for (int t = 0; t < len_b[i]; t++) {
+          const float lnew = logprob_of(&gpr, T - 1 + t, ids_b[i * R + t]);
+          const float r = fabsf(expf(lnew - lp_b[i * R + t]) - 1.0f);
+          if (lnew != lp_b[i * R + t]) ratio_exact = 0;
+          if (r > ratio_max) ratio_max = r;
+          n_cmp++;
+        }
+      }
+      const int gr_ok = share_same && ratio_exact && n_cmp > 0;
+      printf("        GRPO with MLP adapters: shared-prefill rollouts == per-rollout %s | pi_old (decode)"
+             " vs pi_new (training forward) over %d tokens: %s, max |ratio-1| %.2e -> %s\n",
+             share_same ? "bit-exact" : "DIFFER", n_cmp, ratio_exact ? "bit-exact" : "DIFFER",
+             ratio_max, gr_ok ? "OK" : "FAIL");
+      ok41 &= gr_ok;
+      tensor_free(&glg); tensor_free(&gpr);
+      llama_lora_acts_free(&gla); llama_acts_free(&gac);
+    }
+
+    // (d) merge equivalence (mutates mm: last use of the adapted model).
+    llama_forward_train_lora(&mm, ids, seq, &ac, &lg, &lo, &la);
+    float wg0 = mm.blocks[0].Wgate.data[0], wd0 = mm.blocks[nl - 1].Wdown.data[0];
+    llama_lora_merge(&mm, &lo);
+    llama_forward_train(&mm, ids, seq, &ac, &lbase);
+    float mdiff = 0.0f, mscale = 0.0f;
+    for (int i = 0; i < seq * vocab; i++) {
+      const float d = fabsf(lbase.data[i] - lg.data[i]);
+      if (d > mdiff) mdiff = d;
+      if (fabsf(lg.data[i]) > mscale) mscale = fabsf(lg.data[i]);
+    }
+    int b_zero = 1;
+    for (int p = 1; p < n_lp; p += 2)
+      for (size_t k = 0; k < lp[p]->size; k++) if (lp[p]->data[k] != 0.0f) b_zero = 0;
+    const int w_moved = (mm.blocks[0].Wgate.data[0] != wg0) && (mm.blocks[nl - 1].Wdown.data[0] != wd0);
+    const int merge_ok = (mdiff / (mscale + 1e-6f) < 1e-4f) && b_zero && w_moved;
+    printf("    (d) merge (Wgate/Wup/Wdown too): max |diff| %.2e vs |logit| %.2e (rel %.2e) | every B zeroed:"
+           " %s | MLP weights moved: %s -> %s\n",
+           mdiff, mscale, mdiff / (mscale + 1e-6f), b_zero ? "yes" : "NO", w_moved ? "yes" : "NO",
+           merge_ok ? "OK" : "FAIL");
+    ok41 &= merge_ok;
+
+    // (e) per-tensor LR multipliers.
+    {
+      int s2[2] = {3, 5}, s1[1] = {4};
+      Tensor P[4], Q[4];                      // P: matrices, Q: 1-D
+      for (int c = 0; c < 4; c++) { P[c] = tensor_create(s2, 2); Q[c] = tensor_create(s1, 1); }
+      for (int c = 0; c < 4; c++) {
+        for (size_t k = 0; k < P[c].size; k++) P[c].data[k] = 0.1f * (float)((int)(k % 7) - 3);
+        for (size_t k = 0; k < Q[c].size; k++) Q[c].data[k] = 0.2f * (float)((int)(k % 5) - 2);
+      }
+      Tensor *l0[2] = {&P[0], &Q[0]}, *l1[2] = {&P[1], &Q[1]};
+      Tensor *l2[2] = {&P[2], &Q[2]}, *l3[2] = {&P[3], &Q[3]};
+      float ones[2] = {1.0f, 1.0f};
+      Adam a0 = adamw_create(l0, 2, 0.01f, 0.1f), a1 = adamw_create(l1, 2, 0.01f, 0.1f);
+      adam_set_lr_mult(&a1, ones, 2);
+      int mask[2] = {1, 0};
+      Muon m0 = muon_create(l2, 2, mask, 0.01f, 0.1f), m1 = muon_create(l3, 2, mask, 0.01f, 0.1f);
+      muon_set_lr_mult(&m1, ones);
+      for (int s = 0; s < 6; s++) {
+        for (int c = 0; c < 4; c++) {
+          for (size_t k = 0; k < P[c].size; k++) P[c].grad[k] = 0.05f * (float)((int)((k * 3 + s) % 9) - 4);
+          for (size_t k = 0; k < Q[c].size; k++) Q[c].grad[k] = 0.03f * (float)((int)((k + 2 * s) % 7) - 3);
+        }
+        adam_step(&a0, l0, 2); adam_step(&a1, l1, 2);
+        muon_step(&m0, l2, 2); muon_step(&m1, l3, 2);
+      }
+      const int adam_same = memcmp(P[0].data, P[1].data, P[0].size * sizeof(float)) == 0 &&
+                            memcmp(Q[0].data, Q[1].data, Q[0].size * sizeof(float)) == 0;
+      const int muon_same = memcmp(P[2].data, P[3].data, P[2].size * sizeof(float)) == 0 &&
+                            memcmp(Q[2].data, Q[3].data, Q[2].size * sizeof(float)) == 0;
+      adam_free(&a0); adam_free(&a1); muon_free(&m0); muon_free(&m1);
+
+      // LoRA+ {1, 16}: a first Adam step moves each entry by ~lr (m_hat/sqrt(v_hat)
+      // = sign(g)), so B's step must be 16x A's. Muon: the 1-D tensor lives in the
+      // inner AdamW, which must receive ITS multiplier through the sub-list.
+      float plus[2] = {1.0f, 16.0f};
+      for (int c = 0; c < 2; c++) {
+        for (size_t k = 0; k < P[c].size; k++) { P[c].data[k] = 0.0f; P[c].grad[k] = (k & 1) ? 0.3f : -0.2f; }
+        for (size_t k = 0; k < Q[c].size; k++) { Q[c].data[k] = 0.0f; Q[c].grad[k] = (k & 1) ? -0.4f : 0.1f; }
+      }
+      Adam ap2 = adam_create(l0, 2, 0.01f);
+      adam_set_lr_mult(&ap2, plus, 2);
+      adam_step(&ap2, l0, 2);
+      Muon mp2 = muon_create(l1, 2, mask, 0.01f, 0.0f);
+      muon_set_lr_mult(&mp2, plus);
+      muon_step(&mp2, l1, 2);
+      const float ra = fabsf(Q[0].data[0]) / fabsf(P[0].data[0]);
+      const float rm = fabsf(Q[1].data[0]) / 0.01f;      // inner AdamW step / lr
+      adam_free(&ap2); muon_free(&mp2);
+      for (int c = 0; c < 4; c++) { tensor_free(&P[c]); tensor_free(&Q[c]); }
+
+      // llama_lora_plus_mult marks exactly the B tensors.
+      float *mult = (float*)malloc((size_t)n_lp * sizeof(float));
+      llama_lora_plus_mult(&lo, 16.0f, mult);
+      int mark_ok = 1;
+      for (int l = 0; l < nl; l++) {
+        const LoraAdapter *all[7] = {&lo.q[l], &lo.k[l], &lo.v[l], &lo.o[l],
+                                     &lo.gate[l], &lo.up[l], &lo.down[l]};
+        for (int p = 0; p < n_lp; p++)
+          for (int j = 0; j < 7; j++) {
+            if (lp[p] == &all[j]->A && mult[p] != 1.0f) mark_ok = 0;
+            if (lp[p] == &all[j]->B && mult[p] != 16.0f) mark_ok = 0;
+          }
+      }
+      free(mult);
+      const int opt_ok = adam_same && muon_same && fabsf(ra - 16.0f) < 1e-2f &&
+                         fabsf(rm - 16.0f) < 1e-2f && mark_ok;
+      printf("    (e) lr multiplier all-ones == none, 6 steps (wd 0.1): Adam %s, Muon (+inner AdamW) %s |"
+             " LoRA+ {1,16} first-step ratio: Adam %.4f, Muon's inner AdamW %.4f | B tensors marked: %s -> %s\n",
+             adam_same ? "bit-identical" : "DIFFER", muon_same ? "bit-identical" : "DIFFER", ra, rm,
+             mark_ok ? "yes" : "NO", opt_ok ? "OK" : "FAIL");
+      ok41 &= opt_ok;
+    }
+
+    free(lp);
+    tensor_free(&lg); tensor_free(&pr); tensor_free(&lbase); tensor_free(&ld);
+    llama_kv_free(&kv); llama_kv_free(&kv2); llama_kv_free(&kv3);
+    llama_lora_acts_free(&la); llama_acts_free(&ac);
+    llama_lora_free(&lo); llama_lora_free(&att);
+    llama_model_free(&mm);
+
+    // (f) Tiny adaptation comparison. Pretrain a base on task A (full fine-tune),
+    // freeze it, adapt to task B with (1) attention-only LoRA, (2) all-layer LoRA,
+    // (3) all-layer + LoRA+ 16 — same base, same attention-adapter init (MLP
+    // adapters draw after them), same rank, lr and steps.
+    {
+      const int V2 = 24, sq2 = 8, r2 = 2, steps = 150;
+      const float lr2 = 0.01f;
+      srand(4142);
+      LlamaModel tb = llama_model_create_train(V2, 8, 2, 4, 2, 2, 16, 32, 10000.0f, 1e-5f);
+      llama_model_randomize(&tb);
+      int tid[8] = {5, 2, 8, 1, 6, 13, 20, 3};
+      int tA[8] = {2, 8, 1, 6, 13, 20, 3, 11};
+      int tB[8] = {7, 3, 5, 2, 9, 17, 0, 22};
+      int ts[2] = {sq2, V2};
+      Tensor tl = tensor_create(ts, 2), tp = tensor_create(ts, 2);
+      LlamaActs ta = llama_acts_create(&tb, sq2);
+      Tensor **bp = (Tensor**)malloc((size_t)llama_param_count(&tb) * sizeof(Tensor*));
+      int nbp = llama_collect_params(&tb, bp);
+      Adam pre = adam_create(bp, nbp, 0.02f);
+      for (int s = 0; s < 300; s++) {
+        llama_forward_train(&tb, tid, sq2, &ta, &tl);
+        cross_entropy_forward(&tl, tA, &tp);
+        tensor_zero_grad(&tl);
+        cross_entropy_backward(&tp, tA, &tl);
+        llama_backward(&tb, tid, sq2, &ta, &tl);
+        adam_step(&pre, bp, nbp);
+      }
+      adam_free(&pre); free(bp);
+
+      const char *names[3] = {"attention-only", "all-layer (MLP too)", "all-layer + LoRA+ 16"};
+      float first[3], mid[3], last[3];
+      int ntens[3];
+      size_t nscal[3];
+      int train_ok = 1;
+      for (int run = 0; run < 3; run++) {
+        srand(4143);
+        LlamaLora tlo = llama_lora_create_ex(&tb, r2, 2.0f * r2, run > 0);
+        llama_lora_init(&tlo);
+        LlamaLoraActs tla = llama_lora_acts_create(&tb, &tlo, sq2);
+        Tensor **tpl = (Tensor**)malloc((size_t)llama_lora_param_count(&tlo) * sizeof(Tensor*));
+        const int ntp = llama_lora_collect_params(&tlo, tpl);
+        ntens[run] = ntp;
+        nscal[run] = 0;
+        for (int p = 0; p < ntp; p++) nscal[run] += tpl[p]->size;
+        Adam to = adam_create(tpl, ntp, lr2);
+        if (run == 2) {
+          float *mult = (float*)malloc((size_t)ntp * sizeof(float));
+          llama_lora_plus_mult(&tlo, 16.0f, mult);
+          adam_set_lr_mult(&to, mult, ntp);
+          free(mult);
+        }
+        for (int s = 0; s < steps; s++) {
+          llama_forward_train_lora(&tb, tid, sq2, &ta, &tl, &tlo, &tla);
+          const float loss = cross_entropy_forward(&tl, tB, &tp);
+          if (s == 0) first[run] = loss;
+          if (s == steps / 3) mid[run] = loss;
+          tensor_zero_grad(&tl);
+          cross_entropy_backward(&tp, tB, &tl);
+          llama_backward_lora(&tb, tid, sq2, &ta, &tl, &tlo, &tla);
+          adam_step(&to, tpl, ntp);
+        }
+        llama_forward_train_lora(&tb, tid, sq2, &ta, &tl, &tlo, &tla);
+        last[run] = cross_entropy_forward(&tl, tB, &tp);
+        train_ok &= isfinite(last[run]) && last[run] < first[run];
+        adam_free(&to); free(tpl);
+        llama_lora_acts_free(&tla); llama_lora_free(&tlo);
+      }
+      printf("    (f) adapt a frozen base (pretrained on task A) to task B, rank %d, lr %g, %d steps:\n",
+             r2, (double)lr2, steps);
+      for (int run = 0; run < 3; run++)
+        printf("        %-22s %2d tensors %4zu scalars: loss %.4f -> %.4f (step %d) -> %.4f\n",
+               names[run], ntens[run], nscal[run], first[run], mid[run], steps / 3, last[run]);
+      printf("        all-layer ends %s attention-only (%.4f vs %.4f; it also trains %.1fx the scalars);"
+             " LoRA+ ends %s all-layer (%.4f) -> %s\n",
+             last[1] < last[0] ? "BELOW" : "at/above", last[1], last[0],
+             (double)nscal[1] / (double)nscal[0], last[2] < last[1] ? "below" : "at/above", last[2],
+             train_ok ? "OK" : "FAIL");
+      ok41 &= train_ok;
+      tensor_free(&tl); tensor_free(&tp);
+      llama_acts_free(&ta); llama_model_free(&tb);
+    }
+    printf("    -> %s\n\n", ok41 ? "OK" : "FAIL");
+    all_ok &= ok41;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

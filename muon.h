@@ -55,6 +55,7 @@ typedef struct {
   int ns_steps;        // Newton-Schulz iterations (default 5)
   float weight_decay;  // decoupled, applied to BOTH groups' matrices (AdamW rule
                        // for its group: 1-D tensors are never decayed)
+  float *lr_mult;      // optional per-tensor LR multiplier [n_params]; NULL = none
 } Muon;
 
 // Routing rule: mask[i] = 1 for every 2-D tensor NOT in `exclude` (pass the
@@ -73,6 +74,11 @@ Muon muon_create(Tensor **params, int n_params, const int *mask, float lr,
 void muon_step(Muon *o, Tensor **params, int n_params);
 
 void muon_set_lr(Muon *o, float lr);   // sets the inner AdamW's LR too
+
+// Per-tensor LR multipliers over the FULL parameter list (copied; NULL removes
+// them): a Muon tensor p steps with lr * mult[p] (decay included), and the inner
+// AdamW gets the matching sub-list. For LoRA+ under --optim muon.
+void muon_set_lr_mult(Muon *o, const float *mult);
 void muon_free(Muon *o);
 
 // The orthogonalization on its own: O ~= NewtonSchulz(G / ||G||_F), steps

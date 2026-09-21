@@ -63,6 +63,8 @@ typedef struct {
   float lr_min;             // < 0 => constant LR
   int lora_r;               // LoRA rank (0 => full fine-tune; not recommended here)
   float lora_alpha;
+  int lora_mlp;             // 1 => adapters on Wgate/Wup/Wdown too (0 => attention only)
+  float lora_plus;          // LoRA+: lr_B = lora_plus * lr, A keeps lr (0 => off)
 
   // --- The GRPO objective ---
   float clip_eps;           // PPO-style ratio clip, 1 +/- clip_eps (0 => no clipping)

@@ -128,12 +128,32 @@ Muon muon_create(Tensor **params, int n_params, const int *mask, float lr,
   o.nesterov = 1;
   o.ns_steps = 5;
   o.weight_decay = weight_decay;
+  o.lr_mult = NULL;
   return o;
 }
 
 void muon_set_lr(Muon *o, float lr) {
   o->lr = lr;
   adam_set_lr(&o->adam, lr);
+}
+
+void muon_set_lr_mult(Muon *o, const float *mult) {
+  free(o->lr_mult);
+  o->lr_mult = NULL;
+  if (!mult) {
+    if (o->n_adam > 0) adam_set_lr_mult(&o->adam, NULL, 0);
+    return;
+  }
+  o->lr_mult = (float*)xmalloc((size_t)o->n_params * sizeof(float));
+  memcpy(o->lr_mult, mult, (size_t)o->n_params * sizeof(float));
+  if (o->n_adam > 0) {            // the AdamW group's multipliers, in its own order
+    float *sub = (float*)xmalloc((size_t)o->n_adam * sizeof(float));
+    int n = 0;
+    for (int i = 0; i < o->n_params; i++)
+      if (!o->is_muon[i]) sub[n++] = mult[i];
+    adam_set_lr_mult(&o->adam, sub, n);
+    free(sub);
+  }
 }
 
 void muon_step(Muon *o, Tensor **params, int n_params) {
@@ -162,9 +182,10 @@ void muon_step(Muon *o, Tensor **params, int n_params) {
     // Moonshot RMS matching: orthogonal => element RMS 1/sqrt(max(r,c)); scaling
     // by 0.2*sqrt(max(r,c)) lands the update at RMS ~0.2, AdamW's typical size.
     const float scale = 0.2f * sqrtf((float)(rows > cols ? rows : cols));
-    const float decay = 1.0f - o->lr * o->weight_decay;
+    const float lr = o->lr_mult ? o->lr * o->lr_mult[p] : o->lr;   // LoRA+ etc.
+    const float decay = 1.0f - lr * o->weight_decay;
     for (size_t i = 0; i < w->size; i++)
-      w->data[i] = w->data[i] * decay - o->lr * scale * U[i];
+      w->data[i] = w->data[i] * decay - lr * scale * U[i];
   }
   free(U);
 
@@ -176,7 +197,8 @@ void muon_step(Muon *o, Tensor **params, int n_params) {
 
 void muon_free(Muon *o) {
   for (int i = 0; i < o->n_params; i++) free(o->mom[i]);
-  free(o->mom); free(o->is_muon); free(o->sub);
+  free(o->mom); free(o->is_muon); free(o->sub); free(o->lr_mult);
+  o->lr_mult = NULL;
   adam_free(&o->adam);
   o->mom = NULL; o->is_muon = NULL; o->sub = NULL;
   o->n_params = o->n_adam = 0;

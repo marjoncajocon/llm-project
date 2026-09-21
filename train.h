@@ -31,6 +31,8 @@ typedef struct {
   float rope_base;         // RoPE frequency base (10000 is standard)
   int lora_r;              // LoRA rank; > 0 => freeze the base, train adapters only
   float lora_alpha;        // LoRA scaling (scale = alpha / r); 0 => use r (scale 1)
+  int lora_mlp;            // 1 => ALSO adapt Wgate/Wup/Wdown (0 => attention only, default)
+  float lora_plus;         // LoRA+: lr_B = lora_plus * lr (A keeps lr); 0 => off (default)
   const char *hf_tok;      // .hf/.tok vocab of a REAL model (hftok.h): fine-tune with
                            // the model's OWN tokenizer instead of training a byte BPE
   int window;              // sliding-window attention size (0 => full causal attention)

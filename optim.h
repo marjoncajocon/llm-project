@@ -16,6 +16,9 @@ typedef struct {
   float beta2;     // second-moment decay
   float eps;       // numerical epsilon
   float weight_decay;  // DECOUPLED weight decay (AdamW); 0 = plain Adam
+  float *lr_mult;      // optional per-TENSOR LR multiplier [n_params] (owned copy),
+                       // NULL (the default) = every tensor uses lr — the historical,
+                       // bit-identical step. See adam_set_lr_mult.
 } Adam;
 
 // Create optimizer state sized for the given parameter tensors (uses each
@@ -38,6 +41,13 @@ void adam_step(Adam *o, Tensor **params, int n_params);
 
 // Set the learning rate (call once per step when using a schedule).
 void adam_set_lr(Adam *o, float lr);
+
+// Per-tensor learning-rate multipliers: tensor p (in the order adam_step is given
+// them) is updated with lr * mult[p], decay included (it is decoupled, lr-scaled).
+// Used for LoRA+ (lr_B = ratio * lr_A; llama_lora_plus_mult). The array is COPIED;
+// mult == NULL removes it (back to the plain step). mult[p] == 1 for every p is
+// bit-identical to no multiplier (x * 1.0f == x exactly in IEEE float).
+void adam_set_lr_mult(Adam *o, const float *mult, int n_params);
 
 // Release optimizer state.
 void adam_free(Adam *o);

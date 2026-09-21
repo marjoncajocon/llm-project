@@ -295,6 +295,11 @@ static void train_usage(void) {
     "                    on Wq/Wk/Wv/Wo (merged into the weights before saving).\n"
     "                    Pair with --resume to fine-tune a pretrained checkpoint.\n"
     "  --lora-alpha F    LoRA scaling (scale = alpha / r; default alpha = r)\n"
+    "  --lora-mlp        with --lora-r: ALSO put adapters on the SwiGLU MLP\n"
+    "                    (Wgate/Wup/Wdown). Attention-only LoRA underperforms\n"
+    "                    (\"LoRA Without Regret\", 2025). Default off.\n"
+    "  --lora-plus F     LoRA+: adapter B matrices train at F x --lr (A keeps\n"
+    "                    --lr); 16 is the paper's choice. Default off.\n"
     "  --hf-tok F        fine-tune with a REAL model's own vocabulary (.hf, see\n"
     "                    tools/export_tokenizer.py) instead of training a byte BPE.\n"
     "                    Its real EOS token is used, so no vocab slot is added.\n"
@@ -345,6 +350,8 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--global-every") == 0 && llama) { NEED_VAL(); cfg.global_every = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--lora-mlp") == 0 && llama) { cfg.lora_mlp = 1; }
+    else if (strcmp(f, "--lora-plus") == 0 && llama) { NEED_VAL(); cfg.lora_plus = (float)atof(argv[++i]); }
     else if (strcmp(f, "--hf-tok") == 0 && llama) { NEED_VAL(); cfg.hf_tok = argv[++i]; }
     else if (strcmp(f, "--optim") == 0 && llama) {
       NEED_VAL(); const char *o = argv[++i];
@@ -408,6 +415,8 @@ static void grpo_usage(void) {
     "  --warmup N / --min-lr F   cosine schedule (default: constant LR)\n"
     "  --lora-r N        LoRA rank, base frozen (default 8; 0 = full fine-tune)\n"
     "  --lora-alpha F    LoRA scaling (default 16)\n"
+    "  --lora-mlp        adapters on the MLP (Wgate/Wup/Wdown) too (default off)\n"
+    "  --lora-plus F     LoRA+: B matrices train at F x --lr (16 typical; default off)\n"
     "Objective:\n"
     "  --clip-eps F      PPO-style ratio clip, 1 +/- eps (default 0.2; 0 = off)\n"
     "  --clip-high F     DAPO clip-higher: upper bound 1 + F instead of 1 + eps\n"
@@ -483,6 +492,8 @@ static int run_grpo(int argc, char **argv) {
     else if (strcmp(f, "--min-lr") == 0)  { NEED_VAL(); cfg.lr_min = (float)atof(argv[++i]); }
     else if (strcmp(f, "--lora-r") == 0)  { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-alpha") == 0) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--lora-mlp") == 0) { cfg.lora_mlp = 1; }
+    else if (strcmp(f, "--lora-plus") == 0) { NEED_VAL(); cfg.lora_plus = (float)atof(argv[++i]); }
     else if (strcmp(f, "--clip-eps") == 0){ NEED_VAL(); cfg.clip_eps = (float)atof(argv[++i]); }
     else if (strcmp(f, "--kl") == 0)      { NEED_VAL(); cfg.kl_beta = (float)atof(argv[++i]); }
     else if (strcmp(f, "--clip-high") == 0) { NEED_VAL(); cfg.clip_eps_high = (float)atof(argv[++i]); }
