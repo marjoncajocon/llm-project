@@ -13,7 +13,8 @@ setup step, like the weight converters).
     int32 bos_id, uint8 template_kind, uint16 sys_len, <sys_len> default_system,
     uint32 n_special, then per special: int32 id, uint8 eog, uint16 len, <len> str
     --- v3 tail ---
-    uint8 pretok_kind   (0 = GPT-2 regex, 1 = Qwen2/2.5/3 regex; see PRE_* below)
+    uint8 pretok_kind   (0 = GPT-2 regex, 1 = Qwen2/2.5/3 regex, 2 = SmolLM2 exact:
+                         Digits(individual) then GPT-2 regex per piece; see PRE_* below)
 v1/v2 files (no pretok byte) load as GPT-2; older C builds read v3 files too
 (they stop after the specials), but would split Qwen text with the GPT-2 rule.
 Encoding uses the byte-level-BPE rule "merge the adjacent pair whose combined
@@ -26,7 +27,7 @@ import sys
 TMPL_PLAIN, TMPL_CHATML, TMPL_LLAMA3 = 0, 1, 2
 
 # Pretokenizer kinds (hftok.h HFTOK_PRE_*).
-PRE_GPT2, PRE_QWEN2 = 0, 1
+PRE_GPT2, PRE_QWEN2, PRE_SMOL = 0, 1, 2
 # The GPT-2 byte-level regex (what ByteLevel(use_regex=true) applies).
 GPT2_REGEX = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 # Qwen2 / Qwen2.5 / Qwen3 Split regex, character for character as in tokenizer.json.
@@ -37,42 +38,59 @@ QWEN2_REGEX = (r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}""
 def pretok_kind(tj):
     r"""Map a tokenizer.json `pre_tokenizer` to a C pretokenizer kind, or exit if
     the engine cannot reproduce it (a wrong split silently changes every id).
-      Split(Qwen2 regex) [+ ByteLevel(use_regex=false)]      -> PRE_QWEN2
-      ByteLevel(use_regex=true) [+ Digits(individual) before] -> PRE_GPT2
-    Digits(individual_digits) + GPT-2 ByteLevel (SmolLM2) is APPROXIMATED as
-    GPT-2 (unchanged behaviour): a vocab trained with isolated digits has no
-    multi-digit or space+digit merges, so BPE usually lands on the same ids. It
-    does NOT when 2+ whitespace chars precede a digit ("  1." -> HF 'ĠĠ','1';
-    C ' ',' 1' -> 'Ġ','Ġ','1'): tools/verify_hftok.py finds 353/5283 corpus texts
-    differ for SmolLM2 (mostly indented code). An exact mode would split digits
-    out first, then apply the GPT-2 rule per piece."""
+      Split(Qwen2 regex) [+ ByteLevel(use_regex=false)]           -> PRE_QWEN2
+      ByteLevel(use_regex=true) / Split(GPT-2 regex)              -> PRE_GPT2
+      Digits(individual_digits=true) THEN ByteLevel(use_regex=true)
+        (SmolLM2 family)                                          -> PRE_SMOL
+    PRE_SMOL is HF's Sequence semantics exactly: every numeric char becomes its
+    own piece first, then the GPT-2 regex runs on each remaining piece, so a
+    piece's end is end-of-text for \s+(?!\S) ("x  1" -> x|'  '|1). Files written
+    before PRE_SMOL existed carry PRE_GPT2 for SmolLM2, an approximation that
+    differs when 2+ whitespace chars precede a digit (tools/verify_hftok.py: 353
+    of 5283 corpus texts, mostly indented code); those files still load and
+    tokenize exactly as before. Builds older than PRE_SMOL reject a kind-2 file
+    (unknown kind) rather than mis-split it."""
     pt = tj.get("pre_tokenizer") or {}
     items = pt.get("pretokenizers", []) if pt.get("type") == "Sequence" else [pt]
-    kinds = set()
+    steps = []   # ordered: "digits", PRE_GPT2, PRE_QWEN2
     for it in items:
         ty = it.get("type")
         if ty == "Split":
             pat = (it.get("pattern") or {}).get("Regex")
             if pat == QWEN2_REGEX and it.get("behavior") == "Isolated" and not it.get("invert"):
-                kinds.add(PRE_QWEN2)
+                steps.append(PRE_QWEN2)
             elif pat == GPT2_REGEX and it.get("behavior") == "Isolated" and not it.get("invert"):
-                kinds.add(PRE_GPT2)
+                steps.append(PRE_GPT2)
             else:
                 sys.exit("error: unsupported Split pre-tokenizer regex %r "
                          "(the C engine knows the GPT-2 and Qwen2 rules only)" % pat)
         elif ty == "ByteLevel":
+            if it.get("add_prefix_space"):
+                sys.exit("error: ByteLevel(add_prefix_space=true) pre-tokenizer is unsupported "
+                         "(the C engine does not prepend a space)")
             if it.get("use_regex", True):
-                kinds.add(PRE_GPT2)
+                steps.append(PRE_GPT2)
         elif ty == "Digits":
             if not it.get("individual_digits"):
                 sys.exit("error: Digits(individual_digits=false) pre-tokenizer is unsupported")
+            steps.append("digits")
         else:
             sys.exit("error: unsupported pre-tokenizer %r" % ty)
-    if not kinds:
+    # The same regex split applied twice in a row is a no-op the second time
+    # (e.g. Split(GPT-2 regex) + ByteLevel(use_regex=true)).
+    steps = [x for i, x in enumerate(steps) if i == 0 or x != steps[i - 1]]
+    # Digits before the Qwen2 regex is NOT the same as Qwen2 alone ("  1": the
+    # piece end changes the \s+(?!\S) split), so it is rejected, not approximated.
+    if steps == [PRE_GPT2]:
+        kind = PRE_GPT2
+    elif steps == [PRE_QWEN2]:
+        kind = PRE_QWEN2
+    elif steps == ["digits", PRE_GPT2]:
+        kind = PRE_SMOL
+    elif not [s for s in steps if s != "digits"]:
         sys.exit("error: no pre-tokenizer split found (%r)" % pt)
-    if len(kinds) > 1:
-        sys.exit("error: conflicting pre-tokenizer splits %r" % pt)
-    kind = kinds.pop()
+    else:
+        sys.exit("error: unsupported pre-tokenizer combination %r" % pt)
     norm = tj.get("normalizer")
     if norm and norm.get("type") != "NFC":
         sys.exit("error: unsupported normalizer %r" % norm)

@@ -18,8 +18,14 @@
 
 // Pretokenizer kinds (the regex that splits text into words before BPE). Stored
 // in .tok v3; v1/v2 files are GPT-2.
-#define HFTOK_PRE_GPT2  0   // GPT-2 regex (' ?\p{L}+| ?\p{N}+|...'): GPT-2, SmolLM2
+#define HFTOK_PRE_GPT2  0   // GPT-2 regex (' ?\p{L}+| ?\p{N}+|...') with ASCII-approximate
+                            // classes: GPT-2; also v1/v2 files and SmolLM2 files exported
+                            // before kind 2 existed (an approximation for SmolLM2)
 #define HFTOK_PRE_QWEN2 1   // Qwen2/2.5/3 regex: single digits, [^\r\n\p{L}\p{N}]?\p{L}+, ...
+#define HFTOK_PRE_SMOL  2   // SmolLM2 exact: HF Sequence[Digits(individual_digits=true),
+                            // ByteLevel(use_regex=true)] = every \p{N} char its own piece,
+                            // then the GPT-2 regex (real Unicode classes) on each other piece
+#define HFTOK_PRE_MAX   HFTOK_PRE_SMOL
 
 typedef struct {
   int n_vocab;
@@ -54,7 +60,7 @@ int hftok_encode(const HFTok *t, const char *text, int *ids, int max_ids);
 
 // Split text[0,len) into pretokens with the given HFTOK_PRE_* rule (no special-
 // token handling): starts[i]/lens[i] are byte offsets/lengths, at most max of them.
-// Returns the count. Exposed for tests (selftest [45], `hftok split`).
+// Returns the count. Exposed for tests (selftest [45]/[46], `hftok split-hex`).
 int hftok_pretok_split(int kind, const char *text, int len, int *starts, int *lens, int max);
 
 // Decode ids back into bytes (NUL-terminated). Returns the byte length.
