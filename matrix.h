@@ -23,6 +23,17 @@ int matmul_simd_enabled(void);       // currently in use
 void matmul_set_simd(int on);        // force on/off (on is ignored if unavailable)
 const char *matmul_simd_name(void);  // "avx2+fma" or "portable C"
 
+// Few-row forward matmuls (M < 4 x threads -- single-token decode) are threaded
+// over OUTPUT COLUMNS in 64-wide units instead of rows. Each element is still
+// one FMA chain in k order, so this is bit-identical to one thread (selftest
+// [38]).
+//
+// Test hook for that claim: 0 = normal dispatch; 1 = every forward matmul runs
+// as ONE serial call over all rows; n >= 2 = every forward matmul takes the
+// column path in n pieces, run one after another in the calling thread (so the
+// column split is exercised even without a thread pool, e.g. on wasm).
+void matmul_debug_split(int mode);
+
 // Matrix Addition: C = A + B (element-wise)
 void matadd(const Tensor *A, const Tensor *B, Tensor *C);
 

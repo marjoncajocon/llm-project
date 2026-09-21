@@ -680,6 +680,54 @@ static int selftest_agent_safety(void) {
   return ok_all;
 }
 
+// Part [38]: the pre-fast-path sampler, kept verbatim as the reference -- a full
+// qsort of all V (prob, id) pairs, then top-k / top-p / renormalize / walk --
+// split in two so one sort serves many RNG draws. tiebreak = 0 is agent-1's
+// comparator (ties left to qsort), 1 the current total order (ties -> lower id).
+typedef struct { float p; int idx; } RefPI;
+static int ref_cmp_old(const void *a, const void *b) {
+  float pa = ((const RefPI*)a)->p, pb = ((const RefPI*)b)->p;
+  return (pa < pb) - (pa > pb);
+}
+static int ref_cmp_total(const void *a, const void *b) {
+  const RefPI *x = (const RefPI*)a, *y = (const RefPI*)b;
+  if (x->p != y->p) return (x->p < y->p) - (x->p > y->p);
+  return (x->idx > y->idx) - (x->idx < y->idx);
+}
+// Fills pi (V entries, sorted); returns keep and the kept mass *z.
+static int ref_sample_prepare(const float *l, int V, float temperature, int top_k, float top_p,
+                              int tiebreak, RefPI *pi, float *z) {
+  float max_l = l[0];
+  for (int j = 1; j < V; j++) if (l[j] > max_l) max_l = l[j];
+  float sum = 0.0f;
+  for (int j = 0; j < V; j++) {
+    float e = expf((l[j] - max_l) / temperature);
+    pi[j].p = e; pi[j].idx = j; sum += e;
+  }
+  for (int j = 0; j < V; j++) pi[j].p /= sum;
+  qsort(pi, (size_t)V, sizeof(RefPI), tiebreak ? ref_cmp_total : ref_cmp_old);
+  int keep = V;
+  if (top_k > 0 && top_k < keep) keep = top_k;
+  if (top_p > 0.0f && top_p < 1.0f) {
+    float cum = 0.0f;
+    int kp = 0;
+    for (int i = 0; i < keep; i++) { cum += pi[i].p; kp++; if (cum >= top_p) break; }
+    keep = kp;
+  }
+  if (keep < 1) keep = 1;
+  float zz = 0.0f;
+  for (int i = 0; i < keep; i++) zz += pi[i].p;
+  *z = zz;
+  return keep;
+}
+static int ref_sample_draw(const RefPI *pi, int keep, float z, Rng *rng) {
+  float u = rng_uniform(rng) * z;
+  int chosen = pi[keep - 1].idx;
+  float acc = 0.0f;
+  for (int i = 0; i < keep; i++) { acc += pi[i].p; if (u <= acc) { chosen = pi[i].idx; break; } }
+  return chosen;
+}
+
 int run_selftest(void) {
   printf("=== Minimal GPT-2 Style Transformer Demo ===\n\n");
   int all_ok = 1;
@@ -4070,6 +4118,192 @@ int run_selftest(void) {
     free(lp_old); free(lp_new); free(lp_base);
     free(lp);
     llama_lora_free(&slo); llama_model_free(&sm);
+  }
+
+  // --------------------------------------------------------------------------
+  // [38] Decode fast paths. (a) A few-row forward matmul (M < 4 x threads, i.e.
+  // single-token decode) is threaded over 64-wide COLUMN units instead of rows
+  // and swept in L1-sized column blocks; it must be bit-identical to one serial
+  // call for every M = 1..8, on the real SmolLM2-135M shapes (lm_head's N =
+  // 49152 with a shortened K) and ragged ones -- with the real pool, and with
+  // 3 / 7 column pieces forced (so the split is tested even with 1 thread). The
+  // printed hash of the pool results must not change with $TF_THREADS.
+  // (b) sample_token sorts only the candidates above an exponent threshold; the
+  // token must equal the full-sort reference for the same RNG draw, on peaked,
+  // flat and tie-heavy rows, across top-k / top-p / temperature settings.
+  // (c) Prefill with logits = NULL leaves a bit-identical KV cache.
+  // --------------------------------------------------------------------------
+  {
+    printf("[38] Decode fast paths: column-threaded few-row matmul, candidate-only top-k/top-p sort\n");
+    const int gpu_was = gpu_is_enabled();
+    gpu_set_enabled(0);
+    const int was_on = matmul_simd_enabled();
+    const int SH[][2] = {                         // K, N
+      {96, 49152}, {576, 1536}, {1536, 576}, {576, 576}, {576, 192},
+      {130, 3001}, {577, 1000}, {64, 129}, {33, 70},
+    };
+    const int nsh = (int)(sizeof(SH) / sizeof(SH[0]));
+    unsigned long long lcg = 38;
+    #define RND38() ((float)((lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL) >> 40) \
+                     / 8388608.0f - 1.0f)
+    int mm_ok = 1, n_cmp = 0, modes = 0;
+    unsigned long long hash = 1469598103934665603ULL;   // FNV-1a over the pool results
+    for (int mode = 1; mode >= 0; mode--) {
+      if (mode == 1 && !matmul_simd_available()) continue;
+      matmul_set_simd(mode);
+      modes++;
+      for (int s = 0; s < nsh; s++) {
+        const int K = SH[s][0], N = SH[s][1];
+        int sb[2] = {K, N};
+        Tensor B = tensor_create_nograd(sb, 2);
+        for (size_t i = 0; i < B.size; i++) B.data[i] = RND38();
+        for (int M = 1; M <= 8; M++) {
+          int sa[2] = {M, K}, sc[2] = {M, N};
+          Tensor A = tensor_create_nograd(sa, 2);
+          for (size_t i = 0; i < A.size; i++) A.data[i] = RND38();
+          Tensor C[4];
+          const int split[4] = {1, 0, 3, 7};       // serial, pool, 3 / 7 column pieces
+          for (int v = 0; v < 4; v++) {
+            C[v] = tensor_create_nograd(sc, 2);
+            for (size_t i = 0; i < C[v].size; i++) C[v].data[i] = 12345.0f;  // must be overwritten
+            matmul_debug_split(split[v]);
+            matmul(&A, &B, &C[v]);
+          }
+          matmul_debug_split(0);
+          for (int v = 1; v < 4; v++) {
+            if (memcmp(C[0].data, C[v].data, C[0].size * sizeof(float)) != 0) mm_ok = 0;
+            n_cmp++;
+          }
+          const unsigned char *hb = (const unsigned char*)C[1].data;
+          for (size_t i = 0; i < C[1].size * sizeof(float); i++) {
+            hash ^= hb[i]; hash *= 1099511628211ULL;
+          }
+          for (int v = 0; v < 4; v++) tensor_free(&C[v]);
+          tensor_free(&A);
+        }
+        tensor_free(&B);
+      }
+    }
+    #undef RND38
+    matmul_set_simd(was_on);
+    gpu_set_enabled(gpu_was);
+    printf("    matmul M=1..8 x %d shapes (incl. K96xN49152, N=3001/1000/129/70) x %d kernel set(s):\n"
+           "      pool (%s) and 3/7 forced column pieces == one serial call: %d comparisons %s"
+           " | pool result hash %016llx -> %s\n",
+           nsh, modes, modes == 2 ? "avx2+fma, portable C" : matmul_simd_name(),
+           n_cmp, mm_ok ? "bit-exact" : "DIFFER", hash, mm_ok ? "OK" : "FAIL");
+    all_ok &= mm_ok;
+
+    // (b) sampler
+    const int SV = 49152;
+    int ds[2] = {1, SV};
+    Tensor lg = tensor_create_nograd(ds, 2);
+    RefPI *refpi = (RefPI*)malloc((size_t)SV * sizeof(RefPI));
+    RefPI *oldpi = (RefPI*)malloc((size_t)SV * sizeof(RefPI));
+    const float ST[][3] = {                       // temperature, top_k, top_p
+      {1.0f, 0, 0.95f}, {0.8f, 40, 0.95f}, {1.0f, 50, 1.0f}, {0.7f, 0, 0.5f},
+      {1.3f, 0, 0.99f}, {1.0f, 0, 1.0f}, {1.0f, 1, 0.9f}, {2.0f, 5000, 0.9f},
+    };
+    const int nst = (int)(sizeof(ST) / sizeof(ST[0]));
+    const char *dname[3] = {"peaked", "flat", "ties"};
+    int s_same = 0, s_tot = 0, o_same = 0, o_tot = 0, fast = 0;
+    unsigned long long sl = 3838;
+    #define SRND() ((double)((sl = sl * 6364136223846793005ULL + 1442695040888963407ULL) >> 11) \
+                    / 9007199254740992.0)
+    for (int d = 0; d < 3; d++) {
+      // peaked / flat rows use a permutation of SV evenly spaced levels, so no
+      // two logits (and no two probabilities) are equal: there the reference with
+      // agent-1's tie-agnostic comparator is well defined and must agree too.
+      for (int j = 0; j < SV; j++) {
+        const double lev = (double)((j * 7919) % SV) / SV;               // distinct, [0,1)
+        if (d == 0) lg.data[j] = (float)(4.0 * lev - 2.0);               // peaked: noise +
+        else if (d == 1) lg.data[j] = (float)(0.5 * lev);                // flat
+        else lg.data[j] = (float)(int)(SRND() * 4.0);                    // ties: 4 levels
+      }
+      if (d == 0)                                  // ... a few dominant tokens
+        for (int t = 0; t < 40; t++) lg.data[(t * 7919) % SV] = 6.0f + 0.25f * (float)t;
+      if (d == 2)                                  // an exact tie at the top, too
+        for (int t = 0; t < 6; t++) lg.data[(t * 4099 + 11) % SV] = 9.0f;
+      for (int st = 0; st < nst; st++) {
+        const float tp = ST[st][0], pp = ST[st][2];
+        const int tk = (int)ST[st][1];
+        float zr = 0.0f, zo = 0.0f;
+        const int kr = ref_sample_prepare(lg.data, SV, tp, tk, pp, 1, refpi, &zr);
+        const int ko = (d != 2) ? ref_sample_prepare(lg.data, SV, tp, tk, pp, 0, oldpi, &zo) : 0;
+        Rng ra = rng_create(1000 + (unsigned)(d * 31 + st)), rb = ra, rc = ra;
+        for (int draw = 0; draw < 8; draw++) {
+          int sorted = SV;
+          const int tf = sample_token_debug(&lg, 0, tp, tk, pp, &ra, &sorted);
+          s_same += (tf == ref_sample_draw(refpi, kr, zr, &rb)); s_tot++;
+          fast += (sorted < SV);
+          if (d != 2) {                            // tie-free rows: agent-1's comparator too
+            o_same += (tf == ref_sample_draw(oldpi, ko, zo, &rc)); o_tot++;
+          }
+        }
+      }
+    }
+    #undef SRND
+    tensor_free(&lg);
+    free(refpi); free(oldpi);
+    const int samp_ok = (s_same == s_tot) && (o_same == o_tot) && fast > 0 && fast < s_tot;
+    printf("    sampler, V=%d, %s/%s/%s rows x %d temp/top-k/top-p settings x 8 draws:\n"
+           "      == full sort %d/%d | == agent-1 comparator (tie-free rows) %d/%d |"
+           " candidate-only sort used %d/%d -> %s\n",
+           SV, dname[0], dname[1], dname[2], nst, s_same, s_tot, o_same, o_tot, fast, s_tot,
+           samp_ok ? "OK" : "FAIL");
+    all_ok &= samp_ok;
+
+    // (c) llama_decode_step_lora(..., logits = NULL): the prefill form (grpo.c
+    // prefill_prompt) skips the last layer's attention/FFN, the final norm and
+    // lm_head. The KV cache it leaves -- and so every later logit -- must be
+    // bit-identical to decoding with logits.
+    {
+      const int vocab = 24, nl = 3, T = 12;
+      srand(38);
+      LlamaModel pm = llama_model_create_train(vocab, 16, nl, 4, 2, 4, 32, 48, 10000.0f, 1e-5f);
+      llama_model_set_qk_norm(&pm, 1);
+      llama_model_randomize(&pm);
+      llama_model_set_window(&pm, 5, 2);     // ring buffers wrap inside the prompt
+      LlamaLora plo = llama_lora_create(&pm, 4, 8.0f);
+      llama_lora_init(&plo);
+      Tensor **pp = (Tensor**)malloc((size_t)llama_lora_param_count(&plo) * sizeof(Tensor*));
+      const int npp = llama_lora_collect_params(&plo, pp);
+      for (int p = 0; p < npp; p++)
+        for (size_t k = 0; k < pp[p]->size; k++)
+          pp[p]->data[k] += 0.05f * (float)((int)((k * 17 + (size_t)p * 3) % 11) - 5);
+      LlamaDecodeLora pdv = llama_lora_decode_view(&plo);
+      const int prompt[12] = {3, 17, 1, 9, 22, 5, 5, 14, 0, 8, 19, 2};
+      int vs[2] = {1, vocab};
+      Tensor la = tensor_create(vs, 2), lb = tensor_create(vs, 2);
+      LlamaKV ka = llama_kv_create(&pm), kb = llama_kv_create(&pm);
+      for (int i = 0; i < T; i++) {
+        llama_decode_step_lora(&pm, &ka, prompt[i], &la, &pdv);
+        llama_decode_step_lora(&pm, &kb, prompt[i], (i == T - 1) ? &lb : NULL, &pdv);
+      }
+      int kv_same = (ka.len == kb.len);
+      for (int l = 0; l < nl; l++) {
+        const int used = ka.len < ka.cap[l] ? ka.len : ka.cap[l];
+        const size_t bytes = (size_t)used * ka.kv_dim * sizeof(float);
+        if (memcmp(ka.k[l], kb.k[l], bytes) != 0 || memcmp(ka.v[l], kb.v[l], bytes) != 0) kv_same = 0;
+      }
+      int lg_same = memcmp(la.data, lb.data, (size_t)vocab * sizeof(float)) == 0;
+      for (int i = 0; i < 6; i++) {           // continue decoding from both caches
+        const int tk = (i * 5 + 2) % vocab;
+        llama_decode_step_lora(&pm, &ka, tk, &la, &pdv);
+        llama_decode_step_lora(&pm, &kb, tk, &lb, &pdv);
+        if (memcmp(la.data, lb.data, (size_t)vocab * sizeof(float)) != 0) lg_same = 0;
+      }
+      const int pre_ok = kv_same && lg_same;
+      printf("    prefill with logits=NULL (LoRA, QK-norm, wrapping windows): KV cache %s,"
+             " last-prompt + 6 further logits %s -> %s\n\n",
+             kv_same ? "identical" : "DIFFERS", lg_same ? "bit-exact" : "DIFFER",
+             pre_ok ? "OK" : "FAIL");
+      all_ok &= pre_ok;
+      tensor_free(&la); tensor_free(&lb);
+      llama_kv_free(&ka); llama_kv_free(&kb);
+      free(pp);
+      llama_lora_free(&plo); llama_model_free(&pm);
+    }
   }
 
   // --------------------------------------------------------------------------

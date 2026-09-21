@@ -170,6 +170,9 @@ void llama_kv_copy(LlamaKV *dst, const LlamaKV *src);
 
 // Decode ONE token at position kv->len: append its K/V to the cache, attend over
 // positions 0..kv->len, and write logits (1, vocab). Advances kv->len.
+// logits == NULL skips the final norm and lm_head (the costliest matmul of a
+// small model): prompt prefill needs only the LAST position's logits. The KV
+// cache is written exactly as with logits.
 void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logits);
 
 // A read-only view of the four per-layer adapter arrays of a LlamaLora, so the

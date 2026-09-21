@@ -280,11 +280,14 @@ static int copy_weights(LlamaModel *dst, LlamaModel *src) {
 // Token-by-token (not one batched llama_forward_train_lora) on purpose: the
 // batched forward is only ~1e-3-close to decode (selftest [26]), and the sampled
 // rollouts must stay bit-identical to what a per-rollout decode would draw.
+// Only the last position's logits are ever read, so the earlier steps pass NULL
+// and skip the final norm + lm_head (576 x 49152, the largest matmul of a 135M
+// step); the KV cache they write is unchanged.
 static void prefill_prompt(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
                            const int *prompt_ids, int n_prompt, Tensor *logits) {
   kv->len = 0;
   for (int i = 0; i < n_prompt; i++)
-    llama_decode_step_lora(m, kv, prompt_ids[i], logits, lo);
+    llama_decode_step_lora(m, kv, prompt_ids[i], (i == n_prompt - 1) ? logits : NULL, lo);
 }
 
 // One rollout: start from the prefilled prompt, then sample up to max_new tokens

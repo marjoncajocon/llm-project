@@ -267,6 +267,16 @@ columns are what a portable binary (`make cross`, `cross-gpu`) gains from the di
 These are single-kernel numbers — end-to-end training/decode time was **not** measured here, and
 decode (M=1) is essentially unchanged.
 
+**Decode (M=1) threading and sampling.** Row-parallel matmul leaves a 1-row product on one
+thread, so a forward with `M < 4 × threads` is split over **output columns** (64-wide units)
+instead — still one FMA chain per element, bit-identical to one thread (selftest `[38]`). On a
+synthetic 30-layer 135M-shaped model this takes a decode step from 33.1 to 23.3 ms at
+`TF_THREADS=3` (1 thread: unchanged, it is DRAM-bound). `sample_token` sorts only the top-k /
+top-p candidates (threshold by float exponent, total-order comparator, full-sort fallback), which
+gives the same token as a full sort for the same RNG draw: 5.1 → 0.5–2.9 ms per token on
+peaked 49152-way rows. `llama_decode_step_lora(…, NULL, …)` skips the last layer's attention/FFN,
+the final norm and lm_head, for prompt prefill (GRPO uses it). Details: notes.md.
+
 **Numerics.** Each output element is one FMA chain in reduction order, whichever tile, panel,
 row block or thread computes it — so the SIMD path is **bit-exact across row counts and thread
 counts**, and the KV-cache / LoRA-decode gates (`[4]`, `[19]`, `[22]`, `[26]`) stay `0.00e+00`
