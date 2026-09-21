@@ -713,7 +713,9 @@ RNG semantics: lockstep interleaves the draws, so the training default's ONE sha
 cannot be reproduced. With the flag, rollout i of the run's g-th sampled group draws from its own
 stream `hash(--seed, g, i)` — training is **distribution-equivalent** to the default, not
 draw-identical. `--eval-only` already gives every rollout its own `hash(--seed, task, k)` stream, so
-there the flag is **byte-identical** (same dump, same summary numbers). Measured on a synthetic
+there the flag is **byte-identical** (same dump, same summary numbers), with or without
+`--constrain` (the per-task constraint index is shared; each rollout keeps its own decoder state
+and RNG, exactly as when it runs alone). Measured on a synthetic
 SmolLM2-135M-shaped model (G = 8, one thread; see the commit message): ~3.4x (6 layers) to ~4x
 (2 layers) less decode time per token per rollout. Verified by `[48]`.
 

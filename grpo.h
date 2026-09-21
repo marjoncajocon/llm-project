@@ -35,6 +35,7 @@
 #ifndef GRPO_H
 #define GRPO_H
 
+#include "constrain.h"
 #include "llama.h"
 #include "sampler.h"
 
@@ -109,6 +110,10 @@ typedef struct {
   int eval_k;               // rollouts per task (default 1; with temp 0 that is greedy)
   int eval_limit;           // evaluate only the first N tasks of the file (0 => all)
   const char *eval_dump;    // JSONL path: one line per rollout (NULL => no dump)
+  int constrain;            // 1 => constrained decoding of the action (constrain.h), the
+                            // task's prompt as the grounding text. EVAL ONLY: a masked
+                            // sampler is not the policy whose ratio GRPO trains on.
+  ConstrainOpts con;        // its options (constrain_default_opts())
 
   // --- Run control ---
   unsigned seed;
@@ -364,5 +369,14 @@ long grpo_debug_rollout_group(const LlamaModel *m, const LlamaDecodeLora *lo,
 void grpo_debug_eval_task(const LlamaModel *m, const int *prompt_ids, int n_prompt,
                           int task, const GrpoConfig *cfg,
                           int *out_ids, float *out_logp, int *out_len);
+
+// The same WITH a tokenizer (tok != NULL: EOS / closing-tag stops, as in
+// grpo_eval_run) and, when cfg->constrain, constrained decoding grounded in
+// prompt_text (convocab_from_hftok(tok), constrain_create(prompt_text)). out_stop
+// (may be NULL) gets eval_k stop codes: 0 cap, 1 eos, 2 tag, 3 err (a dead end).
+// Returns the number of constrained picks made (0 unconstrained). Selftest [48].
+long grpo_debug_eval_task_ex(const LlamaModel *m, const HFTok *tok, const char *prompt_text,
+                             const int *prompt_ids, int n_prompt, int task, const GrpoConfig *cfg,
+                             int *out_ids, float *out_logp, int *out_len, int *out_stop);
 
 #endif // GRPO_H

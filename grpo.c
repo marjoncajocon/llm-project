@@ -60,6 +60,8 @@ GrpoConfig grpo_default_config(void) {
   c.eval_k = 1;
   c.eval_limit = 0;
   c.eval_dump = NULL;
+  c.constrain = 0;         // unconstrained sampling unless --constrain (eval only)
+  c.con = constrain_default_opts();
   c.seed = 1;
   c.verbose = 0;
   return c;
@@ -433,7 +435,16 @@ static void prefill_prompt(const LlamaModel *m, const LlamaDecodeLora *lo, Llama
 // the sampled tokens are identical to prefilling per rollout (selftest [37]).
 // tmpl == NULL prefills here instead (the old per-rollout path, kept for [37]).
 //
-typedef enum { STOP_CAP = 0, STOP_EOS = 1, STOP_TAG = 2 } StopReason;
+typedef enum { STOP_CAP = 0, STOP_EOS = 1, STOP_TAG = 2, STOP_ERR = 3 } StopReason;
+
+// Constrained decoding for one rollout (grpo --eval-only --constrain): the task's
+// span index, the vocabulary view, and counters for the eval summary. NULL => the
+// plain sampler, exactly as before.
+typedef struct {
+  const Constrain *c;
+  const ConVocab *v;
+  long picks, full_scans, errors;
+} ConCtx;
 
 // Test hooks only (grpo_debug_rollout_group): with no tokenizer, sampling this
 // token ends a rollout as EOS would. -1 (always, outside that hook) = never.
@@ -459,7 +470,7 @@ static int rollout(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
                    const HFTok *tok, const int *prompt_ids, int n_prompt,
                    const GrpoConfig *cfg, Rng *rng, Tensor *logits, Tensor *probs,
                    int *out_ids, float *out_logp, char *text, int text_cap,
-                   StopReason *stop) {
+                   StopReason *stop, ConCtx *cx) {
   if (tmpl) {
     llama_kv_copy(kv, tmpl);
     memcpy(logits->data, tmpl_logits->data, logits->size * sizeof(float));
@@ -472,12 +483,31 @@ static int rollout(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
   text[0] = '\0';
   const int room = m->max_seq - n_prompt;
   const int cap = (cfg->max_new < room) ? cfg->max_new : room;
+  ConState cst;
+  if (cx) constrain_init(cx->c, &cst);
   while (n < cap) {
     // The log-prob is taken from the UNTEMPERED softmax: temperature/top-k/top-p
     // shape the exploration, but the policy whose ratio we measure — and whose
     // gradient we take — is the model's own distribution.
     softmax_rowwise(logits, probs);
-    const int t = sample_token(logits, 0, cfg->temperature, cfg->top_k, cfg->top_p, rng);
+    int t;
+    if (cx) {
+      // Constrained: the highest-ranked candidate that keeps the output a valid
+      // action prefix (constrain.h); the budget is the tokens this rollout has left.
+      int full = 0;
+      t = constrain_pick(cx->c, cx->v, &cst, logits->data, cfg->temperature, cfg->top_k,
+                         cfg->top_p, rng, cap - n, &full);
+      cx->picks++;
+      cx->full_scans += full;
+      if (t < 0) {
+        fprintf(stderr, "grpo: constrained decode: no token of the vocabulary continues a valid action\n");
+        cx->errors++;
+        *stop = STOP_ERR;
+        break;
+      }
+    } else {
+      t = sample_token(logits, 0, cfg->temperature, cfg->top_k, cfg->top_p, rng);
+    }
     out_logp[n] = logprob_of(probs, 0, t);
     out_ids[n++] = t;
     if (tok) {
@@ -488,6 +518,7 @@ static int rollout(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaKV *kv,
       hftok_decode(tok, out_ids, n, text, text_cap);
       if (strstr(text, "</tool>") || strstr(text, "</done>")) { *stop = STOP_TAG; break; }
     } else if (t == S_debug_stop_tok) { *stop = STOP_EOS; break; }   // tests only
+    if (cx && constrain_complete(&cst)) { *stop = STOP_TAG; break; }
     llama_decode_step_lora(m, kv, t, logits, lo);
   }
   if (tok) hftok_decode(tok, out_ids, n, text, text_cap);
@@ -518,8 +549,13 @@ static long rollout_batch(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaK
                           const LlamaKV *tmpl, const Tensor *tmpl_logits, const HFTok *tok,
                           int n_prompt, const GrpoConfig *cfg, Rng *rngs, Tensor *blogits,
                           Tensor *probs, int *const *out_ids, float *const *out_logp,
-                          char *const *text, int text_cap, StopReason *stop, int *out_len) {
+                          char *const *text, int text_cap, StopReason *stop, int *out_len,
+                          ConCtx *cx) {
   const int V = m->vocab;
+  // Constrained decoding (eval only): the per-task index and vocabulary view are
+  // read-only and shared; the decoder state is per rollout, and each pick draws
+  // from that rollout's own rng -- exactly what rollout() does for it alone.
+  ConState *cst = cx ? (ConState*)malloc((size_t)G * sizeof(ConState)) : NULL;
   int *live = (int*)malloc((size_t)G * sizeof(int));
   int *row = (int*)malloc((size_t)G * sizeof(int));      // rollout i's row in blogits
   int *dtok = (int*)malloc((size_t)G * sizeof(int));
@@ -531,6 +567,7 @@ static long rollout_batch(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaK
     memcpy(&blogits->data[(size_t)i * V], tmpl_logits->data, (size_t)V * sizeof(float));
     out_len[i] = 0; stop[i] = STOP_CAP; text[i][0] = '\0';
     row[i] = i; live[i] = (cap > 0);
+    if (cx) constrain_init(cx->c, &cst[i]);
   }
   long calls = 0;
   for (;;) {
@@ -544,8 +581,22 @@ static long rollout_batch(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaK
       lr.data = &blogits->data[(size_t)row[i] * V]; lr.grad = NULL;
       lr.shape = vs; lr.ndim = 2; lr.size = (size_t)V;
       softmax_rowwise(&lr, probs);
-      const int t = sample_token(&lr, 0, cfg->temperature, cfg->top_k, cfg->top_p, &rngs[i]);
       const int n = out_len[i];
+      int t;
+      if (cx) {
+        int full = 0;
+        t = constrain_pick(cx->c, cx->v, &cst[i], lr.data, cfg->temperature, cfg->top_k,
+                           cfg->top_p, &rngs[i], cap - n, &full);
+        cx->picks++;
+        cx->full_scans += full;
+        if (t < 0) {
+          fprintf(stderr, "grpo: constrained decode: no token of the vocabulary continues a valid action\n");
+          cx->errors++;
+          stop[i] = STOP_ERR; live[i] = 0; continue;
+        }
+      } else {
+        t = sample_token(&lr, 0, cfg->temperature, cfg->top_k, cfg->top_p, &rngs[i]);
+      }
       out_logp[i][n] = logprob_of(probs, 0, t);
       out_ids[i][n] = t;
       out_len[i] = n + 1;
@@ -556,6 +607,7 @@ static long rollout_batch(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaK
           stop[i] = STOP_TAG; live[i] = 0; continue;
         }
       } else if (t == S_debug_stop_tok) { stop[i] = STOP_EOS; live[i] = 0; continue; }
+      if (cx && constrain_complete(&cst[i])) { stop[i] = STOP_TAG; live[i] = 0; continue; }
       if (n + 1 >= cap) { live[i] = 0; continue; }       // STOP_CAP: nothing left to decode
       dkv[nd] = &kvs[i]; dtok[nd] = t; row[i] = nd; nd++;
     }
@@ -570,7 +622,7 @@ static long rollout_batch(const LlamaModel *m, const LlamaDecodeLora *lo, LlamaK
   }
   if (tok)
     for (int i = 0; i < G; i++) hftok_decode(tok, out_ids[i], out_len[i], text[i], text_cap);
-  free(live); free(row); free(dtok); free(dkv);
+  free(live); free(row); free(dtok); free(dkv); free(cst);
   return calls;
 }
 
@@ -622,9 +674,11 @@ static void rollout_batch_free(RolloutBatch *b) {
 
 static long rollout_batch_run(const LlamaModel *m, const LlamaDecodeLora *lo, RolloutBatch *b,
                               const LlamaKV *tmpl, const Tensor *tmpl_logits, const HFTok *tok,
-                              int n_prompt, const GrpoConfig *cfg, Tensor *probs, int text_cap) {
+                              int n_prompt, const GrpoConfig *cfg, Tensor *probs, int text_cap,
+                              ConCtx *cx) {
   return rollout_batch(m, lo, b->kv, b->G, tmpl, tmpl_logits, tok, n_prompt, cfg, b->rng,
-                       &b->logits, probs, b->ids, b->logp, b->text, text_cap, b->stop, b->len);
+                       &b->logits, probs, b->ids, b->logp, b->text, text_cap, b->stop, b->len,
+                       cx);
 }
 
 long grpo_debug_rollout_group(const LlamaModel *m, const LlamaDecodeLora *lo,
@@ -642,7 +696,7 @@ long grpo_debug_rollout_group(const LlamaModel *m, const LlamaDecodeLora *lo,
   if (batched) {
     RolloutBatch b = rollout_batch_create(m, G, n_prompt + cfg->max_new, cfg->max_new, 1);
     for (int i = 0; i < G; i++) b.rng[i] = rng_create(seeds[i]);
-    calls = rollout_batch_run(m, lo, &b, &pkv, &plogits, NULL, n_prompt, cfg, &probs, 1);
+    calls = rollout_batch_run(m, lo, &b, &pkv, &plogits, NULL, n_prompt, cfg, &probs, 1, NULL);
     for (int i = 0; i < G; i++) {
       out_len[i] = b.len[i];
       memcpy(&out_ids[(size_t)i * cfg->max_new], b.ids[i], (size_t)b.len[i] * sizeof(int));
@@ -657,7 +711,7 @@ long grpo_debug_rollout_group(const LlamaModel *m, const LlamaDecodeLora *lo,
       Rng rng = rng_create(seeds[i]);
       out_len[i] = rollout(m, lo, &kv, &pkv, &plogits, NULL, prompt_ids, n_prompt, cfg, &rng,
                            &logits, &probs, &out_ids[(size_t)i * cfg->max_new],
-                           &out_logp[(size_t)i * cfg->max_new], text, 1, &stop);
+                           &out_logp[(size_t)i * cfg->max_new], text, 1, &stop, NULL);
     }
     llama_kv_free(&kv);
   }
@@ -687,7 +741,7 @@ long grpo_debug_sample_group(const LlamaModel *m, const LlamaDecodeLora *lo,
     out_len[i] = rollout(m, lo, &kv, shared_prefill ? &pkv : NULL, &plogits, NULL,
                          prompt_ids, n_prompt, cfg, rng, &logits, &probs,
                          &out_ids[(size_t)i * cfg->max_new],
-                         &out_logp[(size_t)i * cfg->max_new], text, 1, &stop);
+                         &out_logp[(size_t)i * cfg->max_new], text, 1, &stop, NULL);
     if (!shared_prefill) prefill_steps += n_prompt;
   }
   llama_kv_free(&kv); llama_kv_free(&pkv);
@@ -975,7 +1029,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
           rb.rng[i] = rng_create(grpo_batch_rollout_seed(cfg->seed, batch_group, i));
         batch_group++;
         rollout_batch_run(&model, use_lora ? &dview : NULL, &rb, &pkv, &plogits, &tok, T,
-                          cfg, &dprobs, TEXT_CAP);
+                          cfg, &dprobs, TEXT_CAP, NULL);
       }
       int off = 0;
       for (int i = 0; i < G; i++) {
@@ -993,7 +1047,7 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
           rlen[gi] = rollout(&model, use_lora ? &dview : NULL, &kv, &pkv, &plogits, &tok,
                              pids[ti], T, cfg, &rng, &dlogits, &dprobs,
                              rid[gi], &flat_old[(size_t)g * G * cap_new + off],
-                             text, TEXT_CAP, &stop);
+                             text, TEXT_CAP, &stop, NULL);
         }
         if (stop == STOP_CAP) capped++;
         RewardParts parts;
@@ -1284,41 +1338,70 @@ static int eval_rollout(const LlamaModel *m, LlamaKV *kv, const LlamaKV *pkv,
                         const Tensor *plogits, const HFTok *tok, const int *pids, int T,
                         int task, int kk, const GrpoConfig *cfg, Tensor *logits,
                         Tensor *probs, int *ids, float *logp, char *text, int text_cap,
-                        StopReason *stop) {
+                        StopReason *stop, ConCtx *cx) {
   Rng rng = rng_create(grpo_eval_rollout_seed(cfg->seed, task, kk));
   return rollout(m, NULL, kv, pkv, plogits, tok, pids, T, cfg, &rng, logits, probs,
-                 ids, logp, text, text_cap, stop);
+                 ids, logp, text, text_cap, stop, cx);
 }
 
 void grpo_debug_eval_task(const LlamaModel *m, const int *prompt_ids, int n_prompt,
                           int task, const GrpoConfig *cfg,
                           int *out_ids, float *out_logp, int *out_len) {
+  grpo_debug_eval_task_ex(m, NULL, NULL, prompt_ids, n_prompt, task, cfg,
+                          out_ids, out_logp, out_len, NULL);
+}
+
+long grpo_debug_eval_task_ex(const LlamaModel *m, const HFTok *tok, const char *prompt_text,
+                             const int *prompt_ids, int n_prompt, int task, const GrpoConfig *cfg,
+                             int *out_ids, float *out_logp, int *out_len, int *out_stop) {
+  const int K = cfg->eval_k;
   int ds[2] = {1, m->vocab};
   Tensor logits = tensor_create(ds, 2), probs = tensor_create(ds, 2);
   Tensor plogits = tensor_create(ds, 2);
   LlamaKV kv = llama_kv_create(m), pkv = llama_kv_create_len(m, n_prompt);
-  char text[1];
+  const int text_cap = tok ? TEXT_CAP : 1;
+  char *text = (char*)malloc((size_t)text_cap);
+  // The constraint exactly as grpo_eval_run builds it: vocabulary view from the
+  // tokenizer (clamped to the model's vocab), grounded in the task's prompt text.
+  ConVocab cvoc;
+  memset(&cvoc, 0, sizeof(cvoc));
+  ConCtx cx;
+  memset(&cx, 0, sizeof(cx));
+  cx.v = &cvoc;
+  Constrain *tcon = NULL;
+  if (cfg->constrain && tok && prompt_text && convocab_from_hftok(&cvoc, tok) == 0) {
+    if (cvoc.V > m->vocab) cvoc.V = m->vocab;
+    tcon = constrain_create(prompt_text, &cfg->con);
+    cx.c = tcon;
+  }
   prefill_prompt(m, NULL, &pkv, prompt_ids, n_prompt, &plogits);
   if (cfg->batch_rollouts) {                 // the K rollouts in lockstep
-    const int K = cfg->eval_k;
-    RolloutBatch b = rollout_batch_create(m, K, n_prompt + cfg->max_new, cfg->max_new, 1);
+    RolloutBatch b = rollout_batch_create(m, K, n_prompt + cfg->max_new, cfg->max_new, text_cap);
     for (int kk = 0; kk < K; kk++) b.rng[kk] = rng_create(grpo_eval_rollout_seed(cfg->seed, task, kk));
-    rollout_batch_run(m, NULL, &b, &pkv, &plogits, NULL, n_prompt, cfg, &probs, 1);
+    rollout_batch_run(m, NULL, &b, &pkv, &plogits, tok, n_prompt, cfg, &probs, text_cap,
+                      tcon ? &cx : NULL);
     for (int kk = 0; kk < K; kk++) {
       out_len[kk] = b.len[kk];
+      if (out_stop) out_stop[kk] = (int)b.stop[kk];
       memcpy(&out_ids[(size_t)kk * cfg->max_new], b.ids[kk], (size_t)b.len[kk] * sizeof(int));
       memcpy(&out_logp[(size_t)kk * cfg->max_new], b.logp[kk], (size_t)b.len[kk] * sizeof(float));
     }
     rollout_batch_free(&b);
   }
-  for (int kk = 0; kk < cfg->eval_k && !cfg->batch_rollouts; kk++) {
-    StopReason stop;
-    out_len[kk] = eval_rollout(m, &kv, &pkv, &plogits, NULL, prompt_ids, n_prompt, task, kk,
+  for (int kk = 0; kk < K && !cfg->batch_rollouts; kk++) {
+    StopReason stop = STOP_CAP;
+    out_len[kk] = eval_rollout(m, &kv, &pkv, &plogits, tok, prompt_ids, n_prompt, task, kk,
                                cfg, &logits, &probs, &out_ids[(size_t)kk * cfg->max_new],
-                               &out_logp[(size_t)kk * cfg->max_new], text, 1, &stop);
+                               &out_logp[(size_t)kk * cfg->max_new], text, text_cap, &stop,
+                               tcon ? &cx : NULL);
+    if (out_stop) out_stop[kk] = (int)stop;
   }
+  constrain_free(tcon);
+  convocab_free(&cvoc);
+  free(text);
   llama_kv_free(&kv); llama_kv_free(&pkv);
   tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
+  return cx.picks;
 }
 
 // A short task "family" from the REFERENCE action — what the task asks for:
@@ -1479,6 +1562,13 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
   char *line = (char*)malloc(LINE_CAP);
   const float match_max = reward_match_max(cfg->reward_version);
   const int rv = cfg->reward_version == 2 ? 2 : 1;
+  ConVocab cvoc;
+  memset(&cvoc, 0, sizeof(cvoc));
+  ConCtx cx;
+  memset(&cx, 0, sizeof(cx));
+  cx.v = &cvoc;
+  int con_fail = cfg->constrain && convocab_from_hftok(&cvoc, &tok) != 0;
+  if (cvoc.V > V) cvoc.V = V;                 // only ids the model has logits for
 
   printf("GRPO EVAL: tasks 0..%d of %d in file order | k %d per task | reward v%d | seed %u\n",
          n_eval - 1, n_tasks, K, rv, cfg->seed);
@@ -1496,6 +1586,12 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
            " identical output)\n", K);
   if (cfg->temperature <= 0.0f && K > 1)
     printf("  NOTE: temp 0 is greedy, so all %d rollouts of a task are identical; use --k 1\n", K);
+  if (cfg->constrain)
+    printf("  CONSTRAINED decoding: one action block%s%s%s | think <= %d bytes | window %d\n",
+           cfg->con.ground_path ? ", path = whole-token prompt span" : "",
+           cfg->con.ground_body ? ", write body = prompt span" : "",
+           cfg->con.ground_cmd ? ", command args = prompt spans" : "",
+           cfg->con.think_max, cfg->con.window);
   fflush(stdout);
 
   RewardMonitor mon;
@@ -1508,7 +1604,7 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
   int fam_tasks[EVAL_FAMILIES] = {0};
   const clock_t t0 = clock();
 
-  for (int ti = 0; ti < n_eval; ti++) {
+  for (int ti = 0; ti < n_eval && !con_fail; ti++) {
     if (plen[ti] == 0) continue;
     const int T = plen[ti];
     const char *fam = task_family(tasks[ti].reference);
@@ -1517,9 +1613,16 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
     fam_tasks[fi]++;
     // One prefill per task, forked into each of the K rollouts.
     prefill_prompt(&model, NULL, &pkv, pids[ti], T, &plogits);
+    Constrain *tcon = NULL;
+    if (cfg->constrain) {
+      tcon = constrain_create(tasks[ti].prompt, &cfg->con);   // grounding text = the task prompt
+      if (!tcon) { con_fail = 1; break; }
+      cx.c = tcon;
+    }
     if (batched) {                  // all K at once, rollout kk on its eval stream
       for (int kk = 0; kk < K; kk++) rb.rng[kk] = rng_create(grpo_eval_rollout_seed(ec.seed, ti, kk));
-      rollout_batch_run(&model, NULL, &rb, &pkv, &plogits, &tok, T, &ec, &probs, TEXT_CAP);
+      rollout_batch_run(&model, NULL, &rb, &pkv, &plogits, &tok, T, &ec, &probs, TEXT_CAP,
+                        tcon ? &cx : NULL);
     }
     int task_exact = 0;
     for (int kk = 0; kk < K; kk++) {
@@ -1530,7 +1633,8 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
         n = rb.len[kk]; stop = rb.stop[kk]; text = rb.text[kk];
       } else {
         n = eval_rollout(&model, &kv, &pkv, &plogits, &tok, pids[ti], T, ti, kk, &ec,
-                         &logits, &probs, ids, logp, etext, TEXT_CAP, &stop);
+                         &logits, &probs, ids, logp, etext, TEXT_CAP, &stop,
+                         tcon ? &cx : NULL);
       }
       RewardParts parts;
       const float r = reward_score_version(cfg->reward_version, tasks[ti].prompt, text,
@@ -1539,7 +1643,8 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
       mon_add(&mon, &parts, stop == STOP_CAP);
       sum_total += r; n_exact += exact; n_roll++; task_exact += exact;
       fam_total[fi] += r; fam_exact[fi] += exact; fam_n[fi]++;
-      const char *sname = stop == STOP_EOS ? "eos" : (stop == STOP_TAG ? "tag" : "cap");
+      const char *sname = stop == STOP_EOS ? "eos" : (stop == STOP_TAG ? "tag"
+                        : (stop == STOP_ERR ? "err" : "cap"));
       if (dump) {
         fprintf(dump, "{\"task\":%d,\"k\":%d,\"family\":", ti, kk);
         if (fam) json_str(dump, fam); else fputs("null", dump);
@@ -1559,6 +1664,7 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
                (double)parts.match, sname, n, parts.reason[0] ? parts.reason : "ok", line);
       }
     }
+    constrain_free(tcon);
     tasks_done++;
     if (task_exact > 0) tasks_any_exact++;
     if (2 * task_exact > K) tasks_major_exact++;
@@ -1580,6 +1686,9 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
              100.0 * tasks_major_exact / tasks_done, K, 100.0 * tasks_any_exact / tasks_done);
     printf("\n");
     mon_print("  ", &mon);
+    if (cfg->constrain)
+      printf("  constrained: %ld picks, %ld needed a full-vocab scan, %ld dead ends (stop \"err\")\n",
+             cx.picks, cx.full_scans, cx.errors);
     printf("  per family (from the reference action):\n");
     for (int f = 0; f < EVAL_FAMILIES; f++) {
       if (fam_n[f] == 0) continue;
@@ -1592,10 +1701,12 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
     printf("EVAL SUMMARY: no task could be evaluated (%d skipped: prompt too long)\n", too_long);
   }
 
-  int rc = (n_roll > 0) ? 0 : 1;
+  if (con_fail) fprintf(stderr, "error: out of memory building the decode constraint\n");
+  int rc = (n_roll > 0 && !con_fail) ? 0 : 1;
   if (dump && fclose(dump) != 0) { fprintf(stderr, "error writing '%s'\n", cfg->eval_dump); rc = 1; }
   free(ids); free(logp); free(etext); free(line);
   if (batched) rollout_batch_free(&rb);
+  convocab_free(&cvoc);
   llama_kv_free(&kv); llama_kv_free(&pkv);
   tensor_free(&logits); tensor_free(&probs); tensor_free(&plogits);
   llama_model_free(&model);

@@ -21,6 +21,7 @@ HFGenOpts hfgen_default_opts(void) {
   o.seed = 1234ull;
   o.n_samples = 1;
   o.emit = 1;
+  o.con = constrain_default_opts();
   return o;
 }
 
@@ -178,7 +179,36 @@ static int dec_generate(Dec *d, const HFTok *tok, const int *pids, int np,
             "oldest %d tokens (kept the last %d, room for %d new)\n",
             np, d->max_seq, first, keep, d->max_seq - keep);
 
+  // Constrained decoding (opt-in): one span index for the prompt, one vocab view.
+  Constrain *con = NULL;
+  ConVocab cv;
+  memset(&cv, 0, sizeof(cv));
+  if (o->constrain) {
+    if (!tok) {
+      emit_error(o, "constrained decoding needs the model's tokenizer");
+      return 1;
+    }
+    char *ptxt = NULL;
+    if (!o->con_prompt) {
+      int cap_txt = 16;
+      for (int i = 0; i < np; i++)
+        if (pids[i] >= 0 && pids[i] < tok->n_vocab) cap_txt += tok->tok_len[pids[i]];
+      ptxt = (char*)malloc((size_t)cap_txt);
+      if (ptxt) hftok_decode(tok, pids, np, ptxt, cap_txt);
+    }
+    con = constrain_create(o->con_prompt ? o->con_prompt : (ptxt ? ptxt : ""), &o->con);
+    free(ptxt);
+    if (!con || convocab_from_hftok(&cv, tok) != 0) {
+      constrain_free(con);
+      convocab_free(&cv);
+      emit_error(o, "out of memory building the decode constraint");
+      return 1;
+    }
+    if (cv.V > d->vocab) cv.V = d->vocab;     // only ids the model has logits for
+  }
+
   const int N = o->n_samples > 1 ? o->n_samples : 1;
+  int rc = 0;
   int lz[2] = {1, d->vocab};
   Tensor logits = tensor_create(lz, 2), plogits = tensor_create(lz, 2);
   const int cap = o->n_new > 0 ? o->n_new : 0;
@@ -199,15 +229,30 @@ static int dec_generate(Dec *d, const HFTok *tok, const int *pids, int np,
     int pos = keep, gn = 0, prevlen = 0;
     Rng rng = rng_create(o->seed + (unsigned long long)smp);
     if (o->emit && N > 1) { printf("{\"sample\":%d,\"seed\":%llu}\n", smp, o->seed + (unsigned long long)smp); fflush(stdout); }
+    ConState cst;
+    if (con) constrain_init(con, &cst);
     for (int s = 0; s < o->n_new && pos < d->max_seq; s++) {
-      int nx = sample_token(&logits, 0, o->temp, o->top_k, o->top_p, &rng);
+      int nx;
+      if (con) {
+        const int left_new = o->n_new - s, left_ctx = d->max_seq - pos;
+        nx = constrain_pick(con, &cv, &cst, logits.data, o->temp, o->top_k, o->top_p, &rng,
+                            left_new < left_ctx ? left_new : left_ctx, NULL);
+        if (nx < 0) {
+          emit_error(o, "constrained decode: no token of the vocabulary continues a valid action");
+          rc = 1;
+          break;
+        }
+      } else {
+        nx = sample_token(&logits, 0, o->temp, o->top_k, o->top_p, &rng);
+      }
       if (tok && hftok_is_eog(tok, nx)) break;
       gen[gn++] = nx;
       int stop = 0;
       if (tok) {
         hftok_decode(tok, gen, gn, dec, 1 << 20);
-        stop = hf_stop(dec);
+        if (!con) stop = hf_stop(dec);
         if (o->stop_tags && hfgen_cut_at_tag(dec)) stop = 1;
+        if (con && constrain_complete(&cst)) stop = 1;
         if (o->emit) hf_emit_delta(dec, &prevlen);
       }
       if (stop) break;                         // no need to decode a token we stop at
@@ -222,7 +267,9 @@ static int dec_generate(Dec *d, const HFTok *tok, const int *pids, int np,
   if (d->has_tmpl) { llama_kv_free(&d->tmpl); d->has_tmpl = 0; }
   tensor_free(&logits); tensor_free(&plogits);
   free(gen); free(dec);
-  return 0;
+  constrain_free(con);
+  convocab_free(&cv);
+  return rc;
 }
 
 int hfgen_llama(const LlamaModel *m, const HFTok *tok, const int *pids, int np,

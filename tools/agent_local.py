@@ -37,6 +37,12 @@ GENERATION stops at the first closed </tool> / </done> block (`hfgen --stop-tags
 AGENT_STOP_TAGS=0 turns it off): the agent executes only that block, so decoding the
 rest of the budget is wasted time.
 
+CONSTRAINED DECODING (off by default): AGENT_CONSTRAIN=1 (or `--constrain` among the
+arguments) runs hfgen --constrain -- the reply is always ONE well-formed action block
+and its path="..." a whole-token span of the prompt, so a char-slipped filename
+(ctngh4 -> cngh4) cannot be emitted. AGENT_CONSTRAIN=cmd / body / all also grounds
+run_command arguments / the write_file body (see constrain.h).
+
 FAILURE is not success: if the engine cannot generate, or the model produces
 nothing, this program exits nonzero with the reason on stderr, and the agent stops
 with "backend error" instead of recording a fake <done>.
@@ -67,6 +73,7 @@ BEST_OF = int(os.environ.get("AGENT_BEST_OF", "1"))
 PROPOSE_TEMP = float(os.environ.get("AGENT_TEMP", "0.7"))
 GREEDY_TEMP = float(os.environ.get("AGENT_GREEDY_TEMP", "0.1"))
 STOP_TAGS = os.environ.get("AGENT_STOP_TAGS", "1") != "0"
+CONSTRAIN = os.environ.get("AGENT_CONSTRAIN", "")        # "" / "0" = off (default)
 
 # --- self-training trace (STaR) ------------------------------------------------
 # Off unless AGENT_TRACE names a .jsonl. Each step appends the EXACT (prompt,
@@ -269,7 +276,8 @@ def printable(s):
 
 def gen(model, tok, prompt, temp, seed, n_new=N_NEW):
     """One raw model completion (raises GenerationError on engine failure)."""
-    return run_hfgen(ENGINE, model, tok, prompt, temp, seed, n_new=n_new, stop_tags=STOP_TAGS)[0]
+    return run_hfgen(ENGINE, model, tok, prompt, temp, seed, n_new=n_new, stop_tags=STOP_TAGS,
+                     constrain=CONSTRAIN)[0]
 
 
 def fail(msg):
@@ -279,8 +287,12 @@ def fail(msg):
 
 
 def main():
+    global CONSTRAIN
+    if "--constrain" in sys.argv[1:]:
+        sys.argv = [a for a in sys.argv if a != "--constrain"]
+        CONSTRAIN = CONSTRAIN if CONSTRAIN not in ("", "0") else "1"
     if len(sys.argv) < 3:
-        sys.exit("usage: agent_local.py <model.bin> <tok.hf> [transcript]")
+        sys.exit("usage: agent_local.py <model.bin> <tok.hf> [--constrain] [transcript]")
     model, tok = sys.argv[1], sys.argv[2]
     # agent.c reads our stdout as UTF-8 bytes; a Windows pipe would otherwise get
     # the ANSI code page and crash on the first character outside it.
@@ -310,7 +322,7 @@ def main():
             from agent_critic import critique, parse_history
             taken, last_obs, last_action = parse_history(transcript.splitlines())
             cands = propose(ENGINE, model, tok, prompt, BEST_OF, PROPOSE_TEMP, seed=1,
-                            n_new=N_NEW, stop_tags=STOP_TAGS)
+                            n_new=N_NEW, stop_tags=STOP_TAGS, constrain=CONSTRAIN)
             choice, log = critique(cands, prompt, taken, last_obs, last_action)
             for line in log:
                 sys.stderr.write("  " + printable(line) + "\n")

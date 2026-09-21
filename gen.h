@@ -14,6 +14,7 @@
 #ifndef GEN_H
 #define GEN_H
 
+#include "constrain.h"
 #include "hftok.h"
 #include "llama.h"
 
@@ -28,9 +29,15 @@ typedef struct {
   int emit;                  // 1: stream JSON deltas to stdout
   int *out_ids;              // optional: n_samples * n_new sampled ids (tests)
   int *out_len;              // optional: n_samples lengths
+  int constrain;             // 1: constrained decoding of the action (constrain.h); needs tok.
+                             //    Each sample stops once its action is complete; the role-label
+                             //    text stop is not applied (the grammar decides the end).
+  ConstrainOpts con;         // its options (constrain_default_opts())
+  const char *con_prompt;    // text the arguments are grounded in (NULL: the decoded prompt ids)
 } HFGenOpts;
 
-HFGenOpts hfgen_default_opts(void);   // 128 tokens, temp 0.8, k 40, p 0.95, seed 1234, 1 sample, emit
+HFGenOpts hfgen_default_opts(void);   // 128 tokens, temp 0.8, k 40, p 0.95, seed 1234, 1 sample, emit,
+                                      // no constraint
 
 // How much of an np-token prompt to keep for a model with context max_seq when
 // n_new tokens are wanted. If the prompt plus the reply does not fit, the OLDEST
