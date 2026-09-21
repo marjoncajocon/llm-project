@@ -388,6 +388,12 @@ static void grpo_usage(void) {
     "                    The reference is the FROZEN BASE -- the same weights with\n"
     "                    the adapters off -- so it costs one extra forward per\n"
     "                    rollout and no extra memory.\n"
+    "Reward:\n"
+    "  --reward v1|v2    v1 (default) = the original reward; reproduces old runs.\n"
+    "                    v2 = format * (0.3 grounded + 0.7 match): a rollout cut\n"
+    "                    off at --max-new scores 0, <done>/prose are grounded only\n"
+    "                    when the reference is the same kind, every command\n"
+    "                    argument must be grounded, leaked MODEL:/OBSERVATION: fail\n"
     "Run control:\n"
     "  --seed N          RNG seed (default 1)\n"
     "  --verbose         print a scored sample rollout per group\n"
@@ -440,6 +446,13 @@ static int run_grpo(int argc, char **argv) {
       else if (strcmp(m, "token") == 0) cfg.loss_agg = GRPO_AGG_TOKEN;
       else if (strcmp(m, "const") == 0) cfg.loss_agg = GRPO_AGG_CONST;
       else { fprintf(stderr, "--loss-agg must be seq, token or const (got '%s')\n", m); return 2; }
+    }
+    else if (strcmp(f, "--reward") == 0) {
+      NEED_VAL();
+      const char *v = argv[++i];
+      if      (strcmp(v, "v1") == 0 || strcmp(v, "1") == 0) cfg.reward_version = 1;
+      else if (strcmp(v, "v2") == 0 || strcmp(v, "2") == 0) cfg.reward_version = 2;
+      else { fprintf(stderr, "--reward must be v1 or v2 (got '%s')\n", v); return 2; }
     }
     else if (strcmp(f, "--seed") == 0)    { NEED_VAL(); cfg.seed = (unsigned)atoi(argv[++i]); }
     else if (strcmp(f, "--verbose") == 0) { cfg.verbose = 1; }

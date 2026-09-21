@@ -222,10 +222,25 @@ static float action_match(const ToolCall *got, const ToolCall *want) {
   return 0.0f;
 }
 
+// Which kind of action a parsed response is, for the reward-hacking monitor.
+// Anything that failed the format term counts as MALFORMED, whatever it parsed as.
+static int action_kind(const ToolCall *tc, int had_tag, int format_passed) {
+  if (!format_passed) return REWARD_ACT_MALFORMED;
+  switch (tc->kind) {
+    case TOOL_DONE:        return REWARD_ACT_DONE;
+    case TOOL_READ_FILE:   return REWARD_ACT_READ;
+    case TOOL_WRITE_FILE:  return REWARD_ACT_WRITE;
+    case TOOL_RUN_COMMAND: return REWARD_ACT_RUN;
+    case TOOL_NONE:        return had_tag ? REWARD_ACT_MALFORMED : REWARD_ACT_PROSE;
+  }
+  return REWARD_ACT_MALFORMED;
+}
+
 float reward_score(const char *prompt, const char *response,
                    const char *reference, RewardParts *parts) {
   RewardParts p;
   memset(&p, 0, sizeof(p));
+  p.action = REWARD_ACT_MALFORMED;
 
   const int has_ref = (reference && reference[0]);
   // No reference => rescale the two remaining terms so a perfect response still
@@ -284,7 +299,235 @@ float reward_score(const char *prompt, const char *response,
   }
 
   p.total = p.format + p.grounded + p.match;
+  p.action = action_kind(&tc, had_tag, p.format > 0.0f);
   free(clean); free(pnorm);
   if (parts) *parts = p;
   return p.total;
+}
+
+// ===========================================================================
+// Reward v2 (see reward.h). Everything above this line is v1 and is left as it
+// was (plus filling RewardParts.action), so a v1 run reproduces bit for bit.
+// ===========================================================================
+
+#define W2_GROUND  0.30f
+#define W2_MATCH   0.70f
+
+// Transcript markers a rollout has no business emitting inside an argument: they
+// mean the model ran past its own turn and started writing the NEXT one (the
+// observation, the user's reply) into its action. Tested on the normalized
+// (lowercased) argument, so "Model:" is caught too.
+static const char *const MARKERS[] = {"model:", "observation:", "goal:", "user:", NULL};
+
+// 1 if `value` carries a leaked transcript marker or a '<' (the start of a tag —
+// a second action, or a half-written closing tag, smuggled inside an attribute
+// or a body). Copies a short reason to `why`.
+static int has_leak(const char *value, char *why, int why_size) {
+  const size_t vl = strlen(value) + 1;
+  char *vn = (char*)malloc(vl);
+  if (!vn) return 0;
+  norm_into(value, vn, (int)vl);
+  int leak = 0;
+  if (strchr(vn, '<')) {
+    snprintf(why, (size_t)why_size, "leaked-tag:%.40s", value);
+    leak = 1;
+  }
+  for (int i = 0; !leak && MARKERS[i]; i++)
+    if (strstr(vn, MARKERS[i])) {
+      snprintf(why, (size_t)why_size, "leaked-marker:%s", MARKERS[i]);
+      leak = 1;
+    }
+  free(vn);
+  return leak;
+}
+
+// A path must look like a file: carry an extension dot or a directory slash. This
+// is what stops read_file path="list" from passing on the strength of the word
+// "list" appearing somewhere in the goal. Exempt only when the REFERENCE path is
+// itself bare (Makefile, LICENSE): then a bare path is the expected shape.
+static int path_shaped(const char *path) {
+  return strchr(path, '.') != NULL || strchr(path, '/') != NULL;
+}
+
+// Every argument token of a command must be grounded. The command is split into
+// pipeline segments at | ; & (so "ps -aux | grep docker" is two segments, each
+// with its own verb). In each segment the FIRST token is the verb and is exempt —
+// "list the files" legitimately becomes `ls`, and v1 exempted verbs too — and a
+// token beginning with '-' is a flag and is exempt. Every other token (subcommand,
+// file, branch, value) must occur in the prompt as a whole token — or in the
+// REFERENCE command (`ref_norm`, may be NULL): "show running processes" -> `ps aux`
+// is correct although "aux" is nowhere in the prompt, and the reference is
+// verified ground truth, not the model's opinion. An invented token that is in
+// neither still fails. Returns 1 if all are grounded; else 0 with the offender in
+// `bad`.
+static int command_args_grounded(const char *cmd, const char *prompt_norm,
+                                 const char *ref_norm, char *bad, int bad_size) {
+  const size_t cl = strlen(cmd) + 1;
+  char *buf = (char*)malloc(cl);
+  if (!buf) return 1;                            // OOM: do not fail the rollout
+  memcpy(buf, cmd, cl);
+  int ok = 1, first_in_segment = 1, any_token = 0;
+  char *p = buf;
+  while (*p && ok) {
+    if (*p == '|' || *p == ';' || *p == '&') { first_in_segment = 1; p++; continue; }
+    if (isspace((unsigned char)*p)) { p++; continue; }
+    char *start = p;
+    while (*p && !isspace((unsigned char)*p) && *p != '|' && *p != ';' && *p != '&') p++;
+    const char saved = *p;
+    *p = '\0';
+    any_token = 1;
+    if (first_in_segment) {
+      first_in_segment = 0;                      // the verb: canonical, not copied
+    } else if (start[0] != '-') {
+      if (!grounded(prompt_norm, start) && !(ref_norm && grounded(ref_norm, start))) {
+        snprintf(bad, (size_t)bad_size, "ungrounded-cmd-arg:%.40s", start);
+        ok = 0;
+      }
+    }
+    *p = saved;
+  }
+  free(buf);
+  if (ok && !any_token) { snprintf(bad, (size_t)bad_size, "empty-command"); ok = 0; }
+  return ok;
+}
+
+// v2 grounding of a TOOL call's arguments. Stricter than v1 in three ways: leaked
+// markers/tags fail, paths must be file-shaped, and every command argument (not
+// just the ones with a known file extension) must be grounded.
+static int grounding_ok_v2(const char *prompt_norm, const ToolCall *tc,
+                           const ToolCall *ref, char *reason, int reason_size) {
+  if (tc->kind == TOOL_WRITE_FILE || tc->kind == TOOL_READ_FILE) {
+    if (!tc->path[0]) { snprintf(reason, (size_t)reason_size, "empty-path"); return 0; }
+    if (has_leak(tc->path, reason, reason_size)) return 0;
+    if (!path_shaped(tc->path) && !(ref && ref->path[0] && !path_shaped(ref->path))) {
+      snprintf(reason, (size_t)reason_size, "not-a-path:%.48s", tc->path);
+      return 0;
+    }
+    if (!grounded(prompt_norm, tc->path)) {
+      snprintf(reason, (size_t)reason_size, "ungrounded-path:%.48s", tc->path);
+      return 0;
+    }
+  }
+  if (tc->kind == TOOL_WRITE_FILE) {
+    const char *b = tc->body;
+    while (*b && isspace((unsigned char)*b)) b++;
+    if (!*b) { snprintf(reason, (size_t)reason_size, "empty-write-content"); return 0; }
+    if (has_leak(tc->body, reason, reason_size)) return 0;
+    if (!grounded(prompt_norm, tc->body)) {
+      snprintf(reason, (size_t)reason_size, "ungrounded-content:%.40s", tc->body);
+      return 0;
+    }
+  }
+  if (tc->kind == TOOL_RUN_COMMAND) {
+    if (has_leak(tc->command, reason, reason_size)) return 0;
+    char *rn = NULL;
+    if (ref && ref->kind == TOOL_RUN_COMMAND && ref->command[0]) {
+      const size_t rl = strlen(ref->command) + 1;
+      rn = (char*)malloc(rl);
+      if (rn) norm_into(ref->command, rn, (int)rl);
+    }
+    const int ok = command_args_grounded(tc->command, prompt_norm, rn, reason, reason_size);
+    free(rn);
+    if (!ok) return 0;
+  }
+  return 1;
+}
+
+float reward_score_v2(const char *prompt, const char *response,
+                      const char *reference, int capped, RewardParts *parts) {
+  RewardParts p;
+  memset(&p, 0, sizeof(p));
+  p.action = REWARD_ACT_MALFORMED;
+
+  const int has_ref = (reference && reference[0]);
+  const size_t rl = strlen(response) + 1;
+  char *clean = (char*)malloc(rl);
+  const size_t pl = strlen(prompt) + 1;
+  char *pnorm = (char*)malloc(pl);
+  if (!clean || !pnorm) {                 // OOM: score 0, never crash a long run
+    free(clean); free(pnorm);
+    if (parts) { snprintf(p.reason, sizeof(p.reason), "oom"); *parts = p; }
+    return 0.0f;
+  }
+  strip_reasoning(response, clean, (int)rl);
+  norm_into(prompt, pnorm, (int)pl);
+
+  ToolCall tc;
+  toolcall_parse(clean, &tc);
+  const int had_tag = (strstr(clean, "<tool") != NULL || strstr(clean, "<done") != NULL);
+
+  ToolCall ref;
+  memset(&ref, 0, sizeof(ref));
+  ref.kind = TOOL_NONE;
+  if (has_ref) {
+    const size_t fl = strlen(reference) + 1;
+    char *rclean = (char*)malloc(fl);
+    if (rclean) {
+      strip_reasoning(reference, rclean, (int)fl);
+      toolcall_parse(rclean, &ref);
+      free(rclean);
+    }
+  }
+
+  // format: a GATE (0 or 1), not a weight — a malformed action earns nothing.
+  int fmt = 0;
+  if (tc.kind == TOOL_NONE && !had_tag) fmt = 1;        // plain prose
+  else if (format_ok(clean, &tc)) fmt = 1;
+  if (!fmt) snprintf(p.reason, sizeof(p.reason), "malformed-action");
+  p.format = (float)fmt;
+  p.action = action_kind(&tc, had_tag, fmt);
+
+  // grounded: a tool call by its arguments. Prose and <done> carry no arguments,
+  // so they are "grounded" only when the reference is the SAME kind — the decision
+  // to stop (or to answer in prose) is exactly what has to be right. With no
+  // reference there is nothing to check that decision against: half credit.
+  float g = 0.0f;
+  char why[96];
+  why[0] = '\0';
+  if (tc.kind == TOOL_DONE || tc.kind == TOOL_NONE) {
+    if (!fmt) g = 0.0f;
+    else if (!has_ref) g = 0.5f;
+    else if (ref.kind == tc.kind) g = 1.0f;
+    else snprintf(why, sizeof(why), "%s-but-reference-differs",
+                  tc.kind == TOOL_DONE ? "done" : "prose");
+  } else if (grounding_ok_v2(pnorm, &tc, has_ref ? &ref : NULL, why, (int)sizeof(why))) {
+    g = 1.0f;
+  }
+  if (g < 1.0f && why[0] && !p.reason[0]) snprintf(p.reason, sizeof(p.reason), "%s", why);
+  p.grounded = W2_GROUND * g;
+
+  // match: v1's action_match, reweighted. No reference => grounding is the whole
+  // (ungated) remainder, rescaled so a perfect response still scores 1.0.
+  float gscale = 1.0f;
+  if (has_ref) {
+    const float m = action_match(&tc, &ref);
+    p.match = W2_MATCH * m;
+    if (m < 1.0f && !p.reason[0])
+      snprintf(p.reason, sizeof(p.reason), "action-mismatch(%.1f)", (double)m);
+  } else {
+    gscale = 1.0f / W2_GROUND;
+  }
+
+  p.total = p.format * (p.grounded * gscale + p.match);
+  if (capped) {
+    // Cut off at --max-new: whatever was produced is not a finished action, and a
+    // truncated rollout must never be a safe score to fall back on.
+    p.total = 0.0f;
+    snprintf(p.reason, sizeof(p.reason), "capped");
+  }
+  free(clean); free(pnorm);
+  if (parts) *parts = p;
+  return p.total;
+}
+
+float reward_score_version(int version, const char *prompt, const char *response,
+                           const char *reference, int capped, RewardParts *parts) {
+  if (version == 2) return reward_score_v2(prompt, response, reference, capped, parts);
+  return reward_score(prompt, response, reference, parts);
+}
+
+const char *reward_action_name(int action) {
+  static const char *const names[REWARD_ACT_COUNT] =
+    {"done", "prose", "read", "write", "run", "malformed"};
+  return (action >= 0 && action < REWARD_ACT_COUNT) ? names[action] : "?";
 }

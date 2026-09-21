@@ -82,6 +82,13 @@ typedef struct {
                             // fresh task and resample, up to this many times, so the step
                             // is not spent on a group with no gradient (0 => off)
 
+  // --- The reward ---
+  int reward_version;       // 1 (default) => reward_score, the original reward;
+                            // 2 => reward_score_v2: format gates, capped rollouts
+                            // score 0, <done>/prose earn grounding only when the
+                            // reference is the same kind, stricter command grounding
+                            // (reward.h). Opt-in so v1 runs reproduce.
+
   // --- Run control ---
   unsigned seed;
   int verbose;              // 1 => print a scored sample rollout per group

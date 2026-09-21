@@ -2054,6 +2054,82 @@ int run_selftest(void) {
            rw_ok ? ncase : ncase - 1, ncase, rw_ok ? "OK" : "FAIL");
     all_ok &= rw_ok;
 
+    // Reward v2 (opt-in, grpo --reward v2). The v1 lines above are unchanged; these
+    // probe the v1 free floors v2 exists to close.
+    {
+      // (a) every original case keeps its verdict: 4 perfect -> 1.0, 6 penalized.
+      int keep = 1;
+      for (int i = 0; i < ncase; i++) {
+        RewardParts p;
+        const float r = reward_score_v2(prompt, cases[i].resp, cases[i].ref, 0, &p);
+        if ((r > 0.999f) != cases[i].want_full) {
+          keep = 0;
+          printf("    v2 MISMATCH: %-30s r=%.2f %s\n", cases[i].what, (double)r, p.reason);
+        }
+      }
+      printf("    v2: %d/%d original cases keep their verdict (4 perfect at 1.00) -> %s\n",
+             keep ? ncase : ncase - 1, ncase, keep ? "OK" : "FAIL");
+      all_ok &= keep;
+
+      // (b) the free floor: prose cut off at --max-new, and a premature <done> on a
+      // task whose reference is a tool call. v1 pays 0.5 for either.
+      const char *prose = "I think I should first check whether the file";
+      const char *done = "<done>all finished</done>";
+      const float p1 = reward_score(prompt, prose, ref_write, NULL);
+      const float p2 = reward_score_v2(prompt, prose, ref_write, 1, NULL);
+      const float d1 = reward_score(prompt, done, ref_write, NULL);
+      const float d2 = reward_score_v2(prompt, done, ref_write, 0, NULL);
+      const int floor_ok = p2 == 0.0f && d2 < 0.3f;
+      printf("    v2: truncated prose %.2f (v1 %.2f), premature <done> %.2f (v1 %.2f) -> %s\n",
+             (double)p2, (double)p1, (double)d2, (double)d1, floor_ok ? "OK" : "FAIL");
+      all_ok &= floor_ok;
+
+      // (c) command grounding: a leaked transcript marker and an invented flag value
+      // lose grounding; a legitimate pipe whose every argument is in the prompt
+      // keeps full marks.
+      const char *cprompt = "GOAL: run docker run -p 8080:8080 then run ps -aux | grep docker | MODEL:";
+      const char *cref = "<tool name=\"run_command\" command=\"docker run -p 8080:8080\"></tool>";
+      const char *leak = "<tool name=\"run_command\" command=\"docker run -e xx=yy | MODEL:\"></tool>";
+      const char *invent = "<tool name=\"run_command\" command=\"docker run -e xx=yy\"></tool>";
+      const char *pipe = "<tool name=\"run_command\" command=\"ps -aux | grep docker\"></tool>";
+      RewardParts l1, l2, i2, q2;
+      reward_score(cprompt, leak, cref, &l1);
+      reward_score_v2(cprompt, leak, cref, 0, &l2);
+      reward_score_v2(cprompt, invent, cref, 0, &i2);
+      const float qr = reward_score_v2(cprompt, pipe, pipe, 0, &q2);
+      const float cr = reward_score_v2(cprompt, cref, cref, 0, NULL);
+      const int cmd_ok = l2.grounded == 0.0f && i2.grounded == 0.0f && qr > 0.999f &&
+                         cr > 0.999f;
+      printf("    v2: 'docker run -e xx=yy | MODEL:' grounded %.2f (v1 %.2f), invented "
+             "arg %.2f, legit pipe %.2f -> %s\n",
+             (double)l2.grounded, (double)l1.grounded, (double)i2.grounded, (double)qr,
+             cmd_ok ? "OK" : "FAIL");
+      all_ok &= cmd_ok;
+
+      // (d) read_file path="list" — "list" is in the prompt, but it is not a file.
+      const char *lprompt = "GOAL: list the files, then read notes.txt | MODEL:";
+      const char *lresp = "<tool name=\"read_file\" path=\"list\"></tool>";
+      const char *lref = "<tool name=\"read_file\" path=\"notes.txt\"></tool>";
+      RewardParts r1, r2;
+      reward_score(lprompt, lresp, lref, &r1);
+      reward_score_v2(lprompt, lresp, lref, 0, &r2);
+      const int path_ok = r2.grounded == 0.0f;
+      printf("    v2: read_file path=\"list\" grounded %.2f (v1 %.2f) -> %s\n",
+             (double)r2.grounded, (double)r1.grounded, path_ok ? "OK" : "FAIL");
+      all_ok &= path_ok;
+
+      // (e) opt-in: version 1 through the dispatcher is exactly reward_score, cap
+      // flag ignored — so an old run's rewards reproduce bit for bit.
+      int same = 1;
+      for (int i = 0; i < ncase; i++)
+        same &= reward_score_version(1, prompt, cases[i].resp, cases[i].ref, 1, NULL) ==
+                reward_score(prompt, cases[i].resp, cases[i].ref, NULL);
+      same &= reward_score_version(1, prompt, prose, ref_write, 1, NULL) == p1;
+      printf("    v2 is opt-in: --reward v1 reproduces reward_score exactly -> %s\n",
+             same ? "OK" : "FAIL");
+      all_ok &= same;
+    }
+
     // The whole-token rule: "ok" must not match inside "cooking".
     int tok_rule = reward_grounded_in("i am cooking dinner", "ok") == 0 &&
                    reward_grounded_in("read notes.txt now", "notes.txt") == 1 &&
