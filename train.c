@@ -51,6 +51,8 @@ TrainConfig train_default_config(void) {
   c.rope_base = 10000.0f;
   c.lora_r = 0;            // 0 => full fine-tune (no adapters)
   c.lora_alpha = 0.0f;     // 0 => alpha = r, i.e. scale 1
+  c.lora_mlp = 0;          // 0 => adapters on attention only (Wq/Wk/Wv/Wo)
+  c.lora_plus = 0.0f;      // 0 => A and B share the LR (no LoRA+)
   c.hf_tok = NULL;         // NULL => train/load our own byte-level BPE
   c.window = 0;            // 0 => full causal attention (no sliding window)
   c.global_every = 0;
@@ -493,6 +495,19 @@ static void llama_opt_step(LlamaOpt *o, Tensor **params, int n_params, float lr)
   else         { adam_set_lr(&o->adam, lr); adam_step(&o->adam, params, n_params); }
 }
 
+// LoRA+: B adapters step with lora_plus x the LR (A keeps it). No-op when off,
+// so the default optimizer state is untouched.
+static void llama_opt_lora_plus(LlamaOpt *o, const TrainConfig *cfg, const LlamaLora *lo,
+                                int n_params) {
+  if (cfg->lora_plus <= 0.0f) return;
+  float *mult = (float*)malloc((size_t)n_params * sizeof(float));
+  llama_lora_plus_mult(lo, cfg->lora_plus, mult);
+  if (o->muon) muon_set_lr_mult(&o->mu, mult);
+  else         adam_set_lr_mult(&o->adam, mult, n_params);
+  free(mult);
+  printf("  LoRA+: lr(B) = %g x lr(A)\n", (double)cfg->lora_plus);
+}
+
 static void llama_opt_free(LlamaOpt *o) {
   if (o->muon) muon_free(&o->mu); else adam_free(&o->adam);
 }
@@ -668,18 +683,19 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   LlamaLora lora; LlamaLoraActs lacts;
   Tensor **params; int n_params;
   if (use_lora) {
-    lora = llama_lora_create(&model, cfg->lora_r, lora_alpha_of(cfg));
+    lora = llama_lora_create_ex(&model, cfg->lora_r, lora_alpha_of(cfg), cfg->lora_mlp);
     llama_lora_init(&lora);
     lacts = llama_lora_acts_create(&model, &lora, maxL);
     params = (Tensor**)malloc((size_t)llama_lora_param_count(&lora) * sizeof(Tensor*));
     n_params = llama_lora_collect_params(&lora, params);
-    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo, base FROZEN (%d adapter tensors)\n",
-           cfg->lora_r, lora_alpha_of(cfg), n_params);
+    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo%s, base FROZEN (%d adapter tensors)\n",
+           cfg->lora_r, lora_alpha_of(cfg), cfg->lora_mlp ? "+Wgate/Wup/Wdown" : "", n_params);
   } else {
     params = (Tensor**)malloc((size_t)llama_param_count(&model) * sizeof(Tensor*));
     n_params = llama_collect_params(&model, params);
   }
   LlamaOpt opt = llama_opt_create(cfg, &model, use_lora, params, n_params);
+  if (use_lora) llama_opt_lora_plus(&opt, cfg, &lora, n_params);
   print_recipe(cfg);
 
   // Variable-length training: run each example at its OWN length instead of padding
@@ -841,13 +857,13 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
   LlamaLora lora; LlamaLoraActs lacts;
   Tensor **params; int n_params;
   if (use_lora) {
-    lora = llama_lora_create(&model, cfg->lora_r, lora_alpha_of(cfg));
+    lora = llama_lora_create_ex(&model, cfg->lora_r, lora_alpha_of(cfg), cfg->lora_mlp);
     llama_lora_init(&lora);
     lacts = llama_lora_acts_create(&model, &lora, ctx);
     params = (Tensor**)malloc((size_t)llama_lora_param_count(&lora) * sizeof(Tensor*));
     n_params = llama_lora_collect_params(&lora, params);
-    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo, base FROZEN (%d adapter tensors)\n",
-           cfg->lora_r, lora_alpha_of(cfg), n_params);
+    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo%s, base FROZEN (%d adapter tensors)\n",
+           cfg->lora_r, lora_alpha_of(cfg), cfg->lora_mlp ? "+Wgate/Wup/Wdown" : "", n_params);
     if (cfg->checkpoint_every > 0)
       printf("  LoRA: --checkpoint-every ignored (adapters are merged only at the end)\n");
   } else {
@@ -855,6 +871,7 @@ int llama_train_run(const char *data_path, const TrainConfig *cfg) {
     n_params = llama_collect_params(&model, params);
   }
   LlamaOpt opt = llama_opt_create(cfg, &model, use_lora, params, n_params);
+  if (use_lora) llama_opt_lora_plus(&opt, cfg, &lora, n_params);
   print_recipe(cfg);
 
   int *inp = (int*)malloc(ctx * sizeof(int));

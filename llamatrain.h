@@ -86,6 +86,9 @@ void llama_zero_grad(LlamaModel *m);
 // ---------------------------------------------------------------------------
 // LoRA fine-tuning: adapters on the four attention projections of every layer
 // (Wq, Wk, Wv, Wo — the conventional choice), with the base model FROZEN.
+// llama_lora_create_ex(..., mlp = 1) adds adapters on the SwiGLU MLP too
+// (Wgate, Wup, Wdown; `--lora-mlp`), and llama_lora_plus_mult gives the B
+// matrices a larger LR (LoRA+, `--lora-plus`).
 //
 //   LlamaLora lo = llama_lora_create(&m, 8, 16.0f);  llama_lora_init(&lo);
 //   LlamaLoraActs la = llama_lora_acts_create(&m, &lo, seq_len);
@@ -102,19 +105,33 @@ void llama_zero_grad(LlamaModel *m);
 typedef struct {
   int n_layers, r;
   LoraAdapter *q, *k, *v, *o;   // n_layers each
+  // Optional MLP adapters on Wgate/Wup/Wdown (n_layers each), or all NULL.
+  // "LoRA Without Regret" (Thinking Machines, 2025): attention-only LoRA clearly
+  // underperforms; the MLP is where most of a layer's parameters (and most of
+  // LoRA's benefit) live.
+  LoraAdapter *gate, *up, *down;
 } LlamaLora;
 
-// r = rank, alpha = LoRA scaling (scale = alpha / r).
+// r = rank, alpha = LoRA scaling (scale = alpha / r). Attention-only adapters.
 LlamaLora llama_lora_create(const LlamaModel *m, int r, float alpha);
+
+// Same, and with mlp != 0 ALSO adapters on the SwiGLU projections Wgate (d_model
+// -> d_ff), Wup (d_model -> d_ff) and Wdown (d_ff -> d_model). mlp == 0 is
+// exactly llama_lora_create.
+LlamaLora llama_lora_create_ex(const LlamaModel *m, int r, float alpha, int mlp);
 void llama_lora_free(LlamaLora *lo);
 
 // A <- small random, B <- 0, so the adapted model starts bit-identical to the base.
+// The attention adapters draw rand() exactly as before; the MLP adapters (if any)
+// draw AFTER all of them, so enabling the MLP adapters leaves the attention
+// adapters' init unchanged.
 void llama_lora_init(LlamaLora *lo);
 
 // Per-layer adapter activation caches for a given sequence length.
 typedef struct {
   int n_layers;
   LoraCache *q, *k, *v, *o;
+  LoraCache *gate, *up, *down;   // NULL unless the LlamaLora has MLP adapters
 } LlamaLoraActs;
 
 LlamaLoraActs llama_lora_acts_create(const LlamaModel *m, const LlamaLora *lo, int seq_len);
@@ -124,9 +141,18 @@ void llama_lora_acts_free(LlamaLoraActs *la);
 // llama_acts_set_len). Call alongside it before a shorter forward.
 void llama_lora_acts_set_len(LlamaLoraActs *la, int seq_len);
 
-// Trainable adapter tensors (== 8 * n_layers: an A and a B per projection).
+// Trainable adapter tensors (== 8 * n_layers: an A and a B per projection, plus
+// 6 * n_layers with MLP adapters). Order: every layer's q,k,v,o (A then B), then
+// -- with MLP adapters -- every layer's gate,up,down (A then B). So the list
+// always alternates A, B, A, B, ...
 int llama_lora_param_count(const LlamaLora *lo);
 int llama_lora_collect_params(LlamaLora *lo, Tensor **list);
+
+// LoRA+ (Hayou et al., 2024): train B with a larger learning rate than A
+// (lr_B = ratio * lr_A; ~16 is the paper's recommendation). Fills mult[] (one
+// float per collected param, in llama_lora_collect_params order) with 1 for every
+// A and `ratio` for every B, for adam_set_lr_mult / muon_set_lr_mult.
+void llama_lora_plus_mult(const LlamaLora *lo, float ratio, float *mult);
 
 // Fold the learned corrections into the base weights (W += scale * A @ B) and
 // reset the adapters to zero, so the result is an ORDINARY LlamaModel that
@@ -153,8 +179,8 @@ void llama_backward_accum(LlamaModel *m, const int *ids, int seq_len,
 // Zero every adapter gradient (the LoRA counterpart of llama_zero_grad).
 void llama_lora_zero_grad(const LlamaLora *lo);
 
-// Pack the four adapter arrays into the view llama_decode_step_lora takes, so an
-// adapted policy can be SAMPLED from with the KV cache. Passing a NULL lo yields
+// Pack the adapter arrays (plus the MLP ones, if any) into the view that
+// llama_decode_step_lora takes, so an adapted policy can be SAMPLED from with the KV cache. Passing a NULL lo yields
 // an all-NULL view, which that function treats as "no adapters".
 LlamaDecodeLora llama_lora_decode_view(const LlamaLora *lo);
 

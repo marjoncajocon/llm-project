@@ -42,6 +42,8 @@ GrpoConfig grpo_default_config(void) {
   c.lr_min = -1.0f;        // constant LR
   c.lora_r = 8;
   c.lora_alpha = 16.0f;
+  c.lora_mlp = 0;          // attention-only adapters unless --lora-mlp
+  c.lora_plus = 0.0f;      // one LR for A and B unless --lora-plus
   c.clip_eps = 0.2f;
   c.clip_eps_high = -1.0f;   // symmetric
   c.kl_beta = 0.0f;
@@ -519,8 +521,9 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
   Tensor **params;
   int n_params;
   if (use_lora) {
-    lora = llama_lora_create(&model, cfg->lora_r,
-                             cfg->lora_alpha > 0.0f ? cfg->lora_alpha : (float)cfg->lora_r);
+    lora = llama_lora_create_ex(&model, cfg->lora_r,
+                                cfg->lora_alpha > 0.0f ? cfg->lora_alpha : (float)cfg->lora_r,
+                                cfg->lora_mlp);
     llama_lora_init(&lora);
     lacts = llama_lora_acts_create(&model, &lora, maxL);
     dview = llama_lora_decode_view(&lora);
@@ -531,6 +534,12 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
     n_params = llama_collect_params(&model, params);
   }
   Adam opt = adamw_create(params, n_params, cfg->lr, cfg->weight_decay);
+  if (use_lora && cfg->lora_plus > 0.0f) {       // LoRA+: B gets lora_plus x the LR
+    float *mult = (float*)malloc((size_t)n_params * sizeof(float));
+    llama_lora_plus_mult(&lora, cfg->lora_plus, mult);
+    adam_set_lr_mult(&opt, mult, n_params);
+    free(mult);
+  }
   LlamaKV kv = llama_kv_create(&model);
   // The group's prompt, prefilled ONCE (with the current adapters) and forked
   // into every rollout of the group — see rollout(). Sized for the longest prompt
@@ -576,10 +585,13 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
          cfg->loss_agg == GRPO_AGG_TOKEN ? "token" :
          (cfg->loss_agg == GRPO_AGG_CONST ? "const" : "seq"),
          cfg->resample, cfg->resample == 1 ? "" : "s");
-  if (use_lora)
-    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo, base FROZEN (%d adapter tensors)\n",
+  if (use_lora) {
+    printf("  LoRA: rank %d alpha %g on Wq/Wk/Wv/Wo%s, base FROZEN (%d adapter tensors)\n",
            cfg->lora_r, (double)(cfg->lora_alpha > 0.0f ? cfg->lora_alpha : (float)cfg->lora_r),
-           n_params);
+           cfg->lora_mlp ? "+Wgate/Wup/Wdown" : "", n_params);
+    if (cfg->lora_plus > 0.0f)
+      printf("  LoRA+: lr(B) = %g x lr(A)\n", (double)cfg->lora_plus);
+  }
   fflush(stdout);
 
   if (cfg->reward_version == 2)

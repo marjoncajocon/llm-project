@@ -92,7 +92,22 @@ void llama_lora_acts_set_len(LlamaLoraActs *la, int seq_len) {
     set_rows(&la->k[l].xa, seq_len); set_rows(&la->k[l].y, seq_len);
     set_rows(&la->v[l].xa, seq_len); set_rows(&la->v[l].y, seq_len);
     set_rows(&la->o[l].xa, seq_len); set_rows(&la->o[l].y, seq_len);
+    if (la->gate) {
+      set_rows(&la->gate[l].xa, seq_len); set_rows(&la->gate[l].y, seq_len);
+      set_rows(&la->up[l].xa, seq_len);   set_rows(&la->up[l].y, seq_len);
+      set_rows(&la->down[l].xa, seq_len); set_rows(&la->down[l].y, seq_len);
+    }
   }
+}
+
+// The per-layer SwiGLU adapter view (NULL when there are no MLP adapters, which
+// makes swiglu_*_lora exactly the plain SwiGLU).
+static const SwigluLora *mlp_view(const LlamaLora *lo, LlamaLoraActs *la, int l,
+                                  SwigluLora *buf) {
+  if (!lo || !lo->gate) return NULL;
+  buf->gate = &lo->gate[l]; buf->up = &lo->up[l]; buf->down = &lo->down[l];
+  buf->cg = &la->gate[l];   buf->cu = &la->up[l]; buf->cd = &la->down[l];
+  return buf;
 }
 
 void llama_acts_free(LlamaActs *a) {
@@ -182,7 +197,9 @@ void llama_forward_train_lora(LlamaModel *m, const int *ids, int seq_len,
 
     // --- Feed-forward sub-layer ---
     rmsnorm(&a->h[l], &b->ffn_norm, &a->hn[l], b->eps);
-    swiglu_forward(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l]);
+    SwigluLora slb;
+    swiglu_forward_lora(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l],
+                        mlp_view(lo, la, l, &slb));
     matadd(&a->h[l], &a->f[l], &a->block_out[l]);     // residual
   }
 
@@ -232,8 +249,9 @@ static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
 
     // --- Feed-forward sub-layer (reverse) ---
     matadd_backward(&a->block_out[l], &a->h[l], &a->f[l]);
-    if (frozen) swiglu_backward_dx(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l]);
-    else        swiglu_backward(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l]);
+    SwigluLora slb;
+    swiglu_backward_lora(&a->hn[l], &b->Wgate, &b->Wup, &b->Wdown, &a->sc[l], &a->f[l],
+                         mlp_view(lo, la, l, &slb), frozen);
     // Completes h->grad: the FFN branch adds to the residual term already there.
     rmsnorm_backward(&a->h[l], &b->ffn_norm, &a->hn[l], &b->ffn_norm, b->eps);
 
@@ -358,6 +376,10 @@ static void free_adapters(LoraAdapter *arr, int n_layers) {
 }
 
 LlamaLora llama_lora_create(const LlamaModel *m, int r, float alpha) {
+  return llama_lora_create_ex(m, r, alpha, 0);
+}
+
+LlamaLora llama_lora_create_ex(const LlamaModel *m, int r, float alpha, int mlp) {
   LlamaLora lo;
   const int dm = m->d_model;
   const int qd = m->n_heads * m->head_dim, kvd = m->n_kv * m->head_dim;
@@ -367,6 +389,12 @@ LlamaLora llama_lora_create(const LlamaModel *m, int r, float alpha) {
   lo.k = adapters(m->n_layers, dm, kvd, r, alpha);  // Wk/Wv: (d_model, n_kv*head_dim)
   lo.v = adapters(m->n_layers, dm, kvd, r, alpha);
   lo.o = adapters(m->n_layers, qd, dm, r, alpha);   // Wo: (n_heads*head_dim, d_model)
+  lo.gate = lo.up = lo.down = NULL;
+  if (mlp) {
+    lo.gate = adapters(m->n_layers, dm, m->d_ff, r, alpha);   // Wgate: (d_model, d_ff)
+    lo.up = adapters(m->n_layers, dm, m->d_ff, r, alpha);     // Wup:   (d_model, d_ff)
+    lo.down = adapters(m->n_layers, m->d_ff, dm, r, alpha);   // Wdown: (d_ff, d_model)
+  }
   return lo;
 }
 
@@ -376,6 +404,12 @@ void llama_lora_free(LlamaLora *lo) {
   free_adapters(lo->v, lo->n_layers);
   free_adapters(lo->o, lo->n_layers);
   lo->q = lo->k = lo->v = lo->o = NULL;
+  if (lo->gate) {
+    free_adapters(lo->gate, lo->n_layers);
+    free_adapters(lo->up, lo->n_layers);
+    free_adapters(lo->down, lo->n_layers);
+  }
+  lo->gate = lo->up = lo->down = NULL;
 }
 
 void llama_lora_init(LlamaLora *lo) {
@@ -383,6 +417,10 @@ void llama_lora_init(LlamaLora *lo) {
     lora_init(&lo->q[l]); lora_init(&lo->k[l]);
     lora_init(&lo->v[l]); lora_init(&lo->o[l]);
   }
+  if (lo->gate)                 // after ALL attention adapters: their draws are unchanged
+    for (int l = 0; l < lo->n_layers; l++) {
+      lora_init(&lo->gate[l]); lora_init(&lo->up[l]); lora_init(&lo->down[l]);
+    }
 }
 
 static LoraCache *caches(int n_layers, int seq_len, int r, int d_out) {
@@ -405,6 +443,12 @@ LlamaLoraActs llama_lora_acts_create(const LlamaModel *m, const LlamaLora *lo, i
   la.k = caches(m->n_layers, seq_len, lo->r, kvd);
   la.v = caches(m->n_layers, seq_len, lo->r, kvd);
   la.o = caches(m->n_layers, seq_len, lo->r, dm);
+  la.gate = la.up = la.down = NULL;
+  if (lo->gate) {
+    la.gate = caches(m->n_layers, seq_len, lo->r, m->d_ff);
+    la.up = caches(m->n_layers, seq_len, lo->r, m->d_ff);
+    la.down = caches(m->n_layers, seq_len, lo->r, dm);
+  }
   return la;
 }
 
@@ -414,6 +458,12 @@ void llama_lora_acts_free(LlamaLoraActs *la) {
   free_caches(la->v, la->n_layers);
   free_caches(la->o, la->n_layers);
   la->q = la->k = la->v = la->o = NULL;
+  if (la->gate) {
+    free_caches(la->gate, la->n_layers);
+    free_caches(la->up, la->n_layers);
+    free_caches(la->down, la->n_layers);
+  }
+  la->gate = la->up = la->down = NULL;
 }
 
 // W += scale * (A @ B), then zero B so re-merging is a no-op.
@@ -432,6 +482,11 @@ void llama_lora_merge(LlamaModel *m, LlamaLora *lo) {
     merge_one(&m->blocks[l].Wk, &lo->k[l]);
     merge_one(&m->blocks[l].Wv, &lo->v[l]);
     merge_one(&m->blocks[l].Wo, &lo->o[l]);
+    if (lo->gate) {
+      merge_one(&m->blocks[l].Wgate, &lo->gate[l]);
+      merge_one(&m->blocks[l].Wup, &lo->up[l]);
+      merge_one(&m->blocks[l].Wdown, &lo->down[l]);
+    }
   }
 }
 
@@ -441,6 +496,11 @@ void llama_lora_zero_grad(const LlamaLora *lo) {
     tensor_zero_grad(&lo->k[l].A); tensor_zero_grad(&lo->k[l].B);
     tensor_zero_grad(&lo->v[l].A); tensor_zero_grad(&lo->v[l].B);
     tensor_zero_grad(&lo->o[l].A); tensor_zero_grad(&lo->o[l].B);
+    if (lo->gate) {
+      tensor_zero_grad(&lo->gate[l].A); tensor_zero_grad(&lo->gate[l].B);
+      tensor_zero_grad(&lo->up[l].A);   tensor_zero_grad(&lo->up[l].B);
+      tensor_zero_grad(&lo->down[l].A); tensor_zero_grad(&lo->down[l].B);
+    }
   }
 }
 
@@ -450,11 +510,15 @@ LlamaDecodeLora llama_lora_decode_view(const LlamaLora *lo) {
   v.k = lo ? lo->k : NULL;
   v.v = lo ? lo->v : NULL;
   v.o = lo ? lo->o : NULL;
+  v.gate = lo ? lo->gate : NULL;
+  v.up = lo ? lo->up : NULL;
+  v.down = lo ? lo->down : NULL;
   return v;
 }
 
 int llama_lora_param_count(const LlamaLora *lo) {
-  return 8 * lo->n_layers;   // A and B for each of q, k, v, o
+  // A and B for each of q, k, v, o (+ gate, up, down with MLP adapters)
+  return (lo->gate ? 14 : 8) * lo->n_layers;
 }
 
 int llama_lora_collect_params(LlamaLora *lo, Tensor **list) {
@@ -465,5 +529,16 @@ int llama_lora_collect_params(LlamaLora *lo, Tensor **list) {
     list[n++] = &lo->v[l].A; list[n++] = &lo->v[l].B;
     list[n++] = &lo->o[l].A; list[n++] = &lo->o[l].B;
   }
+  if (lo->gate)                 // appended, so the attention prefix keeps its order
+    for (int l = 0; l < lo->n_layers; l++) {
+      list[n++] = &lo->gate[l].A; list[n++] = &lo->gate[l].B;
+      list[n++] = &lo->up[l].A;   list[n++] = &lo->up[l].B;
+      list[n++] = &lo->down[l].A; list[n++] = &lo->down[l].B;
+    }
   return n;
+}
+
+void llama_lora_plus_mult(const LlamaLora *lo, float ratio, float *mult) {
+  const int n = llama_lora_param_count(lo);
+  for (int i = 0; i < n; i++) mult[i] = (i & 1) ? ratio : 1.0f;   // A, B, A, B, ...
 }

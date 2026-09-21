@@ -178,9 +178,11 @@ void llama_decode_step(const LlamaModel *m, LlamaKV *kv, int token, Tensor *logi
 // A read-only view of the four per-layer adapter arrays of a LlamaLora, so the
 // decode path can apply adapters WITHOUT depending on llamatrain.h (which
 // includes this header). Build one with llama_lora_decode_view (llamatrain.h),
-// or by hand: each field is either NULL or an array of n_layers adapters.
+// or by hand: q/k/v/o must be arrays of n_layers adapters; gate/up/down are
+// either NULL (no MLP adapters) or arrays of n_layers adapters.
 typedef struct {
   const LoraAdapter *q, *k, *v, *o;
+  const LoraAdapter *gate, *up, *down;
 } LlamaDecodeLora;
 
 // KV-cache decode WITH LoRA adapters applied — the incremental counterpart of
@@ -189,8 +191,9 @@ typedef struct {
 // affordable; see grpo.h). Passing lo == NULL is exactly llama_decode_step.
 //
 // The adapters must be applied in the same places and the same order as the
-// training forward — after the q/k/v bias but BEFORE QK-norm and RoPE, and onto
-// the output projection's result — or the two paths disagree and the importance
+// training forward — after the q/k/v bias but BEFORE QK-norm and RoPE, onto
+// the output projection's result, and (MLP adapters) onto g and u before SiLU and
+// onto the down projection's result — or the two paths disagree and the importance
 // ratio a policy-gradient update computes is meaningless.
 void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
                             Tensor *logits, const LlamaDecodeLora *lo);

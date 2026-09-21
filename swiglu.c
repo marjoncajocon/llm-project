@@ -30,16 +30,25 @@ void swiglu_cache_free(SwigluCache *c) {
   tensor_free(&c->g); tensor_free(&c->u); tensor_free(&c->a); tensor_free(&c->h);
 }
 
-void swiglu_forward(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
-                    const Tensor *W_down, SwigluCache *c, Tensor *y) {
+void swiglu_forward_lora(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
+                         const Tensor *W_down, SwigluCache *c, Tensor *y,
+                         const SwigluLora *sl) {
   const int nf = c->g.shape[0] * c->g.shape[1];
   matmul(x, W_gate, &c->g);                 // g = x @ W_gate
+  if (sl && sl->gate) lora_forward(sl->gate, x, &c->g, sl->cg);   // before SiLU
   matmul(x, W_up, &c->u);                    // u = x @ W_up
+  if (sl && sl->up) lora_forward(sl->up, x, &c->u, sl->cu);
   for (int i = 0; i < nf; i++) {
     c->a.data[i] = silu(c->g.data[i]);       // a = SiLU(g)
     c->h.data[i] = c->a.data[i] * c->u.data[i];  // h = a (*) u
   }
   matmul(&c->h, W_down, y);                   // y = h @ W_down
+  if (sl && sl->down) lora_forward(sl->down, &c->h, y, sl->cd);
+}
+
+void swiglu_forward(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
+                    const Tensor *W_down, SwigluCache *c, Tensor *y) {
+  swiglu_forward_lora(x, W_gate, W_up, W_down, c, y, NULL);
 }
 
 // `frozen` selects the input-gradient-only matmul backward: with the three FFN
@@ -48,13 +57,16 @@ void swiglu_forward(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
 // three matrices), so skipping it is the single biggest saving available.
 static void swiglu_backward_impl(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
                                  const Tensor *W_down, SwigluCache *c, const Tensor *y,
-                                 int frozen) {
+                                 const SwigluLora *sl, int frozen) {
   const int nf = c->g.shape[0] * c->g.shape[1];
   tensor_zero_grad(&c->g); tensor_zero_grad(&c->u);
   tensor_zero_grad(&c->a); tensor_zero_grad(&c->h);
 
   if (frozen) matmul_backward_dx(&c->h, W_down, y);   // dh only
   else        matmul_backward(&c->h, W_down, y);      // dh (h->grad), dW_down
+  // The down-adapter saw h too: its dh must be in h->grad BEFORE the elementwise
+  // gate backward below reads it.
+  if (sl && sl->down) lora_backward(sl->down, &c->h, y, sl->cd);
   for (int i = 0; i < nf; i++) {
     float dh = c->h.grad[i];
     c->a.grad[i] += dh * c->u.data[i];        // da += dh * u
@@ -70,14 +82,23 @@ static void swiglu_backward_impl(const Tensor *x, const Tensor *W_gate, const Te
     matmul_backward(x, W_gate, &c->g);        // dx += dg @ W_gate^T, dW_gate += x^T @ dg
     matmul_backward(x, W_up, &c->u);          // dx += du @ W_up^T,   dW_up   += x^T @ du
   }
+  // Gate/up adapters read dg/du (their outputs' grads) and add into dx.
+  if (sl && sl->gate) lora_backward(sl->gate, x, &c->g, sl->cg);
+  if (sl && sl->up)   lora_backward(sl->up, x, &c->u, sl->cu);
 }
 
 void swiglu_backward(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
                      const Tensor *W_down, SwigluCache *c, const Tensor *y) {
-  swiglu_backward_impl(x, W_gate, W_up, W_down, c, y, 0);
+  swiglu_backward_impl(x, W_gate, W_up, W_down, c, y, NULL, 0);
 }
 
 void swiglu_backward_dx(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
                         const Tensor *W_down, SwigluCache *c, const Tensor *y) {
-  swiglu_backward_impl(x, W_gate, W_up, W_down, c, y, 1);
+  swiglu_backward_impl(x, W_gate, W_up, W_down, c, y, NULL, 1);
+}
+
+void swiglu_backward_lora(const Tensor *x, const Tensor *W_gate, const Tensor *W_up,
+                          const Tensor *W_down, SwigluCache *c, const Tensor *y,
+                          const SwigluLora *sl, int frozen) {
+  swiglu_backward_impl(x, W_gate, W_up, W_down, c, y, sl, frozen);
 }

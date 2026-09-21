@@ -29,6 +29,7 @@ Adam adam_create(Tensor **params, int n_params, float lr) {
   o.beta2 = 0.999f;
   o.eps = 1e-8f;
   o.weight_decay = 0.0f;
+  o.lr_mult = NULL;
   return o;
 }
 
@@ -39,6 +40,15 @@ Adam adamw_create(Tensor **params, int n_params, float lr, float weight_decay) {
 }
 
 void adam_set_lr(Adam *o, float lr) { o->lr = lr; }
+
+void adam_set_lr_mult(Adam *o, const float *mult, int n_params) {
+  free(o->lr_mult);
+  o->lr_mult = NULL;
+  if (!mult || n_params <= 0) return;
+  o->lr_mult = (float*)malloc((size_t)n_params * sizeof(float));
+  if (!o->lr_mult) { fprintf(stderr, "Error: Adam lr_mult allocation failed\n"); exit(EXIT_FAILURE); }
+  memcpy(o->lr_mult, mult, (size_t)n_params * sizeof(float));
+}
 
 void adam_step(Adam *o, Tensor **params, int n_params) {
   o->t += 1;
@@ -52,6 +62,7 @@ void adam_step(Adam *o, Tensor **params, int n_params) {
     // Decoupled decay applies to weight matrices only, never to 1-D biases /
     // norm gains (see optim.h). wd == 0 leaves this a plain Adam step.
     const float wd = (o->weight_decay != 0.0f && param->ndim >= 2) ? o->weight_decay : 0.0f;
+    const float lr = o->lr_mult ? o->lr * o->lr_mult[p] : o->lr;   // LoRA+ etc.
     for (size_t i = 0; i < param->size; i++, idx++) {
       float g = param->grad[i];
       o->m[idx] = o->beta1 * o->m[idx] + (1.0f - o->beta1) * g;
@@ -61,7 +72,7 @@ void adam_step(Adam *o, Tensor **params, int n_params) {
       float w = param->data[i];
       // AdamW: the decay term is NOT divided by sqrt(v_hat) — that decoupling is
       // the whole point, so regularization strength doesn't depend on grad scale.
-      param->data[i] = w - o->lr * (m_hat / (sqrtf(v_hat) + o->eps) + wd * w);
+      param->data[i] = w - lr * (m_hat / (sqrtf(v_hat) + o->eps) + wd * w);
     }
   }
 }
@@ -133,6 +144,8 @@ float lr_cosine_warmup(float base_lr, float min_lr, int step,
 void adam_free(Adam *o) {
   free(o->m);
   free(o->v);
+  free(o->lr_mult);
+  o->lr_mult = NULL;
   o->m = NULL;
   o->v = NULL;
   o->total = 0;
