@@ -5861,6 +5861,128 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 46: SmolLM2-exact pretokenizer (hftok.c, .tok v3 kind 2). HF runs a
+  // Sequence of Digits(individual_digits=true) then ByteLevel(use_regex=true):
+  // every \p{N} char is its own piece, then the GPT-2 regex runs on each piece,
+  // so a piece's end is end-of-text for \s+(?!\S) ("x  1" -> x|'  '|1). Kind 0
+  // (the GPT-2 rule with ASCII-approximate classes, which old SmolLM2 exports
+  // carry) must stay exactly as it was. Expected kind-2 splits are HF
+  // tokenizers' pre_tokenize_str on SmolLM2-135M's tokenizer.json; expected
+  // kind-0 splits are the pre-change build's output (tools/verify_hftok.py
+  // checks full ids on a >50k-text corpus).
+  // --------------------------------------------------------------------------
+  {
+    printf("[46] SmolLM2-exact pretokenizer: Digits(individual) then GPT-2 regex per piece (.tok kind 2)\n");
+    int ok46 = 1;
+    // input, kind-2 split (= HF), kind-0 split (unchanged), pieces joined by '|'.
+    static const char *tab46[][3] = {
+      { "x  1", "x|  |1", "x| | 1" },
+      { "  1.", "  |1|.", " | 1|." },
+      { "    return 42;", "   | return| |4|2|;", "   | return| 42|;" },
+      { "\t\t3", "\t\t|3", "\t|\t|3" },
+      { "a 1b", "a| |1|b", "a| 1|b" },
+      { " 1", " |1", " 1" },
+      { "  \n  42", "  \n  |4|2", "  \n | 42" },
+      { "\xE3\x80\x80\xE3\x80\x80" "1", "\xE3\x80\x80\xE3\x80\x80|1", "\xE3\x80\x80\xE3\x80\x80|1" },
+      { "x  ", "x|  ", "x|  " },
+      { "'s1", "'s|1", "'s|1" },
+      { "1's", "1|'s", "1|'s" },
+      { "12345", "1|2|3|4|5", "12345" },
+      { "3.14", "3|.|1|4", "3|.|14" },
+      { "don't 5", "don|'t| |5", "don|'t| 5" },
+      { "\xC2\xBDx", "\xC2\xBD|x", "\xC2\xBDx" },
+      { "\xE2\x85\xAB", "\xE2\x85\xAB", "\xE2\x85\xAB" },
+      { "\xD9\xA3\xD9\xA4", "\xD9\xA3|\xD9\xA4", "\xD9\xA3\xD9\xA4" },
+      { "foo \xE2\x80\x94" "bar", "foo| \xE2\x80\x94|bar", "foo| \xE2\x80\x94" "bar" },
+      { "caf\xC3\xA9 2", "caf\xC3\xA9| |2", "caf\xC3\xA9| 2" },
+      { "\xC2\xA0" "7", "\xC2\xA0|7", "\xC2\xA0|7" },
+      { "if (x)  {\n    y = 10;\n}", "if| (|x|)| | {|\n   | y| =| |1|0|;|\n|}", "if| (|x|)| | {|\n   | y| =| 10|;|\n|}" },
+      { "v2.0  rc1", "v|2|.|0| | rc|1", "v|2|.|0| | rc|1" },
+      { " \t 9", " \t |9", " \t| 9" },
+      { "x = [1,  2]", "x| =| [|1|,|  |2|]", "x| =| [|1|,| | 2|]" },
+      { "\xE4\xB8\xAD\xE6\x96\x87  8", "\xE4\xB8\xAD\xE6\x96\x87|  |8", "\xE4\xB8\xAD\xE6\x96\x87| | 8" },
+    };
+    const int n46 = (int)(sizeof(tab46) / sizeof(tab46[0]));
+    int bad2 = 0, bad0 = 0, differ = 0;
+    for (int i = 0; i < n46; i++) {
+      const char *s = tab46[i][0];
+      char joined[2][256];
+      for (int k = 0; k < 2; k++) {
+        int st[64], ln[64], jp = 0;
+        const int np = hftok_pretok_split(k == 0 ? HFTOK_PRE_SMOL : HFTOK_PRE_GPT2, s, (int)strlen(s), st, ln, 64);
+        for (int q = 0; q < np && jp < 200; q++) {
+          if (q) joined[k][jp++] = '|';
+          memcpy(joined[k] + jp, s + st[q], (size_t)ln[q]); jp += ln[q];
+        }
+        joined[k][jp] = '\0';
+      }
+      if (strcmp(joined[0], tab46[i][1]) != 0) { bad2++; printf("    MISMATCH kind-2 split of case %d: got '%s'\n", i, joined[0]); }
+      if (strcmp(joined[1], tab46[i][2]) != 0) { bad0++; printf("    MISMATCH kind-0 split of case %d: got '%s'\n", i, joined[1]); }
+      differ += strcmp(tab46[i][1], tab46[i][2]) != 0;
+    }
+    printf("    kind 2 (SmolLM2 exact): %d/%d tricky strings split exactly as HF (indent+digits, '  1.',"
+           " tabs, U+3000, 1/2 U+216B Arabic digits, em dash, NBSP, contractions)\n", n46 - bad2, n46);
+    printf("    kind 0 (GPT-2 rule, old files): %d/%d splits identical to the pre-change build"
+           " (%d of the %d cases split differently from kind 2)\n", n46 - bad0, n46, differ, n46);
+    ok46 &= bad2 == 0 && bad0 == 0 && differ > 0;
+
+    // .tok header round trip. Vocab: 256 single bytes except slot 4 = "th" (so
+    // byte 0x04 has no token, like SmolLM2's vocab), 256 = "  ", 257 = " 1",
+    // 258 = "the". Written as v2 (-> kind 0), v3 kind 0, v3 kind 2, v3 kind 3.
+    //   "x  1":    kind 0 -> x| |' 1' = x,' ',257      kind 2 -> x|'  '|1 = x,256,'1'
+    //   "th\x04e": kind 0 -> 0x04 becomes id 0: th(4),0,e   kind 2 -> dropped, and a
+    //              merge barrier as in HF: th(4),e (not "the")
+    int hdr_ok = 1;
+    const int vers[4] = {2, 3, 3, 3}, kinds[4] = {-1, HFTOK_PRE_GPT2, HFTOK_PRE_SMOL, 3};
+    for (int c = 0; c < 4; c++) {
+      FILE *tf = fopen("smol_tok.tmp", "wb");
+      if (!tf) { hdr_ok = 0; break; }
+      const uint32_t n_voc = 259, v32 = (uint32_t)vers[c]; const int32_t eos = -1, bos = -1;
+      fwrite("HFTK", 1, 4, tf); fwrite(&v32, 4, 1, tf); fwrite(&n_voc, 4, 1, tf); fwrite(&eos, 4, 1, tf);
+      for (int b = 0; b < 256; b++) {
+        if (b == 4) { uint16_t l = 2; fwrite(&l, 2, 1, tf); fwrite("th", 1, 2, tf); continue; }
+        uint16_t l = 1; unsigned char ch = (unsigned char)b; fwrite(&l, 2, 1, tf); fwrite(&ch, 1, 1, tf);
+      }
+      { uint16_t l = 2; fwrite(&l, 2, 1, tf); fwrite("  ", 1, 2, tf); }
+      { uint16_t l = 2; fwrite(&l, 2, 1, tf); fwrite(" 1", 1, 2, tf); }
+      { uint16_t l = 3; fwrite(&l, 2, 1, tf); fwrite("the", 1, 3, tf); }
+      const uint8_t tk = 0; const uint16_t sl = 0; const uint32_t nsp = 0;
+      fwrite(&bos, 4, 1, tf); fwrite(&tk, 1, 1, tf); fwrite(&sl, 2, 1, tf); fwrite(&nsp, 4, 1, tf);
+      if (vers[c] == 3) { const uint8_t pk = (uint8_t)kinds[c]; fwrite(&pk, 1, 1, tf); }
+      fclose(tf);
+      HFTok ht;
+      if (kinds[c] == 3) {
+        fflush(stdout);
+        fprintf(stderr, "(selftest [46]: the next line is an expected error)\n");
+        const int rc = hftok_load(&ht, "smol_tok.tmp");
+        if (rc == 0) hftok_free(&ht);
+        hdr_ok &= rc != 0;                       // unknown kind: rejected, not mis-split
+        continue;
+      }
+      if (hftok_load(&ht, "smol_tok.tmp") != 0) { hdr_ok = 0; break; }
+      int a[16], b[16];
+      const int na = hftok_encode(&ht, "x  1", a, 16);
+      const int nb = hftok_encode(&ht, "th\x04" "e", b, 16);
+      const int nt = hftok_encode(&ht, "the", b + 8, 8);
+      if (kinds[c] == HFTOK_PRE_SMOL)
+        hdr_ok &= ht.pretok == HFTOK_PRE_SMOL && na == 3 && a[0] == 'x' && a[1] == 256 && a[2] == '1' &&
+                  nb == 2 && b[0] == 4 && b[1] == 'e' && nt == 1 && b[8] == 258;
+      else
+        hdr_ok &= ht.pretok == HFTOK_PRE_GPT2 && na == 3 && a[0] == 'x' && a[1] == ' ' && a[2] == 257 &&
+                  nb == 3 && b[0] == 4 && b[1] == 0 && b[2] == 'e' && nt == 1 && b[8] == 258;
+      hftok_free(&ht);
+    }
+    remove("smol_tok.tmp");
+    printf("    .tok header: v2 and v3-kind-0 files -> GPT-2 rule ('x  1' = x,' ',[' 1']; tokenless"
+           " byte -> id 0, as before) | v3 kind 2 -> x,['  '],1 and 'th<04>e' = [th],e (byte dropped,"
+           " merge barrier, as HF) | kind 3 rejected -> %s\n", hdr_ok ? "OK" : "FAIL");
+    ok46 &= hdr_ok;
+
+    printf("    -> %s\n\n", ok46 ? "OK" : "FAIL");
+    all_ok &= ok46;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

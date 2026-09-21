@@ -81,9 +81,9 @@ int hftok_load(HFTok *t, const char *path) {
   if (ver >= 3) {
     uint8_t pk;
     if (fread(&pk, 1, 1, f) != 1) { fprintf(stderr, "error: truncated v3 pretokenizer kind\n"); fclose(f); return 1; }
-    if (pk > HFTOK_PRE_QWEN2) {
+    if (pk > HFTOK_PRE_MAX) {
       fprintf(stderr, "error: '%s' needs pretokenizer kind %u (this build knows 0..%d)\n",
-              path, (unsigned)pk, HFTOK_PRE_QWEN2);
+              path, (unsigned)pk, HFTOK_PRE_MAX);
       fclose(f); return 1;
     }
     t->pretok = pk;
@@ -310,10 +310,92 @@ static int next_chunk_qwen2(const char *s, int len, int *pos, int *cs, int *cl) 
   *cl = e - p; *pos = e; return 1;           // 6 at end of text / 7. \s+
 }
 
+// --- pretokenization (SmolLM2 exact: Digits(individual) then GPT-2 regex) --
+// HF runs a Sequence: Digits(individual_digits=true) splits the text so that
+// every numeric char (Rust char::is_numeric = \p{N}) is its own piece; then
+// ByteLevel(use_regex=true, add_prefix_space=false) applies the GPT-2 regex
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+// to EACH piece separately -- so a piece's end acts as end-of-text for the
+// \s+(?!\S) lookahead: "x  1" -> x|'  '|1 (kind 0 gives x|' '|' 1'). Classes
+// are real Unicode (unitab.h), unlike kind 0's ASCII approximation.
+
+// The GPT-2 regex on s[0,len) with Unicode classes (len = the piece's end).
+static int next_chunk_gpt2u(const char *s, int len, int *pos, int *cs, int *cl) {
+  const int p = *pos;
+  if (p >= len) return 0;
+  const unsigned char *u = (const unsigned char*)s;
+  int n0, n1;
+  const uint32_t c0 = u_decode(u, len, p, &n0);
+  const int has1 = p + n0 < len;
+  const uint32_t c1 = has1 ? u_decode(u, len, p + n0, &n1) : 0;
+  *cs = p;
+
+  // 1. 's|'t|'re|'ve|'m|'ll|'d  (case-sensitive, ASCII)
+  if (c0 == '\'' && has1) {
+    if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') { *cl = 2; *pos = p + 2; return 1; }
+    if (p + 2 < len) {
+      const unsigned char b = u[p + 2];
+      if ((c1 == 'r' && b == 'e') || (c1 == 'v' && b == 'e') || (c1 == 'l' && b == 'l')) {
+        *cl = 3; *pos = p + 3; return 1;
+      }
+    }
+  }
+  // 2-4.  ?\p{L}+ |  ?\p{N}+ |  ?[^\s\p{L}\p{N}]+  (one optional leading ' ')
+  int cls0 = u_is_L(c0) ? 1 : u_is_N(c0) ? 2 : u_is_S(c0) ? 0 : 3;
+  int q = p, cls = cls0;
+  if (c0 == ' ' && has1) {
+    const int cls1 = u_is_L(c1) ? 1 : u_is_N(c1) ? 2 : u_is_S(c1) ? 0 : 3;
+    if (cls1) { q = p + n0; cls = cls1; }
+  }
+  if (cls) {
+    int e = q, n;
+    while (e < len) {
+      const uint32_t c = u_decode(u, len, e, &n);
+      const int k = u_is_L(c) ? 1 : u_is_N(c) ? 2 : u_is_S(c) ? 0 : 3;
+      if (k != cls) break;
+      e += n;
+    }
+    *cl = e - p; *pos = e; return 1;
+  }
+  // 5-6. c0 is \s: \s+(?!\S) leaves the last space char for the next token when
+  // a non-space follows (if the run is 2+ chars), else \s+ takes the whole run.
+  int e = p, last_start = p, n;
+  while (e < len) {
+    const uint32_t c = u_decode(u, len, e, &n);
+    if (!u_is_S(c)) break;
+    last_start = e;
+    e += n;
+  }
+  if (e < len && last_start > p) { *cl = last_start - p; *pos = last_start; return 1; }
+  *cl = e - p; *pos = e; return 1;
+}
+
+// SmolLM2 exact: *seg_end carries the end of the current non-numeric piece
+// between calls (start it at 0), so each piece is scanned once.
+static int next_chunk_smol(const char *s, int len, int *pos, int *seg_end, int *cs, int *cl) {
+  const int p = *pos;
+  if (p >= len) return 0;
+  const unsigned char *u = (const unsigned char*)s;
+  if (p >= *seg_end) {
+    int n;
+    if (u_is_N(u_decode(u, len, p, &n))) { *cs = p; *cl = n; *pos = p + n; return 1; }
+    int e = p;
+    while (e < len && !u_is_N(u_decode(u, len, e, &n))) e += n;
+    *seg_end = e;
+  }
+  return next_chunk_gpt2u(s, *seg_end, pos, cs, cl);
+}
+
+// One pretoken under kind `kind` (seg_end: state for HFTOK_PRE_SMOL).
+static int next_pretok(int kind, const char *s, int len, int *pos, int *seg_end, int *cs, int *cl) {
+  if (kind == HFTOK_PRE_QWEN2) return next_chunk_qwen2(s, len, pos, cs, cl);
+  if (kind == HFTOK_PRE_SMOL) return next_chunk_smol(s, len, pos, seg_end, cs, cl);
+  return next_chunk(s, len, pos, cs, cl);
+}
+
 int hftok_pretok_split(int kind, const char *text, int len, int *starts, int *lens, int max) {
-  int pos = 0, cs, cl, n = 0;
-  while (n < max && (kind == HFTOK_PRE_QWEN2 ? next_chunk_qwen2(text, len, &pos, &cs, &cl)
-                                             : next_chunk(text, len, &pos, &cs, &cl))) {
+  int pos = 0, seg = 0, cs, cl, n = 0;
+  while (n < max && next_pretok(kind, text, len, &pos, &seg, &cs, &cl)) {
     starts[n] = cs; lens[n] = cl; n++;
   }
   return n;
@@ -321,37 +403,49 @@ int hftok_pretok_split(int kind, const char *text, int len, int *starts, int *le
 
 // --- encode / decode -------------------------------------------------------
 
+// BPE: repeatedly merge the adjacent pair with the lowest combined-token id.
+// Returns the new piece count.
+static int bpe_merge(const HFTok *t, int *pieces, int npc, unsigned char *buf) {
+  for (;;) {
+    int best_i = -1, best_id = INT_MAX;
+    for (int i = 0; i + 1 < npc; i++) {
+      int a = pieces[i], b = pieces[i + 1];
+      int la = t->tok_len[a], lb = t->tok_len[b];
+      memcpy(buf, t->tok_bytes[a], (size_t)la);
+      memcpy(buf + la, t->tok_bytes[b], (size_t)lb);
+      int mid = hftok_lookup(t, buf, la + lb);
+      if (mid >= 0 && mid < best_id) { best_id = mid; best_i = i; }
+    }
+    if (best_i < 0) return npc;
+    pieces[best_i] = best_id;
+    for (int j = best_i + 1; j < npc - 1; j++) pieces[j] = pieces[j + 1];
+    npc--;
+  }
+}
+
 // Byte-level BPE encode a plain run text[start,end) (no special tokens inside).
+// A byte with no single-byte token (SmolLM2's vocab lacks 21, e.g. 0x04, 0xF1)
+// becomes id 0 under kinds 0/1 (unchanged behaviour). Under HFTOK_PRE_SMOL it is
+// dropped and acts as a merge barrier, as in HF's BPE (no unk token): "th\x04e"
+// -> [th][e], not [the].
 static int encode_run(const HFTok *t, const char *text, int start, int end,
                       int *ids, int n, int max_ids, unsigned char *buf, int *pieces) {
   const char *s = text + start;
   int len = end - start;
-  int pos = 0, cs, cl;
-  const int qwen = (t->pretok == HFTOK_PRE_QWEN2);
-  while (n < max_ids && (qwen ? next_chunk_qwen2(s, len, &pos, &cs, &cl)
-                              : next_chunk(s, len, &pos, &cs, &cl))) {
+  int pos = 0, seg = 0, cs, cl;
+  const int drop = (t->pretok == HFTOK_PRE_SMOL);
+  while (n < max_ids && next_pretok(t->pretok, s, len, &pos, &seg, &cs, &cl)) {
     int npc = 0;
-    for (int i = 0; i < cl; i++) {
-      int id = t->byte2id[(unsigned char)s[cs + i]];
-      pieces[npc++] = (id >= 0) ? id : 0;
-    }
-    // BPE: repeatedly merge the adjacent pair with the lowest combined-token id.
-    for (;;) {
-      int best_i = -1, best_id = INT_MAX;
-      for (int i = 0; i + 1 < npc; i++) {
-        int a = pieces[i], b = pieces[i + 1];
-        int la = t->tok_len[a], lb = t->tok_len[b];
-        memcpy(buf, t->tok_bytes[a], (size_t)la);
-        memcpy(buf + la, t->tok_bytes[b], (size_t)lb);
-        int mid = hftok_lookup(t, buf, la + lb);
-        if (mid >= 0 && mid < best_id) { best_id = mid; best_i = i; }
+    for (int i = 0; i <= cl; i++) {
+      if (i < cl) {
+        const int id = t->byte2id[(unsigned char)s[cs + i]];
+        if (id >= 0 || !drop) { pieces[npc++] = (id >= 0) ? id : 0; continue; }
       }
-      if (best_i < 0) break;
-      pieces[best_i] = best_id;
-      for (int j = best_i + 1; j < npc - 1; j++) pieces[j] = pieces[j + 1];
-      npc--;
+      // end of the pretoken, or (kind 2) a dropped byte: merge what came before.
+      npc = bpe_merge(t, pieces, npc, buf);
+      for (int k = 0; k < npc && n < max_ids; k++) ids[n++] = pieces[k];
+      npc = 0;
     }
-    for (int i = 0; i < npc && n < max_ids; i++) ids[n++] = pieces[i];
   }
   return n;
 }
@@ -373,7 +467,11 @@ static int match_special(const HFTok *t, const char *text, int pos, int len, int
 int hftok_encode(const HFTok *t, const char *text, int *ids, int max_ids) {
   int len = (int)strlen(text);
   int n = 0;
-  unsigned char *buf = (unsigned char*)malloc((size_t)len + 2);   // concat scratch
+  // Concat scratch for a BPE pair. Usually <= the chunk length, but a byte with
+  // no single-byte token (0xC0/0xC1/0xF5-0xFF in most byte-level vocabs; only in
+  // invalid UTF-8) falls back to id 0, whose bytes can be a special's literal
+  // ("<|endoftext|>"): size for two tokens of the maximum length (uint16).
+  unsigned char *buf = (unsigned char*)malloc((size_t)len + 2 + 2 * 65535);
   int *pieces = (int*)malloc(((size_t)len + 1) * sizeof(int));
   int run_start = 0, pos = 0;
   while (pos < len && n < max_ids) {
