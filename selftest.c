@@ -1869,7 +1869,7 @@ int run_selftest(void) {
     // (a) zero variance => no signal
     float flat_r[4] = {0.5f, 0.5f, 0.5f, 0.5f};
     float adv[4];
-    int live_flat = grpo_advantages(flat_r, 4, adv);
+    int live_flat = grpo_advantages(flat_r, 4, &gc, adv);
     int flat_ok = (live_flat == 0);
     for (int i = 0; i < 4; i++) if (adv[i] != 0.0f) flat_ok = 0;
     printf("    all-equal rewards -> skipped, advantages all zero -> %s\n",
@@ -1878,7 +1878,7 @@ int run_selftest(void) {
 
     // (b) advantages are z-scores: mean 0, better-than-average positive.
     float rew[4] = {1.0f, 0.0f, 0.5f, 0.5f};
-    int live = grpo_advantages(rew, 4, adv);
+    int live = grpo_advantages(rew, 4, &gc, adv);
     double amean = 0.0;
     for (int i = 0; i < 4; i++) amean += adv[i];
     int adv_ok = live && fabs(amean) < 1e-5 && adv[0] > 0.0f && adv[1] < 0.0f &&
@@ -1894,8 +1894,9 @@ int run_selftest(void) {
     // rho = exp(lp_new - lp_old): 1.0, 1.5 (above 1+eps), 0.5 (below 1-eps), 1.0
     const float lp_new[4] = {0.0f, 0.405465f, -0.693147f, 0.0f};
     float cpos[4], cneg[4];
-    grpo_token_coeffs(+1.0f, 1, 4, lp_new, lp_old, NULL, &gc, cpos);
-    grpo_token_coeffs(-1.0f, 1, 4, lp_new, lp_old, NULL, &gc, cneg);
+    const float n14 = grpo_loss_norm(&gc, 1, 4, 0);     // seq: G * len = 4
+    grpo_token_coeffs(+1.0f, n14, 4, lp_new, lp_old, NULL, &gc, cpos);
+    grpo_token_coeffs(-1.0f, n14, 4, lp_new, lp_old, NULL, &gc, cneg);
     // Positive advantage: the HIGH ratio is clipped away, the low one is kept.
     // Negative advantage: the LOW ratio is clipped away, the high one is kept.
     int clip_ok = (cpos[0] != 0.0f) && (cpos[1] == 0.0f) && (cpos[2] != 0.0f) &&
@@ -1906,6 +1907,58 @@ int run_selftest(void) {
     printf("    clip eps 0.2: adv>0 drops rho=1.5, adv<0 drops rho=0.5, "
            "unclipped = adv*rho/(G*len) -> %s\n", clip_ok ? "OK" : "FAIL");
     all_ok &= clip_ok;
+
+    // (d) DAPO clip-higher: rho = 1.25 sits between 1+0.2 and 1+0.28. Symmetric
+    //     clipping drops it for adv > 0; clip-higher keeps it. The LOWER bound
+    //     must not move: rho = 0.75 with adv < 0 is dropped either way.
+    {
+      const float hi_new[2] = {0.223144f, -0.287682f};   // rho 1.25, 0.75
+      const float hi_old[2] = {0.0f, 0.0f};
+      GrpoConfig sym = gc, dapo = gc;
+      grpo_preset_dapo(&dapo);
+      float s_pos[2], d_pos[2], s_neg[2], d_neg[2];
+      grpo_token_coeffs(+1.0f, 2.0f, 2, hi_new, hi_old, NULL, &sym, s_pos);
+      grpo_token_coeffs(+1.0f, 2.0f, 2, hi_new, hi_old, NULL, &dapo, d_pos);
+      grpo_token_coeffs(-1.0f, 2.0f, 2, hi_new, hi_old, NULL, &sym, s_neg);
+      grpo_token_coeffs(-1.0f, 2.0f, 2, hi_new, hi_old, NULL, &dapo, d_neg);
+      int hi_ok = (s_pos[0] == 0.0f) && (d_pos[0] != 0.0f) &&
+                  (s_neg[1] == 0.0f) && (d_neg[1] == 0.0f) &&
+                  fabsf(d_pos[0] - 1.25f / 2.0f) < 1e-5f;
+      printf("    clip-higher 0.28: adv>0 keeps rho=1.25 (symmetric drops it), "
+             "lower bound unchanged -> %s\n", hi_ok ? "OK" : "FAIL");
+      all_ok &= hi_ok;
+    }
+
+    // (e) Dr. GRPO advantage: r - mean, no std division. For {1, 0, .5, .5} the
+    //     mean is 0.5, so exactly {+.5, -.5, 0, 0}.
+    {
+      GrpoConfig dr = gc;
+      grpo_preset_dr_grpo(&dr);
+      float dadv[4], dflat[4];
+      int dlive = grpo_advantages(rew, 4, &dr, dadv);
+      int dr_ok = dlive && fabsf(dadv[0] - 0.5f) < 1e-6f && fabsf(dadv[1] + 0.5f) < 1e-6f &&
+                  fabsf(dadv[2]) < 1e-6f && fabsf(dadv[3]) < 1e-6f;
+      // ...and a flat group is still flat without the std.
+      dr_ok &= (grpo_advantages(flat_r, 4, &dr, dflat) == 0);
+      printf("    no-std advantages %.3f %.3f %.3f %.3f = r - mean, flat still skipped -> %s\n",
+             (double)dadv[0], (double)dadv[1], (double)dadv[2], (double)dadv[3],
+             dr_ok ? "OK" : "FAIL");
+      all_ok &= dr_ok;
+    }
+
+    // (f) the three loss normalizers, for G = 4, max_new = 96, a 10-token rollout,
+    //     60 live tokens in the step: seq 40, token 60, const 384.
+    {
+      GrpoConfig a = gc;
+      a.group = 4; a.max_new = 96;
+      a.loss_agg = GRPO_AGG_SEQ;   const float ns = grpo_loss_norm(&a, 4, 10, 60);
+      a.loss_agg = GRPO_AGG_TOKEN; const float nt = grpo_loss_norm(&a, 4, 10, 60);
+      a.loss_agg = GRPO_AGG_CONST; const float nc = grpo_loss_norm(&a, 4, 10, 60);
+      int agg_ok = ns == 40.0f && nt == 60.0f && nc == 384.0f;
+      printf("    loss-agg normalizers seq %.0f / token %.0f / const %.0f -> %s\n",
+             (double)ns, (double)nt, (double)nc, agg_ok ? "OK" : "FAIL");
+      all_ok &= agg_ok;
+    }
 
     // pg_backward with a uniform 1/N coefficient must reproduce cross-entropy
     // exactly — the identity the whole design rests on.
@@ -2067,7 +2120,7 @@ int run_selftest(void) {
         if (s == 0) first_mean = mean_r;
         if (s == STEPS - 1) last_mean = mean_r;
 
-        if (!grpo_advantages(rrew, GG, radv)) continue;   // no spread, no update
+        if (!grpo_advantages(rrew, GG, &cfg, radv)) continue;   // no spread, no update
 
         llama_zero_grad(&gm);
         int seq2[6], tgt2[6];
@@ -2084,7 +2137,8 @@ int run_selftest(void) {
           float lp_new[4];
           for (int t = 0; t < RLEN; t++)
             lp_new[t] = logprob_of(&gprob, pn - 1 + t, rid[i][t]);
-          grpo_token_coeffs(radv[i], GG, rlens[i], lp_new, rlp[i], NULL, &cfg, rcoef);
+          grpo_token_coeffs(radv[i], grpo_loss_norm(&cfg, GG, rlens[i], 0), rlens[i],
+                            lp_new, rlp[i], NULL, &cfg, rcoef);
           for (int t = 0; t < RLEN; t++) coef2[pn - 1 + t] = rcoef[t];
 
           tensor_zero_grad(&glog);

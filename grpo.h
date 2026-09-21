@@ -61,18 +61,59 @@ typedef struct {
 
   // --- The GRPO objective ---
   float clip_eps;           // PPO-style ratio clip, 1 +/- clip_eps (0 => no clipping)
+  float clip_eps_high;      // DAPO "clip-higher": the UPPER bound becomes 1 + clip_eps_high
+                            // (< 0 => symmetric, i.e. clip_eps). A wider upper bound lets
+                            // a low-probability token that turned out good grow faster,
+                            // which is what keeps the policy from collapsing onto the
+                            // tokens it already favours (entropy collapse).
   float kl_beta;            // KL-to-reference penalty (0 => off, and then the extra
                             // reference forward per rollout is skipped entirely)
+  int std_norm;             // 1 => Â = (r - mean) / std (original GRPO); 0 => Â = r - mean
+                            // (Dr. GRPO). Dividing by std up-weights groups that are
+                            // NEARLY flat — the easiest and the hardest tasks — which
+                            // is a difficulty bias, not a signal.
+  int loss_agg;             // how per-token terms are averaged — a GrpoAgg value
+  int resample;             // DAPO dynamic sampling: when a group comes back flat, draw a
+                            // fresh task and resample, up to this many times, so the step
+                            // is not spent on a group with no gradient (0 => off)
 
   // --- Run control ---
   unsigned seed;
   int verbose;              // 1 => print a scored sample rollout per group
 } GrpoConfig;
+
+// How a rollout's per-token terms are normalized. This is not a detail: it decides
+// how much a LONG rollout counts against a short one.
+typedef enum {
+  // 1 / (G * len_i) — the original GRPO. Every rollout carries equal total weight,
+  // so each token of a long rollout counts for less. A long WRONG answer is
+  // therefore punished less per token than a short wrong one, which quietly
+  // rewards rambling when the answer is bad.
+  GRPO_AGG_SEQ = 0,
+  // 1 / (total tokens of every live rollout in the step) — DAPO. Every TOKEN
+  // carries equal weight, whichever rollout it came from.
+  GRPO_AGG_TOKEN = 1,
+  // 1 / (G * max_new) — Dr. GRPO. A constant, so length has no effect on the weight.
+  GRPO_AGG_CONST = 2
+} GrpoAgg;
+
+// The presets, applied on top of whatever else is in *c (CLI flags that come AFTER
+// the preset still win, so `--dapo --clip-high 0.3` works).
+//   DAPO:     clip-higher 0.28, token-level loss, up to 2 resamples of a flat group.
+//   Dr. GRPO: no std division, constant normalizer.
+void grpo_preset_dapo(GrpoConfig *c);
+void grpo_preset_dr_grpo(GrpoConfig *c);
+
+// The per-token denominator for rollout i under cfg->loss_agg. `step_tokens` is the
+// response-token total of every live rollout in the step (only GRPO_AGG_TOKEN reads it).
+float grpo_loss_norm(const GrpoConfig *cfg, int G, int len, int step_tokens);
 // There is deliberately no mid-run checkpointing. Saving would mean merging the
 // adapters into the base, and llama_lora_merge resets B to zero — after which
 // dA is identically zero and training stalls. A run saves once, at the end.
 
-// Defaults: G=8, 1 group/step, mu=1, clip 0.2, KL off, LoRA rank 8, lr 1e-5.
+// Defaults: G=8, 1 group/step, mu=1, clip 0.2, KL off, LoRA rank 8, lr 1e-5 —
+// and the ORIGINAL objective (symmetric clip, std-normalized advantage, per-sequence
+// loss, no resampling), so a run from before the DAPO/Dr. GRPO options reproduces.
 GrpoConfig grpo_default_config(void);
 
 // Run GRPO over a task file of `prompt<TAB>reference_action` lines — the SAME
@@ -88,13 +129,14 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg);
 // that is not just "run the model".
 //
 // For each rollout i with reward r_i and length lens[i]:
-//     Â_i     = (r_i - mean_r) / (std_r + 1e-4)
+//     Â_i     = (r_i - mean_r) / (std_r + 1e-4)          (std_norm = 1)
+//             =  r_i - mean_r                            (std_norm = 0)
 // and for each of its tokens t:
 //     rho     = exp(logp_new - logp_old)                  (importance ratio)
-//     clipped = (Â > 0 && rho > 1+eps) || (Â < 0 && rho < 1-eps)
+//     clipped = (Â > 0 && rho > 1+eps_high) || (Â < 0 && rho < 1-eps)
 //     pg      = clipped ? 0 : Â * rho
 //     kl      = beta * (rho_ref - 1),  rho_ref = exp(logp_ref - logp_new)
-//     coeff   = (pg + kl) / (G * lens[i])
+//     coeff   = (pg + kl) / norm_i,   norm_i = grpo_loss_norm(cfg, G, lens[i], ...)
 //
 // coeff is the per-token weight to hand to pg_backward (loss.h). The sign
 // convention is loss-like: pg_backward adds coeff * (p - onehot), and (p - onehot)
@@ -120,11 +162,13 @@ int grpo_group_coeffs(const float *rewards, int G, const int *lens,
 //
 // grpo_advantages fills adv_out (length G) and returns 1 if the group has spread,
 // 0 if every reward was identical (advantages all zero — skip the group).
-int grpo_advantages(const float *rewards, int G, float *adv_out);
+// It reads only cfg->std_norm.
+int grpo_advantages(const float *rewards, int G, const GrpoConfig *cfg, float *adv_out);
 
-// Per-token coefficients for ONE rollout of the group, given its advantage.
-// coeff_out must have room for `len` entries. logp_ref may be NULL.
-void grpo_token_coeffs(float adv, int G, int len, const float *logp_new,
+// Per-token coefficients for ONE rollout of the group, given its advantage and its
+// denominator from grpo_loss_norm. coeff_out must have room for `len` entries.
+// logp_ref may be NULL.
+void grpo_token_coeffs(float adv, float norm, int len, const float *logp_new,
                        const float *logp_old, const float *logp_ref,
                        const GrpoConfig *cfg, float *coeff_out);
 
