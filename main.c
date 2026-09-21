@@ -245,9 +245,14 @@ static void train_usage(void) {
     "\n"
     "`llama-train` takes the SAME flags but trains the modern LLaMA-family\n"
     "architecture (RMSNorm+RoPE+GQA+SwiGLU) and writes an LLMA checkpoint that\n"
-    "`transformer llama` generates from. Two extra flags:\n"
+    "`transformer llama` generates from. Extra flags:\n"
     "  --kv-heads N      GQA key/value heads (default = --heads, i.e. plain MHA)\n"
     "  --rope-base F     RoPE frequency base (default 10000)\n"
+    "  --window W        sliding-window attention: each position attends only to\n"
+    "                    its W most recent positions (default 0 = full attention)\n"
+    "  --global-every N  with --window: every Nth layer stays full/global\n"
+    "                    (2 = alternate like Gemma 2; 6 = 5 local : 1 global like\n"
+    "                    Gemma 3; default 0 = every layer windowed, like Mistral)\n"
     "  --lora-r N        LoRA rank: FREEZE the base and train only low-rank adapters\n"
     "                    on Wq/Wk/Wv/Wo (merged into the weights before saving).\n"
     "                    Pair with --resume to fine-tune a pretrained checkpoint.\n"
@@ -293,6 +298,8 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--batch") == 0)   { NEED_VAL(); cfg.batch = atoi(argv[++i]); }
     else if (strcmp(f, "--kv-heads") == 0 && llama) { NEED_VAL(); cfg.n_kv = atoi(argv[++i]); }
     else if (strcmp(f, "--rope-base") == 0 && llama) { NEED_VAL(); cfg.rope_base = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--window") == 0 && llama) { NEED_VAL(); cfg.window = atoi(argv[++i]); }
+    else if (strcmp(f, "--global-every") == 0 && llama) { NEED_VAL(); cfg.global_every = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-r") == 0 && llama) { NEED_VAL(); cfg.lora_r = atoi(argv[++i]); }
     else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
     else if (strcmp(f, "--hf-tok") == 0 && llama) { NEED_VAL(); cfg.hf_tok = argv[++i]; }

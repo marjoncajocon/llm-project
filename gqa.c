@@ -1,4 +1,4 @@
-// gqa.c - Grouped-Query Attention (causal, LLaMA-family)
+// gqa.c - Grouped-Query Attention (causal, optional sliding window, LLaMA-family)
 #include "gqa.h"
 
 #include <math.h>
@@ -7,6 +7,7 @@
 GqaCache gqa_cache_create(int n, int n_heads, int n_kv, int head_dim) {
   GqaCache c;
   c.n = n; c.n_heads = n_heads; c.n_kv = n_kv; c.head_dim = head_dim;
+  c.window = 0;                         // full causal attention unless the caller sets one
   c.att = (float*)calloc((size_t)n_heads * n * n, sizeof(float));
   return c;
 }
@@ -25,9 +26,11 @@ void gqa_forward(const Tensor *Q, const Tensor *K, const Tensor *V, GqaCache *c,
     const int qoff = h * hd, koff = kv * hd;
     for (int i = 0; i < n; i++) {
       float *att = &c->att[((size_t)h * n + i) * n];
-      // scores over j = 0..i (causal), softmax
+      const int lo = gqa_window_lo(i, c->window);   // 0 unless a sliding window cuts in
+      // scores over j = lo..i (causal + window), softmax
+      for (int j = 0; j < lo; j++) att[j] = 0.0f;   // outside the window: masked
       float maxs = -INFINITY;
-      for (int j = 0; j <= i; j++) {
+      for (int j = lo; j <= i; j++) {
         float dot = 0.0f;
         for (int d = 0; d < hd; d++) dot += Q->data[i * qd + qoff + d] * K->data[j * kd + koff + d];
         float s = dot * scale;
@@ -35,14 +38,14 @@ void gqa_forward(const Tensor *Q, const Tensor *K, const Tensor *V, GqaCache *c,
         if (s > maxs) maxs = s;
       }
       float sum = 0.0f;
-      for (int j = 0; j <= i; j++) { float e = expf(att[j] - maxs); att[j] = e; sum += e; }
+      for (int j = lo; j <= i; j++) { float e = expf(att[j] - maxs); att[j] = e; sum += e; }
       float inv = 1.0f / sum;
-      for (int j = 0; j <= i; j++) att[j] *= inv;
+      for (int j = lo; j <= i; j++) att[j] *= inv;
       for (int j = i + 1; j < n; j++) att[j] = 0.0f;
       // output O_h[i] = sum_j att[j] * V_kv[j]
       for (int d = 0; d < hd; d++) {
         float o = 0.0f;
-        for (int j = 0; j <= i; j++) o += att[j] * V->data[j * kd + koff + d];
+        for (int j = lo; j <= i; j++) o += att[j] * V->data[j * kd + koff + d];
         O->data[i * qd + qoff + d] = o;
       }
     }
@@ -63,10 +66,11 @@ void gqa_backward(const Tensor *Q, const Tensor *K, const Tensor *V,
     for (int i = 0; i < n; i++) {
       const float *att = &c->att[((size_t)h * n + i) * n];
       const float *dO = &O->grad[i * qd + qoff];
+      const int lo = gqa_window_lo(i, c->window);   // masked keys get no gradient
 
       // dV_kv[j] += att[j] * dO  ;  datt[j] = <dO, V_kv[j]>
       float dot_ad = 0.0f;
-      for (int j = 0; j <= i; j++) {
+      for (int j = lo; j <= i; j++) {
         float dj = 0.0f;
         for (int d = 0; d < hd; d++) {
           dj += dO[d] * V->data[j * kd + koff + d];
@@ -77,7 +81,7 @@ void gqa_backward(const Tensor *Q, const Tensor *K, const Tensor *V,
       }
       // softmax backward: ds[j] = att[j] * (datt[j] - sum_k att[k] datt[k])
       // score s[j] = scale * <Q_i, K_j>  =>  dQ_i += ds*scale*K_j ; dK_j += ds*scale*Q_i
-      for (int j = 0; j <= i; j++) {
+      for (int j = lo; j <= i; j++) {
         float ds = att[j] * (datt[j] - dot_ad);
         float dss = ds * scale;
         for (int d = 0; d < hd; d++) {

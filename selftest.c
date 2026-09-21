@@ -2233,6 +2233,274 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 31: SLIDING-WINDOW attention (gqa.h window, per layer via
+  // llama_model_set_window). Position i attends only to [i-W+1, i]. Gates:
+  //   (a) numerical gradient check of GQA WITH a window that actually cuts in
+  //       (the masked keys must get exactly no gradient, the rest the right one),
+  //   (b) W >= seq_len is full causal attention BIT-EXACTLY — at the GQA level
+  //       and through a whole model — so a "large enough" window is free,
+  //   (c) a token outside the window has ZERO influence: perturbing an
+  //       out-of-window K/V row leaves that output row bit-identical, and in a
+  //       stacked all-windowed model the receptive field is exactly L*(W-1)
+  //       positions back (perturbing token 0 changes positions <= L*(W-1) and
+  //       leaves every later position bit-identical),
+  //   (d) KV-cache decode == full forward, BIT-EXACT, with the window on and a
+  //       global layer mixed in, running long enough that the per-layer ring
+  //       buffer (cap = W slots) wraps several times; plus the int8 decode path,
+  //       the training forward, and a v3 checkpoint round-trip.
+  // --------------------------------------------------------------------------
+  {
+    printf("[31] Sliding-window attention (per-layer window, local/global mix)\n");
+
+    // (a) + (b) + (c, GQA level)
+    {
+      const int n = 6, H = 4, KV = 2, hd = 3, W = 2;
+      int qs[2] = {n, H * hd}, ks[2] = {n, KV * hd};
+      Tensor Q = tensor_create(qs, 2), O = tensor_create(qs, 2), Of = tensor_create(qs, 2);
+      Tensor K = tensor_create(ks, 2), V = tensor_create(ks, 2);
+      GqaCache c = gqa_cache_create(n, H, KV, hd);
+      for (int i = 0; i < n * H * hd; i++) Q.data[i] = ((i * 13 % 100) / 50.0f) - 1.0f;
+      for (int i = 0; i < n * KV * hd; i++) {
+        K.data[i] = ((i * 17 % 100) / 50.0f) - 1.0f;
+        V.data[i] = ((i * 23 % 100) / 50.0f) - 1.0f;
+      }
+      float w[72];
+      for (int i = 0; i < n * H * hd; i++) w[i] = ((i * 31 % 100) / 50.0f) - 1.0f;
+
+      // (a) analytic grads (L = sum(w * O)) vs central differences, window W.
+      c.window = W;
+      gqa_forward(&Q, &K, &V, &c, &O);
+      tensor_zero_grad(&Q); tensor_zero_grad(&K); tensor_zero_grad(&V);
+      for (int i = 0; i < n * H * hd; i++) O.grad[i] = w[i];
+      gqa_backward(&Q, &K, &V, &c, &O);
+      const float h = 1e-3f;
+      float max_cond = 0.0f;
+      Tensor *ps[3] = {&Q, &K, &V};
+      for (int pi = 0; pi < 3; pi++) {
+        Tensor *T = ps[pi];
+        int sz = T->shape[0] * T->shape[1];
+        for (int k = 0; k < sz; k++) {
+          float s = T->data[k];
+          T->data[k] = s + h; gqa_forward(&Q, &K, &V, &c, &O);
+          float lp = 0.0f; for (int i = 0; i < n * H * hd; i++) lp += w[i] * O.data[i];
+          T->data[k] = s - h; gqa_forward(&Q, &K, &V, &c, &O);
+          float lm = 0.0f; for (int i = 0; i < n * H * hd; i++) lm += w[i] * O.data[i];
+          T->data[k] = s;
+          float num = (lp - lm) / (2.0f * h), rel = fabsf(num - T->grad[k]) / (fabsf(T->grad[k]) + 1e-3f);
+          if (fabsf(T->grad[k]) > 1e-2f && rel > max_cond) max_cond = rel;
+        }
+      }
+      // The window must actually change the result (else (a) proves nothing new).
+      gqa_forward(&Q, &K, &V, &c, &O);
+      c.window = 0;
+      gqa_forward(&Q, &K, &V, &c, &Of);
+      float cut = 0.0f;
+      for (int i = 0; i < n * H * hd; i++) { float d = fabsf(O.data[i] - Of.data[i]); if (d > cut) cut = d; }
+      int grad_ok = (max_cond < 1e-2f) && (cut > 1e-4f);
+      printf("    (a) gradient check W=%d, n=%d (Q, K, V): max rel error %.2e | window changes output by %.2e -> %s\n",
+             W, n, max_cond, cut, grad_ok ? "OK" : "FAIL");
+      all_ok &= grad_ok;
+
+      // (b) W >= n must equal full causal attention exactly (W = n and W = n+5).
+      float big = 0.0f;
+      const int bigw[2] = {n, n + 5};
+      for (int t = 0; t < 2; t++) {
+        c.window = bigw[t];
+        gqa_forward(&Q, &K, &V, &c, &O);
+        for (int i = 0; i < n * H * hd; i++) { float d = fabsf(O.data[i] - Of.data[i]); if (d > big) big = d; }
+      }
+      int big_ok = (big == 0.0f);
+      printf("    (b) GQA: W=%d and W=%d vs full causal: max |diff| = %.2e (must be exactly 0) -> %s\n",
+             n, n + 5, big, big_ok ? "OK" : "FAIL");
+      all_ok &= big_ok;
+
+      // (c, GQA level) perturb K/V of position 1: with W=2, rows i >= 3 cannot
+      // see it (bit-identical), rows 1 and 2 can (must change).
+      c.window = W;
+      gqa_forward(&Q, &K, &V, &c, &Of);
+      for (int d = 0; d < KV * hd; d++) { K.data[1 * KV * hd + d] += 0.7f; V.data[1 * KV * hd + d] -= 0.9f; }
+      gqa_forward(&Q, &K, &V, &c, &O);
+      float out_win = 0.0f, in_win = 0.0f;
+      for (int i = 0; i < n; i++)
+        for (int j = 0; j < H * hd; j++) {
+          float d = fabsf(O.data[i * H * hd + j] - Of.data[i * H * hd + j]);
+          if (i >= 1 + W) { if (d > out_win) out_win = d; }
+          else if (i >= 1 && d > in_win) in_win = d;
+        }
+      int iso_ok = (out_win == 0.0f) && (in_win > 1e-4f);
+      printf("    (c) GQA: perturb K/V at pos 1 (W=%d): rows >= %d max|diff| = %.2e (==0), rows 1..%d |diff| = %.2e (>0) -> %s\n",
+             W, 1 + W, out_win, W, in_win, iso_ok ? "OK" : "FAIL");
+      all_ok &= iso_ok;
+      gqa_cache_free(&c);
+      tensor_free(&Q); tensor_free(&K); tensor_free(&V); tensor_free(&O); tensor_free(&Of);
+    }
+
+    const int vocab = 32, dm = 8, nh = 4, nkv = 2, hd = 2, dff = 16;
+
+    // (b, model level) + (c, model level): receptive field of a stacked window.
+    {
+      const int nl = 2, W = 2, seq = 8;
+      srand(31);
+      LlamaModel lm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+      llama_model_randomize(&lm);
+      int ids[8]  = {3, 7, 1, 9, 2, 5, 11, 4};
+      int ids2[8] = {20, 7, 1, 9, 2, 5, 11, 4};   // differs only in token 0
+      int ls[2] = {seq, vocab};
+      Tensor Lfull = tensor_create(ls, 2), L1 = tensor_create(ls, 2), L2 = tensor_create(ls, 2);
+
+      llama_model_forward(&lm, ids, seq, &Lfull);
+      llama_model_set_window(&lm, seq, 2);          // W = seq_len on the local layers
+      llama_model_forward(&lm, ids, seq, &L1);
+      float big = 0.0f;
+      for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L1.data[i] - Lfull.data[i]); if (d > big) big = d; }
+      int big_ok = (big == 0.0f);
+      printf("    (b) model: window = seq_len (%d) vs no window: max |logit diff| = %.2e (must be exactly 0) -> %s\n",
+             seq, big, big_ok ? "OK" : "FAIL");
+      all_ok &= big_ok;
+
+      llama_model_set_window(&lm, W, 0);            // every layer windowed (Mistral-style)
+      llama_model_forward(&lm, ids, seq, &L1);
+      llama_model_forward(&lm, ids2, seq, &L2);
+      const int reach = nl * (W - 1);               // last position token 0 can reach
+      float far = 0.0f, near = 1e30f;
+      for (int i = 0; i < seq; i++) {
+        float mx = 0.0f;
+        for (int j = 0; j < vocab; j++) { float d = fabsf(L1.data[i * vocab + j] - L2.data[i * vocab + j]); if (d > mx) mx = d; }
+        if (i > reach) { if (mx > far) far = mx; }
+        else if (mx < near) near = mx;
+      }
+      int rf_ok = (far == 0.0f) && (near > 1e-6f);
+      printf("    (c) model: %d layers all W=%d, perturb token 0: positions > %d max|diff| = %.2e (==0), positions 0..%d min|diff| = %.2e (>0) -> %s\n",
+             nl, W, reach, far, reach, near, rf_ok ? "OK" : "FAIL");
+      all_ok &= rf_ok;
+
+      // With one GLOBAL layer mixed in, token 0 reaches every position again.
+      llama_model_set_window(&lm, W, 2);            // layer 1 global
+      llama_model_forward(&lm, ids, seq, &L1);
+      llama_model_forward(&lm, ids2, seq, &L2);
+      float last = 0.0f;
+      for (int j = 0; j < vocab; j++) { float d = fabsf(L1.data[(seq - 1) * vocab + j] - L2.data[(seq - 1) * vocab + j]); if (d > last) last = d; }
+      int glob_ok = (last > 1e-6f);
+      printf("        with layer 1 global (--global-every 2): last position |diff| = %.2e (>0) -> %s\n",
+             last, glob_ok ? "OK" : "FAIL");
+      all_ok &= glob_ok;
+      tensor_free(&Lfull); tensor_free(&L1); tensor_free(&L2);
+      llama_model_free(&lm);
+    }
+
+    // (d) decode == forward, bit-exact, ring buffer wrapping; int8 path;
+    // training forward; checkpoint round-trip.
+    {
+      const int nl = 3, W = 3, seq = 11;            // layers 0,1 local (W=3), layer 2 global
+      srand(37);
+      LlamaModel lm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 32, 10000.0f, 1e-5f);
+      llama_model_randomize(&lm);
+      llama_model_set_window(&lm, W, 3);
+      int ids[11] = {3, 7, 1, 9, 2, 5, 11, 4, 30, 17, 6};
+      int fs[2] = {seq, vocab}, ds[2] = {1, vocab};
+      Tensor Lf = tensor_create(fs, 2), Ld = tensor_create(ds, 2), Lt = tensor_create(fs, 2);
+      llama_model_forward(&lm, ids, seq, &Lf);
+
+      LlamaKV kv = llama_kv_create(&lm);
+      float maxd = 0.0f;
+      for (int i = 0; i < seq; i++) {
+        llama_decode_step(&lm, &kv, ids[i], &Ld);
+        for (int j = 0; j < vocab; j++) { float d = fabsf(Ld.data[j] - Lf.data[i * vocab + j]); if (d > maxd) maxd = d; }
+      }
+      int dec_ok = (maxd == 0.0f) && kv.cap[0] == W && kv.cap[1] == W && kv.cap[2] == kv.max_seq;
+      printf("    (d) KV decode (%d positions, ring cap %d/%d/%d slots of max_seq %d) vs full forward: max |logit diff| = %.2e -> %s\n",
+             seq, kv.cap[0], kv.cap[1], kv.cap[2], kv.max_seq, maxd, dec_ok ? "OK" : "FAIL");
+      all_ok &= dec_ok;
+
+      // Reusing the cache for a new sequence (len = 0) must still be exact.
+      kv.len = 0;
+      float again = 0.0f;
+      for (int i = 0; i < seq; i++) {
+        llama_decode_step(&lm, &kv, ids[i], &Ld);
+        for (int j = 0; j < vocab; j++) { float d = fabsf(Ld.data[j] - Lf.data[i * vocab + j]); if (d > again) again = d; }
+      }
+      int again_ok = (again == 0.0f);
+      printf("        cache reused (len reset to 0): max |diff| = %.2e -> %s\n", again, again_ok ? "OK" : "FAIL");
+      all_ok &= again_ok;
+
+      // int8 decode honours the window too. It carries quantization error, so
+      // the gate is relative: it must track the WINDOWED fp32 forward (within
+      // 2% — three layers of int8 at d_model 8 sit near 1%, cf. [21]) and sit
+      // clearly closer to it than to the full-attention forward.
+      Tensor Lnw = tensor_create(fs, 2);
+      llama_model_set_window(&lm, 0, 0);
+      llama_model_forward(&lm, ids, seq, &Lnw);
+      llama_model_set_window(&lm, W, 3);
+      QLlamaModel qm = q_llama_quantize_from(&lm);
+      LlamaKV qkv = q_llama_kv_create(&qm);
+      double num = 0.0, den = 0.0, num_nw = 0.0;
+      for (int i = 0; i < seq; i++) {
+        q_llama_decode_step(&qm, &qkv, ids[i], &Ld);
+        for (int j = 0; j < vocab; j++) {
+          double d = (double)Ld.data[j] - Lf.data[i * vocab + j];
+          double e = (double)Ld.data[j] - Lnw.data[i * vocab + j];
+          num += d * d; num_nw += e * e;
+          den += (double)Lf.data[i * vocab + j] * Lf.data[i * vocab + j];
+        }
+      }
+      double qrel = sqrt(num / (den + 1e-30)), qrel_nw = sqrt(num_nw / (den + 1e-30));
+      int q_ok = (qrel < 2e-2) && (qrel < 0.5 * qrel_nw) && qkv.cap[0] == W;
+      printf("        int8 decode (windowed): L2 rel error %.2e vs windowed fp32 (<2e-2), %.2e vs full-attention fp32 -> %s\n",
+             qrel, qrel_nw, q_ok ? "OK" : "FAIL");
+      all_ok &= q_ok;
+      tensor_free(&Lnw);
+
+      // The training forward must see the same window (else the backward would
+      // differentiate a different function than inference runs).
+      LlamaActs acts = llama_acts_create(&lm, seq);
+      llama_forward_train(&lm, ids, seq, &acts, &Lt);
+      float tr = 0.0f;
+      for (int i = 0; i < seq * vocab; i++) { float d = fabsf(Lt.data[i] - Lf.data[i]); if (d > tr) tr = d; }
+      int tr_ok = (tr == 0.0f);
+      printf("        train forward == inference forward (windowed): max |diff| = %.2e -> %s\n",
+             tr, tr_ok ? "OK" : "FAIL");
+      all_ok &= tr_ok;
+
+      // Checkpoint: a windowed model saves as v3 and round-trips exactly; an
+      // unwindowed one still saves as v2 (readable by pre-window builds).
+      int rt_ok = 0;
+      uint32_t ver_w = 0, ver_0 = 0;
+      if (llama_model_save("swa_ckpt.tmp", &lm) == 0) {
+        FILE *f = fopen("swa_ckpt.tmp", "rb");
+        if (f) { uint32_t hdr[2]; if (fread(hdr, sizeof(uint32_t), 2, f) == 2) ver_w = hdr[1]; fclose(f); }
+        LlamaModel lm2;
+        if (llama_model_load("swa_ckpt.tmp", &lm2) == 0) {
+          Tensor L3 = tensor_create(fs, 2);
+          llama_model_forward(&lm2, ids, seq, &L3);
+          float md = 0.0f;
+          for (int i = 0; i < seq * vocab; i++) { float d = fabsf(L3.data[i] - Lf.data[i]); if (d > md) md = d; }
+          int same_w = 1;
+          for (int l = 0; l < nl; l++) if (lm2.blocks[l].window != lm.blocks[l].window) same_w = 0;
+          rt_ok = (md == 0.0f) && same_w && ver_w == 3;
+          tensor_free(&L3);
+          llama_model_free(&lm2);
+        }
+      }
+      llama_model_set_window(&lm, 0, 0);            // window off -> must write v2
+      if (llama_model_save("swa_ckpt.tmp", &lm) == 0) {
+        FILE *f = fopen("swa_ckpt.tmp", "rb");
+        if (f) { uint32_t hdr[2]; if (fread(hdr, sizeof(uint32_t), 2, f) == 2) ver_0 = hdr[1]; fclose(f); }
+      }
+      remove("swa_ckpt.tmp");
+      rt_ok = rt_ok && ver_0 == 2;
+      printf("        checkpoint: windowed -> v%u, round-trip windows + logits exact; no window -> v%u -> %s\n\n",
+             ver_w, ver_0, rt_ok ? "OK" : "FAIL");
+      all_ok &= rt_ok;
+
+      llama_acts_free(&acts);
+      llama_kv_free(&qkv); q_llama_model_free(&qm);
+      llama_kv_free(&kv);
+      tensor_free(&Lf); tensor_free(&Ld); tensor_free(&Lt);
+      llama_model_free(&lm);
+    }
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

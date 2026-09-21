@@ -14,10 +14,27 @@
 //   Q: (n, n_heads * head_dim)      K, V: (n, n_kv * head_dim)      O: (n, n_heads * head_dim)
 // Causal: position i attends only to j <= i. Scale = 1/sqrt(head_dim).
 // The forward caches the softmax weights so the backward needs no recompute.
+//
+// Sliding window (optional): with window W > 0, position i attends only to the
+// W most recent positions j in [max(0, i-W+1), i] — itself included, so W = 1
+// is "attend to self only". Keys outside the window are masked exactly like
+// future keys (weight 0, no gradient). W <= 0 is ordinary full causal attention
+// and runs the IDENTICAL arithmetic as before the window existed (the loop just
+// starts at j = 0), so it is bit-for-bit unchanged. W >= n is also full causal
+// attention, bit-exactly (the window's left edge never rises above 0).
+// gqa_cache_create sets window = 0; the caller sets c.window before forward.
 typedef struct {
   int n, n_heads, n_kv, head_dim;
-  float *att;   // (n_heads, n, n) row-softmax weights (only j<=i used)
+  int window;   // sliding-window size W (<= 0 = full causal attention)
+  float *att;   // (n_heads, n, n) row-softmax weights (only lo(i)<=j<=i used)
 } GqaCache;
+
+// First key position query i may attend to under window W (0 when W <= 0).
+// Shared by the batched forward/backward here and the KV-cache decode in llama.c
+// so the two can never disagree about the window's edge.
+static inline int gqa_window_lo(int i, int window) {
+  return (window > 0 && i - window + 1 > 0) ? i - window + 1 : 0;
+}
 
 GqaCache gqa_cache_create(int n, int n_heads, int n_kv, int head_dim);
 void gqa_cache_free(GqaCache *c);

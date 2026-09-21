@@ -467,6 +467,49 @@ download, 3.0 s once cached). `model/qwen/*.bin` git-ignored.
 Perf follow-ups: explicit AVX2/NEON intrinsics + a wider (block) qmatmul for prefill; thread qmatmul.
 Block/model forward-only (add backward to fine-tune).
 
+## Modern architecture — step 15: sliding-window attention (per layer) — DONE (2026-09-21)
+
+Mistral, Gemma 2/3, gpt-oss and most hybrid designs restrict some or all layers to a **sliding
+window**: position i attends only to j in `[max(0, i-W+1), i]` (W positions, itself included).
+- `gqa.h/.c`: `GqaCache.window` (0 from `gqa_cache_create`, the caller sets it) + a shared
+  `gqa_window_lo(i, W)`. Forward and backward just start the j-loop at `lo` instead of 0 (masked keys:
+  weight 0, no gradient). **W <= 0 runs the identical arithmetic as before** — whole smoke-test output
+  diffed byte-identical against the pre-change build. W >= n is also exactly full attention.
+- **Representation: one int per layer** (`LlamaBlock.window`, `QLlamaBlock.window`; <= 0 = global),
+  because the real patterns disagree (Mistral: all windowed; Gemma 2 / gpt-oss: alternate; Gemma 3:
+  5 local : 1 global; Qwen2: upper layers only). `llama_model_set_window(m, W, N)` builds the common
+  "every Nth layer global" pattern (layer l global iff `(l+1) % N == 0`; N = 0 -> all windowed);
+  anything else is set per block directly. `llama_model_copy_window` keeps it across the trainable
+  rebuilds in `train.c` (both resume paths) and `grpo.c`.
+- **KV cache = per-layer ring buffer.** `LlamaKV.cap[l] = min(W, max_seq)` slots for a windowed layer
+  (position p in slot `p % cap`), `max_seq` for a global one; `len` stays the absolute position, so
+  every caller that resets `kv.len = 0` works unchanged. The single-token attention is now one shared
+  `decode_attention()` (fp32 + int8 paths, LoRA decode inherits it), visiting positions in ascending
+  order lo..pos exactly like `gqa_forward` -> **still bit-exact** after the ring wraps.
+- **Checkpoint LLMA/LLMQ v3** = v2 + `n_layers` int32 windows right after the float config. Written
+  ONLY when some layer has a window; otherwise v2, byte-identical to before (so older builds keep
+  reading it). Loaders accept v2 (all windows 0) and v3; negative/absurd windows rejected.
+  `convert_llama.py` writes v3 from `layer_types` / `sliding_window` (Qwen2's `use_sliding_window`
+  and `max_window_layers` honoured); `--tiny --window W --global-every N` for a no-download test.
+  Verified: the old converter's `--tiny` v2 file loads and generates identically in old and new
+  builds; a windowed v3 LLMA and a windowed int8 LLMQ both load and generate.
+- CLI: `llama-train --window W --global-every N` (fresh models; `--resume` keeps the checkpoint's).
+
+Verified — new smoke-test **part `[31]`**: (a) GQA gradient check with W=2 over Q/K/V, max rel
+**4.19e-03**; (b) W = n and W = n+5 vs full: **0.00e+00**, and through a whole model: **0.00e+00**;
+(c) perturbing an out-of-window K/V row leaves those output rows **exactly** unchanged, and in a
+2-layer all-windowed W=2 model perturbing token 0 changes positions 0..2 only (receptive field
+L·(W-1) = 2) with later positions **0.00e+00**; one global layer restores full reach; (d) KV decode
+vs full forward, 3 layers (local, local, global), W=3, 11 positions so the 3-slot rings wrap:
+**0.00e+00**, also after reusing the cache; int8 windowed decode 1.04e-02 vs windowed fp32 (1.25 vs
+full-attention fp32); training forward == inference forward **0.00e+00**; v3 round-trip exact, no
+window -> v2. A deliberate off-by-one in the decode window fails (d). `-Wall` clean.
+
+Caveats: the batched forward/backward still allocate the full `n x n` attention buffer and skip the
+masked work only by loop bounds (compute is O(n·W) but memory is not); converter support covers
+LLaMA-shaped models only (Mistral yes; Gemma/gpt-oss need other architecture pieces first);
+LLMA v3 files are not readable by pre-window builds.
+
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
 `imggen`/`audgen` now have a **dataset mode** in addition to the original single-example

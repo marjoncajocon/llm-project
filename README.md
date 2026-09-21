@@ -61,9 +61,9 @@ defined in the matching `.c`.
 | `rmsnorm.h` / `rmsnorm.c`         | `rmsnorm` (LLaMA-family; RMS-only norm, no mean/bias) + backward |
 | `rope.h` / `rope.c`               | `rope` (LLaMA-family rotary position embeddings) + backward     |
 | `swiglu.h` / `swiglu.c`           | `swiglu` (LLaMA-family gated FFN: SiLU gate) + backward         |
-| `gqa.h` / `gqa.c`                 | `gqa` (LLaMA-family grouped-query causal attention) + backward |
+| `gqa.h` / `gqa.c`                 | `gqa` (LLaMA-family grouped-query causal attention, optional sliding window) + backward |
 | `quant.h` / `quant.c`             | int8 per-channel weight quantize/dequantize (for the LLMQ checkpoint) |
-| `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode |
+| `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode (per-layer sliding window, ring-buffer cache) |
 | `llamatrain.h` / `llamatrain.c`   | **Training** the LLaMA-family model: cached-activation forward + full backward |
 | `lora.h` / `lora.c`               | LoRA low-rank adapters (`y += scale·(x·A)·B`) for fine-tuning a frozen base |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
@@ -417,9 +417,20 @@ more data + a bigger model.
 
 Identical flags to `train`, but trains the LLaMA-family architecture (RMSNorm + RoPE + GQA +
 SwiGLU, via `llamatrain.c`) and writes an **LLMA** checkpoint that `transformer llama` generates
-from. Two extra flags: `--kv-heads N` (GQA key/value heads; default = `--heads`, i.e. plain
+from. Extra flags: `--kv-heads N` (GQA key/value heads; default = `--heads`, i.e. plain
 multi-head) and `--rope-base F` (default 10000). `head_dim` is `d_model / heads` and must be even,
 since RoPE rotates feature pairs.
+
+**Sliding-window attention** (Mistral, Gemma 2/3, gpt-oss): `--window W` makes each position attend
+only to its `W` most recent positions (itself included); `--global-every N` keeps every Nth layer
+full/global (`2` = alternate local/global like Gemma 2 and gpt-oss, `6` = 5 local : 1 global like
+Gemma 3, `0` = every layer windowed like Mistral). The window is stored per layer in the checkpoint
+(LLMA **v3**; a model without a window is still written as v2, byte-identical to before, and old v2
+checkpoints load unchanged). Windowed layers get a `W`-slot ring-buffer KV cache during decode, so
+their memory no longer grows with context. Applies to fresh models; `--resume` keeps the window the
+checkpoint was saved with. `tools/convert_llama.py` reads `sliding_window` / `layer_types` from an HF
+config. Smoke-test part `[31]` gates it (gradient check, `W >= seq` == full attention exactly,
+out-of-window tokens have zero influence, decode == forward bit-exact with the ring wrapping).
 
 ```sh
 # Train a small modern model with GQA (4 query heads sharing 2 KV heads):

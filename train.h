@@ -33,6 +33,10 @@ typedef struct {
   float lora_alpha;        // LoRA scaling (scale = alpha / r); 0 => use r (scale 1)
   const char *hf_tok;      // .hf/.tok vocab of a REAL model (hftok.h): fine-tune with
                            // the model's OWN tokenizer instead of training a byte BPE
+  int window;              // sliding-window attention size (0 => full causal attention)
+  int global_every;        // with window: every Nth layer stays global (0 => none);
+                           // see llama_model_set_window. FRESH models only — a
+                           // resumed checkpoint keeps the window it was saved with.
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).
