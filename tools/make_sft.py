@@ -18,6 +18,10 @@ import argparse
 import os
 import random
 import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from risk_filter import drop_block  # noqa: E402
 
 
 def slug(title):
@@ -26,16 +30,18 @@ def slug(title):
 
 
 def commands_from_file(path, limit=500):
-    """Real shell commands, one per line (tools/crawl_stackoverflow.py --commands)."""
-    cmds = []
+    """Real shell commands, one per line (tools/crawl_stackoverflow.py --commands).
+
+    BLOCK-level commands (the agent's run_command classifier, risk.c, via
+    tools/risk_filter.py) are dropped before the limit: the model must not learn
+    rm -rf / git reset --hard / out-of-workspace paths as a routine answer."""
+    cands = []
     if path and os.path.isfile(path):
         for line in open(path, encoding="utf-8"):
             c = line.strip()
             if c and 3 <= len(c) <= 60:
-                cmds.append(c)
-            if len(cmds) >= limit:
-                break
-    return cmds
+                cands.append(c)
+    return drop_block(cands, label="run_command examples (%s)" % path)[:limit] if cands else []
 
 
 def filenames_from_wiki(wiki_dir, limit=400):

@@ -79,7 +79,8 @@ defined in the matching `.c`.
 | `tokenizer.h` / `tokenizer.c`     | Byte-level BPE: encode/decode + merge-learning (train) + save/load |
 | `toolcall.h` / `toolcall.c`       | Parse `<tool …>`/`<done>` blocks from model output (agent)    |
 | `toolexec.h` / `toolexec.c`       | Execute a tool call: write_file / read_file / run_command     |
-| `approval.h` / `approval.c`       | Approval gate for tool actions (ask y/N, or auto)             |
+| `risk.h` / `risk.c`               | run_command risk classifier: SAFE / REVIEW / BLOCK (sh + cmd + PowerShell parsing) |
+| `approval.h` / `approval.c`       | Approval gate for tool actions (ask y/N, typed `yes` for BLOCK, or auto) |
 | `agent.h` / `agent.c`             | Agent loop: parse → approve → execute → observe               |
 | `image.h` / `image.c`             | Minimal image loading (binary PPM) — Phase E (multimodal)     |
 | `patch.h` / `patch.c`             | ViT-style patch embedding + backward (trainable image front-end) |
@@ -763,6 +764,23 @@ transformer agent --workspace scratch/ --timeout 30   # tool root + run_command 
   `OBSERVATION: [[obs:NONCE]]` ... `[[/obs:NONCE]]` with a per-run random nonce, and role-marker
   lines (`MODEL:`, `GOAL:`, `USER:` ...) inside it are prefixed with `> `. A transcript overflow
   stops the run with an error rather than truncating it.
+- Command risk (`risk.h`): every `run_command` is classified **SAFE / REVIEW / BLOCK** from the
+  command text alone (never the model's explanation of it) and the prompt shows the level and
+  reason. SAFE = read-only (`ls`, `dir`, `cat`, `grep`, `git status/log/diff`, `echo` without
+  redirection ...); REVIEW = writes, moves, installs, network, interpreters, and any command it
+  does not recognize; BLOCK = recursive/forced/wildcard deletes (`rm -rf`, `del /s`, `rd /s`,
+  `Remove-Item -Recurse`, `find -delete`, `xargs rm`), `format`/`mkfs`/`dd of=`, `git reset
+  --hard` / `clean -f` / `push --force` / `checkout -- .`, `chmod -R`, download piped into a
+  shell, `shutdown`, `reg delete`, and any absolute, `~` or `..`-escaping path. The string is
+  tokenized under sh, cmd.exe and PowerShell rules and split on `; & && || |` and newlines;
+  wrappers (`sudo`, `env`, `xargs`, `timeout` ...), `$(...)`, `sh -c`, `cmd /c`,
+  `powershell -Command`, `eval` and `iex` are followed recursively; the highest level wins.
+  BLOCK needs the full word `yes` typed; with `--auto` it is refused without asking.
+  **Defence in depth, not a sandbox:** a string classifier can never be complete (a script
+  written now and run later, aliases, interpreters, encodings ...). `transformer risk "<cmd>"`
+  prints the verdict for one command; `--stdin` classifies one command per line (used by
+  `tools/risk_filter.py` to keep BLOCK commands out of the routine training pools). Selftest
+  part [42] checks a 300-command table.
 
 Breaking change (Sep 2026): the default used to be auto-approve with tool paths relative to the
 current directory (the repo root). Pass `--auto` for unattended runs and `--workspace .` only if

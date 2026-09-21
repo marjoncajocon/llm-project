@@ -20,6 +20,7 @@
 #include "grpo.h"
 #include "agent.h"
 #include "toolexec.h"
+#include "risk.h"
 #include "caption.h"
 #include "text2media.h"
 #include "t2i.h"
@@ -177,6 +178,49 @@ static int run_generate(int argc, char **argv) {
 }
 
 // ============================================================================
+// `risk` subcommand: the run_command risk classifier (risk.h) on its own.
+//   transformer risk "<command>"   -> prints "LEVEL<TAB>reason"; exit status
+//                                     0 SAFE, 1 REVIEW, 2 BLOCK
+//   transformer risk --stdin       -> one command per input line; prints one
+//                                     "LEVEL<TAB>reason" line per input line
+//                                     (exit 0). Used by tools/risk_filter.py so
+//                                     the training-data filter and the runtime
+//                                     gate are the SAME code.
+// Classifies strings only; nothing is executed.
+// ============================================================================
+static int run_risk(int argc, char **argv) {
+  char why[256];
+  if (argc == 3 && strcmp(argv[2], "--stdin") == 0) {
+    static char line[65536 + 4];
+    while (fgets(line, sizeof(line), stdin)) {
+      size_t n = strlen(line);
+      int whole = n > 0 && line[n - 1] == '\n';
+      while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+      RiskLevel lv;
+      if (!whole && !feof(stdin)) {                 // over-long line: never analyzed
+        int c;
+        while ((c = getchar()) != EOF && c != '\n') {}
+        lv = RISK_BLOCK;
+        snprintf(why, sizeof(why), "line too long to analyze");
+      } else {
+        lv = risk_classify(line, why, (int)sizeof(why));
+      }
+      for (char *p = why; *p; p++) if (*p == '\t' || *p == '\n' || *p == '\r') *p = ' ';
+      printf("%s\t%s\n", risk_level_name(lv), why);
+    }
+    return 0;
+  }
+  if (argc != 3) {
+    fprintf(stderr, "usage: transformer risk \"<command>\"   (exit 0 SAFE, 1 REVIEW, 2 BLOCK)\n"
+                    "       transformer risk --stdin       (one command per line)\n");
+    return 64;
+  }
+  RiskLevel lv = risk_classify(argv[2], why, (int)sizeof(why));
+  printf("%s\t%s\n", risk_level_name(lv), why);
+  return (int)lv;
+}
+
+// ============================================================================
 // `agent` subcommand: the parse -> approve -> execute -> observe loop with a
 // pluggable model backend.
 //   transformer agent                 -> built-in scripted backend (demo)
@@ -189,7 +233,9 @@ static int run_generate(int argc, char **argv) {
 //   --auto            auto-approve write_file/read_file (default: ask y/N for
 //                     every action). run_command ALWAYS asks, even with --auto,
 //                     and auto-approved writes refuse .git/, tools/ and
-//                     executable/script extensions.
+//                     executable/script extensions. Every run_command is
+//                     risk-classified (risk.h): BLOCK needs a typed "yes",
+//                     and with --auto it is refused without asking.
 //   --ask             accepted for compatibility (it is the default)
 //   --timeout SEC     wall-clock limit per run_command (default 60)
 // ============================================================================
@@ -1424,6 +1470,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
   if (argc > 1 && strcmp(argv[1], "agent") == 0) return run_agent(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "risk") == 0) return run_risk(argc, argv);
   if (argc > 1 && strcmp(argv[1], "train") == 0) return run_train(argc, argv);
   if (argc > 1 && strcmp(argv[1], "imggen") == 0) return run_imggen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "audgen") == 0) return run_audgen(argc, argv);

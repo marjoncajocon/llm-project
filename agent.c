@@ -17,6 +17,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "risk.h"
 #include "toolcall.h"
 #include "toolexec.h"
 
@@ -292,7 +293,13 @@ int agent_run(const char *goal, AgentBackend *backend, const AgentConfig *cfg_in
     // run_command executes arbitrary shell input from the model, so it is NEVER
     // auto-approved: it always requires an explicit interactive y/N, even in
     // APPROVAL_AUTO mode (where a non-interactive stdin denies it by default).
+    // It is also risk-classified (risk.h) from the COMMAND TEXT ONLY -- the
+    // model's surrounding explanation never reaches the classifier or the
+    // prompt, so it cannot argue a command into a lower level. BLOCK needs a
+    // typed "yes", and is refused outright when the run is in --auto mode.
     ApprovalMode step_mode = cfg->mode;
+    RiskLevel risk = RISK_SAFE;
+    char risk_why[256] = "";
     switch (tc.kind) {
       case TOOL_WRITE_FILE:
         snprintf(action, sizeof(action), "write_file '%s' (%zu bytes)", tc.path, strlen(tc.body));
@@ -307,6 +314,7 @@ int agent_run(const char *goal, AgentBackend *backend, const AgentConfig *cfg_in
       case TOOL_RUN_COMMAND:
         snprintf(action, sizeof(action), "run_command: %s", tc.command);
         step_mode = APPROVAL_ASK;
+        risk = risk_classify(tc.command, risk_why, (int)sizeof(risk_why));
         break;
       default:
         snprintf(action, sizeof(action), "unknown");
@@ -315,10 +323,20 @@ int agent_run(const char *goal, AgentBackend *backend, const AgentConfig *cfg_in
     SAY("tool requested: %s\n", action);
 
     int allowed;
-    if (cfg->quiet) allowed = step_mode == APPROVAL_AUTO;   // quiet runs never read stdin
-    else allowed = approval_confirm(step_mode, action);
-    if (!allowed) snprintf(obs, sizeof(obs), "denied by user");
-    else toolexec_run(&tc, &pol, obs, sizeof(obs));
+    if (tc.kind == TOOL_RUN_COMMAND && risk == RISK_BLOCK && cfg->mode == APPROVAL_AUTO) {
+      SAY("  risk: BLOCK -- %s\n  [refused] BLOCK-level commands are never run in --auto mode\n", risk_why);
+      snprintf(obs, sizeof(obs), "refused: command classified BLOCK (%s); not run in --auto mode. "
+               "Use a read-only command to inspect first, or ask the user.", risk_why);
+      allowed = -1;
+    } else if (cfg->quiet) {
+      allowed = step_mode == APPROVAL_AUTO;                  // quiet runs never read stdin
+    } else if (tc.kind == TOOL_RUN_COMMAND) {
+      allowed = approval_confirm_risk(step_mode, action, risk, risk_why);
+    } else {
+      allowed = approval_confirm(step_mode, action);
+    }
+    if (allowed == 0) snprintf(obs, sizeof(obs), "denied by user");
+    else if (allowed > 0) toolexec_run(&tc, &pol, obs, sizeof(obs));
 
     if (agent_format_observation(obs, nonce, block, sizeof(block)) != 0 ||
         tappend(transcript, sizeof(transcript), block) != 0) {
