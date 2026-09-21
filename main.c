@@ -25,6 +25,7 @@
 #include "t2i.h"
 #include "vqvae.h"
 #include "hftok.h"
+#include "gen.h"
 #include "image.h"
 #include "patch.h"
 #include "video.h"
@@ -192,14 +193,19 @@ static int run_generate(int argc, char **argv) {
 //                     executable/script extensions.
 //   --ask             accepted for compatibility (it is the default)
 //   --timeout SEC     wall-clock limit per run_command (default 60)
+//   --no-compact      stop when the transcript is full instead of compacting it
+//                     (clip old observations, then drop the oldest turns)
+// Exit status: 0 normal end, 2 transcript full, 3 the --cmd backend failed.
 // ============================================================================
 static int run_agent(int argc, char **argv) {
   const char *goal = "Create a note file, then read it back to verify.";
   const char *cmd = NULL;
   const char *wsdir = "workspace";
   AgentConfig cfg = agent_default_config();       // APPROVAL_ASK
+  cfg.compact = 1;                                // a full transcript is compacted, not fatal
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--ask") == 0) cfg.mode = APPROVAL_ASK;
+    else if (strcmp(argv[i], "--no-compact") == 0) cfg.compact = 0;
     else if (strcmp(argv[i], "--auto") == 0) cfg.mode = APPROVAL_AUTO;
     else if (strcmp(argv[i], "--cmd") == 0 && i + 1 < argc) cmd = argv[++i];
     else if (strcmp(argv[i], "--goal") == 0 && i + 1 < argc) goal = argv[++i];
@@ -208,7 +214,7 @@ static int run_agent(int argc, char **argv) {
     else {
       fprintf(stderr, "agent: unknown option '%s'\n"
               "usage: transformer agent [--goal \"...\"] [--cmd \"<prog>\"] [--workspace DIR]\n"
-              "                         [--auto] [--timeout SEC]\n", argv[i]);
+              "                         [--auto] [--timeout SEC] [--no-compact]\n", argv[i]);
       return 1;
     }
   }
@@ -899,164 +905,61 @@ static int run_llama(int argc, char **argv) {
 // `hfgen` subcommand: pure-C text chat for HF models (GPT-2 / LLaMA-family) using
 // the engine's own byte-level BPE tokenizer (hftok) — NO Python at runtime.
 // Reads the prompt text from stdin, tokenizes it, generates, and streams each
-// token's decoded text as a JSON delta {"d":"piece"} then {"done":true}.
-//   transformer hfgen <model.bin> <tok.hf> [n_new]
+// token's decoded text as a JSON delta {"d":"piece"} then {"done":true}. The
+// generation core (prompt fitting, stop-at-tag, multi-sample) is gen.c.
+//   transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]
+//                     [--stop-tags] [--samples N]
 // ============================================================================
-static void hf_emit_delta(const char *full, int *prevlen) {
-  int fl = (int)strlen(full);
-  fputs("{\"d\":\"", stdout);
-  for (int i = *prevlen; i < fl; i++) {
-    unsigned char c = (unsigned char)full[i];
-    if (c == '"') fputs("\\\"", stdout);
-    else if (c == '\\') fputs("\\\\", stdout);
-    else if (c == '\n') fputs("\\n", stdout);
-    else if (c == '\r') fputs("\\r", stdout);
-    else if (c == '\t') fputs("\\t", stdout);
-    else if (c < 0x20) printf("\\u%04x", c);
-    else putchar(c);
-  }
-  fputs("\"}\n", stdout);
-  fflush(stdout);
-  *prevlen = fl;
-}
-
-// Truncate the decoded text at an end-of-turn marker or a hallucinated next turn.
-// Catches: literal end tokens (some models emit <|endoftext|>/<|im_end|> as text);
-// and a role label on its own line (User/You/Human/Assistant/AI/System) as a WHOLE
-// WORD — followed by ':', whitespace, or end — so "User"/"You" stop it but
-// "Users"/"Youtube" in real text don't. Cuts at the EARLIEST match.
-static int hf_stop(char *dec) {
-  char *cut = NULL;
-  static const char *ends[] = {"<|endoftext|>", "<|im_end|>", "<|eot_id|>", NULL};
-  for (int i = 0; ends[i]; i++) {
-    char *s = strstr(dec, ends[i]);
-    if (s && (!cut || s < cut)) cut = s;
-  }
-  static const char *labels[] = {"User", "You", "Human", "Assistant", "AI", "System", "Q", NULL};
-  for (char *p = dec; (p = strchr(p, '\n')) != NULL; p++) {
-    char *w = p + 1;
-    for (int i = 0; labels[i]; i++) {
-      int ll = (int)strlen(labels[i]);
-      if (strncmp(w, labels[i], (size_t)ll) == 0) {
-        char a = w[ll];
-        if (a == '\0' || a == ':' || a == ' ' || a == '\t' || a == '\r' || a == '\n') {
-          if (!cut || p < cut) cut = p;
-          break;
-        }
-      }
-    }
-  }
-  if (cut) { *cut = '\0'; return 1; }
-  return 0;
-}
-
-// Generate from an already-tokenized prompt (pids/np), streaming JSON deltas.
-// Stops on the model's real end-of-generation token (hftok_is_eog) — no string
-// heuristic needed once a chat template is used; hf_stop stays as a safety net
-// for base models that emit role labels as plain text.
-static int hf_generate(HFTok *tok, const char *mpath, int *pids, int np, int n_new,
-                       float temp, unsigned long long seed) {
-  unsigned int magic = 0;
-  FILE *pf = fopen(mpath, "rb");
-  if (!pf) { fprintf(stderr, "cannot open '%s'\n", mpath); return 1; }
-  if (fread(&magic, 4, 1, pf) != 1) magic = 0;
-  fclose(pf);
-
-  const float top_p = 0.95f;
-  const int top_k = 40;
-  Rng rng = rng_create(seed);
-  char *dec = (char*)malloc(1 << 20);
-  int prevlen = 0;
-  int *gen = (int*)malloc((size_t)(np + n_new) * sizeof(int));
-  int gn = 0;
-
-  if (magic == 0x43545047u) {                 // 'GPTC' — GPT-2 family
-    GPT m;
-    if (gpt_load(mpath, &m) != 0) { goto done; }
-    int lz[2] = {1, m.vocab_size};
-    Tensor logits = tensor_create(lz, 2);
-    KVCache kv = gpt_kvcache_create(&m);
-    for (int i = 0; i < np; i++) { gen[gn++] = pids[i]; gpt_decode_step(&m, &kv, pids[i], &logits); }
-    for (int s = 0; s < n_new && kv.len < m.max_seq_len; s++) {
-      int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
-      if (hftok_is_eog(tok, nx)) break;
-      gen[gn++] = nx;
-      gpt_decode_step(&m, &kv, nx, &logits);
-      hftok_decode(tok, gen + np, gn - np, dec, 1 << 20);
-      int stop = hf_stop(dec);
-      hf_emit_delta(dec, &prevlen);
-      if (stop) break;
-    }
-    tensor_free(&logits); gpt_kvcache_free(&kv); gpt_free(&m);
-  } else if (magic == 0x514D4C4Cu) {          // 'LLMQ' — int8 llama
-    QLlamaModel m;
-    if (q_llama_model_load(mpath, &m) != 0) { goto done; }
-    int lz[2] = {1, m.vocab};
-    Tensor logits = tensor_create(lz, 2);
-    LlamaKV kv = q_llama_kv_create(&m);
-    for (int i = 0; i < np && i < m.max_seq; i++) { gen[gn++] = pids[i]; q_llama_decode_step(&m, &kv, pids[i], &logits); }
-    for (int s = 0; s < n_new && kv.len < m.max_seq; s++) {
-      int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
-      if (hftok_is_eog(tok, nx)) break;
-      gen[gn++] = nx;
-      q_llama_decode_step(&m, &kv, nx, &logits);
-      hftok_decode(tok, gen + np, gn - np, dec, 1 << 20);
-      int stop = hf_stop(dec);
-      hf_emit_delta(dec, &prevlen);
-      if (stop) break;
-    }
-    tensor_free(&logits); llama_kv_free(&kv); q_llama_model_free(&m);
-  } else if (magic == 0x414D4C4Cu) {          // 'LLMA' — f32 llama
-    LlamaModel m;
-    if (llama_model_load(mpath, &m) != 0) { goto done; }
-    int lz[2] = {1, m.vocab};
-    Tensor logits = tensor_create(lz, 2);
-    LlamaKV kv = llama_kv_create(&m);
-    for (int i = 0; i < np && i < m.max_seq; i++) { gen[gn++] = pids[i]; llama_decode_step(&m, &kv, pids[i], &logits); }
-    for (int s = 0; s < n_new && kv.len < m.max_seq; s++) {
-      int nx = sample_token(&logits, 0, temp, top_k, top_p, &rng);
-      if (hftok_is_eog(tok, nx)) break;
-      gen[gn++] = nx;
-      llama_decode_step(&m, &kv, nx, &logits);
-      hftok_decode(tok, gen + np, gn - np, dec, 1 << 20);
-      int stop = hf_stop(dec);
-      hf_emit_delta(dec, &prevlen);
-      if (stop) break;
-    }
-    tensor_free(&logits); llama_kv_free(&kv); llama_model_free(&m);
-  } else {
-    fprintf(stderr, "error: '%s' is not a GPTC/LLMA/LLMQ checkpoint\n", mpath);
-  }
-
-done:
-  printf("{\"done\":true}\n");
-  fflush(stdout);
-  free(dec); free(gen);
-  return 0;
-}
-
 static int run_hfgen(int argc, char **argv) {
-  if (argc < 4) {
-    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]\n"
+  // Flags may appear anywhere after <tok.hf>; the rest stay positional.
+  const char *pos[8];
+  int npos = 0, stop_tags = 0, n_samples = 1, bad = 0;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--stop-tags") == 0) stop_tags = 1;
+    else if (strcmp(argv[i], "--samples") == 0 && i + 1 < argc) n_samples = atoi(argv[++i]);
+    else if (strncmp(argv[i], "--", 2) == 0) bad = 1;
+    else if (npos < 8) pos[npos++] = argv[i];
+  }
+  if (npos < 2 || bad || n_samples < 1 || n_samples > 64) {
+    fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]"
+                    " [--stop-tags] [--samples N]\n"
                     "  temp defaults to 0.8; use a low value (e.g. 0.1) for an\n"
                     "  instruction-tuned model that should answer deterministically.\n"
-                    "  seed defaults to 1234; vary it for different samples at temp>0.\n");
+                    "  seed defaults to 1234; vary it for different samples at temp>0.\n"
+                    "  --stop-tags  stop once the first action block is closed by </tool>\n"
+                    "               or </done> (the agent executes only that block).\n"
+                    "  --samples N  N samples (1..64) from ONE model load and ONE prompt\n"
+                    "               prefill, sample i seeded seed+i; each framed by\n"
+                    "               {\"sample\":i,\"seed\":S} ... {\"end\":i}.\n"
+                    "  A prompt longer than the context keeps its most recent tokens (with a\n"
+                    "  warning on stderr); if nothing can be generated it prints\n"
+                    "  {\"error\":...} and exits nonzero.\n");
     return 2;
   }
-  int n_new = (argc > 4) ? atoi(argv[4]) : 128;
-  float temp = (argc > 5) ? (float)atof(argv[5]) : 0.8f;
-  unsigned long long seed = (argc > 6) ? strtoull(argv[6], NULL, 10) : 1234ull;
+  HFGenOpts o = hfgen_default_opts();
+  o.n_new = (npos > 2) ? atoi(pos[2]) : 128;
+  o.temp = (npos > 3) ? (float)atof(pos[3]) : 0.8f;
+  o.seed = (npos > 4) ? strtoull(pos[4], NULL, 10) : 1234ull;
+  o.stop_tags = stop_tags;
+  o.n_samples = n_samples;
   HFTok tok;
-  if (hftok_load(&tok, argv[3]) != 0) return 1;
+  if (hftok_load(&tok, pos[1]) != 0) return 1;
 
-  // read the whole prompt from stdin and tokenize it (special-token aware).
-  static char prompt[1 << 16];
-  int plen = (int)fread(prompt, 1, sizeof(prompt) - 1, stdin);
+  // Read the WHOLE prompt from stdin (no size cap: an over-long prompt is cut
+  // from the FRONT after tokenizing, keeping its newest text) and tokenize it
+  // (special-token aware).
+  size_t pcap = 1 << 16, plen = 0, r;
+  char *prompt = (char*)malloc(pcap);
+  while ((r = fread(prompt + plen, 1, pcap - 1 - plen, stdin)) > 0) {
+    plen += r;
+    if (plen == pcap - 1) { pcap *= 2; prompt = (char*)realloc(prompt, pcap); }
+  }
   prompt[plen] = '\0';
-  int cap = plen + 16;
+  int cap = (int)plen + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, prompt, pids, cap);
-  int rc = hf_generate(&tok, argv[2], pids, np, n_new, temp, seed);
+  free(prompt);
+  int rc = hfgen_file(&tok, pos[0], pids, np, &o);
   free(pids); hftok_free(&tok);
   return rc;
 }
@@ -1098,7 +1001,9 @@ static int run_hfchat(int argc, char **argv) {
   int cap = (int)strlen(rendered) + 16;
   int *pids = (int*)malloc((size_t)cap * sizeof(int));
   int np = hftok_encode(&tok, rendered, pids, cap);
-  int rc = hf_generate(&tok, argv[2], pids, np, n_new, 0.8f, 1234ull);
+  HFGenOpts o = hfgen_default_opts();
+  o.n_new = n_new;
+  int rc = hfgen_file(&tok, argv[2], pids, np, &o);
   free(pids); hftok_free(&tok);
   return rc;
 }

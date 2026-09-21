@@ -41,6 +41,8 @@
 #include "train.h"
 #include "agent.h"
 #include "toolexec.h"
+#include "gen.h"
+#include "hftok.h"
 
 // Scalar loss L = sum(w * rmsnorm(x, gamma)) — used by the [13] gradient check.
 static float rms_scalar_loss(const Tensor *x, const Tensor *gm, Tensor *y,
@@ -677,6 +679,251 @@ static int selftest_agent_safety(void) {
   st36_rmdir(sub_tools);
   st36_rmdir(sub_git);
   st36_rmdir(ws);
+  return ok_all;
+}
+
+// ---- generation / transcript-budget helpers for part [40] ----------------
+// A v1 .tok vocab of 24 pieces: letters, a space, and fragments of the agent's
+// closing tags (including a split "</" + "tool>" and a piece that runs PAST a
+// tag), so a random model's samples contain tags at data-dependent points.
+static const char *const ST40_PIECES[24] = {
+  "a", "b", "c", "d", "e", "f", "g", "h", " ", "x", "y", "z",
+  "</", "tool>", "done>", "<", "</tool>", "</done>", "ok", "</tool>zz",
+  "m", "n", "o", "p"
+};
+
+static int st40_write_tok(const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return 1;
+  uint32_t ver = 1, n = 24;
+  int32_t eos = -1;                          // no end-of-generation token
+  fwrite("HFTK", 1, 4, f); fwrite(&ver, 4, 1, f); fwrite(&n, 4, 1, f); fwrite(&eos, 4, 1, f);
+  for (int i = 0; i < 24; i++) {
+    uint16_t len = (uint16_t)strlen(ST40_PIECES[i]);
+    fwrite(&len, 2, 1, f); fwrite(ST40_PIECES[i], 1, len, f);
+  }
+  return fclose(f) != 0;
+}
+
+// Length of the shortest prefix of ids whose text holds a complete action block
+// by the hfgen_cut_at_tag rule -- where stop_tags must end the sample (0: never).
+static int st40_first_tag(const HFTok *tok, const int *ids, int n) {
+  char buf[512];
+  for (int k = 1; k <= n; k++) {
+    hftok_decode(tok, ids, k, buf, sizeof(buf));
+    if (hfgen_cut_at_tag(buf)) return k;
+  }
+  return 0;
+}
+
+// A transcript like agent.c builds: GOAL, then turns of MODEL + framed observation.
+static void st40_transcript(char *t, int cap, int turns, int obs_len) {
+  const char *nonce = "0123456789abcdef";
+  snprintf(t, (size_t)cap, "GOAL: summarize the logs\n");
+  char *obs = (char*)malloc((size_t)obs_len + 1);
+  char *blk = (char*)malloc((size_t)obs_len + 256);
+  for (int k = 0; k < turns; k++) {
+    size_t l = strlen(t);
+    snprintf(t + l, (size_t)cap - l, "MODEL: <tool name=\"read_file\" path=\"log%d.txt\"></tool>\n", k);
+    for (int i = 0; i < obs_len; i++) obs[i] = (char)('A' + (i + k) % 26);
+    obs[0] = (char)('0' + k);                // mark which observation this is
+    obs[obs_len - 1] = '$';
+    obs[obs_len] = '\0';
+    agent_format_observation(obs, nonce, blk, obs_len + 256);
+    l = strlen(t);
+    snprintf(t + l, (size_t)cap - l, "%s", blk);
+  }
+  free(obs); free(blk);
+}
+
+static int st40_count(const char *s, const char *w) {
+  int c = 0;
+  for (const char *p = s; (p = strstr(p, w)) != NULL; p++) c++;
+  return c;
+}
+
+static int st40_run(void) {
+  int ok_all = 1;
+  printf("[40] Agent generation path: tail-keeping prompt fit, stop-at-tag, N samples from one"
+         " prefill, transcript budget\n");
+  const int vocab = 24, dm = 16, nl = 3, nh = 4, nkv = 2, hd = 4, dff = 32, msq = 48, W = 5;
+  srand(40);
+  LlamaModel m = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, msq, 10000.0f, 1e-5f);
+  llama_model_randomize(&m);
+  llama_model_set_window(&m, W, 2);          // windowed rings wrap inside the prompt
+
+  // (a) prompt fit: 60 tokens into a 48-token context with 10 new -> keep the LAST 38.
+  int first = -1;
+  const int keep = hfgen_fit_prompt(60, msq, 10, &first);
+  int f2 = -1, f3 = -1, f4 = -1;
+  const int fit_ok = keep == 38 && first == 22 &&
+                     hfgen_fit_prompt(20, msq, 10, &f2) == 20 && f2 == 0 &&   // fits: untouched
+                     hfgen_fit_prompt(40, msq, 100, &f3) == 24 && f3 == 16 &&  // reserve <= ctx/2
+                     hfgen_fit_prompt(0, msq, 10, &f4) == 0;                    // nothing to do
+  int lp[60], tail[38], alt[60];
+  for (int i = 0; i < 60; i++) lp[i] = (i * 7 + 3) % vocab;
+  memcpy(tail, lp + 22, sizeof(tail));
+  memcpy(alt, lp, sizeof(alt));
+  for (int i = 0; i < 22; i++) alt[i] = (alt[i] + 5) % vocab;   // change ONLY dropped tokens
+  HFGenOpts o = hfgen_default_opts();
+  o.emit = 0; o.n_new = 10; o.temp = 1.0f; o.top_k = 0; o.top_p = 1.0f; o.seed = 77;
+  int ids_long[10], ids_tail[10], ids_alt[10], n_long = 0, n_tail = 0, n_alt = 0;
+  o.out_ids = ids_long; o.out_len = &n_long;
+  const int rc_long = hfgen_llama(&m, NULL, lp, 60, &o);
+  o.out_ids = ids_tail; o.out_len = &n_tail;
+  hfgen_llama(&m, NULL, tail, 38, &o);
+  o.out_ids = ids_alt; o.out_len = &n_alt;
+  hfgen_llama(&m, NULL, alt, 60, &o);
+  const int same_tail = n_long == n_tail && memcmp(ids_long, ids_tail, sizeof(ids_long)) == 0;
+  const int same_alt = n_long == n_alt && memcmp(ids_long, ids_alt, sizeof(ids_long)) == 0;
+  o.out_ids = NULL; o.out_len = NULL;
+  fprintf(stderr, "(selftest [40]: the next line is an expected error)\n");
+  const int rc_empty = hfgen_llama(&m, NULL, lp, 0, &o);
+  const int tail_ok = fit_ok && rc_long == 0 && n_long == 10 && same_tail && same_alt && rc_empty != 0;
+  printf("    fit 60 prompt tokens into ctx %d with 10 new: keep the last %d (drop the oldest %d) |"
+         " 20 tokens untouched | reserve capped at ctx/2 | empty prompt -> error (rc %d)\n",
+         msq, keep, first, rc_empty);
+  printf("    over-long prompt: %d new tokens (the old first-max_seq prefill left room for 0) =="
+         " tail-only prompt %s, == prompt with different DROPPED tokens %s -> %s\n", n_long,
+         same_tail ? "yes" : "NO", same_alt ? "yes" : "NO", tail_ok ? "OK" : "FAIL");
+  ok_all &= tail_ok;
+
+  // (b) stop-at-tag, on the string helper and on real sampling with a tokenizer.
+  char s1[] = "<think>x</think><tool name=\"read_file\" path=\"a\"></tool> junk <done>n</done>";
+  char s2[] = "<done>ok</done><tool name=\"x\"></tool>";
+  char s3[] = "no tag </tool";
+  char s4[] = "<tool name=\"write_file\" path=\"a\">see </done> here</tool>tail";
+  char s5[] = "<tool name=\"read_file\" path=\"a\"> no close yet </done>";
+  char s6[] = "junk </done> more </tool>";
+  const int c1 = hfgen_cut_at_tag(s1), c2 = hfgen_cut_at_tag(s2), c3 = hfgen_cut_at_tag(s3);
+  const int c4 = hfgen_cut_at_tag(s4), c5 = hfgen_cut_at_tag(s5), c6 = hfgen_cut_at_tag(s6);
+  const int cut_ok = c1 && strcmp(s1, "<think>x</think><tool name=\"read_file\" path=\"a\"></tool>") == 0 &&
+                     c2 && strcmp(s2, "<done>ok</done>") == 0 && !c3 && strcmp(s3, "no tag </tool") == 0 &&
+                     c4 && strcmp(s4, "<tool name=\"write_file\" path=\"a\">see </done> here</tool>") == 0 &&
+                     !c5 && c6 && strcmp(s6, "junk </done>") == 0;
+  const char *tokpath = "st40_vocab.tok.tmp";
+  HFTok tok;
+  const int tok_ok = st40_write_tok(tokpath) == 0 && hftok_load(&tok, tokpath) == 0;
+  remove(tokpath);
+  int stop_ok = 0, n_free = 0, n_stop = 0, at = 0, tagged = 0, all_exact = 1;
+  enum { R = 40 };
+  int pr[6] = {15, 13, 0, 18, 8, 2};
+  if (tok_ok) {
+    int ids_free[R], ids_stop[R];
+    o.n_new = R; o.seed = 4040;
+    o.stop_tags = 0; o.out_ids = ids_free; o.out_len = &n_free;
+    hfgen_llama(&m, &tok, pr, 6, &o);
+    o.stop_tags = 1; o.out_ids = ids_stop; o.out_len = &n_stop;
+    hfgen_llama(&m, &tok, pr, 6, &o);
+    at = st40_first_tag(&tok, ids_free, n_free);
+    // Over more seeds: whenever an unstopped sample contains a tag, the stopped
+    // one must end exactly on the token completing its FIRST tag (same prefix);
+    // without a tag both must be identical.
+    for (int sd = 0; sd < 16; sd++) {
+      int a[R], b[R], na = 0, nb = 0;
+      o.seed = 100 + (unsigned long long)sd;
+      o.stop_tags = 0; o.out_ids = a; o.out_len = &na; hfgen_llama(&m, &tok, pr, 6, &o);
+      o.stop_tags = 1; o.out_ids = b; o.out_len = &nb; hfgen_llama(&m, &tok, pr, 6, &o);
+      const int k = st40_first_tag(&tok, a, na);
+      const int good = k ? (nb == k && memcmp(a, b, (size_t)k * sizeof(int)) == 0)
+                         : (nb == na && memcmp(a, b, (size_t)na * sizeof(int)) == 0);
+      if (k) tagged++;
+      all_exact &= good;
+    }
+    stop_ok = at > 0 && n_free == R && n_stop == at &&
+              memcmp(ids_free, ids_stop, (size_t)at * sizeof(int)) == 0 && tagged > 0 && all_exact;
+  }
+  printf("    cut_at_tag: <tool> block closed by </tool> %s | <done> block by </done> %s | '</done>'"
+         " inside a write_file body kept %s | open block not yet closed %s | nothing opened:"
+         " earliest tag %s | no tag untouched %s\n", c1 ? "yes" : "NO", c2 ? "yes" : "NO",
+         c4 ? "yes" : "NO", !c5 ? "yes" : "NO", c6 ? "yes" : "NO", !c3 ? "yes" : "NO");
+  printf("    sampling with a 24-piece vocab: without stop_tags %d tokens (the first tag completes"
+         " at token %d); with it %d tokens, same prefix | 16 more seeds: %d contain a tag, stops"
+         " exact %s -> %s\n", n_free, at, n_stop, tagged, all_exact ? "yes" : "NO",
+         cut_ok && stop_ok ? "OK" : "FAIL");
+  ok_all &= cut_ok && stop_ok;
+
+  // (c) N samples from ONE prefill == N separate single-sample runs (seed+i), bit
+  //     for bit, with ring-buffer layers wrapping inside the prompt (the prefilled
+  //     cache is forked from a template via llama_kv_copy).
+  enum { NS = 4, RN = 12 };
+  int pr2[20];
+  for (int i = 0; i < 20; i++) pr2[i] = (i * 11 + 5) % vocab;
+  int multi[NS * RN], mlen[NS], single[R], slen = 0, same = 1, distinct = 0;
+  o.stop_tags = 0; o.n_new = RN; o.seed = 9000; o.n_samples = NS;
+  o.out_ids = multi; o.out_len = mlen;
+  hfgen_llama(&m, NULL, pr2, 20, &o);
+  for (int i = 0; i < NS; i++) {
+    HFGenOpts s = o;
+    s.n_samples = 1; s.seed = 9000 + (unsigned long long)i;
+    s.out_ids = single; s.out_len = &slen;
+    hfgen_llama(&m, NULL, pr2, 20, &s);
+    if (slen != mlen[i] || memcmp(single, multi + i * RN, (size_t)slen * sizeof(int)) != 0) same = 0;
+    if (i > 0 && memcmp(multi, multi + i * RN, (size_t)RN * sizeof(int)) != 0) distinct++;
+  }
+  int tmulti[NS * R], tmlen[NS], tsame = tok_ok;   // and with the tokenizer + stop-at-tag
+  if (tok_ok) {
+    o.n_new = R; o.seed = 100; o.stop_tags = 1; o.out_ids = tmulti; o.out_len = tmlen;
+    hfgen_llama(&m, &tok, pr, 6, &o);
+    for (int i = 0; i < NS; i++) {
+      HFGenOpts s = o;
+      s.n_samples = 1; s.seed = 100 + (unsigned long long)i;
+      s.out_ids = single; s.out_len = &slen;
+      hfgen_llama(&m, &tok, pr, 6, &s);
+      if (slen != tmlen[i] || memcmp(single, tmulti + i * R, (size_t)slen * sizeof(int)) != 0) tsame = 0;
+    }
+  }
+  const int ns_ok = same && distinct == NS - 1 && tsame;
+  printf("    %d samples x %d tokens from ONE prefill (%d prompt steps, not %d) == %d separate runs"
+         " seeded seed+i: %s | samples differ: %d/%d | with tokenizer + stop_tags: %s -> %s\n",
+         NS, RN, 20, NS * 20, NS, same ? "bit-exact" : "DIFFER", distinct, NS - 1,
+         tsame ? "bit-exact" : "DIFFER", ns_ok ? "OK" : "FAIL");
+  ok_all &= ns_ok;
+  if (tok_ok) hftok_free(&tok);
+  llama_model_free(&m);
+
+  // (d) transcript budget: GOAL + recent turns kept, old observations clipped
+  //     head+tail around an explicit elision marker, the latest whole, frames intact.
+  const int TC = 16384, need = 2000;
+  char *t = (char*)malloc((size_t)TC);
+  st40_transcript(t, TC, 5, 3000);                 // 5 turns x ~3.1 KB
+  const size_t before = strlen(t);
+  const int crc = agent_compact_transcript(t, TC, need, 1);
+  const size_t after = strlen(t);
+  const char *lastturn = strstr(t, "path=\"log4.txt\"");
+  const int clip_ok = crc == 0 && after + need + 1 <= (size_t)TC &&
+      strncmp(t, "GOAL: summarize the logs\n", 25) == 0 &&
+      st40_count(t, "MODEL: ") == 5 &&                          // clipping alone was enough
+      st40_count(t, " bytes elided]") == 4 &&                   // 4 old ones clipped...
+      lastturn && strstr(lastturn, " bytes elided]") == NULL && // ...the latest is whole
+      st40_count(t, "OBSERVATION: [[obs:0123456789abcdef]]\n") == 5 &&
+      st40_count(t, "\n[[/obs:0123456789abcdef]]\n") == 5 &&
+      strstr(t, "]]\n0BCD") != NULL && strstr(t, "$\n[[/obs:") != NULL;   // head and tail kept
+  // keep_last_obs = 0 (the block being added IS the newest observation): all 5 clip.
+  st40_transcript(t, TC, 5, 3000);
+  agent_compact_transcript(t, TC, need, 0);
+  const int all_clipped = st40_count(t, " bytes elided]") == 5;
+  // Far too big for clipping alone: the oldest turns go, GOAL + latest turn stay.
+  st40_transcript(t, TC, 5, 3000);
+  const int drc = agent_compact_transcript(t, TC, 12000, 1);
+  const int turns_left = st40_count(t, "MODEL: ");
+  const int drop_ok = drc == 0 && strncmp(t, "GOAL: summarize the logs\n", 25) == 0 &&
+      strstr(t, "path=\"log4.txt\"") != NULL && strstr(t, "path=\"log0.txt\"") == NULL &&
+      turns_left >= 1 && turns_left < 5 &&
+      st40_count(t, "[[obs:0123456789abcdef]]") == turns_left &&
+      st40_count(t, "[[/obs:0123456789abcdef]]") == turns_left;
+  // Impossible: even GOAL + the latest turn cannot make that much room.
+  st40_transcript(t, TC, 2, 3000);
+  const int irc = agent_compact_transcript(t, TC, 15000, 1);
+  printf("    compact a %zu-byte transcript for +%d bytes -> %zu bytes: GOAL + 5 turns kept, 4 old"
+         " observations clipped head+tail around '[N bytes elided]', latest whole, 5/5 nonce"
+         " frames intact %s\n", before, need, after, clip_ok ? "yes" : "NO");
+  printf("    new observation pending: all 5 old ones clipped %s | +12000 bytes: oldest turns"
+         " dropped, %d left, GOAL + latest kept %s | impossible -> -1 %s -> %s\n\n",
+         all_clipped ? "yes" : "NO", turns_left, drop_ok ? "yes" : "NO", irc == -1 ? "yes" : "NO",
+         clip_ok && all_clipped && drop_ok && irc == -1 ? "OK" : "FAIL");
+  ok_all &= clip_ok && all_clipped && drop_ok && irc == -1;
+  free(t);
   return ok_all;
 }
 
@@ -4071,6 +4318,15 @@ int run_selftest(void) {
     free(lp);
     llama_lora_free(&slo); llama_model_free(&sm);
   }
+
+  // --------------------------------------------------------------------------
+  // [40] The generation path the tool-using agent runs on (gen.c, agent.c): an
+  // over-long prompt keeps its NEWEST tokens, opt-in stop at the first </tool> /
+  // </done>, N samples from ONE prefill equal N separate runs bit for bit, and
+  // the transcript budget (clip old observations head+tail, keep GOAL + latest
+  // turn, nonce frames intact).
+  // --------------------------------------------------------------------------
+  all_ok &= st40_run();
 
   // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
