@@ -3463,6 +3463,15 @@ write_file / run_command exist; `toolcall_parse` already rejects them at runtime
 the right action for such a question becomes `web_search`. Keep this prompt as a regression test.
 (The release wrapper `E:\llm-release\ai.py` now labels invented tools as invalid.)
 
+**1c. User regression prompts** (kept in `E:\llm-release\test_prompts.txt`; run every new model):
+`what year of the animal is 1996?` (→ Year of the Rat, stop cleanly), `what is the color of the sky
+in one word` (→ "Blue"), `open notes.md`, `save hello into greet.txt` (keep `.txt`), `what is a
+compiler`. 2026-09-22: ALL five models (base, dapo, dapo-mlp, A1, A2) fail the sky prompt — loops,
+rambling, or "black … (SI)". Cause: the only prose data is Wikipedia first sentences ("The X is the
+…"), so there is no instruction following ("in one word") or common sense. Fix = short-answer /
+format-constraint instruction data (e.g. a capped slice of smol-smoltalk, see the data research) and
+mainly the Qwen2.5-Coder-0.5B-Instruct base, which is already instruction-tuned.
+
 **2. Web search ("search Google like Claude").** How Claude does it: the model decides to call a
 search tool, the harness runs the query server-side, the results (title/url/snippet) come back as a
 tool result, and the model answers from them with sources. Plan for this engine:
