@@ -3522,6 +3522,28 @@ works (5-step smoke: loss 3.07 → 1.15, peak RSS 4.3 GB). **B1** (Qwen + the sa
 `E:\llm-test\phaseB.sh`, logs `E:\llm-test\logs\phaseB\`. Release CLI `E:\llm-release` now has
 models `sft` (A1) and `qwen`.
 
+### 2026-09-22 — Phase B result: Qwen2.5-Coder-0.5B agent (B1) is the best agent — but forgot some chat skill
+
+**B1** = Qwen2.5-Coder-0.5B-Instruct (converted, `E:\llm-test\model\qwen25c`) + the SAME SFT as A1
+(`sft_mix.txt`, 1270 steps, LoRA r16 a32 + MLP, lr 1e-3→1e-4; 2 h 36 min at 3 threads, peak RSS
+~4.3 GB; loss 3.43 → 0.055 with noisy single-batch spikes that recovered). `E:\llm-test\phaseB.sh`.
+
+| model | in-dist exact | held-out exact |
+|---|---|---|
+| A1 (SmolLM2-135M + SFT) | 59.5% | 66.5% |
+| **B1 (Qwen-0.5B + same SFT)** | **75.0%** (+15.5 vs A1, p=1e-4) | **77.5%** (+11.0, p=.003) |
+
+Write 97% in-dist; run 100% held-out; `save hello into greet.txt` keeps `.txt` (135M drops it).
+A real `/agent` task (create todo.md → read back → done) works end to end. ~12 s per task vs ~4 s.
+**Catastrophic forgetting found (user's regression prompts):** original Qwen answers the sky prompt
+"blue"; B1 answers "usually gray … black" in chat mode, and in the raw agent format writes a file
+`sky_in_one_word`. Compiler answer still fine. The agent data's only prose is Wikipedia first sentences,
+which overwrote "answer briefly" behaviour. **Fix (B2):** mix general instruction data into the SFT —
+preferably self-distillation replay (the ORIGINAL Qwen answers varied instructions: one-word, lists,
+code, how-to; train on those answers alongside the agent rows) or a capped slice of an open
+instruction set (e.g. smol-smoltalk), plus a lower LR; judge on held-out + `test_prompts.txt`.
+Release CLI: `/model qwen-agent` (B1, agent tasks) next to `/model qwen` (original, chat).
+
 ### ▶ PLANNED (user request 2026-09-22): the model knows the CURRENT TIME and can SEARCH THE WEB
 
 Status: NOT STARTED — design agreed, pick up after Phase A (SFT+DAPO on data-v2) / Phase B (Qwen2.5-Coder-0.5B).
