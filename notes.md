@@ -3506,6 +3506,18 @@ rambling, or "black … (SI)". Cause: the only prose data is Wikipedia first sen
 format-constraint instruction data (e.g. a capped slice of smol-smoltalk, see the data research) and
 mainly the Qwen2.5-Coder-0.5B-Instruct base, which is already instruction-tuned.
 
+**1d. Release-CLI false positive on code (user found 2026-09-22).** `/model qwen` +
+`can you create me a print star pattern using c` → cut off with "[stopped: the model started
+repeating itself]". NOT the model: `ai.py`'s loop guard (built for the 135M models) treated C
+indentation (8 spaces = a 2-char chunk ×4) and `||` (C logical OR) as degeneration. Fixed in
+`E:\llm-release\ai.py`: a loop now needs a chunk with a letter/digit repeated ≥6×; the transcript
+separator markers (`||`, ` | MODEL:` …) apply only to the raw-format 135M agent models; chat models
+default to 512 reply tokens (was 160 — also too short for code) and a "[reply hit the N-token
+limit]" hint prints when the cap is reached. Verified offline on a C sample (kept whole) and on the
+135M loop cases (still cut). **TODO after Phase B finishes (needs the RAM):** re-run the star-pattern
+prompt on Qwen live and add it to `test_prompts.txt`. Longer term: move degeneration handling into
+the engine (repetition penalty / n-gram block in `sampler.c`, opt-in) instead of a wrapper heuristic.
+
 **2. Web search ("search Google like Claude").** How Claude does it: the model decides to call a
 search tool, the harness runs the query server-side, the results (title/url/snippet) come back as a
 tool result, and the model answers from them with sources. Plan for this engine:
