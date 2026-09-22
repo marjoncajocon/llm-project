@@ -3557,6 +3557,23 @@ facts (its "blue" for the sky came from chat-mode sampling at T=0.8).
 yes-no from a small key) before building `sft_b2.txt`; the rest keeps the teacher's answers.
 First B2 run was stopped before training on the uncorrected data; B2b = `E:\llm-test\phaseB2b.sh`.
 
+**B2 RESULT — the best model of the project.** B2 = ORIGINAL Qwen + SFT on `sft_b2.txt` (5,082 agent
+rows + 748 replay rows = 187 kept answers × 2 copies × {ChatML row, raw row}; 79 of them answer-keyed)
+with `--sft-escapes`, lr 5e-4 → 5e-5 (B1: 1e-3 → 1e-4), 1457 steps, 2 h 14 min, loss 5.83 → ~0.01–0.05.
+
+| model | in-dist exact | held-out exact |
+|---|---|---|
+| B1 (agent data only, lr 1e-3) | 75.0% | 77.5% |
+| **B2 (agent + corrected replay, lr 5e-4)** | **89.5%** (+14.5 vs B1, 37 fixed / 8 broken, p=2e-5) | **88.0%** (+10.5, p=.0015) |
+
+Delete 33 → 93% (in-dist) / 57 → 95% (held-out); read 62 → 77 / 63 → 89. NOT isolated whether the
+lower LR or the replay rows drive the agent gain (a B2 at lr 1e-3, or B1 at lr 5e-4, would tell).
+Chat (greedy, ChatML): brevity RESTORED — one-word questions get one word and no agent markup leaks
+(B1 answered "banana" with `…</think><done>…</done>`); banana → "Yellow" (was in the replay set);
+sky (held out on purpose) → "White" (original Qwen: "blue") — facts not in the replay set stay
+unreliable, likely a colour bias from the key's several "White" answers. Spot check: `open notes.md`
+→ `write_file` (B1: read_file) — watch this. Release: `E:\llm-release\models\qwen-agent` = B2.
+
 ### ▶ PLANNED (user request 2026-09-22): the model knows the CURRENT TIME and can SEARCH THE WEB
 
 Status: NOT STARTED — design agreed, pick up after Phase A (SFT+DAPO on data-v2) / Phase B (Qwen2.5-Coder-0.5B).
