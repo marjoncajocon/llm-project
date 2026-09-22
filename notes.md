@@ -3453,6 +3453,16 @@ the date because the application puts it in the context. Plan:
       Vary DATE values so the model copies the given date instead of memorizing one.
 - [ ] Eval: held-out time questions with random DATE lines; exact-match on the date string.
 
+**1b. Answer vs act (found by the user 2026-09-22).** Prompt `what year of the animal is 1996` →
+base/dapo emit `run_command date`, dapo-mlp INVENTS a tool `year_of_the_animal` (correct answer: Year
+of the Rat, Fire Rat, from 1996-02-19). The model only ever saw "what is <wiki title>" prose and tool
+calls, so out-of-scope questions turn into actions. Fix: When2Call-style data (arXiv 2504.18851) —
+general-knowledge questions → prose answer or an honest "I don't know" `<done>`; "how do I X" → prose;
+"do X" → tool; plus a penalty/invalid-format for unknown tool names in reward v2 (only read_file /
+write_file / run_command exist; `toolcall_parse` already rejects them at runtime). With web search (2)
+the right action for such a question becomes `web_search`. Keep this prompt as a regression test.
+(The release wrapper `E:\llm-release\ai.py` now labels invented tools as invalid.)
+
 **2. Web search ("search Google like Claude").** How Claude does it: the model decides to call a
 search tool, the harness runs the query server-side, the results (title/url/snippet) come back as a
 tool result, and the model answers from them with sources. Plan for this engine:
