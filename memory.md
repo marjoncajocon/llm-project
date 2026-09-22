@@ -38,6 +38,15 @@ lives in `notes.md` (esp. its "▶ CONTINUATION GUIDE").
 > judged on the held-out set. Use lr 1e-4 (not 1e-5) for LoRA GRPO. **NOTHING PROMOTED**;
 > candidates in `E:\llm-test\model\runs\v3_*.bin`.
 
+> **▶▶ IN PROGRESS / PLANNED (2026-09-22):** Phase A = SFT on `E:\llm-test\data\v2\sft_mix.txt`
+> (5082 pairs, data-v2 + original, decontaminated) then DAPO — queue `E:\llm-test\phaseA.sh`, logs
+> `E:\llm-test\logs\phaseA\`. Phase B = Qwen2.5-Coder-0.5B-Instruct as the new base (download cached
+> in `E:\llm-test\hf`, HF_HOME there). A test release CLI is at `E:\llm-release` (`ai.bat`).
+> **User-requested next features** (design in notes.md "PLANNED … CURRENT TIME … SEARCH THE WEB"):
+> (1) the model knows the current date/time (DATE line injected into every prompt + `get_time` tool +
+> training data); (2) web search like Claude (`web_search`/`fetch_url` tools via a Python helper,
+> REVIEW-level approval, untrusted-observation framing, API key in env) — best done on the Qwen base.
+
 > **▶▶ GRPO RAN AT LAST — and the task file was the problem — ✅ (2026-09-05, `efae068`):**
 > GRPO (`1b17c2e`) was built and verified in September but never run at scale. Run as-is on
 > `data/grpo_tasks.txt` it produced **5 of 5 flat groups at a mean reward of exactly 1.0000** —

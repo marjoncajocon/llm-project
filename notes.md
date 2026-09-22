@@ -3436,6 +3436,41 @@ model/smollm/reason_e2.bin --hf-tok model/smollm/tok.hf --out model/runs/X.bin -
 --hf-tok … --eval-only --temp 0 --dump X.jsonl`; compare `python tools/evalcard.py A.jsonl B.jsonl`.
 Queue scripts: `E:\llm-test\overnight3.sh … overnight9.sh`; logs + dumps: `E:\llm-test\logs\v3\`.
 
+### ▶ PLANNED (user request 2026-09-22): the model knows the CURRENT TIME and can SEARCH THE WEB
+
+Status: NOT STARTED — design agreed, pick up after Phase A (SFT+DAPO on data-v2) / Phase B (Qwen2.5-Coder-0.5B).
+
+**1. Current date/time.** A model's weights have no clock; frontier assistants (Claude included) know
+the date because the application puts it in the context. Plan:
+- [ ] Context injection: `ai.py`, `tools/agent_local.py` and `agent.c` prepend one line
+      `DATE: 2026-09-22 08:20 (Asia/Manila, UTC+8)` (local clock, ISO format) to every prompt /
+      transcript. Keep it the FIRST line so the transcript budget never clips it (like GOAL).
+- [ ] Tool `get_time` (no args) in `toolcall.c`/`toolexec.c` → observation = the same ISO line.
+      Risk level SAFE (read-only) in `risk.c`.
+- [ ] Data (`tools/make_agent_traj.py` family `time`): "what time is it", "what's today's date",
+      "how many days until Friday", "name the log file after today's date" → answer from the DATE
+      line (prose / `<done>`) or use it as an argument (`write_file path="log-2026-09-22.txt"`).
+      Vary DATE values so the model copies the given date instead of memorizing one.
+- [ ] Eval: held-out time questions with random DATE lines; exact-match on the date string.
+
+**2. Web search ("search Google like Claude").** How Claude does it: the model decides to call a
+search tool, the harness runs the query server-side, the results (title/url/snippet) come back as a
+tool result, and the model answers from them with sources. Plan for this engine:
+- [ ] Tools `web_search query="..."` and `fetch_url url="..."`. The C engine has no HTTPS/TLS, so
+      `toolexec.c` calls a helper `tools/web_tool.py` (subprocess, timeout, output cap).
+- [ ] Backend choice (needs a decision + usually an API key): Google Programmable Search JSON API
+      (key + cx; ~100 free queries/day), Brave Search API, or DuckDuckGo HTML (no key; fragile).
+      Store the key in an env var, never in the repo. Cache results on E:\llm-test\webcache.
+- [ ] Safety (agent safety layer already has the pieces): network tools are REVIEW (ask the user),
+      results are UNTRUSTED observations — reuse the nonce framing + role-marker neutralizing (prompt
+      injection from web pages), strip HTML, cap to ~1.5 KB per result, 3–5 results. Never let a
+      fetched page trigger file writes or commands without approval.
+- [ ] Data: when to search vs answer directly (unknown/current facts → search; "open notes.md" → no),
+      trajectories `web_search → answer citing the snippet url`, and "no good result → say so".
+      Reward (GRPO): answer contains a fact present in a returned snippet + cites its url.
+- [ ] Reality check: a 135M model will be weak at reading and summarizing results; this feature is
+      much more useful on the Qwen2.5-Coder-0.5B base (Phase B) or larger. Do it after Phase B.
+
 #-------------------------------#
 #for checking#
 Raw Coding (HumanEval+)
