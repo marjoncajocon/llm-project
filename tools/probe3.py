@@ -13,8 +13,12 @@ import subprocess
 import sys
 
 ENGINE = os.path.abspath("transformer.exe")
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "model/smollm/reason_clean.bin"
-TOK = "model/smollm/tok.hf"
+MODEL = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "model/smollm/reason_clean.bin"
+# --tok F: the model's own vocabulary. It used to be hard-coded to SmolLM2's, which silently
+# decoded garbage for any other base (a Qwen model then crashed the print below).
+TOK = sys.argv[sys.argv.index("--tok") + 1] if "--tok" in sys.argv else "model/smollm/tok.hf"
+if hasattr(sys.stdout, "reconfigure"):          # model text may hold any Unicode (Windows cp1252)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def gen(prompt, nnew=64):

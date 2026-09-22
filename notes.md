@@ -3573,6 +3573,12 @@ Chat (greedy, ChatML): brevity RESTORED — one-word questions get one word and 
 sky (held out on purpose) → "White" (original Qwen: "blue") — facts not in the replay set stay
 unreliable, likely a colour bias from the key's several "White" answers. Spot check: `open notes.md`
 → `write_file` (B1: read_file) — watch this. Release: `E:\llm-release\models\qwen-agent` = B2.
+Independent probes (remeasure): probe3 **8/8**; memtest A **100%**, B **70%** (below the 75% bar —
+6 misses, all `run <gibberish command>` routed to read_file/write_file or prefixed with `rm`);
+critic A 92% (base 96), critic B multi-step **4/4** greedy. → B2 is the best overall, but add
+"run <unknown command>" routing rows before promoting it. Harness bug fixed: `tools/probe3.py`
+hard-coded the SmolLM2 vocabulary (Qwen decoded garbage → cp1252 print crash → "?"); it now takes
+`--tok` (remeasure passes it) and prints UTF-8; base still 8/8 with the fix.
 
 ### ▶ PLANNED (user request 2026-09-22): the model knows the CURRENT TIME and can SEARCH THE WEB
 

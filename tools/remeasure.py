@@ -66,7 +66,7 @@ def main():
   print("re-measuring %s\n  tok=%s train=%s engine=%s" % (model, tok, train, engine))
 
   probe = run("1/3 next-action probe (8 cases)",
-              [PY, os.path.join(HERE, "probe3.py"), model])
+              [PY, os.path.join(HERE, "probe3.py"), model, "--tok", tok])
   mem = run("2/3 sft_memtest (memorization vs generalization)",
             [PY, os.path.join(HERE, "sft_memtest.py"), engine, model, tok, train])
   crit = run("3/3 eval_critic (grounding + multi-step, best_of=%s M=%s)" % (best_of, m),
