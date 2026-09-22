@@ -5,17 +5,42 @@ CC      = gcc
 CFLAGS  = -std=c11 -O3 -march=native -Wall -pthread
 LDLIBS  = -lm -pthread
 
-# --- Optional GPU backend (OpenCL) ---------------------------------------
-# `make`        -> CPU only, exactly as before.
-# `make GPU=1`  -> adds the OpenCL backend (gpu.c). NO OpenCL SDK, header or
-#                  import library is required: the driver is opened with
-#                  dlopen/LoadLibrary at runtime and its entry points resolved
-#                  by name (see gpu.h). All that is needed is -ldl on POSIX.
-# A GPU build on a machine with no GPU still links, runs, and falls back to the
-# CPU — that fallback is a tested property, not a hope.
+# --- Optional GPU backends (see backend.h) -------------------------------
+# `make`             -> CPU only, exactly as before (plus the always-present
+#                       `mock` test backend, which is never auto-selected).
+# `make GPU=opencl`  -> + OpenCL  (backend_opencl.c, -DTF_GPU). `GPU=1` is the
+#                       same thing, kept for compatibility.
+# `make GPU=cuda`    -> + CUDA    (backend_cuda.c, -DTF_CUDA: driver API + cuBLAS)
+# `make GPU=hip`     -> + HIP/ROCm (backend_hip.c, -DTF_HIP: HIP runtime + hipBLAS)
+# `make GPU=all`     -> all three; at runtime `auto` picks cuda, hip, opencl in
+#                       that order, or `--backend X` / TF_BACKEND=X picks one.
+# NO SDK, header or import library is required for any of them: every driver
+# and BLAS library is opened with dlopen/LoadLibrary at runtime and its entry
+# points resolved by name. All that is needed is -ldl on POSIX. A GPU build on
+# a machine without the libraries still links, runs, and falls back to the CPU
+# -- that fallback is a tested property (selftest [49]), not a hope.
 GPU ?= 0
+GPU_FLAGS =
+ifneq ($(filter-out 0 1 opencl cuda hip all,$(GPU)),)
+  $(error GPU=$(GPU) is not one of: 0 1 opencl cuda hip all)
+endif
 ifeq ($(GPU),1)
-  CFLAGS += -DTF_GPU
+  GPU_FLAGS = -DTF_GPU
+endif
+ifeq ($(GPU),opencl)
+  GPU_FLAGS = -DTF_GPU
+endif
+ifeq ($(GPU),cuda)
+  GPU_FLAGS = -DTF_CUDA
+endif
+ifeq ($(GPU),hip)
+  GPU_FLAGS = -DTF_HIP
+endif
+ifeq ($(GPU),all)
+  GPU_FLAGS = -DTF_GPU -DTF_CUDA -DTF_HIP
+endif
+ifneq ($(GPU_FLAGS),)
+  CFLAGS += $(GPU_FLAGS)
   ifeq ($(OS),Windows_NT)
   else
     LDLIBS += -ldl
@@ -25,7 +50,8 @@ endif
 TARGET  = transformer
 OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o muon.o rmsnorm.o rope.o swiglu.o moe.o gqa.o quant.o llama.o lora.o llamatrain.o \
-          toolcall.o toolexec.o risk.o approval.o agent.o corpus.o train.o reward.o grpo.o gpu.o \
+          toolcall.o toolexec.o risk.o approval.o agent.o corpus.o train.o reward.o grpo.o \
+          backend.o backend_opencl.o backend_cuda.o backend_hip.o backend_mock.o \
           image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o constrain.o gen.o selftest.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
@@ -47,8 +73,12 @@ $(TARGET): $(OBJS)
 
 # Header dependencies (rebuild dependents when a header changes).
 tensor.o:     tensor.h
-matrix.o:     matrix.h tensor.h check.h gpu.h
-gpu.o:        gpu.h
+matrix.o:     matrix.h tensor.h check.h backend.h
+backend.o:        backend.h gpu.h
+backend_opencl.o: backend.h
+backend_cuda.o:   backend.h
+backend_hip.o:    backend.h
+backend_mock.o:   backend.h
 activation.o: activation.h tensor.h
 layernorm.o:  layernorm.h tensor.h
 rmsnorm.o:    rmsnorm.h tensor.h
@@ -89,8 +119,8 @@ t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h ch
 vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 hftok.o:      hftok.h
 constrain.o:  constrain.h hftok.h sampler.h tensor.h
-selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h moe.h agent.h approval.h toolcall.h toolexec.h constrain.h gen.h
-main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h toolexec.h constrain.h gen.h
+selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h moe.h agent.h approval.h toolcall.h toolexec.h constrain.h gen.h gpu.h backend.h
+main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h toolexec.h constrain.h gen.h gpu.h backend.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.
 # Requires `zig` and a POSIX shell (Linux/macOS/WSL). No per-OS toolchain needed.
@@ -124,6 +154,23 @@ cross-gpu:
 	  -o "$(BUILDDIR)/transformer-linux-x86_64-gpu" $(SRCS) -lm
 	@echo "GPU build -> $(BUILDDIR)/transformer-linux-x86_64-gpu (upload this to Colab)"
 
+# The CUDA-enabled Colab/Kaggle binary: CUDA (driver API + cuBLAS) AND OpenCL, so
+# one upload can A/B them (`--backend cuda` vs `--backend opencl`; `auto` picks
+# cuda). Again no CUDA toolkit is needed to build: libcuda.so.1 and
+# libcublas.so.* are dlopen()ed on the Colab machine, which has both.
+cross-cuda:
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(COLAB_TARGET) -std=c11 -O2 -Wall -DTF_CUDA -DTF_GPU \
+	  -o "$(BUILDDIR)/transformer-linux-x86_64-cuda" $(SRCS) -lm
+	@echo "CUDA build -> $(BUILDDIR)/transformer-linux-x86_64-cuda (upload this to Colab)"
+
+# HIP/ROCm (+ OpenCL) for a Linux AMD box. Compile-verified only: no free AMD cloud GPU.
+cross-hip:
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(COLAB_TARGET) -std=c11 -O2 -Wall -DTF_HIP -DTF_GPU \
+	  -o "$(BUILDDIR)/transformer-linux-x86_64-hip" $(SRCS) -lm
+	@echo "HIP build -> $(BUILDDIR)/transformer-linux-x86_64-hip"
+
 # Build the Go web testing frontend (tools/webchat). Depends on the engine so
 # `make webchat` produces BOTH exes: ./transformer and tools/webchat/webchat.
 # On Windows without make, use: powershell -File tools\webchat\build.ps1
@@ -136,4 +183,4 @@ clean:
 	rm -f $(BUILDDIR)/transformer-*
 	rm -f tools/webchat/webchat tools/webchat/webchat.exe
 
-.PHONY: all clean cross cross-gpu webchat
+.PHONY: all clean cross cross-gpu cross-cuda cross-hip webchat

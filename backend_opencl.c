@@ -1,36 +1,24 @@
-// gpu.c - Optional OpenCL backend for the matmul hot path (see gpu.h).
+// backend_opencl.c - Optional OpenCL backend for the matmul hot path (formerly
+// gpu.c; gpu.h keeps the design notes, backend.h describes the layer it plugs in).
 //
-// Everything here is behind TF_GPU. Without it this file is a handful of stubs
-// that report "not mine", so the CPU build is byte-for-byte the code it was.
-#include "gpu.h"
+// Everything here is behind TF_GPU. Without it this file only reports "not
+// compiled in", so the CPU build is byte-for-byte the code it was.
+//
+// Moved into the backend layer WITHOUT behaviour change: the kernels, device
+// selection, buffer cache, upload/launch/download sequence and error handling
+// are the old gpu.c's. What moved OUT is generic and now lives in backend.c's
+// dispatch, applied in the same order: the --gpu/--no-gpu enabled flag, the
+// TF_GPU_MIN_M / TF_GPU_MIN_MACS gates and the "both backward halves or abort"
+// rule.
+#include "backend.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if !defined(TF_GPU)
-// ---------------------------------------------------------------------------
-// CPU-only build: stubs. No OpenCL, no dynamic loading, no cost.
-// ---------------------------------------------------------------------------
-int gpu_available(void) { return 0; }
-int gpu_compiled_in(void) { return 0; }
-const char *gpu_device_name(void) { return "none (built without -DTF_GPU)"; }
-int gpu_compute_units(void) { return 0; }
-size_t gpu_global_mem(void) { return 0; }
-void gpu_set_enabled(int on) { (void)on; }
-int gpu_is_enabled(void) { return 0; }
-void gpu_shutdown(void) {}
-int gpu_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
-  (void)A; (void)B; (void)C; (void)M; (void)K; (void)N; return 0;
-}
-int gpu_matmul_backward(const float *A, const float *B, const float *dC,
-                        float *dA, float *dB, int M, int K, int N) {
-  (void)A; (void)B; (void)dC; (void)dA; (void)dB; (void)M; (void)K; (void)N; return 0;
-}
-int gpu_matmul_backward_dx(const float *B, const float *dC, float *dA,
-                           int M, int K, int N) {
-  (void)B; (void)dC; (void)dA; (void)M; (void)K; (void)N; return 0;
-}
+// Not compiled in: the registry lists OpenCL as "not compiled into this binary".
+const TfBackend *tf_backend_opencl(void) { return NULL; }
 
 #else  // ==================== TF_GPU ====================
 
@@ -81,6 +69,8 @@ typedef struct _cl_event        *cl_event;
 #define CL_DEVICE_NAME                 0x102B
 #define CL_DEVICE_MAX_COMPUTE_UNITS    0x1002
 #define CL_DEVICE_GLOBAL_MEM_SIZE      0x101F
+#define CL_DEVICE_MAX_MEM_ALLOC_SIZE   0x1010
+#define CL_DEVICE_HOST_UNIFIED_MEMORY  0x1035
 #define CL_MEM_READ_WRITE              (1 << 0)
 #define CL_PROGRAM_BUILD_LOG           0x1183
 
@@ -227,12 +217,11 @@ static const char *KERNEL_SRC =
 // ---------------------------------------------------------------------------
 static int  g_probed = 0;        // init attempted
 static int  g_ok = 0;            // usable device present
-static int  g_enabled = 1;       // runtime --gpu/--no-gpu
 static char g_name[256] = "not initialized";
 static int  g_cus = 0;
 static size_t g_mem = 0;
-static long g_min_m = 8;
-static long long g_min_macs = (1LL << 22);
+static size_t g_max_alloc = 0;  // capabilities only (gpu-info); no effect on compute
+static int  g_unified = 0;
 
 static dynlib g_lib;
 static cl_context       g_ctx;
@@ -250,14 +239,6 @@ static int g_cache_n = 0;
 static void fail(const char *why) {
   snprintf(g_name, sizeof(g_name), "%s", why);
   g_ok = 0;
-}
-
-static long env_long(const char *k, long dflt) {
-  const char *v = getenv(k);
-  if (!v || !*v) return dflt;
-  char *end = NULL;
-  long n = strtol(v, &end, 10);
-  return (end && end != v && n > 0) ? n : dflt;
 }
 
 static int load_symbols(void) {
@@ -294,8 +275,6 @@ static int pick_device(void) {
 static void init_once(void) {
   if (g_probed) return;
   g_probed = 1;
-  g_min_m = env_long("TF_GPU_MIN_M", 8);
-  g_min_macs = env_long("TF_GPU_MIN_MACS", 1L << 22);
 
   if (!load_symbols()) return;
   if (!pick_device()) return;
@@ -308,6 +287,12 @@ static void init_once(void) {
   p_clGetDeviceInfo(g_dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, NULL);
   g_cus = (int)cus;
   g_mem = (size_t)gmem;
+  cl_ulong maxa = 0;
+  cl_bool unified = 0;
+  p_clGetDeviceInfo(g_dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(maxa), &maxa, NULL);
+  p_clGetDeviceInfo(g_dev, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+  g_max_alloc = (size_t)maxa;
+  g_unified = unified ? 1 : 0;
 
   cl_int err = CL_SUCCESS;
   g_ctx = p_clCreateContext(NULL, 1, &g_dev, NULL, NULL, &err);
@@ -339,13 +324,21 @@ static void init_once(void) {
   g_ok = 1;
 }
 
-int gpu_compiled_in(void) { return 1; }
-int gpu_available(void) { init_once(); return g_ok; }
-const char *gpu_device_name(void) { init_once(); return g_name; }
-int gpu_compute_units(void) { init_once(); return g_cus; }
-size_t gpu_global_mem(void) { init_once(); return g_mem; }
-void gpu_set_enabled(int on) { g_enabled = on ? 1 : 0; }
-int gpu_is_enabled(void) { return g_enabled; }
+static int ocl_init(void) { init_once(); return g_ok; }
+static const char *ocl_device_name(void) { init_once(); return g_name; }
+static void ocl_caps(TfCaps *c) {
+  init_once();
+  memset(c, 0, sizeof(*c));
+  c->mem_bytes = g_mem;
+  c->max_alloc = g_max_alloc;
+  c->compute_units = g_cus;
+  c->unified_memory = g_unified;   // TODO: skip the copies on a unified-memory iGPU
+  c->deterministic = 1;            // fixed kernels, fixed work split
+  c->n_devices = g_ok ? 1 : 0;
+  // The gates the old gpu.c hard-coded (see gpu.h for why M matters separately).
+  c->min_m = 8;
+  c->min_macs = 1LL << 22;
+}
 
 // A device buffer for this host pointer, at least `bytes` long. Cached by
 // pointer so a hot loop does not churn allocations; contents are never assumed.
@@ -374,16 +367,9 @@ static cl_mem buffer_for(const void *host, size_t bytes) {
   return m;
 }
 
-// Should the GPU take this problem at all? See gpu.h for why M matters
-// separately from the total MAC count.
-static int gpu_takes(int M, int K, int N) {
-  if (!g_enabled) return 0;
-  init_once();
-  if (!g_ok) return 0;
-  if (M < g_min_m) return 0;
-  if ((long long)M * N * K < g_min_macs) return 0;
-  return 1;
-}
+// (Whether the GPU takes a problem at all -- enabled flag, device present, the
+// TF_GPU_MIN_M / TF_GPU_MIN_MACS gates -- is decided in backend.c before any
+// function below is called. g_ok is still checked there via the available() hook.)
 
 static void grid_for(int rows, int cols, size_t *gws, size_t *lws) {
   gws[0] = (size_t)((rows + TS - 1) / TS) * TS;
@@ -411,8 +397,7 @@ static int device_failed(const char *where) {
   return 0;
 }
 
-int gpu_matmul(const float *A, const float *B, float *C, int M, int K, int N) {
-  if (!gpu_takes(M, K, N)) return 0;
+static int ocl_sgemm(const float *A, const float *B, float *C, int M, int K, int N) {
   const size_t bA = (size_t)M * K * sizeof(float);
   const size_t bB = (size_t)K * N * sizeof(float);
   const size_t bC = (size_t)M * N * sizeof(float);
@@ -503,27 +488,7 @@ static int run_tn(const float *A, const float *dCh, float *dBh, int M, int K, in
   return 1;
 }
 
-int gpu_matmul_backward(const float *A, const float *B, const float *dC,
-                        float *dA, float *dB, int M, int K, int N) {
-  if (!gpu_takes(M, K, N)) return 0;
-  // Both halves must succeed together: a partial result would leave dA updated
-  // and dB not, which the CPU fallback would then double-count.
-  if (!run_nt(B, dC, dA, M, K, N)) return 0;
-  if (!run_tn(A, dC, dB, M, K, N)) {
-    fprintf(stderr, "gpu: dB half failed after dA succeeded — gradients for this "
-                    "call are INCOMPLETE; aborting rather than training on them\n");
-    exit(1);
-  }
-  return 1;
-}
-
-int gpu_matmul_backward_dx(const float *B, const float *dC, float *dA,
-                           int M, int K, int N) {
-  if (!gpu_takes(M, K, N)) return 0;
-  return run_nt(B, dC, dA, M, K, N);
-}
-
-void gpu_shutdown(void) {
+static void ocl_shutdown(void) {
   if (!g_probed) return;
   for (int i = 0; i < g_cache_n; i++)
     if (g_cache[i].buf) p_clReleaseMemObject(g_cache[i].buf);
@@ -538,5 +503,18 @@ void gpu_shutdown(void) {
   g_prog = NULL; g_q = NULL; g_ctx = NULL;
   g_ok = 0;
 }
+
+// L1 only for now. TODO(P1, docs/ACCELERATORS.md): port onto TfBuf (L2) with a
+// row-major->column-major-capable gemm kernel, and weight residency (L3), so
+// the iGPU can test residency on a real device.
+static const TfBackend OPENCL_OPS = {
+  "opencl", "make GPU=opencl (-DTF_GPU; GPU=1)", 1,
+  ocl_init, ocl_shutdown, ocl_init, ocl_device_name, ocl_caps,
+  ocl_sgemm, run_nt, run_tn,
+  NULL, NULL, NULL, NULL, NULL, NULL,    /* L2: device memory stays private */
+  NULL, NULL,                            /* L3: no residency yet */
+  {0},
+};
+const TfBackend *tf_backend_opencl(void) { return &OPENCL_OPS; }
 
 #endif // TF_GPU

@@ -619,6 +619,58 @@ transpose-back (NS gate), wrong scale (RMS gate). Tiny CLI A/B (d64, 2 layers, 6
 is a wash and Muon is ~2.2x slower per step at 32 tokens/step (NS cost does not shrink with the
 batch). **Not measured:** any run at a scale where Muon's reported gains appear.
 
+## GPU backend layer — OpenCL refactor + CUDA + HIP + mock — BUILT (2026-09-22, branch `gpu-backends`)
+
+User has no NVIDIA GPU; this prepares the engine for several GPU backends and makes all of it
+testable here. `backend.h/.c` holds the backend ops table, the runtime selection
+(`--backend X` > `TF_BACKEND` > `auto` = cuda, hip, opencl in that order, never mock;
+`--gpu/--no-gpu` kept as the enabled flag) and the ONE dispatch point that `matrix.c` calls
+(`backend_matmul*`). `gpu.c` became `backend_opencl.c` with its kernels and launch sequence
+unchanged. What moved out (enabled flag, TF_GPU_MIN_* gates, the rule that both backward
+halves succeed or the run aborts) now lives in `backend.c`, applied in the same order.
+`gpu.h` keeps the design notes plus a `gpu_*` facade meaning "the active real GPU".
+
+- CUDA (`backend_cuda.c`, -DTF_CUDA): driver API + cuBLAS loaded at runtime, no toolkit.
+  Search order: `nvcuda.dll` / `libcuda.so.1` (+ WSL path), then `cublas64_13..10.dll` /
+  `libcublas.so.13..10`, then `/usr/local/cuda/lib64`. `TF_CUDA_LIB` / `TF_CUBLAS_LIB`
+  override. Uses the primary context (the one cuBLAS uses) and rebinds it on every entry,
+  because the current context is per thread. `d2h` runs `cuCtxSynchronize` first, which also
+  surfaces async cuBLAS errors. HIP (`backend_hip.c`) mirrors it: op codes 111/112,
+  `hipSetDevice(0)` on every entry.
+- Row→column-major mapping (`tf_colmajor_*`, shared): C = A·B is sent as Cᵀ = Bᵀ·Aᵀ (swap the
+  operands, keep the ops). The backward forms are dA: (T,N) m=K n=M k=N and dB: (N,T) m=N n=K
+  k=M, with beta 1. The forward uses beta 0, so C is never uploaded.
+- Device-BLAS core (`TfDevBlas`): the host half shared by cuda, hip and mock. It keeps a
+  buffer cache keyed by host pointer (same policy as OpenCL: allocations, not contents),
+  uploads, gemms and downloads. `TF_DEVBLAS_OPS` generates each backend's table entries.
+- Per the ACCELERATORS.md §4 request: L2 opaque `TfBuf` + cuBLAS-shaped `gemm` (trans, ld,
+  alpha/beta, dtypes; F32 only) + `TfStream*` (NULL = default), L3
+  `register_weight`/`invalidate` (upload once; the caller MUST invalidate after mutating or
+  freeing the memory), and `TfCaps` with per-backend gates. Implemented for cuda/hip/mock and
+  tested on the mock. OpenCL is L1 only. The other roadmap items have reserved slots and TODOs.
+- `mock` (always compiled, never auto) = the device-BLAS core on NaN-poisoned host memory +
+  `tf_fake_cublas_sgemm` (a column-major reference that applies cuBLAS's argument rules).
+- `tools/fake_gpu/fake_gpu.c`: fake nvcuda/cublas/amdhip64/hipblas shared libraries. The
+  fakes reject the other vendor's op codes and a missing context. They let the REAL
+  cuda/hip backend files run here.
+
+VERIFIED (TF_THREADS=1):
+
+* Default build: selftest identical to agent-1 apart from the new `[49]` (CRs stripped,
+  stderr dropped).
+* `-DTF_GPU` build on the UHD 730: identical to the agent-1 GPU build apart from `[49]`,
+  `[30]` numbers included.
+* `[49]` passes in the default, opencl, cuda and all-backends builds.
+* With the fake libs, `TF_BACKEND=cuda` and `TF_BACKEND=hip` full selftests PASS; `[30]` runs
+  on "FakeCUDA" and `[49](g)` offloads 21/21 for cuda, hip and opencl.
+* `-Wall` clean. Cross builds pass: x86_64-linux-gnu.2.31 (gpu/cuda/hip), aarch64-linux-gnu
+  (all), wasm32-wasi (CPU; its `clock` deprecation warning in grpo.c predates this work).
+* `make cross-cuda|cross-hip|cross-gpu` and `build_gpu.ps1 -Only cuda|colab-cuda|allgpu`
+  build.
+
+NOT VERIFIED: CUDA on a real NVIDIA card (README "Colab recipe" is the next action), HIP on any
+AMD card, gate tuning for either (defaults copied from OpenCL: M>=8, MACs>=2^22).
+
 ## Dataset-trained imggen / audgen — DONE (2026-07-22)
 
 `imggen`/`audgen` now have a **dataset mode** in addition to the original single-example

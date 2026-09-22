@@ -90,7 +90,10 @@ defined in the matching `.c`.
 | `audiogen.h` / `audiogen.c`       | Audio ↔ tokens (µ-law) for autoregressive audio **generation** (Phase G) |
 | `corpus.h` / `corpus.c`           | Read training text from a file or a directory tree (recursive `.txt`) |
 | `train.h` / `train.c`             | Train a GPT on a text file/dir (tokenizer + model + Adam loop) |
-| `gpu.h` / `gpu.c`                 | Optional OpenCL matmul offload (`-DTF_GPU`); driver loaded at runtime, no SDK |
+| `backend.h` / `backend.c`         | Compute-backend layer: ops table, runtime selection (`--backend`, `TF_BACKEND`), the one matmul dispatch point, row→column-major BLAS mapping, device-BLAS core |
+| `backend_opencl.c` / `backend_cuda.c` / `backend_hip.c` | Optional GPU backends (`-DTF_GPU` / `-DTF_CUDA` / `-DTF_HIP`): OpenCL kernels, cuBLAS, hipBLAS — every driver loaded at runtime, no SDK |
+| `backend_mock.c`                  | Always-present test backend: the CUDA/HIP host path on a fake host-memory device + column-major reference BLAS (selftest `[49]`) |
+| `gpu.h`                           | GPU design notes + the legacy `gpu_*` facade (`gpu-info`, `--gpu/--no-gpu`, selftest `[30]`) |
 | `reward.h` / `reward.c`           | Verifiable reward for a sampled agent response: format + grounding + action match |
 | `grpo.h` / `grpo.c`               | **GRPO**: RL from verifiable rewards — group-relative advantage, clipped policy gradient |
 | `selftest.h` / `selftest.c`       | Built-in smoke test (`run_selftest`): the default `transformer` run           |
@@ -133,7 +136,7 @@ cd tools/guidepdf && go run .     # -> build/guide.pdf
 
 ```sh
 make                # CPU only — the default, unchanged
-make GPU=1          # + the OpenCL backend (gpu.c)
+make GPU=1          # + the OpenCL backend (backend_opencl.c; same as GPU=opencl)
 make cross-gpu      # a Linux x86_64 GPU binary, for Colab or any Linux GPU box
 powershell -File tools/build_gpu.ps1     # all three, from Windows (no make here)
 
@@ -143,7 +146,7 @@ powershell -File tools/build_gpu.ps1     # all three, from Windows (no make here
 
 **The GPU build needs no OpenCL SDK, header, import library or CUDA toolkit.** The driver is
 opened with `dlopen`/`LoadLibrary` at runtime and its ~20 entry points resolved by name; the
-handful of OpenCL types are declared in `gpu.c` rather than pulled from `<CL/cl.h>`. That is
+handful of OpenCL types are declared in `backend_opencl.c` rather than pulled from `<CL/cl.h>`. That is
 what lets a Windows machine with no NVIDIA GPU **cross-compile a working GPU binary for
 Colab** with nothing but `zig cc`.
 
@@ -176,6 +179,156 @@ multiply one row by it loses badly.
 > cannot be done safely without an explicit immutability hint from the model code, because
 > `attention.c` passes **activations** as the `B` operand for Q·Kᵀ — so "B is a weight" is not
 > a safe assumption, and guessing wrong would silently train on stale data rather than crash.
+
+### GPU backends (OpenCL, CUDA, HIP, mock)
+
+All GPU code sits behind one small layer, `backend.h`. It has an ops table per backend, one
+runtime selection, and one dispatch point in `matrix.c`. With no backend active that dispatch
+is a flag test and `return 0`, so the CPU path is **bit-identical** to a build without the
+layer: the default build's selftest output matches the previous build line for line, and so
+does the OpenCL build's (the new part `[49]` is the only addition).
+
+| Backend | Build | Runtime libraries (opened with `dlopen`/`LoadLibrary`, no SDK needed to build) | Verified here? |
+|---|---|---|---|
+| `cpu` | always | none | yes (default) |
+| `opencl` | `make GPU=opencl` (= `GPU=1`) | `OpenCL.dll` / `libOpenCL.so.1` (or `libnvidia-opencl.so.1`) | yes, on the Intel UHD 730 iGPU (`[30]`, `[49]`) |
+| `cuda` | `make GPU=cuda` | `nvcuda.dll` / `libcuda.so.1` (driver) + `cublas64_1x.dll` / `libcublas.so.1x` (toolkit) | code path yes (fake driver, see below); **real GPU: not yet** |
+| `hip` | `make GPU=hip` | `amdhip64*.dll` / `libamdhip64.so` + `hipblas.dll` / `libhipblas.so` | code path yes (fake runtime); **real GPU: never** |
+| `mock` | always | none: a fake host-memory device + a column-major reference BLAS | yes (`[49]`) |
+
+```sh
+make GPU=cuda          # or GPU=opencl | hip | all   (GPU=1 still means opencl)
+make cross-cuda        # Linux x86_64 CUDA+OpenCL binary for Colab/Kaggle -> build/transformer-linux-x86_64-cuda
+make cross-hip         # Linux x86_64 HIP+OpenCL binary (compile-verified only)
+powershell -File tools/build_gpu.ps1 -Only colab-cuda   # the Colab CUDA binary, from Windows
+powershell -File tools/build_gpu.ps1 -Only cuda         # native transformer_cuda.exe (+ -Only hip / allgpu)
+
+./transformer gpu-info                  # every backend: compiled in? available here? why not?
+./transformer --backend cuda gpu-bench  # pick one explicitly
+TF_BACKEND=opencl ./transformer ...     # same, via the environment
+./transformer --no-gpu ...              # CPU only (alias kept; --gpu re-enables)
+```
+
+**Selection.** `--backend X` overrides `TF_BACKEND=X`, which overrides the default `auto`.
+`X` is one of `cpu`, `opencl`, `cuda`, `hip`, `mock` or `auto`. `auto` takes the first
+backend that is compiled in **and** usable, in the order cuda, hip, opencl. It never picks
+`mock`, and it silently uses the CPU when none is usable. A backend you name but cannot get
+gives you one line on stderr saying why (for example "`'cuda' unavailable: no CUDA driver
+library (tried nvcuda.dll)`" or "`'hip' is not compiled into this binary (rebuild with make
+GPU=hip)`"), and then the CPU does every matmul. A device error mid-run disables that backend
+for the rest of the run instead of crashing. The only exception is a backward pass where
+`dA` succeeded and `dB` failed: that aborts, because the result would be half-applied
+gradients.
+
+**How cuBLAS/hipBLAS are used.** Both libraries are column-major and this engine is
+row-major. A row-major `(r x c)` buffer *is* the column-major `(c x r)` transpose, so no
+transpose is ever built. Row-major `C = A·B` is sent as the column-major product `Cᵀ = Bᵀ·Aᵀ`:
+swap the operands, keep the ops. The exact calls:
+
+```
+C  (MxN)  = A @ B      ->  sgemm(N, N, m=N, n=M, k=K, 1, B, ldb=N,  A, lda=K,  0, C,  ldc=N)
+dA (MxK) += dC @ B^T   ->  sgemm(T, N, m=K, n=M, k=N, 1, B, N,      dC, N,     1, dA, K)
+dB (KxN) += A^T @ dC   ->  sgemm(N, T, m=N, n=K, k=M, 1, dC, N,     A, K,      1, dB, N)
+```
+
+The mapping lives once in `backend.c` (`tf_colmajor_*`), and CUDA, HIP and the mock all go
+through it. Selftest `[49]` proves it on every build: it compares the mapping against an fp64
+row-major reference through a column-major "fake cuBLAS". The fake is itself checked against
+a hand-worked 2×3·3×2 example, with all four transpose combinations, NaN-padded leading
+dimensions, `alpha`/`beta`, and cuBLAS's argument rejections. A negative control, the same
+run with the operand swap left out, must be caught.
+
+**Room to grow (docs/ACCELERATORS.md §4).** The ops table has three levels:
+
+* **L1**: the host-pointer GEMM trio that `matrix.c` calls today.
+* **L2**: opaque device buffers (`TfBuf`), plus a cuBLAS-shaped `gemm(transA, transB, m, n,
+  k, alpha, A, lda, B, ldb, beta, C, ldc, dtypes)` and a stream argument (`NULL` = the default
+  stream).
+* **L3**: weight residency, `register_weight` / `invalidate`. A registered weight is uploaded
+  once and every later GEMM skips re-uploading it. Nothing calls it yet; the model code has to
+  opt in.
+
+A `TfCaps` struct carries memory size, the unified-memory flag, and **per-backend dispatch
+gates**. `TF_GPU_MIN_M` / `TF_GPU_MIN_MACS` still override those gates for real GPUs. L2 and
+L3 are implemented for cuda, hip and mock, and tested on the mock. OpenCL is L1 only for now.
+Streams, strided-batched GEMM, non-GEMM ops, kernel launch, graph capture, fp16/bf16/int8 and
+multi-device have reserved slots and TODOs.
+
+**What is verified, and what is not.**
+
+* Verified on this machine (no NVIDIA/AMD GPU), by selftest `[49]` in every build:
+  * backend selection and fallback;
+  * mock == CPU on awkward shapes (all 1s, primes, tile edges) for the forward pass and both
+    backward forms, including accumulate-not-overwrite;
+  * the column-major mapping;
+  * the L2 gemm and its bounds/dtype/ld rejections;
+  * L3 residency: one upload, stale until `invalidate`, then fresh;
+  * device-error fallback;
+  * absent CUDA/HIP gives one clear message and CPU results.
+* Also verified here: the refactored OpenCL backend on the real UHD 730 iGPU (`[30]` numbers
+  unchanged, `[49]` 21/21 offloaded calls match the CPU). The *real* `backend_cuda.c` /
+  `backend_hip.c` code ran end to end too: loader, symbol resolution, context binding,
+  vendor op codes, host `alpha`/`beta`, upload/sync/download. It ran against host-memory
+  stand-in libraries (`tools/fake_gpu/fake_gpu.c`, built as fake `nvcuda`/`cublas`/`amdhip64`/
+  `hipblas` DLLs and selected with `TF_CUDA_LIB` / `TF_CUBLAS_LIB` / `TF_HIP_LIB` /
+  `TF_HIPBLAS_LIB`). The whole selftest passes with `TF_BACKEND=cuda` and with
+  `TF_BACKEND=hip`.
+* Compile-verified: `x86_64-linux-gnu.2.31` (cuda/hip/opencl), `aarch64-linux-gnu` (all
+  backends), `wasm32-wasi` (CPU; no `dlopen`, so no GPU backends).
+* **Not verified:**
+  * CUDA on a real NVIDIA GPU: the real driver/cuBLAS semantics and speed. It needs
+    Colab/Kaggle; use the recipe below.
+  * HIP on any real AMD GPU: there is no free cloud AMD GPU.
+  * Gate tuning for CUDA/HIP: the defaults are copied from OpenCL.
+
+#### Colab recipe: test the CUDA build (T4, about 5 minutes)
+
+On your machine, build the binary. It needs no CUDA toolkit:
+
+```sh
+powershell -File tools\build_gpu.ps1 -Only colab-cuda    # Windows
+make cross-cuda                                          # Linux / macOS
+# -> build/transformer-linux-x86_64-cuda
+```
+
+In a new Colab notebook, set **Runtime → Change runtime type → T4 GPU**, then run each block
+in its own cell:
+
+```python
+from google.colab import files
+up = files.upload()                      # pick build/transformer-linux-x86_64-cuda
+import os; BIN = './' + list(up)[0]; os.chmod(BIN, 0o755); print(BIN)
+```
+```python
+!nvidia-smi -L
+!ls /usr/local/cuda/lib64/libcublas.so* 2>/dev/null | head -3
+!{BIN} gpu-info
+```
+```python
+# The self-test (about a minute). Expect "[30] ... device: Tesla T4 ...",
+# "[49] ... (g) cuda   PRESENT (Tesla T4 ...) ... -> OK" and "Output validation: PASSED".
+!{BIN} 2>/dev/null | grep -A3 '^\[30\]'
+!{BIN} 2>/dev/null | sed -n '/^\[49\]/,$p'
+```
+```python
+# Speed: cuBLAS vs this CPU on the engine's real GEMM shapes, and vs OpenCL on the same card.
+!{BIN} --backend cuda gpu-bench 3
+!apt-get -qq install -y ocl-icd-libopencl1 > /dev/null; mkdir -p /etc/OpenCL/vendors; echo libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd
+!{BIN} --backend opencl gpu-bench 3
+```
+
+If `gpu-info` says `no cuBLAS library`, point the binary at one explicitly. Colab always has
+one inside PyTorch's wheels:
+
+```python
+import glob; libs = glob.glob('/usr/local/lib/python3*/dist-packages/nvidia/cublas/lib/libcublas.so*') + glob.glob('/usr/local/cuda/lib64/libcublas.so*'); print(libs)
+os.environ['TF_CUBLAS_LIB'] = libs[0]
+!{BIN} gpu-info
+```
+
+Kaggle works the same way: select "GPU T4 x2", and the engine uses device 0. Please report
+the `gpu-info` output, the `[49]` block and both `gpu-bench` verdicts. A FAIL in `[49](g)` on
+a real card is exactly the bug this recipe is there to find.
 
 ## Supported platforms
 

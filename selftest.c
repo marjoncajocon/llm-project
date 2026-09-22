@@ -36,6 +36,7 @@
 #include "reward.h"
 #include "grpo.h"
 #include "gpu.h"
+#include "backend.h"
 #include "moe.h"
 #include "muon.h"
 #include "train.h"
@@ -1670,6 +1671,161 @@ static int st47_run(void) {
   constrain_free(cd); constrain_free(cc); constrain_free(cb);
   printf("    -> %s\n\n", ok_all ? "OK" : "FAIL");
   return ok_all;
+}
+
+// ---- backend layer, part [49] ------------------------------------------------
+// Awkward shapes on purpose: 1s in every position (degenerate BLAS dimensions
+// and leading dimensions), primes, and sizes straddling the OpenCL 16/64 tiles.
+static const int ST49_SH[][3] = {
+  {1, 1, 1}, {1, 7, 3}, {5, 1, 9}, {3, 17, 1}, {13, 31, 7}, {40, 33, 47}, {17, 64, 65},
+};
+#define ST49_NSH ((int)(sizeof(ST49_SH) / sizeof(ST49_SH[0])))
+
+static void st49_fill(float *p, size_t n, unsigned seed) {
+  unsigned s = seed * 2654435761u + 12345u;
+  for (size_t i = 0; i < n; i++) {
+    s = s * 1664525u + 1013904223u;
+    p[i] = (float)((s >> 9) & 0xFFFF) / 65536.0f - 0.5f;
+  }
+}
+
+// max|x - ref| / max|ref| over a whole tensor (the part [30] metric). A NaN
+// anywhere in x makes the result NaN, which every "< tol" check then rejects.
+static float st49_rel(const float *x, const float *ref, size_t n) {
+  float md = 0.0f, mv = 0.0f;
+  for (size_t i = 0; i < n; i++) {
+    const float d = fabsf(x[i] - ref[i]);
+    if (!(d <= md)) md = d;
+    if (fabsf(ref[i]) > mv) mv = fabsf(ref[i]);
+  }
+  return md / (mv + 1e-9f);
+}
+
+static void st49_worst(float *w, float r) { if (r > *w || r != r) *w = r; }
+
+// Run matmul, matmul_backward and matmul_backward_dx once through the CPU
+// (backend disabled) and once through whatever backend is selected, on every
+// ST49 shape, with PRE-SEEDED grads (a backend that overwrites instead of
+// accumulating would fail). Worst errors go to e[0..3] = fwd, dA, dB, dx.
+// fwd_only: just the forward (e[1..3] stay 0).
+static void st49_vs_cpu(float e[4], int fwd_only) {
+  e[0] = e[1] = e[2] = e[3] = 0.0f;
+  for (int s = 0; s < ST49_NSH; s++) {
+    const int M = ST49_SH[s][0], K = ST49_SH[s][1], N = ST49_SH[s][2];
+    int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
+    Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
+    st49_fill(A.data, A.size, 11u + s);
+    st49_fill(B.data, B.size, 23u + s);
+    st49_fill(C.grad, C.size, 37u + s);
+    float *gA0 = (float*)malloc(A.size * sizeof(float)), *gB0 = (float*)malloc(B.size * sizeof(float));
+    float *rC = (float*)malloc(C.size * sizeof(float));
+    float *rA = (float*)malloc(A.size * sizeof(float)), *rB = (float*)malloc(B.size * sizeof(float));
+    st49_fill(gA0, A.size, 41u + s);
+    st49_fill(gB0, B.size, 43u + s);
+    for (int pass = 0; pass < 2; pass++) {      // 0 = CPU reference, 1 = backend
+      backend_set_enabled(pass);
+      matmul(&A, &B, &C);
+      if (pass == 0) memcpy(rC, C.data, C.size * sizeof(float));
+      else st49_worst(&e[0], st49_rel(C.data, rC, C.size));
+      if (fwd_only) continue;
+      memcpy(A.grad, gA0, A.size * sizeof(float));
+      memcpy(B.grad, gB0, B.size * sizeof(float));
+      matmul_backward(&A, &B, &C);
+      if (pass == 0) {
+        memcpy(rA, A.grad, A.size * sizeof(float));
+        memcpy(rB, B.grad, B.size * sizeof(float));
+      } else {
+        st49_worst(&e[1], st49_rel(A.grad, rA, A.size));
+        st49_worst(&e[2], st49_rel(B.grad, rB, B.size));
+      }
+      memcpy(A.grad, gA0, A.size * sizeof(float));
+      matmul_backward_dx(&A, &B, &C);
+      if (pass == 0) memcpy(rA, A.grad, A.size * sizeof(float));
+      else st49_worst(&e[3], st49_rel(A.grad, rA, A.size));
+    }
+    backend_set_enabled(1);
+    free(gA0); free(gB0); free(rC); free(rA); free(rB);
+    tensor_free(&A); tensor_free(&B); tensor_free(&C);
+  }
+}
+
+// The three tf_colmajor_* mappings on HOST pointers through the fake cuBLAS,
+// against a row-major double-precision triple loop (independent of both the
+// mapping and the column-major code). Worst errors to e[0..2] = fwd, dA, dB.
+// Returns the OR of the BLAS statuses (0 = every call accepted).
+static int st49_mapping(float e[3]) {
+  int st = 0;
+  e[0] = e[1] = e[2] = 0.0f;
+  for (int s = 0; s < ST49_NSH; s++) {
+    const int M = ST49_SH[s][0], K = ST49_SH[s][1], N = ST49_SH[s][2];
+    const size_t nA = (size_t)M * K, nB = (size_t)K * N, nC = (size_t)M * N;
+    float *A = (float*)malloc(nA * sizeof(float)), *B = (float*)malloc(nB * sizeof(float));
+    float *dC = (float*)malloc(nC * sizeof(float)), *C = (float*)malloc(nC * sizeof(float));
+    float *dA = (float*)malloc(nA * sizeof(float)), *dB = (float*)malloc(nB * sizeof(float));
+    float *rC = (float*)malloc(nC * sizeof(float)), *rA = (float*)malloc(nA * sizeof(float));
+    float *rB = (float*)malloc(nB * sizeof(float));
+    st49_fill(A, nA, 51u + s); st49_fill(B, nB, 53u + s); st49_fill(dC, nC, 57u + s);
+    st49_fill(dA, nA, 59u + s); st49_fill(dB, nB, 61u + s);
+    // References: C = A B, dA0 + dC B^T, dB0 + A^T dC -- row-major, in double.
+    for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) {
+      double acc = 0.0;
+      for (int k = 0; k < K; k++) acc += (double)A[i * K + k] * B[k * N + j];
+      rC[i * N + j] = (float)acc;
+    }
+    for (int i = 0; i < M; i++) for (int k = 0; k < K; k++) {
+      double acc = dA[i * K + k];
+      for (int j = 0; j < N; j++) acc += (double)dC[i * N + j] * B[k * N + j];
+      rA[i * K + k] = (float)acc;
+    }
+    for (int k = 0; k < K; k++) for (int j = 0; j < N; j++) {
+      double acc = dB[k * N + j];
+      for (int i = 0; i < M; i++) acc += (double)A[i * K + k] * dC[i * N + j];
+      rB[k * N + j] = (float)acc;
+    }
+    for (size_t i = 0; i < nC; i++) C[i] = NAN;           // beta = 0 must not read C
+    st |= tf_colmajor_fwd(tf_fake_cublas_sgemm, NULL, A, B, C, M, K, N);
+    st |= tf_colmajor_nt(tf_fake_cublas_sgemm, NULL, B, dC, dA, M, K, N);
+    st |= tf_colmajor_tn(tf_fake_cublas_sgemm, NULL, A, dC, dB, M, K, N);
+    st49_worst(&e[0], st49_rel(C, rC, nC));
+    st49_worst(&e[1], st49_rel(dA, rA, nA));
+    st49_worst(&e[2], st49_rel(dB, rB, nB));
+    free(A); free(B); free(dC); free(C); free(dA); free(dB); free(rC); free(rA); free(rB);
+  }
+  return st;
+}
+
+// The fake cuBLAS itself, against the textbook example worked by hand:
+// A = [1 2 3; 4 5 6] (2x3), B = [7 8; 9 10; 11 12] (3x2), A@B = [58 64; 139 154].
+// Every (transa, transb) combination stores the operand accordingly, with a
+// PADDED leading dimension whose pad cells are NaN (reading one is caught), and
+// alpha = 2, beta = -1 on C0 = 1 so both scalars are exercised. Exact integers.
+static int st49_fake_textbook(int *bad_rejected) {
+  const float Q = NAN;
+  const float An[3 * 3] = {1, 4, Q,   2, 5, Q,   3, 6, Q};     // A,   2x3, ld 3
+  const float At[4 * 2] = {1, 2, 3, Q,   4, 5, 6, Q};          // A^T, 3x2, ld 4
+  const float Bn[4 * 2] = {7, 9, 11, Q,   8, 10, 12, Q};       // B,   3x2, ld 4
+  const float Bt[3 * 3] = {7, 8, Q,   9, 10, Q,   11, 12, Q};  // B^T, 2x3, ld 3
+  const float want[4] = {2 * 58 - 1, 2 * 139 - 1, 2 * 64 - 1, 2 * 154 - 1};
+  int ok = 1;
+  for (int ta = 0; ta < 2; ta++)
+    for (int tb = 0; tb < 2; tb++) {
+      float Cc[3 * 2] = {1, 1, Q, 1, 1, Q};                     // 2x2, ld 3, pad NaN
+      const int st = tf_fake_cublas_sgemm(NULL, ta, tb, 2, 2, 3, 2.0f,
+                                          ta ? At : An, ta ? 4 : 3,
+                                          tb ? Bt : Bn, tb ? 3 : 4, -1.0f, Cc, 3);
+      ok &= st == 0 && Cc[0] == want[0] && Cc[1] == want[1] && Cc[3] == want[2] &&
+            Cc[4] == want[3] && Cc[2] != Cc[2] && Cc[5] != Cc[5];   // pads untouched
+    }
+  // What cuBLAS rejects, the fake rejects (status 7 = INVALID_VALUE).
+  float Cc[4];
+  int rej = 0;
+  rej += tf_fake_cublas_sgemm(NULL, 0, 0, 2, 2, 3, 1.0f, An, 1, Bn, 4, 0.0f, Cc, 2) == 7; // lda < m
+  rej += tf_fake_cublas_sgemm(NULL, 0, 1, 2, 2, 3, 1.0f, An, 3, Bt, 1, 0.0f, Cc, 2) == 7; // ldb < n (op T)
+  rej += tf_fake_cublas_sgemm(NULL, 0, 0, 2, 2, 3, 1.0f, An, 3, Bn, 4, 0.0f, Cc, 1) == 7; // ldc < m
+  rej += tf_fake_cublas_sgemm(NULL, 2, 0, 2, 2, 3, 1.0f, An, 3, Bn, 4, 0.0f, Cc, 2) == 7; // bad op
+  rej += tf_fake_cublas_sgemm(NULL, 0, 0, -1, 2, 3, 1.0f, An, 3, Bn, 4, 0.0f, Cc, 2) == 7; // m < 0
+  *bad_rejected = rej;
+  return ok;
 }
 
 int run_selftest(void) {
@@ -7044,6 +7200,217 @@ int run_selftest(void) {
     llama_lora_free(&blo); llama_model_free(&bm);
     printf("    -> %s\n\n", ok48 ? "OK" : "FAIL");
     all_ok &= ok48;
+  }
+
+  // --------------------------------------------------------------------------
+  // [49] The backend layer (backend.h). Everything a GPU-less machine CAN prove:
+  //   (a) selection: cpu / mock / unknown name / auto (never the mock);
+  //   (b) the mock backend -- the CUDA/HIP host path (device-BLAS core) on a fake
+  //       NaN-poisoned device with a column-major reference BLAS -- against the
+  //       CPU on awkward shapes, fwd + both backward forms, accumulate semantics,
+  //       and --no-gpu (disabled) declining every call;
+  //   (c) the fake cuBLAS against a hand-worked example, its cuBLAS argument
+  //       checks, the row-major -> column-major mapping against an fp64 row-major
+  //       reference, the vendor op codes, and a NEGATIVE CONTROL (mapping with
+  //       the operand swap left out) that must be caught;
+  //   (d) the cuBLAS-shaped L2 gemm on opaque device buffers;
+  //   (e) L3 weight residency: one upload, stale until invalidate, then fresh;
+  //   (f) a device error mid-run: CPU result, backend disabled, no abort;
+  //   (g) every real backend: absent -> one clear message + CPU results; present
+  //       (e.g. OpenCL on an iGPU, CUDA on Colab) -> the (b) comparison on it.
+  // --------------------------------------------------------------------------
+  {
+    printf("[49] Backend layer: selection/fallback, mock (fake device + fake cuBLAS) vs CPU,"
+           " column-major mapping, residency\n");
+    int ok49 = 1;
+    const int was_enabled = backend_is_enabled();
+    const float tol = 1e-5f;       // mock: naive fp32 loops vs AVX2/portable kernels, K <= 64
+    long hh = 0, dd = 0;
+    float e[4];
+
+    // (a) selection
+    int a_ok = 1;
+    backend_request("cpu");
+    a_ok &= strcmp(backend_active_name(), "cpu") == 0 && backend_last_message()[0] == 0;
+    backend_request("mock");
+    a_ok &= strcmp(backend_active_name(), "mock") == 0;
+    a_ok &= backend_request("no-such-backend") == 0 && strcmp(backend_active_name(), "mock") == 0;
+    backend_request("auto");
+    const TfBackend *au = backend_active();
+    a_ok &= au == NULL || au->is_gpu;
+    printf("    (a) cpu -> cpu, mock -> mock, unknown name rejected (selection kept),"
+           " auto -> %s (never the mock) -> %s\n", backend_active_name(), a_ok ? "OK" : "FAIL");
+    ok49 &= a_ok;
+
+    // (b) mock vs CPU
+    backend_request("mock");
+    backend_stats_reset();
+    long g0 = backend_mock_gemm_calls();
+    st49_vs_cpu(e, 0);
+    backend_stats(&hh, &dd);
+    const long gcalls = backend_mock_gemm_calls() - g0;
+    int b_ok = e[0] < tol && e[1] < tol && e[2] < tol && e[3] < tol &&
+               hh == 3 * ST49_NSH && dd == 3 * ST49_NSH && gcalls == 4 * ST49_NSH;
+    printf("    (b) mock, %d awkward shapes (1s, primes, tile edges), pre-seeded grads: fwd %.1e |"
+           " dA %.1e | dB %.1e | dx %.1e (tol %.0e)\n", ST49_NSH, e[0], e[1], e[2], e[3], tol);
+    printf("        %ld/%d calls taken by the mock (%ld fake-cuBLAS gemms), %ld/%d declined while"
+           " disabled (--no-gpu) -> %s\n", hh, 3 * ST49_NSH, gcalls, dd, 3 * ST49_NSH,
+           b_ok ? "OK" : "FAIL");
+    ok49 &= b_ok;
+
+    // (c) fake cuBLAS + the mapping
+    float me[3];
+    int rejected = 0;
+    const int map_st = st49_mapping(me);
+    const int tb_ok = st49_fake_textbook(&rejected);
+    const int ops_ok = tf_cuda_op(0) == 0 && tf_cuda_op(1) == 1 &&
+                       tf_hip_op(0) == 111 && tf_hip_op(1) == 112;
+    // Negative control, FORWARD ONLY: a mapping the BLAS rejects halfway through a
+    // backward pair would (correctly) abort the process, see backend_matmul_backward.
+    backend_mock_set_broken_mapping(1);
+    backend_stats_reset();
+    st49_vs_cpu(e, 1);
+    backend_stats(&hh, &dd);
+    backend_mock_set_broken_mapping(0);
+    const int caught = !(e[0] < tol && hh == ST49_NSH);
+    tf_backend_mock()->shutdown();             // the broken run may have disabled it
+    const int c_ok = map_st == 0 && me[0] < tol && me[1] < tol && me[2] < tol && tb_ok &&
+                     rejected == 5 && ops_ok && caught;
+    printf("    (c) fake cuBLAS: hand-worked 2x3 @ 3x2, all 4 (transa,transb), NaN-padded ld,"
+           " alpha 2 beta -1 -> %s; invalid calls rejected like cuBLAS %d/5\n",
+           tb_ok ? "exact" : "WRONG", rejected);
+    printf("        mapping C^T = B^T A^T (dA: T,N; dB: N,T) vs fp64 row-major: fwd %.1e | dA %.1e |"
+           " dB %.1e; op codes cuBLAS %d/%d hipBLAS %d/%d; operand-swap-omitted control %s -> %s\n",
+           me[0], me[1], me[2], tf_cuda_op(0), tf_cuda_op(1), tf_hip_op(0), tf_hip_op(1),
+           caught ? "caught" : "NOT CAUGHT", c_ok ? "OK" : "FAIL");
+    ok49 &= c_ok;
+
+    // Shared by (d)-(g): one mid-size awkward shape and its CPU reference.
+    const TfBackend *mk = tf_backend_mock();
+    const int M = 13, K = 31, N = 7;
+    int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
+    Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
+    st49_fill(A.data, A.size, 71u);
+    st49_fill(B.data, B.size, 73u);
+    float *ref = (float*)malloc(C.size * sizeof(float));
+    float *ref2 = (float*)malloc(C.size * sizeof(float));
+    float *out = (float*)malloc(C.size * sizeof(float));
+    backend_set_enabled(0);
+    matmul(&A, &B, &C);
+    memcpy(ref, C.data, C.size * sizeof(float));
+    backend_set_enabled(1);
+
+    // (d) L2: opaque buffers + the cuBLAS-shaped gemm, called with the forward
+    // mapping by hand.
+    int d_ok = 0, d_rej = 0;
+    {
+      TfBuf *xA = mk->buf_alloc(A.size * sizeof(float), TF_F32);
+      TfBuf *xB = mk->buf_alloc(B.size * sizeof(float), TF_F32);
+      TfBuf *xC = mk->buf_alloc(C.size * sizeof(float), TF_F32);
+      if (xA && xB && xC &&
+          mk->buf_upload(xA, 0, A.data, A.size * sizeof(float), NULL) &&
+          mk->buf_upload(xB, 0, B.data, B.size * sizeof(float), NULL) &&
+          mk->gemm(NULL, 0, 0, N, M, K, 1.0f, xB, N, xA, K, 0.0f, xC, N, TF_F32, TF_F32) &&
+          mk->buf_download(out, xC, 0, C.size * sizeof(float), NULL))
+        d_ok = st49_rel(out, ref, C.size) < tol;
+      // Rejected: C too small for m x n at ldc, fp16 (not implemented), lda < m.
+      d_rej += !mk->gemm(NULL, 0, 0, N + 1, M, K, 1.0f, xB, N + 1, xA, K, 0.0f, xC, N + 1, TF_F32, TF_F32);
+      d_rej += !mk->gemm(NULL, 0, 0, N, M, K, 1.0f, xB, N, xA, K, 0.0f, xC, N, TF_F16, TF_F32);
+      d_rej += !mk->gemm(NULL, 0, 0, N, M, K, 1.0f, xB, N - 1, xA, K, 0.0f, xC, N, TF_F32, TF_F32);
+      mk->buf_free(xA); mk->buf_free(xB); mk->buf_free(xC);
+    }
+    d_ok &= d_rej == 3;
+    printf("    (d) L2 cuBLAS-shaped gemm on opaque device buffers (%dx%dx%d): %s; out-of-bounds /"
+           " fp16 / bad ld rejected %d/3 -> %s\n", M, K, N, d_ok ? "matches CPU" : "WRONG", d_rej,
+           d_ok ? "OK" : "FAIL");
+    ok49 &= d_ok;
+
+    // (e) L3: weight residency. B is registered; two forwards then upload only A.
+    // Changing B on the host WITHOUT invalidate must give the stale (old) result
+    // -- proof the upload really is skipped -- and invalidate must fix it.
+    int e_ok = 0;
+    long u0 = 0, u1 = 0;
+    {
+      const TfBuf *rb = mk->register_weight(B.data, B.size * sizeof(float), TF_F32);
+      backend_mock_uploads(&u0, NULL);
+      matmul(&A, &B, &C);
+      int good = st49_rel(C.data, ref, C.size) < tol;
+      matmul(&A, &B, &C);
+      good &= st49_rel(C.data, ref, C.size) < tol;
+      backend_mock_uploads(&u1, NULL);
+      B.data[0] += 1.0f;                                   // host changes, no invalidate
+      backend_set_enabled(0);
+      matmul(&A, &B, &C);
+      memcpy(ref2, C.data, C.size * sizeof(float));        // the NEW correct answer
+      backend_set_enabled(1);
+      matmul(&A, &B, &C);
+      const int stale = st49_rel(C.data, ref, C.size) < tol && st49_rel(C.data, ref2, C.size) > tol;
+      mk->invalidate(B.data);
+      matmul(&A, &B, &C);
+      const int fresh = st49_rel(C.data, ref2, C.size) < tol;
+      e_ok = rb != NULL && good && (u1 - u0) == 2 && stale && fresh;
+      printf("    (e) L3 residency: B registered -> 2 forwards cost %ld uploads (A only), host edit"
+             " without invalidate -> %s, after invalidate -> %s -> %s\n", u1 - u0,
+             stale ? "stale (as contracted)" : "NOT stale", fresh ? "fresh" : "STALE",
+             e_ok ? "OK" : "FAIL");
+      B.data[0] -= 1.0f;
+      mk->invalidate(NULL);
+    }
+    ok49 &= e_ok;
+
+    // (f) a device error: the call is carried by the CPU, the backend disables
+    // itself for the rest of the run, nothing aborts; shutdown makes it healthy.
+    backend_mock_set_fail(1);
+    backend_stats_reset();
+    memset(C.data, 0, C.size * sizeof(float));
+    matmul(&A, &B, &C);
+    backend_stats(&hh, &dd);
+    const int dead = !mk->available();
+    backend_mock_set_fail(0);
+    mk->shutdown();
+    const int f_ok = memcmp(C.data, ref, C.size * sizeof(float)) == 0 && hh == 0 && dd == 1 &&
+                     dead && mk->available();
+    printf("    (f) simulated device error: CPU result bit-identical, backend disabled for the run,"
+           " healthy again after shutdown -> %s\n", f_ok ? "OK" : "FAIL");
+    ok49 &= f_ok;
+
+    // (g) the real backends.
+    const char *real[3] = {"cuda", "hip", "opencl"};
+    for (int r = 0; r < 3; r++) {
+      backend_request(real[r]);
+      const TfBackend *b = backend_active();
+      int g_ok;
+      if (!b) {
+        backend_stats_reset();
+        memset(C.data, 0, C.size * sizeof(float));
+        matmul(&A, &B, &C);
+        backend_stats(&hh, &dd);
+        g_ok = backend_last_message()[0] != 0 && hh == 0 &&
+               memcmp(C.data, ref, C.size * sizeof(float)) == 0;
+        printf("    (g) %-6s absent -> \"%s\"; CPU results bit-identical -> %s\n", real[r],
+               backend_last_message(), g_ok ? "OK" : "FAIL");
+      } else {
+        backend_set_gates(1, 0);                 // take every shape, however small
+        backend_stats_reset();
+        st49_vs_cpu(e, 0);
+        backend_stats(&hh, &dd);
+        const float rtol = 1e-4f;                // the part [30] tolerance for real devices
+        g_ok = e[0] < rtol && e[1] < rtol && e[2] < rtol && e[3] < rtol && hh == 3 * ST49_NSH;
+        printf("    (g) %-6s PRESENT (%s), gates lowered, %d awkward shapes: fwd %.1e | dA %.1e |"
+               " dB %.1e | dx %.1e (tol %.0e), %ld/%d offloaded -> %s\n", real[r], b->device_name(),
+               ST49_NSH, e[0], e[1], e[2], e[3], rtol, hh, 3 * ST49_NSH, g_ok ? "OK" : "FAIL");
+      }
+      ok49 &= g_ok;
+    }
+
+    // Restore: selection back to TF_BACKEND / auto (gates re-read), mock memory freed.
+    backend_request(NULL);
+    backend_set_enabled(was_enabled);
+    mk->shutdown();
+    free(ref); free(ref2); free(out);
+    tensor_free(&A); tensor_free(&B); tensor_free(&C);
+    printf("    -> %s\n\n", ok49 ? "OK" : "FAIL");
+    all_ok &= ok49;
   }
 
   // --------------------------------------------------------------------------

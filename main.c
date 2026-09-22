@@ -36,6 +36,7 @@
 #include "llama.h"
 #include "matrix.h"
 #include "gpu.h"
+#include "backend.h"
 #include "selftest.h"
 
 // Portable "make directory if absent" (ignores already-exists).
@@ -1159,30 +1160,61 @@ static int run_hfchat(int argc, char **argv) {
 
 static int run_gpu_info(int argc, char **argv) {
   (void)argc; (void)argv;
+  // Every backend this binary knows about: compiled in or not, and if it is,
+  // whether its runtime library + a device were found HERE.
+  printf("Compute backends (select with --backend X or TF_BACKEND=X; default auto):\n");
+  printf("  %-7s compiled in, always available (matrix.c kernels: %s)\n", "cpu",
+         matmul_simd_name());
+  for (int i = 0; backend_info(i); i++) {
+    const TfBackendInfo *bi = backend_info(i);
+    if (!bi->ops) {
+      printf("  %-7s not compiled in (rebuild with %s)\n", bi->name, bi->build_hint);
+      continue;
+    }
+    const int ok = bi->ops->init();
+    printf("  %-7s compiled in, %s: %s\n", bi->name, ok ? "AVAILABLE" : "unavailable",
+           bi->ops->device_name());
+    if (ok) {
+      TfCaps c;
+      bi->ops->caps(&c);
+      printf("          caps: %.1f GB, %d compute units, unified memory %s, dispatch gates "
+             "M >= %d and M*N*K >= %lld\n",
+             (double)c.mem_bytes / (1024.0 * 1024.0 * 1024.0), c.compute_units,
+             c.unified_memory ? "yes" : "no", c.min_m, c.min_macs);
+      printf("          levels: L1 host GEMM | L2 device buffers + cuBLAS-shaped gemm: %s"
+             " | L3 weight residency: %s\n",
+             bi->ops->gemm ? "yes" : "no", bi->ops->register_weight ? "yes" : "no");
+    }
+  }
+  const char *active = backend_active_name();
+  int gm; long long gmacs;
+  backend_gates(&gm, &gmacs);
+  printf("\nActive: %s%s\n", active, backend_is_enabled() ? "" : " (DISABLED by --no-gpu: CPU)");
+  if (strcmp(active, "cpu") != 0)
+    printf("  gates in force: M >= %d and M*N*K >= %lld (env TF_GPU_MIN_M / TF_GPU_MIN_MACS"
+           " retune real GPUs)\n", gm, gmacs);
+  if (backend_last_message()[0]) printf("  note: %s\n", backend_last_message());
   if (!gpu_compiled_in()) {
-    printf("GPU backend: NOT COMPILED IN (this is a CPU-only build)\n");
-    printf("  Rebuild with:  make GPU=1        (native)\n");
-    printf("                 make cross-gpu    (Linux x86_64 binary for Colab)\n");
+    printf("\nNo GPU backend is compiled into this binary (CPU-only build).\n");
+    printf("  Rebuild with:  make GPU=opencl|cuda|hip|all   (GPU=1 == opencl)\n");
+    printf("                 make cross-gpu / cross-cuda    (Linux x86_64 binaries for Colab)\n");
     return 0;
   }
-  printf("GPU backend: compiled in (OpenCL, loaded at runtime)\n");
-  const int ok = gpu_available();
+  if (!gpu_available()) {
+    printf("\nNo usable GPU -- every matmul runs on the CPU. This is a correct, supported\n");
+    printf("state, not a failure. Typical fixes on Linux/Colab:\n");
+    printf("  cuda  : needs the NVIDIA driver (libcuda.so.1) and cuBLAS (libcublas.so.12);\n");
+    printf("          set TF_CUBLAS_LIB=/full/path/libcublas.so.12 if it is not on the path.\n");
+    printf("  opencl: apt-get install -y ocl-icd-libopencl1\n");
+    printf("          mkdir -p /etc/OpenCL/vendors\n");
+    printf("          echo libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd\n");
+    printf("  hip   : ROCm (libamdhip64.so + libhipblas.so); TF_HIP_LIB / TF_HIPBLAS_LIB.\n");
+    return 0;
+  }
   printf("  device: %s\n", gpu_device_name());
-  if (!ok) {
-    printf("  status: NO USABLE DEVICE -- every matmul will run on the CPU.\n");
-    printf("          This is a correct, supported state, not a failure.\n");
-    printf("          On Linux/Colab, an OpenCL ICD loader is usually all that is missing:\n");
-    printf("            apt-get install -y ocl-icd-libopencl1\n");
-    printf("            mkdir -p /etc/OpenCL/vendors\n");
-    printf("            echo libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd\n");
-    return 0;
-  }
-  printf("  compute units: %d\n", gpu_compute_units());
-  printf("  global memory: %.1f GB\n", (double)gpu_global_mem() / (1024.0 * 1024.0 * 1024.0));
   printf("  status: READY (enabled=%d)\n", gpu_is_enabled());
-  printf("  thresholds: TF_GPU_MIN_M (default 8), TF_GPU_MIN_MACS (default 4194304)\n");
-  printf("              Below either one a matmul stays on the CPU on purpose --\n");
-  printf("              single-token decode (M=1) is bandwidth-bound and loses on a GPU.\n");
+  printf("  Below either gate a matmul stays on the CPU on purpose --\n");
+  printf("  single-token decode (M=1) is bandwidth-bound and loses on a GPU.\n");
   return 0;
 }
 
@@ -1205,6 +1237,12 @@ static int    g_bench_shapes = 0;
 static double g_bench_worst_err = 0.0;
 static double g_bench_best_ratio = 0.0;
 
+// The backend being benchmarked: whatever --backend / TF_BACKEND / auto chose.
+static int bench_have(void) {
+  const TfBackend *b = backend_active();
+  return b && b->available();
+}
+
 static void bench_one(int M, int K, int N, int reps) {
   int sa[2] = {M, K}, sb[2] = {K, N}, sc[2] = {M, N};
   Tensor A = tensor_create(sa, 2), B = tensor_create(sb, 2), C = tensor_create(sc, 2);
@@ -1223,7 +1261,7 @@ static void bench_one(int M, int K, int N, int reps) {
   memcpy(ref, C.data, C.size * sizeof(float));
 
   gpu_set_enabled(1);
-  const int have = gpu_available();
+  const int have = bench_have();
   double gpu_s = 0.0, maxrel = 0.0;
   if (have) {
     matmul(&A, &B, &C);                     // warm up: first call builds/uploads
@@ -1260,9 +1298,13 @@ static int run_gpu_bench(int argc, char **argv) {
   int reps = (argc > 2) ? atoi(argv[2]) : 5;
   if (reps < 1) reps = 1;
   printf("matmul benchmark, %d reps per shape (shapes taken from SmolLM2-135M)\n", reps);
-  if (!gpu_compiled_in())
-    printf("  NOTE: CPU-only build -- this measures the CPU path only.\n");
-  else if (!gpu_available())
+  const TfBackend *be = backend_active();
+  if (be && be->available())
+    printf("  backend: %s -- %s\n", be->name, be->device_name());
+  else if (!gpu_compiled_in())
+    printf("  NOTE: CPU-only build -- this measures the CPU path only (try --backend mock\n"
+           "        to exercise the dispatch path; it is a slow reference, not a GPU).\n");
+  else
     printf("  NOTE: no GPU device found (%s) -- CPU path only.\n", gpu_device_name());
   printf("      M x     K x     N |\n");
   bench_one(256, 576, 1536, reps);      // SwiGLU up/gate projection
@@ -1275,7 +1317,7 @@ static int run_gpu_bench(int argc, char **argv) {
   // A benchmark that makes you infer the conclusion is only half a benchmark.
   // "GPU present" does not mean "GPU worth using" -- an integrated GPU sharing
   // the CPU's memory bus routinely loses to a well-threaded CPU.
-  if (gpu_compiled_in() && gpu_available() && g_bench_shapes > 0) {
+  if (bench_have() && g_bench_shapes > 0) {
     const double geo = exp(g_bench_log_ratio / g_bench_shapes);
     printf("\nVERDICT: %.2fx typical (geometric mean over %d shapes; best single shape "
            "%.2fx)\n         worst rel err vs CPU: %.1e\n",
@@ -1437,6 +1479,19 @@ int main(int argc, char **argv) {
   for (int i = 0; i < argc && fargc < 256; i++) {
     if (i > 0 && strcmp(argv[i], "--no-gpu") == 0) { gpu_set_enabled(0); continue; }
     if (i > 0 && strcmp(argv[i], "--gpu") == 0)    { gpu_set_enabled(1); continue; }
+    // --backend cpu|opencl|cuda|hip|mock|auto (backend.h): overrides TF_BACKEND.
+    if (i > 0 && strncmp(argv[i], "--backend=", 10) == 0) {
+      if (!backend_request(argv[i] + 10)) return 1;
+      continue;
+    }
+    if (i > 0 && strcmp(argv[i], "--backend") == 0) {
+      if (i + 1 >= argc || !backend_request(argv[i + 1])) {
+        if (i + 1 >= argc) fprintf(stderr, "--backend needs a value (cpu|opencl|cuda|hip|mock|auto)\n");
+        return 1;
+      }
+      i++;
+      continue;
+    }
     fargv[fargc++] = argv[i];
   }
   argv = fargv;
@@ -1472,6 +1527,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "unknown command '%s'\n", argv[1]);
     fprintf(stderr, "usage: transformer [train|llama-train|grpo|generate|agent|imggen|audgen|llama] ...\n");
     fprintf(stderr, "       transformer [gpu-info|gpu-bench]   (GPU backend status / CPU-vs-GPU timing)\n");
+    fprintf(stderr, "       global flags: --backend cpu|opencl|cuda|hip|mock|auto (or env TF_BACKEND), --gpu / --no-gpu\n");
     fprintf(stderr, "       transformer simd-bench [reps]      (portable C vs AVX2+FMA kernel timing)\n");
     fprintf(stderr, "       transformer            (no args: run the built-in self-test)\n");
     return 1;

@@ -4,7 +4,7 @@
 #include <stdlib.h>
 
 #include "check.h"
-#include "gpu.h"
+#include "backend.h"
 
 // ===========================================================================
 // Persistent thread pool (also exported as tf_parallel_for, see matrix.h).
@@ -593,10 +593,10 @@ SIMD_FN static void mm_fwd_cols_avx2(int u0, int u1, void *ctx) {
 void matmul(const Tensor *A, const Tensor *B, Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
-  // Optional GPU offload (gpu.h). Returns 0 — "not mine" — for a CPU-only build,
+  // Optional backend offload (backend.h). Returns 0 — "not mine" — for a CPU-only build,
   // when no device was found, when --no-gpu is in force, or when the problem is
   // too small to be worth the dispatch; the CPU path below is then unchanged.
-  if (gpu_matmul(A->data, B->data, C->data, M, K, N)) return;
+  if (backend_matmul(A->data, B->data, C->data, M, K, N)) return;
   MMFwd t = { A->data, B->data, C->data, M, K, N };
   range_fn fn = mm_fwd_rows, fc = mm_fwd_cols;
 #if defined(MM_X86_SIMD)
@@ -762,7 +762,7 @@ SIMD_FN static void mm_bwd_dB_avx2(int k0, int k1, void *ctx) {
 void matmul_backward(const Tensor *A, const Tensor *B, const Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
-  if (gpu_matmul_backward(A->data, B->data, C->grad, A->grad, B->grad, M, K, N)) return;
+  if (backend_matmul_backward(A->data, B->data, C->grad, A->grad, B->grad, M, K, N)) return;
   MMBwd t = { A, B, C, M, K, N };
   range_fn fa = mm_bwd_dA, fb = mm_bwd_dB;
 #if defined(MM_X86_SIMD)
@@ -790,7 +790,7 @@ int matmul_backward_dw_block(void) {
 void matmul_backward_dx(const Tensor *A, const Tensor *B, const Tensor *C) {
   tf_check_matmul(A, B, C);
   const int M = A->shape[0], K = A->shape[1], N = B->shape[1];
-  if (gpu_matmul_backward_dx(B->data, C->grad, A->grad, M, K, N)) return;
+  if (backend_matmul_backward_dx(B->data, C->grad, A->grad, M, K, N)) return;
   MMBwd t = { A, B, C, M, K, N };
   range_fn fa = mm_bwd_dA;
 #if defined(MM_X86_SIMD)
