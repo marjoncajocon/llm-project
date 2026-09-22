@@ -3436,6 +3436,40 @@ model/smollm/reason_e2.bin --hf-tok model/smollm/tok.hf --out model/runs/X.bin -
 --hf-tok … --eval-only --temp 0 --dump X.jsonl`; compare `python tools/evalcard.py A.jsonl B.jsonl`.
 Queue scripts: `E:\llm-test\overnight3.sh … overnight9.sh`; logs + dumps: `E:\llm-test\logs\v3\`.
 
+### 2026-09-22 — Phase A: SFT on data-v2 (the lever the overnight run pointed to) — BIG WIN; Phase B started
+
+**Data** `E:\llm-test\data\v2\sft_mix.txt` — 5,082 pairs: data-v2 generators on the TRAIN lexicon
+(`make_agent_traj` 700 tasks + `hard_tasks` 600 + `make_qa` 300, all `--goal-grammar
+--unscripted-errors 0.25`) + the original `data/clean_reason.txt`; `clean_sft --replay --decontam`
+against BOTH eval sets (0 rejected, 0 replay-inconsistent, 6 decontaminated, 34 dupes).
+**A1** = `reason_e2.bin` + `llama-train --sft --lora-r 16 --lora-alpha 32 --lora-mlp --batch 4
+--steps 1270 --lr 1e-3 --warmup 30 --min-lr 1e-4` (1 epoch, 52 min at 3 threads, loss 0.97 → 0.07).
+**A2** = A1 + DAPO (100 steps, lr 1e-4) on `grpo_hard` + `grpo_diverse`.
+
+| model | in-dist exact | held-out exact | probe3 | memtest A / B | critic A | critic B greedy |
+|---|---|---|---|---|---|---|
+| base (reason_e2) | 22.0% | 17.0% | 8/8 | 95 / 90 | 96% | 4/4 |
+| best overnight RL (D3) | 58.5% | 31.0% | – | – | – | – |
+| **A1 (SFT)** | **59.5%** (75 fixed / 0 broken) | **66.5%** (107 / 8) | 8/8 | 95 / **100** | 96% | **3/4** |
+| A2 (A1 + DAPO) | 60.0% | 67.5% | 8/8 | 95 / 100 | 96% | 3/4 |
+
+- SFT on varied data is the lever: held-out 17 → 66.5% (+49.5, p=3e-23); every family improves
+  (write 9→56, read 24→54, done 29→94, delete 5→62, run 0→62.5).
+- CAVEAT: the held-out set comes from the same data-v2 generator family (disjoint words/phrasings,
+  same task structure); the old-template in-dist set (59.5%) and the hand-written probes are the
+  independent confirmation — non-regressive except ONE greedy miss on eval_critic B case 1
+  (write_file; sampled decoding gets it). Strict promotion rule not met → NOT promoted.
+- DAPO after a strong SFT adds ~nothing (+0.5 / +1.0, n.s.; most groups flat at reward ~0.84).
+- User regression prompts still fail on all 135M models (sky colour, zodiac) — see 1c below.
+
+**Phase B**: Qwen2.5-Coder-0.5B-Instruct converted (`convert_llama.py … --max-seq 4096` → 494.0M
+params, tied, 1.98 GB f32; tokenizer export 0 HF mismatches over 7,864 texts). Runs in the pure-C
+engine: `hfchat` → "blue" for the sky prompt, a correct compiler definition; zodiac still wrong but no
+looping. ~20 s/reply (model reload each call). Logits NOT diffed against HF (no torch here). LoRA SFT
+works (5-step smoke: loss 3.07 → 1.15, peak RSS 4.3 GB). **B1** (Qwen + the same SFT as A1) running:
+`E:\llm-test\phaseB.sh`, logs `E:\llm-test\logs\phaseB\`. Release CLI `E:\llm-release` now has
+models `sft` (A1) and `qwen`.
+
 ### ▶ PLANNED (user request 2026-09-22): the model knows the CURRENT TIME and can SEARCH THE WEB
 
 Status: NOT STARTED — design agreed, pick up after Phase A (SFT+DAPO on data-v2) / Phase B (Qwen2.5-Coder-0.5B).
