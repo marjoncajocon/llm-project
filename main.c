@@ -318,6 +318,8 @@ static void train_usage(void) {
     "  --ctx N       context window (default 64)         --lr F      learning rate (default 3e-4)\n"
     "  --seed N      RNG seed (default 1234)             --val-frac F  held-out fraction (default 0.1)\n"
     "  --resume F    continue training a saved model     --checkpoint-every N  save every N steps\n"
+    "  --sft-escapes with --sft: backslash-n / backslash-t / double backslash in the file\n"
+    "                are newline / tab / backslash (multi-line responses such as code)\n"
     "  --sft         masked instruction tuning: file is 'prompt<TAB>response' lines,\n"
     "                loss on the response only (true SFT). See data/sft.txt.\n"
     "  Training recipe (all OFF by default, so existing runs reproduce exactly):\n"
@@ -386,6 +388,7 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--checkpoint-every") == 0) { NEED_VAL(); cfg.checkpoint_every = atoi(argv[++i]); }
     else if (strcmp(f, "--val-frac") == 0){ NEED_VAL(); cfg.val_frac = (float)atof(argv[++i]); }
     else if (strcmp(f, "--sft") == 0)     { cfg.sft = 1; }
+    else if (strcmp(f, "--sft-escapes") == 0) { cfg.sft_escapes = 1; }
     else if (strcmp(f, "--weight-decay") == 0) { NEED_VAL(); cfg.weight_decay = (float)atof(argv[++i]); }
     else if (strcmp(f, "--clip") == 0)    { NEED_VAL(); cfg.grad_clip = (float)atof(argv[++i]); }
     else if (strcmp(f, "--warmup") == 0)  { NEED_VAL(); cfg.warmup = atoi(argv[++i]); }

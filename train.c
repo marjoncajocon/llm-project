@@ -17,6 +17,24 @@
 #include "llamatrain.h"
 #include "hftok.h"
 
+// --sft-escapes: an SFT file holds one prompt<TAB>response pair per line, so a multi-line
+// response (code) cannot be written literally. With the flag, the two-character sequences
+// backslash-n, backslash-t and backslash-backslash in either field become a newline, a tab
+// and a backslash (in place -- the string only shrinks). Off by default, so existing data
+// files, which may contain literal backslashes, are read byte for byte as before.
+static void sft_unescape(char *s) {
+  char *w = s;
+  for (const char *r = s; *r; r++) {
+    if (r[0] == '\\' && (r[1] == 'n' || r[1] == 't' || r[1] == '\\')) {
+      *w++ = (r[1] == 'n') ? '\n' : (r[1] == 't') ? '\t' : '\\';
+      r++;
+    } else {
+      *w++ = *r;
+    }
+  }
+  *w = '\0';
+}
+
 TrainConfig train_default_config(void) {
   TrainConfig c;
   c.out_model = "model.bin";
@@ -166,6 +184,7 @@ static int train_sft(char *text, const TrainConfig *cfg) {
       char *prompt = line, *resp = tab + 1;
       size_t rl = strlen(resp);                  // strip a trailing CR (Windows files)
       if (rl && resp[rl - 1] == '\r') resp[rl - 1] = '\0';
+      if (cfg->sft_escapes) { sft_unescape(prompt); sft_unescape(resp); }
       if (prompt[0] && resp[0]) {
         int t[4096], r[4096];
         int T = tokenizer_encode(&tok, prompt, t, 4096);
@@ -601,6 +620,7 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
       char *prompt = line, *resp = tab + 1;
       size_t rl = strlen(resp);
       if (rl && resp[rl - 1] == '\r') resp[rl - 1] = '\0';
+      if (cfg->sft_escapes) { sft_unescape(prompt); sft_unescape(resp); }
       if (prompt[0] && resp[0]) {
         int t[4096], r[4096];
         int T = anytok_encode(&tok, prompt, t, 4096);

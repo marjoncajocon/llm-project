@@ -19,6 +19,9 @@ typedef struct {
   int checkpoint_every;    // save every N steps (0 => only at the end)
   float val_frac;          // fraction of tokens held out for validation loss (e.g. 0.1)
   int sft;                 // 1 => masked instruction-tuning (SFT) mode (prompt<TAB>response lines)
+  int sft_escapes;         // 1 => in SFT lines, backslash-n / backslash-t / double backslash are
+                           //      escapes for newline / tab / backslash (multi-line responses
+                           //      such as code); 0 => bytes taken literally (the default)
   // --- Training-recipe options (all default to OFF, so runs stay reproducible) ---
   float weight_decay;      // AdamW decoupled decay on weight matrices (0 => plain Adam)
   float grad_clip;         // global grad-norm clip (0 => off; 1.0 is the usual choice)
