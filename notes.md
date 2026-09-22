@@ -3544,6 +3544,19 @@ code, how-to; train on those answers alongside the agent rows) or a capped slice
 instruction set (e.g. smol-smoltalk), plus a lower LR; judge on held-out + `test_prompts.txt`.
 Release CLI: `/model qwen-agent` (B1, agent tasks) next to `/model qwen` (original, chat).
 
+**Engine VERIFIED against an independent reference (2026-09-22).** `E:\llm-test\qwen_ref.py` = a
+NumPy Qwen2 forward pass reading the ORIGINAL HF `model.safetensors` (bf16 → f32; q/k/v bias, RoPE
+θ=1e6 rotate-half, GQA 14/2, SwiGLU, tied head) — independent of `convert_llama.py` and the C code.
+Greedy output matches the C engine token for token ("Certainly! Below is a simple C function",
+8/8 tokens) and on "In one word, what color is a banana?" both pick "Red" (reference logits: Red
+20.51, Ban 20.36, Yellow 20.14). So the engine is right; Qwen2.5-Coder-0.5B is just weak on simple
+facts (its "blue" for the sky came from chat-mode sampling at T=0.8).
+**B2 data consequence:** the self-distillation teacher was wrong on 52 of 79 short-fact prompts
+(banana → Red, largest planet → Mercury, 33+5 → 48, penguins fly → Yes), so
+`tools/distill_answer_key.py` replaces those answers (arithmetic computed; colours / one-word /
+yes-no from a small key) before building `sft_b2.txt`; the rest keeps the teacher's answers.
+First B2 run was stopped before training on the uncorrected data; B2b = `E:\llm-test\phaseB2b.sh`.
+
 ### ▶ PLANNED (user request 2026-09-22): the model knows the CURRENT TIME and can SEARCH THE WEB
 
 Status: NOT STARTED — design agreed, pick up after Phase A (SFT+DAPO on data-v2) / Phase B (Qwen2.5-Coder-0.5B).
