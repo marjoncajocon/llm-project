@@ -64,6 +64,7 @@
 #define KV_CAP      32
 #define KV_K        40
 #define KV_V        48
+#define KV_SPARE    56
 #define KV_SIZE     64
 
 #endif
