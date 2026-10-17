@@ -88,3 +88,26 @@ tolerance (and greedy decode must produce the same token stream as `transformer.
   `model.inc`, `DESIGN.md` or `build.sh` — if you need a change, say so in your report.
 - Do not commit; the coordinator commits.
 - Every exported function: correct Win64 prologue, stack alignment, saved non-volatiles.
+
+## Additions after the first build (2026-10-17)
+
+- **pool.S**: `pool_run_n(fn, ctx, n, grain, nthreads)` (5th arg on the stack; <=0 = all);
+  data `pool_mem_threads` = SMT cores (P-cores on a hybrid CPU, 6 here). matvec/matmul_rows with
+  M <= `mv_mem_rows` (16) use `pool_mem_threads` (memory-bound), larger M use the whole pool.
+  Tuning data: `mv_small_bytes`, `mv_chunks_per_thread`, `mv_min_chunk_bytes`, `mv_mem_threads`.
+  `pool_run` called from inside a pool job runs inline. **Never call matvec/matmul_rows from inside
+  a pool fn** (they use static scratch).
+- **Q8 Mat** after `mat_q8_pack`: `aux` = Kpad (K rounded up to 16). Packed layout: 16-column
+  panels of Kpad x 16 bytes; each group of 4 k is one 64-byte line (cols 0-7 then 8-15, 4 bytes
+  per column). `colsum` = int32[Npad] holding 128*sum_k w. The loader frees the raw `data` of
+  non-embedding Q8 mats after packing (`data` = 0); `wte.data` always stays.
+- **KV**: `KV_SPARE` (56) holds the cache arena. **K cache layout is decode.S's**: for a layer whose
+  cap is a multiple of 8, slots 8b..8b+7 form a channel-major block,
+  `K[s][c]` at `k + (s>>3)*8*kv_dim + c*8 + (s&7)`; other caps stay row-major. V is row-major.
+  Copying a cache prefix must copy whole 8-slot blocks of K.
+- **tok.S** extras: `tok_free(Tok*)`, `tok_max_piece(Tok*)`. `tok_encode` mutates caches in the Tok
+  (not thread-safe on one Tok).
+- **load.S** extras: `model_free`, `kv_free`, `kv_create_len`, `model_peek_magic`; flag 2 keeps every
+  Q8 mat's raw int8.
+- **decode.S**: `decode_init(Model*)`, `decode_step(...)` returns 1 when the cache is full;
+  `prefill(m, kv, ids, n)` batches 64 rows. head_dim must be a multiple of 8 (64 has a fast path).
