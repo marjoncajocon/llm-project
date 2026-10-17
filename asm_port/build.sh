@@ -6,6 +6,7 @@
 #   ./build.sh test NAME [extra.c ...]
 #                         build tests/NAME.c + all asm objects (+ extra C files,
 #                         e.g. ../quant.c) into build/NAME.exe and run it
+#                         (ASM="tok tok_unitab" links only those asm modules)
 #   ./build.sh clean
 #
 # Environment: ZIG=path to zig.exe (default /d/env/zig/zig.exe)
@@ -42,11 +43,24 @@ case "${1:-all}" in
     ;;
   test)
     name=$2; shift 2
-    # tests link everything except main.o (the test has its own main)
-    OBJS=$(asm_objs | tr ' ' '\n' | grep -v '/main\.o$' | tr '\n' ' ')
+    # tests link everything except main.o (the test has its own main), or only
+    # the modules named in ASM="tok tok_unitab" (so one module's unfinished
+    # file can't break another module's test)
+    if [ -n "${ASM:-}" ]; then
+      OBJS=""
+      for m in $ASM; do
+        o="$B/obj/$m.o"
+        if [ ! -e "$o" ] || [ "$m.S" -nt "$o" ] || [ model.inc -nt "$o" ]; then
+          "$ZIG" cc -target $TARGET -c "$m.S" -o "$o"
+        fi
+        OBJS="$OBJS $o"
+      done
+    else
+      OBJS=$(asm_objs | tr ' ' '\n' | grep -v '/main\.o$' | tr '\n' ' ')
+    fi
     "$ZIG" cc -target $TARGET -O2 -mavx2 -mfma -I.. -o "$B/$name.exe" "tests/$name.c" "$@" $OBJS -lkernel32
     "./$B/$name.exe"
     ;;
   clean) rm -rf "$B" ;;
-  *) sed -n '3,14p' "$0"; exit 2 ;;
+  *) sed -n '3,15p' "$0"; exit 2 ;;
 esac
