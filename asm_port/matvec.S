@@ -13,6 +13,9 @@
 //   void  matmul_rows(const Mat* m, const float* X, i64 M, float* Y)
 //         M rows at once (prefill): Y[i,:] = X[i,:] @ W, row i bit-identical
 //         to matvec(m, X[i,:]) (matvec IS matmul_rows with M = 1).
+//   void  matvec_q8_multi(const MvTask* t, i64 n, const float* x)
+//         several Q8 matvecs sharing x as ONE pool job, with fused epilogues
+//         (bias / residual add / SwiGLU) - see "FUSED DECODE MATVECS" below.
 //   tuning knobs (i64 data, read on every call; the test may change them):
 //         mv_small_bytes        weight bytes below which a call runs single-thread
 //         mv_chunks_per_thread  target number of work chunks per pool thread
@@ -320,9 +323,21 @@ epi16_nocs:
 //   preserves: rbx, r9, r10, r11, r13, r14
 // ===========================================================================
 
-// q8r_vnni_dec: ONE row, the decode kernel. 4 kgroups (16 k, 256 bytes) per
-// iteration into 8 independent accumulators (hides vpdpbusd's 5-cycle latency).
+// q8r_vnni_dec: ONE row, the decode kernel = q8dot1_vnni + the standard epilogue.
 q8r_vnni_dec:
+        call    q8dot1_vnni
+        ROWPTR  0
+        jmp     epi16
+
+// q8dot1_vnni: the raw dot products of ONE activation row with ONE panel.
+//   in : r10 = panel base, r11 = xq row (u8 = q+128), r9 = Kpad (multiple of 16)
+//   out: ymm12 / ymm13 = int32 sum_k u8(x[k]) * w[k][j] for columns 0-7 / 8-15
+//        of the panel (still WITH the +128 offset: subtract colsum[j] = 128*sum_k w)
+//   clobbers: rax, rdx, ymm0-ymm11 (nothing else - the fused kernels rely on it)
+// 4 kgroups (16 k, 256 bytes) per iteration into 8 independent accumulators
+// (hides vpdpbusd's 5-cycle latency); the 8 partial sums are added at the end
+// (integer adds: exact in any order).
+q8dot1_vnni:
         mov     rdx, r10
         xor     eax, eax
         vpxor   ymm0, ymm0, ymm0
@@ -356,8 +371,7 @@ q8r_vnni_dec:
         vpaddd  ymm1, ymm1, ymm3
         vpaddd  ymm5, ymm5, ymm7
         vpaddd  ymm13, ymm1, ymm5
-        ROWPTR  0
-        jmp     epi16
+        ret
 
 // Q8R_VNNI R: R rows (2..6) share every weight load: per kgroup, load the
 // 64-byte line once (ymm14/15) and do 2R vpdpbusd. Accumulators: row r in
@@ -474,6 +488,13 @@ q8r_vnni_\R:
         vpaddd  \accB, \accB, ymm11
 .endm
 q8r_avx2_1:
+        call    q8dot1_avx2
+        ROWPTR  0
+        jmp     epi16_nocs
+
+// q8dot1_avx2: like q8dot1_vnni without VNNI (r11 = s8 activations); the result
+//   needs no colsum correction. Clobbers rax, rdx, ymm0-ymm11, ymm15.
+q8dot1_avx2:
         vmovdqu ymm15, [rip + v_ones16]
         mov     rdx, r10
         xor     eax, eax
@@ -500,8 +521,7 @@ q8r_avx2_1:
         vpaddd  ymm1, ymm1, ymm3
         vpaddd  ymm5, ymm5, ymm7
         vpaddd  ymm13, ymm1, ymm5
-        ROWPTR  0
-        jmp     epi16_nocs
+        ret
 
 // ===========================================================================
 // q8_chunk(ctx, p0, p1): pool_run worker for Q8 - panels [p0,p1), all M rows.
@@ -1116,6 +1136,418 @@ calc_grain:
 1:      ret
 .Lcg_all:
         mov     rax, r10
+        ret
+
+// ===========================================================================
+// FUSED DECODE MATVECS (one activation row, Q8 only)
+//
+// void matvec_q8_multi(const MvTask* t, i64 n, const float* x)
+//   Runs n (<= MV_MAXT) matvecs that share the SAME input x as ONE pool job:
+//   x is quantized once, and the 16-column panels of all the matrices form one
+//   list of work units that the threads pull from. Each matrix can have a fused
+//   epilogue, so the separate bias / residual / SiLU passes (and their pool
+//   dispatches, and the idle tail at the end of every job) disappear.
+//
+//   MvTask (32 bytes): +0 Mat* m (Q8, all with the same K)
+//                      +8 float* y      output (N floats)
+//                      +16 float* add   0, or a vector added to the product
+//                      +24 i64 mode     0 = plain, 1 = SwiGLU pair (see below)
+//   mode 0: y[j] = (as*scale[j])*(float)acc[j]            -- exactly qmatmul
+//           y[j] = that + add[j]   when add != 0          -- bias_add, or the
+//                  residual x[j] += ao[j] with y = add = x (in place is fine:
+//                  each element is read and then written by the same thread)
+//   mode 1: this task and the NEXT one (the "up" matrix; its y/add/mode are
+//           ignored) are computed panel by panel together:
+//             g = (as*sg[j])*acc_g[j]   u = (as*su[j])*acc_u[j]   (both rounded
+//             to float exactly as qmatmul stores them), then
+//             y[j] = (g * s) * u,  s = 1.0f / (1.0f + expf(-g))   (llama.c)
+//   Every value goes through the same IEEE operations in the same order as the
+//   separate loops of the C engine, so the result is bit-identical to them.
+// ===========================================================================
+#define MV_MAXT     8
+// task table entry (128 bytes): fields of matrix 1 at +0, of matrix 2 (the
+// "up" matrix of a SwiGLU pair) at +64 with the same layout
+#define TE_PACKED   0
+#define TE_SCALE    8
+#define TE_COLSUM   16
+#define TE_N        24
+#define TE_START    32          // first work unit (global panel index) of this entry
+#define TE_END      40          // one past its last unit
+#define TE_Y        48
+#define TE_ADD      56
+#define TE_MODE     96
+#define TE_SIZE     128
+// job context
+#define MT_VNNI     0
+#define MT_KPAD     8
+#define MT_TAB      64
+
+        .bss
+        .balign 64
+mt_ctx: .space  MT_TAB + MV_MAXT*TE_SIZE
+
+        .section .rdata,"dr"
+        .balign 32
+// Constants of the expf port (copied from ops.S, which owns the reference
+// version: musl / FreeBSD e_expf.c). 8 copies each = a full ymm memory operand.
+.macro EC8I name, val
+\name:
+        .rept 8
+        .long \val
+        .endr
+.endm
+.macro EC8F name, val
+\name:
+        .rept 8
+        .float \val
+        .endr
+.endm
+        EC8I EC_ABS,    0x7fffffff
+        EC8I EC_SIGN,   0x80000000
+        EC8F EC_HALF,   0.5
+        EC8F EC_ONE,    1.0
+        EC8F EC_TWO,    2.0
+        EC8F EC_INVLN2, 1.4426950216e+0
+        EC8F EC_LN2HI,  6.9314575195e-1
+        EC8F EC_LN2LO,  1.4286067653e-6
+        EC8F EC_P1,     1.6666625440e-1
+        EC8F EC_P2,     -2.7667332906e-3
+        EC8I EC_TH1,    0x3EB17218      // |x| > 0.5*ln2 : needs range reduction
+        EC8I EC_TH2,    0x3F851592      // |x| > 1.5*ln2 : k from rounding, else +-1
+        EC8I EC_B127,   127
+        EC8I EC_SMALL,  0x39000000      // |x| <= 2^-13 : 1 + x
+        EC8I EC_OVF,    0x42b17218      // x >= 88.722839 : +inf
+        EC8I EC_UNF,    0xC2CFF1B5      // x <= -103.972084 : 0
+        EC8I EC_INF,    0x7f800000
+
+        .text
+// MV_EXP8 x, t1..t6 : x = expf(x) in 8 lanes, bit-exact with the scalar expf
+// of the C library. A verbatim copy of EXP8 in ops.S (see the derivation there):
+//   k = 0 / +-1 / trunc(x/ln2 +- 0.5) ; hi = x - k*ln2hi ; lo = k*ln2lo ;
+//   r = hi - lo ; c = r - r^2*(P1 + r^2*P2) ; y = 1 + (r*c/(2-c) - lo + hi) ;
+//   result = y * 2^k  (+ the special cases as blends). No FMA anywhere: the C
+//   reference rounds after every operation.
+.macro MV_EXP8 x, t1, t2, t3, t4, t5, t6
+        vandps    \t1, \x, ymmword ptr [rip + EC_ABS]
+        vandps    \t2, \x, ymmword ptr [rip + EC_SIGN]
+        vorps     \t3, \t2, ymmword ptr [rip + EC_HALF]
+        vmulps    \t4, \x, ymmword ptr [rip + EC_INVLN2]
+        vaddps    \t4, \t4, \t3
+        vroundps  \t4, \t4, 3
+        vorps     \t3, \t2, ymmword ptr [rip + EC_ONE]
+        vpcmpgtd  \t5, \t1, ymmword ptr [rip + EC_TH1]
+        vandps    \t3, \t3, \t5
+        vpcmpgtd  \t5, \t1, ymmword ptr [rip + EC_TH2]
+        vblendvps \t3, \t3, \t4, \t5
+        vmulps    \t4, \t3, ymmword ptr [rip + EC_LN2HI]
+        vsubps    \t4, \x, \t4
+        vmulps    \t5, \t3, ymmword ptr [rip + EC_LN2LO]
+        vsubps    \t2, \t4, \t5
+        vcvtps2dq \t3, \t3
+        vmulps    \t1, \t2, \t2
+        vmulps    \t6, \t1, ymmword ptr [rip + EC_P2]
+        vaddps    \t6, \t6, ymmword ptr [rip + EC_P1]
+        vmulps    \t6, \t6, \t1
+        vsubps    \t6, \t2, \t6
+        vmulps    \t1, \t2, \t6
+        vmovaps   \t2, ymmword ptr [rip + EC_TWO]
+        vsubps    \t2, \t2, \t6
+        vdivps    \t1, \t1, \t2
+        vsubps    \t1, \t1, \t5
+        vaddps    \t1, \t1, \t4
+        vaddps    \t1, \t1, ymmword ptr [rip + EC_ONE]
+        vpsrad    \t4, \t3, 1
+        vpsubd    \t3, \t3, \t4
+        vpaddd    \t4, \t4, ymmword ptr [rip + EC_B127]
+        vpslld    \t4, \t4, 23
+        vpaddd    \t3, \t3, ymmword ptr [rip + EC_B127]
+        vpslld    \t3, \t3, 23
+        vmulps    \t1, \t1, \t4
+        vmulps    \t1, \t1, \t3
+        vandps    \t2, \x, ymmword ptr [rip + EC_ABS]
+        vcmpps    \t3, \t2, ymmword ptr [rip + EC_SMALL], 2
+        vaddps    \t4, \x, ymmword ptr [rip + EC_ONE]
+        vblendvps \t1, \t1, \t4, \t3
+        vcmpps    \t3, \x, ymmword ptr [rip + EC_OVF], 13
+        vblendvps \t1, \t1, ymmword ptr [rip + EC_INF], \t3
+        vcmpps    \t3, \x, ymmword ptr [rip + EC_UNF], 2
+        vandnps   \t1, \t3, \t1
+        vcmpps    \t3, \x, \x, 3
+        vblendvps \x, \t1, \x, \t3
+.endm
+
+// SWIGLU8 gp, ur : ur = (z*s)*ur for 8 lanes, z = the 8 floats at memory gp,
+// s = 1/(1+expf(-z)). Same operation sequence as SILU8 in ops.S (= llama.c).
+// Uses ymm0-ymm7.
+.macro SWIGLU8 gp, ur
+        vmovups   ymm7, ymmword ptr \gp                  // z = g
+        vxorps    ymm0, ymm7, ymmword ptr [rip + EC_SIGN] // -z
+        MV_EXP8   ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6   // expf(-z)
+        vaddps    ymm0, ymm0, ymmword ptr [rip + EC_ONE] // 1 + expf(-z)
+        vmovaps   ymm1, ymmword ptr [rip + EC_ONE]
+        vdivps    ymm0, ymm1, ymm0                       // s = 1 / (...)
+        vmulps    ymm0, ymm0, ymm7                       // z * s
+        vmulps    \ur, ymm0, \ur                         // (z * s) * u
+.endm
+
+// MT_DOT: ymm12/13 = raw int32 dots of the panel at r10 (VNNI or AVX2 kernel)
+.macro MT_DOT
+        cmp     qword ptr [rbx + MT_VNNI], 0
+        je      3f
+        call    q8dot1_vnni
+        jmp     4f
+3:      call    q8dot1_avx2
+4:
+.endm
+
+// mvm_epi (internal): ints -> floats of one panel, exactly like epi16.
+//   in : ymm12/13 = raw dots (columns j0..j0+7 / +8..+15), r13 = j0,
+//        rsi = task entry, r8 = 0 (matrix 1) or 64 (matrix 2), rbx = ctx
+//   out: ymm12/13 = (as*scale[j]) * (float)(acc[j] - colsum[j])
+//        ymm10/11 = lane masks (lane valid = column < N): the last panel of a
+//        matrix may be partial; masked loads read 0 there instead of faulting
+//        and masked stores leave memory alone, so no scalar tail is needed.
+//   clobbers: rax, rcx, rdx, ymm8, ymm9, ymm14
+mvm_epi:
+        mov     rcx, [rsi + r8 + TE_N]
+        sub     rcx, r13                    // columns left in the matrix
+        cmp     rcx, 16
+        jbe     1f
+        mov     ecx, 16
+1:      mov     eax, 8
+        cmp     rcx, rax
+        cmovb   rax, rcx                    // lo = min(cnt, 8)
+        sub     rcx, rax                    // hi = cnt - lo
+        lea     rdx, [rip + masktab + 32]
+        neg     rax
+        vmovdqu ymm10, [rdx + rax*4]        // first lo lanes set
+        neg     rcx
+        vmovdqu ymm11, [rdx + rcx*4]        // first hi lanes set
+        cmp     qword ptr [rbx + MT_VNNI], 0
+        je      2f
+        mov     rdx, [rsi + r8 + TE_COLSUM] // VNNI: remove the +128 offset
+        vpsubd  ymm12, ymm12, [rdx + r13*4] //   (colsum has Npad entries: safe)
+        vpsubd  ymm13, ymm13, [rdx + r13*4 + 32]
+2:      vcvtdq2ps ymm12, ymm12              // (float)acc, same conversion as C
+        vcvtdq2ps ymm13, ymm13
+        mov     rdx, [rsi + r8 + TE_SCALE]
+        vmaskmovps ymm8, ymm10, [rdx + r13*4]
+        vmaskmovps ymm9, ymm11, [rdx + r13*4 + 32]
+        vbroadcastss ymm14, dword ptr [rip + as_buf]
+        vmulps  ymm8, ymm14, ymm8           // as*scale[j]   (C: as * scale[j] * acc)
+        vmulps  ymm9, ymm14, ymm9
+        vmulps  ymm12, ymm8, ymm12          // * (float)acc
+        vmulps  ymm13, ymm9, ymm13
+        ret
+
+// mvm_chunk(ctx, u0, u1): pool worker - work units [u0,u1) of the task table.
+//   Frame: 7 pushes, then [rsp] spare, [rsp+32..192) xmm6-15, [rsp+192..256)
+//   the gate floats of a SwiGLU panel.
+//   Registers: rbx = ctx, rsi = current task entry, r14 = u, r15 = u1,
+//   r9 = Kpad, r11 = xq, r13 = j0, r12 = panel byte offset, r10 = panel.
+mvm_chunk:
+        push    rbx
+        push    rsi
+        push    rdi
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 256
+        SAVE_XMM 32
+        mov     rbx, rcx
+        mov     r14, rdx
+        mov     r15, r8
+        mov     r9, [rbx + MT_KPAD]
+        lea     r11, [rip + xq_buf]
+        lea     rsi, [rbx + MT_TAB]
+.Lmc_u:
+        cmp     r14, r15
+        jae     .Lmc_done
+1:      cmp     r14, [rsi + TE_END]         // find the entry that owns unit u
+        jb      2f                          // (units only grow inside a chunk,
+        add     rsi, TE_SIZE                //  so the cursor only moves forward)
+        jmp     1b
+2:      mov     r13, r14
+        sub     r13, [rsi + TE_START]       // panel index p inside its matrix
+        mov     r12, r13
+        imul    r12, r9
+        shl     r12, 4                      // p * Kpad*16 = byte offset of the panel
+        shl     r13, 4                      // j0 = 16p
+        mov     r10, [rsi + TE_PACKED]
+        add     r10, r12
+        MT_DOT
+        xor     r8d, r8d
+        call    mvm_epi                     // ymm12/13 = y (or g), ymm10/11 = masks
+        cmp     qword ptr [rsi + TE_MODE], 1
+        jne     .Lmc_add
+        // SwiGLU pair: park g, run the same panel of the up matrix
+        vmovups [rsp + 192], ymm12
+        vmovups [rsp + 224], ymm13
+        mov     r10, [rsi + 64 + TE_PACKED]
+        add     r10, r12
+        MT_DOT
+        mov     r8d, 64
+        call    mvm_epi                     // ymm12/13 = u
+        SWIGLU8 "[rsp + 192]", ymm12        // (g*s)*u
+        SWIGLU8 "[rsp + 224]", ymm13
+        jmp     .Lmc_st
+.Lmc_add:
+        mov     rax, [rsi + TE_ADD]         // bias / residual
+        test    rax, rax
+        jz      .Lmc_st
+        vmaskmovps ymm0, ymm10, [rax + r13*4]
+        vmaskmovps ymm1, ymm11, [rax + r13*4 + 32]
+        vaddps  ymm12, ymm12, ymm0
+        vaddps  ymm13, ymm13, ymm1
+.Lmc_st:
+        mov     rax, [rsi + TE_Y]
+        vmaskmovps [rax + r13*4], ymm10, ymm12
+        vmaskmovps [rax + r13*4 + 32], ymm11, ymm13
+        inc     r14
+        jmp     .Lmc_u
+.Lmc_done:
+        RESTORE_XMM 32
+        vzeroupper
+        add     rsp, 256
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rdi
+        pop     rsi
+        pop     rbx
+        ret
+
+// mm_fill (internal): copy one Q8 Mat's kernel fields into a table entry,
+// packing the matrix first if needed.  rcx = Mat*, rdx = &entry fields
+//   -> rax = N, or 0 if the matrix could not be packed. Saves rbx, rsi.
+mm_fill:
+        push    rbx
+        push    rsi
+        sub     rsp, 40
+        mov     rbx, rcx
+        mov     rsi, rdx
+        cmp     qword ptr [rbx + MAT_PACKED], 0
+        jne     1f
+        call    mat_q8_pack
+        test    rax, rax
+        jz      2f
+1:      mov     rax, [rbx + MAT_PACKED]
+        mov     [rsi + TE_PACKED], rax
+        mov     rax, [rbx + MAT_SCALE]
+        mov     [rsi + TE_SCALE], rax
+        mov     rax, [rbx + MAT_COLSUM]
+        mov     [rsi + TE_COLSUM], rax
+        mov     rax, [rbx + MAT_N]
+        mov     [rsi + TE_N], rax
+2:      add     rsp, 40
+        pop     rsi
+        pop     rbx
+        ret
+
+        .globl  matvec_q8_multi
+matvec_q8_multi:
+        push    rbx
+        push    rsi
+        push    rdi
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        sub     rsp, 64                     // [rsp+32] arg 5, [rsp+40] tasks, [rsp+48] threads
+        mov     rsi, rcx
+        mov     [rsp + 40], rcx
+        mov     rdi, rdx
+        cmp     rdi, MV_MAXT
+        jle     1f
+        mov     edi, MV_MAXT
+1:      mov     r12, r8
+        lea     rbx, [rip + mt_ctx]
+        xor     r13d, r13d                  // r13 = total work units so far
+        lea     r14, [rbx + MT_TAB]         // r14 = entry being filled
+        xor     r15d, r15d                  // r15 = 1 if a SwiGLU pair is present
+.Lmm_task:
+        test    rdi, rdi
+        jle     .Lmm_built
+        mov     rcx, [rsi]
+        mov     rdx, r14
+        call    mm_fill
+        test    rax, rax
+        jz      .Lmm_ret
+        mov     [r14 + TE_START], r13
+        add     rax, 15
+        shr     rax, 4                      // panels of this matrix
+        add     r13, rax
+        mov     [r14 + TE_END], r13
+        mov     rax, [rsi + 8]
+        mov     [r14 + TE_Y], rax
+        mov     rax, [rsi + 16]
+        mov     [r14 + TE_ADD], rax
+        mov     qword ptr [r14 + TE_MODE], 0
+        cmp     qword ptr [rsi + 24], 1
+        jne     2f
+        cmp     rdi, 2                      // a pair needs a partner task
+        jb      2f
+        mov     rcx, [rsi + 32]             // the up matrix -> fields at +64
+        lea     rdx, [r14 + 64]
+        call    mm_fill
+        test    rax, rax
+        jz      .Lmm_ret
+        mov     qword ptr [r14 + TE_MODE], 1
+        mov     r15d, 1
+        add     rsi, 32
+        dec     rdi
+2:      add     rsi, 32
+        dec     rdi
+        add     r14, TE_SIZE
+        jmp     .Lmm_task
+.Lmm_built:
+        test    r13, r13
+        jz      .Lmm_ret
+        mov     rcx, [rsp + 40]
+        mov     rcx, [rcx]                  // first Mat: K, Kpad shared by all
+        mov     rax, [rcx + MAT_AUX]
+        mov     [rbx + MT_KPAD], rax
+        mov     rdx, [rcx + MAT_K]
+        mov     rax, [rip + cpu_features]
+        shr     rax, 1
+        and     eax, 1
+        mov     [rbx + MT_VNNI], rax
+        shl     eax, 7
+        mov     r9, rax                     // xor byte: 0x80 (VNNI u8) or 0
+        mov     rcx, r12
+        lea     r8, [rip + xq_buf]
+        call    quant_row                   // x -> xq, xmm0 = as
+        vmovss  dword ptr [rip + as_buf], xmm0
+        vzeroupper
+        mov     ecx, 1
+        call    job_threads                 // memory bound: the P-cores
+        mov     [rsp + 48], rax
+        mov     rdx, [rbx + MT_KPAD]
+        shl     rdx, 4                      // bytes per unit (one panel) ...
+        mov     ecx, r15d
+        shl     rdx, cl                     // ... two panels for SwiGLU
+        mov     rcx, r13
+        mov     r8, [rsp + 48]
+        call    calc_grain
+        lea     rcx, [rip + mvm_chunk]
+        mov     rdx, rbx
+        mov     r8, r13
+        mov     r9, rax
+        mov     rax, [rsp + 48]
+        mov     [rsp + 32], rax
+        call    pool_run_n
+.Lmm_ret:
+        vzeroupper
+        add     rsp, 64
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rdi
+        pop     rsi
+        pop     rbx
         ret
 
 // ===========================================================================

@@ -33,6 +33,19 @@
 //
 // k and v are computed directly INTO the cache slot (matvec writes there, then
 // bias / QK-norm / RoPE work in place) -- no copy.
+//
+// int8 layers (Wq kind Q8, dec_fuse = 1) issue 4 fused pool jobs per layer
+// instead of 7 matvecs + 5 elementwise passes (matvec_q8_multi, matvec.S):
+//   1. q, k, v together (+ biases)          2. x += o@Wo
+//   3. g = SiLU(xn@Wgate) * (xn@Wup)        4. x += g@Wdown
+// Same arithmetic, same order per element, so the result is bit-identical
+// (tests/dec_test.c: logits diff 0 vs C, prefill cache == decode cache).
+// fp32 layers keep the one-matvec-per-matrix path.
+// Prefill runs PF_ROWS = 256 rows per batch, and its rmsnorm / SiLU passes are
+// split over the pool by rows (par_rmsnorm_rows / par_silu_rows).
+//
+// Profiling: with dec_prof_on = 1 every PMARK adds rdtsc ticks to dec_prof[slot]
+// (tests/dec_test.c DEC_ONLY=prof prints the per-op table).
 
 #include "model.inc"
         .intel_syntax noprefix
@@ -53,7 +66,8 @@
 #define AT_O        96
 #define AT_SIZE     128
 
-#define PF_ROWS     64                  // prefill batch (rows per weight pass)
+#define PF_ROWS     256                 // prefill batch (rows per weight pass; 256 measured
+                                        // ~25% faster than 64 on a 424-token prompt)
 #define PSC_FLOATS  (4 * 1024 * 1024)   // prefill attention score scratch (16 MB)
 
 #define MEM_COMMIT_RESERVE 0x3000
@@ -73,6 +87,7 @@ dc_sig:      .space 80          // copy of Model bytes 0..71 (dims, rope_base, e
 dc_block:    .space 8           // VirtualAlloc base of all buffers
 dc_scstride: .space 8           // floats of score scratch per head (decode)
 dc_args:     .space AT_SIZE     // AttnArgs reused by every attention call
+dc_tasks:    .space 4*32        // MvTask list for matvec_q8_multi (see matvec.S)
 dc_ptrs:
 dc_x:   .space 8                // residual stream (d_model)
 dc_xn:  .space 8                // normed input (d_model), also hn
@@ -98,7 +113,71 @@ pf_cs:  .space 8                // one RoPE table per row (PF_ROWS * hd)
 pf_sc:  .space 8                // PSC_FLOATS
 dc_ptrs_end:
 
+// ---------------------------------------------------------------------------
+// Optional per-op profile of decode_step (for tests/dec_test.c DEC_ONLY=prof).
+// When dec_prof_on != 0, PMARK n adds the TSC ticks since the previous mark to
+// dec_prof[n] (so every slot = time of the code BEFORE that mark). Off by
+// default: then each mark is one compare + an untaken branch.
+// ---------------------------------------------------------------------------
+        .data
+        .p2align 6
+        .globl  dec_prof_on, dec_prof
+dec_prof_on: .quad 0
+        .globl  dec_fuse
+dec_fuse:    .quad 1            // 1 = int8 layers use the fused matvec_q8_multi jobs
+                                // (0 = one matvec per matrix; for A/B tests only)
+dec_prof_t:  .quad 0            // TSC of the previous mark
+        .p2align 6
+dec_prof:    .space 8*32        // accumulated ticks per slot (see DP_* below)
+
         .text
+
+// profile slots
+#define DP_START  31            // (only sets the time stamp)
+#define DP_EMBED  0
+#define DP_ANORM  1
+#define DP_WQ     2
+#define DP_WK     3
+#define DP_WV     4
+#define DP_ROPE   5             // QK-norm + RoPE + kv_put
+#define DP_ATTN   6
+#define DP_WO     7
+#define DP_RES1   8
+#define DP_FNORM  9
+#define DP_WG     10
+#define DP_WU     11
+#define DP_SILU   12
+#define DP_WD     13
+#define DP_RES2   14
+#define DP_FINAL  15
+#define DP_HEAD   16
+// prefill slots
+#define DP_PEMB   17            // embeddings + RoPE tables of a batch
+#define DP_PNORM  18            // the two rmsnorm_rows of a layer
+#define DP_PQKV   19            // Q, K, V matmuls + biases
+#define DP_PROPE  20            // QK-norm + RoPE of the batch
+#define DP_PKV    21            // K/V rows into the cache
+#define DP_PATTN  22
+#define DP_PWO    23            // Wo matmul + residual
+#define DP_PGU    24            // gate + up matmuls
+#define DP_PSILU  25
+#define DP_PDOWN  26            // down matmul + residual
+
+// PMARK slot: clobbers rax, rcx, rdx (only used between calls, where they are dead)
+.macro PMARK slot
+        cmp     qword ptr [rip + dec_prof_on], 0
+        je      8f
+        rdtsc
+        shl     rdx, 32
+        or      rax, rdx
+        mov     rcx, rax
+        sub     rax, qword ptr [rip + dec_prof_t]
+        mov     qword ptr [rip + dec_prof_t], rcx
+.if \slot != DP_START
+        add     qword ptr [rip + dec_prof + 8*\slot], rax
+.endif
+8:
+.endm
 
 // ---------------------------------------------------------------------------
 // i64 decode_init(Model* m)
@@ -393,6 +472,7 @@ decode_step:
         mov     r13, qword ptr [rsi + KV_LEN]           // pos = kv->len
         cmp     r13, qword ptr [rsi + KV_MAXSEQ]
         jge     .Lds_fail                               // cache full
+        PMARK   DP_START
         // dims
         mov     rbp, qword ptr [rbx + M_HEADDIM]
         mov     rax, qword ptr [rbx + M_NHEADS]
@@ -435,13 +515,13 @@ decode_step:
         mov     rcx, qword ptr [rip + dc_o]
         mov     qword ptr [rax + AT_O], rcx
 
+        PMARK   DP_EMBED
         mov     rdi, qword ptr [rbx + M_LAYERS]
         xor     r12d, r12d
 .Lds_layer:
         // ---- attention block ----
         RMS     [rip+dc_x], [rdi+L_ATTN_NORM], [rip+dc_xn], [rsp+DS_DM]
-        MATVEC  L_WQ, [rip+dc_xn], [rip+dc_q]
-        BIAS    L_BQ, [rip+dc_q], [rsp+DS_QD]
+        PMARK   DP_ANORM
         // cache slots of this position: slot = pos % cap[l]
         mov     rax, qword ptr [rsi + KV_CAP]
         mov     rcx, qword ptr [rax + r12*8]            // cap
@@ -462,12 +542,52 @@ decode_step:
         mov     qword ptr [rcx + AT_VC], rax
         add     rax, rdx
         mov     qword ptr [rsp + DS_VSLOT], rax
-        // k into dc_k (stored into the blocked K cache after RoPE), v straight
-        // into its row-major cache slot
+        // q, k (into dc_k: stored into the blocked K cache after RoPE) and v
+        // (straight into its row-major cache slot), each plus its bias
+        cmp     qword ptr [rip + dec_fuse], 0
+        je      .Lds_qkv_sep
+        cmp     qword ptr [rdi + L_WQ + MAT_KIND], MATK_Q8
+        jne     .Lds_qkv_sep
+        // int8: ONE pool job for all three (they share xn), bias fused:
+        //   matvec_q8_multi({Wq,q,b_q,0}, {Wk,k,b_k,0}, {Wv,vslot,b_v,0}, n=3, xn)
+        lea     rcx, [rip + dc_tasks]
+        lea     rax, [rdi + L_WQ]
+        mov     qword ptr [rcx + 0], rax
+        mov     rax, qword ptr [rip + dc_q]
+        mov     qword ptr [rcx + 8], rax
+        mov     rax, qword ptr [rdi + L_BQ]
+        mov     qword ptr [rcx + 16], rax
+        mov     qword ptr [rcx + 24], 0
+        lea     rax, [rdi + L_WK]
+        mov     qword ptr [rcx + 32], rax
+        mov     rax, qword ptr [rip + dc_k]
+        mov     qword ptr [rcx + 40], rax
+        mov     rax, qword ptr [rdi + L_BK]
+        mov     qword ptr [rcx + 48], rax
+        mov     qword ptr [rcx + 56], 0
+        lea     rax, [rdi + L_WV]
+        mov     qword ptr [rcx + 64], rax
+        mov     rax, qword ptr [rsp + DS_VSLOT]
+        mov     qword ptr [rcx + 72], rax
+        mov     rax, qword ptr [rdi + L_BV]
+        mov     qword ptr [rcx + 80], rax
+        mov     qword ptr [rcx + 88], 0
+        mov     edx, 3
+        mov     r8, qword ptr [rip + dc_xn]
+        call    matvec_q8_multi
+        PMARK   DP_WQ
+        jmp     .Lds_qkv_done
+.Lds_qkv_sep:                                           // fp32: one matvec each
+        MATVEC  L_WQ, [rip+dc_xn], [rip+dc_q]
+        BIAS    L_BQ, [rip+dc_q], [rsp+DS_QD]
+        PMARK   DP_WQ
         MATVEC  L_WK, [rip+dc_xn], [rip+dc_k]
         BIAS    L_BK, [rip+dc_k], [rsp+DS_KVD]
+        PMARK   DP_WK
         MATVEC  L_WV, [rip+dc_xn], [rsp+DS_VSLOT]
         BIAS    L_BV, [rsp+DS_VSLOT], [rsp+DS_KVD]
+        PMARK   DP_WV
+.Lds_qkv_done:
         // Qwen3 QK-norm (before RoPE)
         cmp     qword ptr [rbx + M_QKNORM], 0
         je      1f
@@ -502,6 +622,7 @@ decode_step:
         mov     rax, qword ptr [rsp + DS_KVD]
         mov     qword ptr [rsp + 32], rax
         call    kv_put
+        PMARK   DP_ROPE
         // prefill mode: the last layer's K/V are cached, nothing after matters
         test    r14, r14
         jnz     2f
@@ -512,24 +633,84 @@ decode_step:
         mov     rax, qword ptr [rdi + L_WINDOW]
         mov     qword ptr [rcx + AT_WINDOW], rax
         call    attention
+        PMARK   DP_ATTN
+        cmp     qword ptr [rip + dec_fuse], 0
+        je      .Lds_ffn_sep
+        cmp     qword ptr [rdi + L_WO + MAT_KIND], MATK_Q8
+        jne     .Lds_ffn_sep
+        // ---- int8: 3 fused jobs for Wo, gate+up, down ----
+        // x += o@Wo  (residual fused: y = add = x)
+        lea     rcx, [rip + dc_tasks]
+        lea     rax, [rdi + L_WO]
+        mov     qword ptr [rcx + 0], rax
+        mov     rax, qword ptr [rip + dc_x]
+        mov     qword ptr [rcx + 8], rax
+        mov     qword ptr [rcx + 16], rax
+        mov     qword ptr [rcx + 24], 0
+        mov     edx, 1
+        mov     r8, qword ptr [rip + dc_o]
+        call    matvec_q8_multi
+        PMARK   DP_WO
+        RMS     [rip+dc_x], [rdi+L_FFN_NORM], [rip+dc_xn], [rsp+DS_DM]
+        PMARK   DP_FNORM
+        // g = SiLU(xn@Wgate) * (xn@Wup)   (a SwiGLU pair: mode 1)
+        lea     rcx, [rip + dc_tasks]
+        lea     rax, [rdi + L_WGATE]
+        mov     qword ptr [rcx + 0], rax
+        mov     rax, qword ptr [rip + dc_g]
+        mov     qword ptr [rcx + 8], rax
+        mov     qword ptr [rcx + 16], 0
+        mov     qword ptr [rcx + 24], 1
+        lea     rax, [rdi + L_WUP]
+        mov     qword ptr [rcx + 32], rax
+        mov     qword ptr [rcx + 40], 0
+        mov     qword ptr [rcx + 48], 0
+        mov     qword ptr [rcx + 56], 0
+        mov     edx, 2
+        mov     r8, qword ptr [rip + dc_xn]
+        call    matvec_q8_multi
+        PMARK   DP_WG
+        // x += g@Wdown
+        lea     rcx, [rip + dc_tasks]
+        lea     rax, [rdi + L_WDOWN]
+        mov     qword ptr [rcx + 0], rax
+        mov     rax, qword ptr [rip + dc_x]
+        mov     qword ptr [rcx + 8], rax
+        mov     qword ptr [rcx + 16], rax
+        mov     qword ptr [rcx + 24], 0
+        mov     edx, 1
+        mov     r8, qword ptr [rip + dc_g]
+        call    matvec_q8_multi
+        PMARK   DP_WD
+        jmp     .Lds_layer_next
+.Lds_ffn_sep:                                           // fp32: separate ops
         MATVEC  L_WO, [rip+dc_o], [rip+dc_ao]
+        PMARK   DP_WO
         mov     rcx, qword ptr [rip + dc_x]                     // residual
         mov     rdx, qword ptr [rip + dc_ao]
         mov     r8, qword ptr [rsp + DS_DM]
         call    vec_add
+        PMARK   DP_RES1
         // ---- feed-forward block (SwiGLU) ----
         RMS     [rip+dc_x], [rdi+L_FFN_NORM], [rip+dc_xn], [rsp+DS_DM]
+        PMARK   DP_FNORM
         MATVEC  L_WGATE, [rip+dc_xn], [rip+dc_g]
+        PMARK   DP_WG
         MATVEC  L_WUP, [rip+dc_xn], [rip+dc_u]
+        PMARK   DP_WU
         mov     rcx, qword ptr [rip + dc_g]
         mov     rdx, qword ptr [rip + dc_u]
         mov     r8, qword ptr [rsp + DS_DFF]
         call    silu_mul
+        PMARK   DP_SILU
         MATVEC  L_WDOWN, [rip+dc_g], [rip+dc_ao]
+        PMARK   DP_WD
         mov     rcx, qword ptr [rip + dc_x]
         mov     rdx, qword ptr [rip + dc_ao]
         mov     r8, qword ptr [rsp + DS_DM]
         call    vec_add
+        PMARK   DP_RES2
+.Lds_layer_next:
         add     rdi, L_SIZE
         inc     r12
         cmp     r12, qword ptr [rbx + M_NLAYERS]
@@ -538,10 +719,12 @@ decode_step:
         test    r14, r14
         jz      3f
         RMS     [rip+dc_x], [rbx+M_FINALNORM], [rip+dc_xn], [rsp+DS_DM]
+        PMARK   DP_FINAL
         lea     rcx, [rbx + M_LMHEAD]
         mov     rdx, qword ptr [rip + dc_xn]
         mov     r8, r14
         call    matvec
+        PMARK   DP_HEAD
 3:      lea     rax, [r13 + 1]
         mov     qword ptr [rsi + KV_LEN], rax           // kv->len = pos + 1
         xor     eax, eax
@@ -603,6 +786,93 @@ put_k_rows:
         pop     rdi
         pop     rsi
         pop     rbx
+        ret
+
+// ---------------------------------------------------------------------------
+// Row-parallel versions of the per-row ops used by prefill. Every row is still
+// computed by the same single-row code (rms_core / SILU8), only different rows
+// run on different threads, so the results are bit-identical.
+//   void par_rmsnorm_rows(x, g, out, i64 n, float eps, i64 rows)  (= rmsnorm_rows)
+//   void par_silu_rows(float* g, const float* u, i64 n, i64 rows)  (= silu_mul of n*rows)
+// pj_ctx: +0 kind (0 rms, 1 silu), +8 a (x / g), +16 b (gain / u), +24 out,
+//         +32 n, +40 eps (f32)
+// ---------------------------------------------------------------------------
+        .bss
+        .p2align 6
+pj_ctx: .space 64
+        .text
+        .p2align 4
+pj_chunk:                                       // pool fn (ctx, r0, r1)
+        sub     rsp, 56
+        mov     r10, rcx
+        mov     r11, r8
+        sub     r11, rdx                        // rows of this chunk
+        mov     r9, qword ptr [r10 + 32]        // n
+        mov     rax, rdx
+        imul    rax, r9
+        shl     rax, 2                          // byte offset of row r0
+        cmp     qword ptr [r10], 0
+        jne     1f
+        mov     rcx, qword ptr [r10 + 8]
+        add     rcx, rax                        // x + r0*n
+        mov     rdx, qword ptr [r10 + 16]       // gain (shared by all rows)
+        mov     r8, qword ptr [r10 + 24]
+        add     r8, rax                         // out + r0*n
+        mov     eax, dword ptr [r10 + 40]
+        mov     dword ptr [rsp + 32], eax       // eps
+        mov     qword ptr [rsp + 40], r11       // rows
+        call    rmsnorm_rows
+        jmp     2f
+1:      mov     rcx, qword ptr [r10 + 8]
+        add     rcx, rax
+        mov     rdx, qword ptr [r10 + 16]
+        add     rdx, rax
+        mov     r8, r11
+        imul    r8, r9                          // floats
+        call    silu_mul
+2:      add     rsp, 56
+        ret
+
+// pj_run (internal): pool_run(pj_chunk, pj_ctx, rows, grain = ceil(rows/16))
+//   rcx = rows
+pj_run:
+        sub     rsp, 40
+        mov     r8, rcx
+        lea     r9, [rcx + 15]
+        shr     r9, 4
+        lea     rcx, [rip + pj_chunk]
+        lea     rdx, [rip + pj_ctx]
+        call    pool_run
+        add     rsp, 40
+        ret
+
+        .globl  par_rmsnorm_rows
+par_rmsnorm_rows:
+        sub     rsp, 40
+        lea     rax, [rip + pj_ctx]
+        mov     qword ptr [rax], 0
+        mov     qword ptr [rax + 8], rcx
+        mov     qword ptr [rax + 16], rdx
+        mov     qword ptr [rax + 24], r8
+        mov     qword ptr [rax + 32], r9
+        mov     r10d, dword ptr [rsp + 40 + 40]
+        mov     dword ptr [rax + 40], r10d
+        mov     rcx, qword ptr [rsp + 40 + 48]  // rows
+        call    pj_run
+        add     rsp, 40
+        ret
+
+        .globl  par_silu_rows
+par_silu_rows:
+        sub     rsp, 40
+        lea     rax, [rip + pj_ctx]
+        mov     qword ptr [rax], 1
+        mov     qword ptr [rax + 8], rcx
+        mov     qword ptr [rax + 16], rdx
+        mov     qword ptr [rax + 32], r8
+        mov     rcx, r9
+        call    pj_run
+        add     rsp, 40
         ret
 
 // ---------------------------------------------------------------------------
@@ -691,6 +961,7 @@ prefill:
         mov     qword ptr [rsp + PF_DFF], rax
 
 .Lpf_batch:
+        PMARK   DP_START
         test    rbp, rbp
         jle     .Lpf_ok
         mov     r13, qword ptr [rsi + KV_LEN]           // pos0
@@ -747,6 +1018,7 @@ prefill:
         cmp     rax, qword ptr [rsp + PF_M]
         jb      .Lpf_embed
 
+        PMARK   DP_PEMB
         mov     rdi, qword ptr [rbx + M_LAYERS]
         xor     r12d, r12d
 .Lpf_layer:
@@ -764,7 +1036,8 @@ prefill:
         mov     dword ptr [rsp + 32], eax
         mov     rax, qword ptr [rsp + PF_M]
         mov     qword ptr [rsp + 40], rax
-        call    rmsnorm_rows
+        call    par_rmsnorm_rows
+        PMARK   DP_PNORM
         // Q, K, V for the whole batch
         MATROWS  L_WQ, [rip+pf_xn], [rip+pf_q]
         BIASROWS L_BQ, [rip+pf_q], [rsp+PF_QD]
@@ -772,6 +1045,7 @@ prefill:
         BIASROWS L_BK, [rip+pf_k], [rsp+PF_KVD]
         MATROWS  L_WV, [rip+pf_xn], [rip+pf_v]
         BIASROWS L_BV, [rip+pf_v], [rsp+PF_KVD]
+        PMARK   DP_PQKV
         cmp     qword ptr [rbx + M_QKNORM], 0
         je      1f
         mov     rcx, qword ptr [rip + pf_q]             // all rows' heads at once
@@ -802,6 +1076,7 @@ prefill:
         mov     rax, qword ptr [rsp + PF_M]
         mov     qword ptr [rsp + 32], rax
         call    rope_apply_rows
+        PMARK   DP_PROPE
 
         // this layer's cache
         mov     rax, qword ptr [rsi + KV_CAP]
@@ -848,6 +1123,7 @@ prefill:
         mov     r8, qword ptr [rsp + PF_KVD]
         imul    r8, qword ptr [rsp + PF_M]
         call    vec_copy
+        PMARK   DP_PKV
         cmp     qword ptr [rsp + PF_LAST], 0
         jne     .Lpf_batch_done
         // attention in chunks of PF_RPC rows (bounded score scratch)
@@ -960,12 +1236,14 @@ prefill:
 
         // ---- output projection + FFN for the whole batch ----
 .Lpf_ffn:
+        PMARK   DP_PATTN
         MATROWS L_WO, [rip+pf_o], [rip+pf_ao]
         mov     rcx, qword ptr [rip + pf_x]
         mov     rdx, qword ptr [rip + pf_ao]
         mov     r8, qword ptr [rsp + PF_DM]
         imul    r8, qword ptr [rsp + PF_M]
         call    vec_add
+        PMARK   DP_PWO
         mov     rcx, qword ptr [rip + pf_x]
         mov     rdx, qword ptr [rdi + L_FFN_NORM]
         mov     r8, qword ptr [rip + pf_xn]
@@ -974,20 +1252,24 @@ prefill:
         mov     dword ptr [rsp + 32], eax
         mov     rax, qword ptr [rsp + PF_M]
         mov     qword ptr [rsp + 40], rax
-        call    rmsnorm_rows
+        call    par_rmsnorm_rows
+        PMARK   DP_PNORM
         MATROWS L_WGATE, [rip+pf_xn], [rip+pf_g]
         MATROWS L_WUP, [rip+pf_xn], [rip+pf_u]
+        PMARK   DP_PGU
         mov     rcx, qword ptr [rip + pf_g]
         mov     rdx, qword ptr [rip + pf_u]
         mov     r8, qword ptr [rsp + PF_DFF]
-        imul    r8, qword ptr [rsp + PF_M]
-        call    silu_mul
+        mov     r9, qword ptr [rsp + PF_M]
+        call    par_silu_rows
+        PMARK   DP_PSILU
         MATROWS L_WDOWN, [rip+pf_g], [rip+pf_ao]
         mov     rcx, qword ptr [rip + pf_x]
         mov     rdx, qword ptr [rip + pf_ao]
         mov     r8, qword ptr [rsp + PF_DM]
         imul    r8, qword ptr [rsp + PF_M]
         call    vec_add
+        PMARK   DP_PDOWN
         add     rdi, L_SIZE
         inc     r12
         cmp     r12, qword ptr [rbx + M_NLAYERS]

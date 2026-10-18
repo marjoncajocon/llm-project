@@ -47,6 +47,8 @@ extern void matvec(const Mat *m, const float *x, float *y);
 extern void matmul_rows(const Mat *m, const float *X, int64_t M, float *Y);
 extern int64_t mv_small_bytes, mv_chunks_per_thread, mv_min_chunk_bytes, mv_mem_threads, mv_mem_rows;
 extern uint64_t stream_read(const void *p, int64_t bytes);
+typedef struct { const Mat *m; float *y; const float *add; int64_t mode; } MvTask;
+extern void matvec_q8_multi(const MvTask *t, int64_t n, const float *x);
 
 // qmatmul's integer core (matrix.c is not linked; integer sums are exact in
 // any order, so this simple loop is a faithful stand-in).
@@ -198,6 +200,59 @@ static void test_f32(int kind, int64_t K, int64_t N, int64_t M) {
   _aligned_free(W); _aligned_free(X); _aligned_free(Y); _aligned_free(y1);
 }
 
+// matvec_q8_multi == the separate C engine steps, bit for bit:
+//   QKV-like: 3 matrices with the same K, bias adds (one task without)
+//   residual: y = add = x (in place)
+//   SwiGLU:   g = qmatmul(Wg), u = qmatmul(Wu), g = (z * (1/(1+expf(-z)))) * u
+static void test_multi(int64_t K, int64_t N1, int64_t N2, int64_t N3) {
+  Mat a, b, c; make_q8(&a, K, N1); make_q8(&b, K, N2); make_q8(&c, K, N3);
+  int64_t NM = N1 > N2 ? N1 : N2; if (N3 > NM) NM = N3;
+  float *x = xalloc(K * 4), *y1 = xalloc(NM * 4 + 64), *y2 = xalloc(NM * 4 + 64), *y3 = xalloc(NM * 4 + 64);
+  float *r1 = xalloc(NM * 4 + 64), *r2 = xalloc(NM * 4 + 64), *r3 = xalloc(NM * 4 + 64);
+  float *b1 = xalloc(NM * 4), *b3 = xalloc(NM * 4), *res = xalloc(NM * 4 + 64), *resr = xalloc(NM * 4 + 64);
+  for (int64_t j = 0; j < NM; j++) { b1[j] = fnormal(); b3[j] = fnormal(); }
+  int64_t feats = cpu_features;
+  for (int path = 0; path < 2; path++) {
+    if (path == 0 && !(feats & 2)) continue;
+    cpu_features = path == 0 ? feats : (feats & ~2);
+    for (int mode = 0; mode < 4; mode++) {
+      fill_x(x, K, mode);
+      // (1) three tasks, biases on 1 and 3
+      ref_q8(a.data, a.scale, (int)K, (int)N1, x, 1, r1); for (int64_t j = 0; j < N1; j++) r1[j] = r1[j] + b1[j];
+      ref_q8(b.data, b.scale, (int)K, (int)N2, x, 1, r2);
+      ref_q8(c.data, c.scale, (int)K, (int)N3, x, 1, r3); for (int64_t j = 0; j < N3; j++) r3[j] = r3[j] + b3[j];
+      y1[N1] = y2[N2] = y3[N3] = 4242.0f;
+      MvTask t3[3] = {{&a, y1, b1, 0}, {&b, y2, 0, 0}, {&c, y3, b3, 0}};
+      matvec_q8_multi(t3, 3, x);
+      CHECK(!memcmp(y1, r1, N1 * 4) && !memcmp(y2, r2, N2 * 4) && !memcmp(y3, r3, N3 * 4),
+            "multi qkv K=%lld N=%lld/%lld/%lld %s mode %d", (long long)K, (long long)N1, (long long)N2, (long long)N3, path ? "avx2" : "vnni", mode);
+      CHECK(y1[N1] == 4242.0f && y2[N2] == 4242.0f && y3[N3] == 4242.0f, "multi wrote past y");
+      // (2) residual in place
+      for (int64_t j = 0; j < N1; j++) res[j] = resr[j] = fnormal();
+      ref_q8(a.data, a.scale, (int)K, (int)N1, x, 1, r1); for (int64_t j = 0; j < N1; j++) resr[j] += r1[j];
+      MvTask t1 = {&a, res, res, 0};
+      matvec_q8_multi(&t1, 1, x);
+      CHECK(!memcmp(res, resr, N1 * 4), "multi residual K=%lld N=%lld %s mode %d", (long long)K, (long long)N1, path ? "avx2" : "vnni", mode);
+      // (3) SwiGLU pair a (gate) + a2 (up, same N)
+      Mat u; make_q8(&u, K, N1);
+      ref_q8(a.data, a.scale, (int)K, (int)N1, x, 1, r1);
+      ref_q8(u.data, u.scale, (int)K, (int)N1, x, 1, r2);
+      for (int64_t j = 0; j < N1; j++) { volatile float z = r1[j]; volatile float sg = 1.0f / (1.0f + expf(-z)); volatile float zs = z * sg; r1[j] = zs * r2[j]; }
+      y1[N1] = 4242.0f;
+      MvTask tp[2] = {{&a, y1, 0, 1}, {&u, 0, 0, 0}};
+      matvec_q8_multi(tp, 2, x);
+      CHECK(!memcmp(y1, r1, N1 * 4) && y1[N1] == 4242.0f, "multi swiglu K=%lld N=%lld %s mode %d", (long long)K, (long long)N1, path ? "avx2" : "vnni", mode);
+      if (memcmp(y1, r1, N1 * 4)) for (int64_t j = 0; j < N1; j++) if (y1[j] != r1[j]) { printf("   j=%lld got %.9g want %.9g\n", (long long)j, y1[j], r1[j]); break; }
+      free_packed(&u); _aligned_free(u.data); _aligned_free(u.scale);
+    }
+  }
+  cpu_features = feats;
+  Mat *ms[3] = {&a, &b, &c};
+  for (int i = 0; i < 3; i++) { free_packed(ms[i]); _aligned_free(ms[i]->data); _aligned_free(ms[i]->scale); }
+  _aligned_free(x); _aligned_free(y1); _aligned_free(y2); _aligned_free(y3); _aligned_free(r1); _aligned_free(r2);
+  _aligned_free(r3); _aligned_free(b1); _aligned_free(b3); _aligned_free(res); _aligned_free(resr);
+}
+
 // pool sanity: every index visited exactly once
 static volatile LONG visit[100003];
 static void visit_fn(void *ctx, int64_t i0, int64_t i1) { (void)ctx; for (int64_t i = i0; i < i1; i++) InterlockedIncrement(&visit[i]); }
@@ -237,6 +292,8 @@ static void run_correctness(void) {
         test_q8_rows(576, 1536, rows[i]);
       }
       test_q8_rows(100, 47, 77);
+      test_multi(896, 896, 128, 128); test_multi(896, 4864, 16, 33); test_multi(576, 1536, 192, 7);
+      test_multi(13, 37, 1, 100); test_multi(4864, 896, 896, 896); test_multi(100, 17, 31, 16);
       test_quantize(13, 37); test_quantize(896, 128); test_quantize(64, 1000);
       test_quantize(100, 7); test_quantize(1, 1); test_quantize(5, 9);
       int64_t fs[][3] = {{896, 896, 1}, {13, 37, 3}, {1, 1, 1}, {576, 1536, 7}, {1536, 576, 13},
@@ -523,16 +580,55 @@ static DWORD WINAPI watchdog(void *arg) {
   return 0;
 }
 
+// kern_test fused [R]: one "token" of Qwen-shaped Q8 weights (KT_MODEL=smol for
+// SmolLM), interleaving the separate matvecs (7 per layer + head) with the
+// fused jobs decode.S issues (QKV, Wo+residual, gate+up+SwiGLU, down+residual,
+// head): best and median ms per token and GB/s of each, R rounds.
+static int dcmp(const void *a, const void *b) { double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y; }
+static void fused_bench(int R) {
+  if (getenv("KT_CPT")) mv_chunks_per_thread = atoi(getenv("KT_CPT"));
+  if (getenv("KT_MINCH")) mv_min_chunk_bytes = atoi(getenv("KT_MINCH"));
+  if (getenv("KT_T")) mv_mem_threads = atoi(getenv("KT_T"));
+  const Cfg *c = getenv("KT_MODEL") && !strcmp(getenv("KT_MODEL"), "smol") ? &SMOL : &QWEN;
+  int64_t bytes; Mat *ms = build_model(c, 2, &bytes);
+  float *x = xalloc(8192 * 4), *y = xalloc((c->V + 64) * 4), *g = xalloc(8192 * 4), *u = xalloc(8192 * 4), *res = xalloc(8192 * 4);
+  for (int i = 0; i < 8192; i++) { x[i] = fnormal(); res[i] = 0; }
+  double t[2][200]; if (R > 200) R = 200;
+  for (int r = 0; r < R; r++) for (int v = 0; v < 2; v++) {
+    double t0 = now_s();
+    for (int L = 0; L < c->L; L++) {
+      Mat *w = &ms[L * 7];
+      if (!v) { for (int i = 0; i < 7; i++) matvec(&w[i], x, i == 6 ? res : y); }
+      else {
+        MvTask qkv[3] = {{&w[0], y, 0, 0}, {&w[1], g, 0, 0}, {&w[2], u, 0, 0}};
+        matvec_q8_multi(qkv, 3, x);
+        MvTask o = {&w[3], res, res, 0}; matvec_q8_multi(&o, 1, x);
+        MvTask gu[2] = {{&w[4], g, 0, 1}, {&w[5], 0, 0, 0}}; matvec_q8_multi(gu, 2, x);
+        MvTask d = {&w[6], res, res, 0}; matvec_q8_multi(&d, 1, x);
+      }
+    }
+    matvec(&ms[c->L * 7], x, y);
+    t[v][r] = now_s() - t0;
+  }
+  for (int v = 0; v < 2; v++) qsort(t[v], R, sizeof(double), dcmp);
+  for (int v = 0; v < 2; v++)
+    printf("  %s %-8s best %6.2f ms (%5.1f GB/s)  median %6.2f ms\n", c->name, v ? "fused" : "separate",
+           t[v][0] * 1e3, bytes / t[v][0] / 1e9, t[v][R / 2] * 1e3);
+  free_model(ms, c);
+}
+
 int main(int argc, char **argv) {
   if (getenv("KT_WATCHDOG")) CreateThread(0, 0, watchdog, (void *)(intptr_t)atoi(getenv("KT_WATCHDOG")), 0, 0);
   setvbuf(stdout, NULL, _IONBF, 0);
   int64_t f = cpu_init();
+  { extern int64_t pool_pin, pool_prio; if (getenv("KT_PIN")) pool_pin = atoi(getenv("KT_PIN")); if (getenv("KT_PRIO")) pool_prio = atoi(getenv("KT_PRIO")); }
   printf("cpu_init: 0x%llx (AVX2+FMA=%d VNNI=%d)  logical CPUs: %lld\n", (long long)f, (int)(f & 1), (int)((f >> 1) & 1),
          (long long)pool_init(0));
   printf("pool_mem_threads (threads used for memory-bound matvec): %lld\n", (long long)pool_mem_threads);
   if (!(f & 1)) { printf("no AVX2/FMA - kernels need it\n"); return 1; }
   if (argc > 1 && !strcmp(argv[1], "bench")) { bench(argc, argv); return 0; }
   if (argc > 1 && !strcmp(argv[1], "threads")) { thread_sweep(); return 0; }
+  if (argc > 1 && !strcmp(argv[1], "fused")) { fused_bench(argc > 2 ? atoi(argv[2]) : 20); return 0; }
   if (argc > 1 && !strcmp(argv[1], "tune")) { tune(); return 0; }
   if (argc > 1 && !strcmp(argv[1], "prefill")) {
     int64_t ts[] = {1, 6, 10, 12, 16};

@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <math.h>
 #include <windows.h>
+#include <intrin.h>
 
 #include "llama.h"
 #include "quant.h"
@@ -557,6 +558,17 @@ static void test_decode(const char *path, int q8) {
   }
   _aligned_free(l2); _aligned_free(l3);
   kv_free(&kv3);
+  // a prompt longer than one prefill batch (PF_ROWS = 256): prefill(300) == 300 decode_step(.., 0)
+  if (V < 100000) {
+    KV ka, kb; kv_create_len(&m, &ka, MAXLEN); kv_create_len(&m, &kb, MAXLEN);
+    int32_t *big = (int32_t*)malloc(300 * 4); for (int i = 0; i < 300; i++) big[i] = (i * 7919 + 13) % 30000;
+    A_prefill(&m, &ka, big, 300);
+    for (int i = 0; i < 300; i++) A_decode_step(&m, &kb, big[i], NULL);
+    int e3 = kv_equal(&ka, &kb, 300);
+    printf("  prefill(300, crosses a batch) KV == decode_step KV: %s\n", e3 ? "bit-exact" : "DIFFERENT");
+    CHECK(e3, "prefill(300) KV != decode KV");
+    free(big); kv_free(&ka); kv_free(&kb);
+  }
   kv_free(&kv); kv_free(&kv2); free_ckv(&ckv);
   tensor_free(&cl); _aligned_free(al);
   model_free(&m);
@@ -603,6 +615,15 @@ static void dbg_prefill(void) {
 }
 
 void matvec(const Mat *m, const float *x, float *y);
+extern int64_t dec_prof_on, dec_prof[32], pool_prof_on, pool_prof[8];
+static double tsc_per_s(void) {
+  double t0 = now_s(); uint64_t c0 = __rdtsc();
+  while (now_s() - t0 < 0.05) {}
+  return (double)(__rdtsc() - c0) / (now_s() - t0);
+}
+// DEC_ONLY=prof: per-token profile of decode_step from the rdtsc marks in decode.S
+// (dec_prof slots) and the pool statistics of pool.S, at a short and a ~500-token
+// context; then the old "everything vs matvecs alone vs attention alone" split.
 static void prof(void) {
   const char *path = getenv("DEC_MODEL") ? getenv("DEC_MODEL") : "../model/qwen/model_int8.bin";
   Model m; memset(&m, 0, sizeof m); model_load(wpath(path), &m, 0);
@@ -611,9 +632,49 @@ static void prof(void) {
   int32_t *ids = (int32_t*)malloc(maxlen * 4); for (int i = 0; i < maxlen; i++) ids[i] = (i * 7919 + 13) % 30000;
   float *x = falloc(8192), *y = falloc(V + 64);
   for (int i = 0; i < 8192; i++) x[i] = gauss();
-  int ctxs[] = {16, 1024, 4096};
-  printf("[profile] %s\n", path);
-  for (int c = 0; c < 3; c++) {
+  double hz = tsc_per_s();
+  printf("[profile] %s  (TSC %.2f GHz)\n", path, hz / 1e9);
+  static const char *names[17] = {"embed+rope tab", "attn rmsnorm", "Wq (+bias)", "Wk (+bias)", "Wv (+bias)",
+    "qknorm/rope/kvput", "attention", "Wo", "residual 1", "ffn rmsnorm", "Wgate", "Wup", "silu*up",
+    "Wdown", "residual 2", "final norm", "lm_head"};
+  int pctx[] = {30, 500};
+  for (int c = 0; c < 2; c++) {
+    const int NS = 32; double best = 1e30; int64_t bp[32], bpp[8];
+    for (int rep = 0; rep < 5; rep++) {
+      kv.len = 0; A_prefill(&m, &kv, ids, pctx[c]);
+      A_decode_step(&m, &kv, ids[pctx[c]], l);
+      memset(dec_prof, 0, sizeof dec_prof); memset(pool_prof, 0, sizeof pool_prof);
+      dec_prof_on = 1; pool_prof_on = 1;
+      double t0 = now_s();
+      for (int s = 0; s < NS; s++) A_decode_step(&m, &kv, ids[s], l);
+      double t = (now_s() - t0) / NS;
+      dec_prof_on = 0; pool_prof_on = 0;
+      if (t < best) { best = t; memcpy(bp, dec_prof, sizeof bp); memcpy(bpp, pool_prof, sizeof bpp); }
+    }
+    double us = 1e6 / hz / NS, tot = 0;
+    printf("  ctx %d: decode_step %.3f ms/token (best of 5 x %d)\n", pctx[c], best * 1e3, NS);
+    for (int i = 0; i < 17; i++) { tot += bp[i] * us; printf("    %-18s %8.1f us\n", names[i], bp[i] * us); }
+    printf("    %-18s %8.1f us\n", "sum of marks", tot);
+    printf("    pool: %.1f parallel runs/token, %.2f us avg inside each, caller waits %.2f us avg,\n"
+           "          worker start latency %.2f us avg (%.1f samples/run), %.1f SetEvent/token\n",
+           (double)bpp[0] / NS, bpp[0] ? bpp[1] * us * NS / bpp[0] : 0, bpp[0] ? bpp[2] * us * NS / bpp[0] : 0,
+           bpp[4] ? bpp[3] * us * NS / bpp[4] : 0, bpp[0] ? (double)bpp[4] / bpp[0] : 0, (double)bpp[5] / NS);
+  }
+  { // prefill profile: 424 tokens (like the README benchmark), best of 3
+    static const char *pn[10] = {"embed+rope tables", "rmsnorm rows", "Q/K/V matmul+bias", "qknorm+rope", "K/V into cache",
+      "attention", "Wo + residual", "gate+up matmul", "silu*up", "down + residual"};
+    double best = 1e30; int64_t bp[32];
+    for (int rep = 0; rep < 3; rep++) {
+      kv.len = 0; memset(dec_prof, 0, sizeof dec_prof); dec_prof_on = 1;
+      double t0 = now_s(); A_prefill(&m, &kv, ids, 424); double t = now_s() - t0;
+      dec_prof_on = 0;
+      if (t < best) { best = t; memcpy(bp, dec_prof, sizeof bp); }
+    }
+    printf("  prefill 424 tokens: %.1f ms = %.0f tok/s\n", best * 1e3, 424 / best);
+    for (int i = 0; i < 10; i++) printf("    %-18s %8.2f ms\n", pn[i], bp[17 + i] * 1e3 / hz);
+  }
+  int ctxs[] = {16, 1024};
+  for (int c = 0; c < 2; c++) {
     kv.len = 0; A_prefill(&m, &kv, ids, ctxs[c]);
     const int NS = 20; double best_full = 1e9, best_mv = 1e9, best_at = 1e9;
     for (int rep = 0; rep < 3; rep++) {
@@ -630,7 +691,6 @@ static void prof(void) {
         matvec(&m.lm_head, x, y);
       }
       double t2 = now_s();
-      // attention alone at this context, all layers
       AttnArgs a; memset(&a, 0, sizeof a);
       int64_t qd = m.n_heads * m.head_dim; float *q = falloc(qd), *o = falloc(qd);
       for (int i = 0; i < qd; i++) q[i] = gauss() * 0.1f;
@@ -696,10 +756,89 @@ static void bench(const char *path) {
   kv_free(&kv); model_free(&m); free(ids); _aligned_free(l);
 }
 
+// CPU time used by OTHER processes since the last call, in cores (busy system
+// time minus our own process time, divided by wall time). The machine is shared
+// with other jobs; a timing taken while they run is thrown away.
+static double foreign_cores(void) {
+  static uint64_t lb, lo; static double lt;
+  FILETIME i, k, u, c, e, pk, pu;
+  GetSystemTimes(&i, &k, &u); GetProcessTimes(GetCurrentProcess(), &c, &e, &pk, &pu);
+#define FT(f) (((uint64_t)(f).dwHighDateTime << 32) | (f).dwLowDateTime)
+  uint64_t busy = FT(k) + FT(u) - FT(i), own = FT(pk) + FT(pu); double t = now_s();
+  double r = lt ? ((double)(busy - lb) - (double)(own - lo)) * 1e-7 / (t - lt) : 99;
+  lb = busy; lo = own; lt = t;
+  return r;
+}
+// DEC_ONLY=speed: decode ms/token at ctx 30 and 500: best of DEC_REPS (7) runs of
+// 32 tokens, counting only runs during which other processes used < 0.3 cores.
+static void speed(void) {
+  const char *path = getenv("DEC_MODEL") ? getenv("DEC_MODEL") : "../model/qwen/model_int8.bin";
+  Model m; memset(&m, 0, sizeof m); model_load(wpath(path), &m, 0);
+  KV kv; kv_create_len(&m, &kv, 1024);
+  int V = (int)m.vocab; float *l = falloc(V);
+  int32_t ids[1024]; for (int i = 0; i < 1024; i++) ids[i] = (i * 7919 + 13) % 30000;
+  int pctx[] = {30, 500}; double r[2]; int reps = getenv("DEC_REPS") ? atoi(getenv("DEC_REPS")) : 7, tries = 0;
+  for (int c = 0; c < 2; c++) {
+    double best = 1e30;
+    for (int ok = 0; ok < reps && tries < 200; tries++) {
+      kv.len = 0; A_prefill(&m, &kv, ids, pctx[c]); A_decode_step(&m, &kv, ids[pctx[c]], l);
+      foreign_cores();
+      double t0 = now_s();
+      for (int s = 0; s < 32; s++) A_decode_step(&m, &kv, ids[s], l);
+      double t = (now_s() - t0) / 32;
+      double fc = foreign_cores(); if (getenv("DEC_FVERB")) printf("  t %.3f foreign %.2f\n", t * 1e3, fc);
+      if (fc > (getenv("DEC_FMAX") ? atof(getenv("DEC_FMAX")) : 0.3)) { Sleep(200); continue; }
+      ok++; best = fmin(best, t);
+    }
+    r[c] = best * 1e3;
+  }
+  printf("[speed] %s: ctx30 %.3f ms  ctx500 %.3f ms  (%d tries)\n", path, r[0], r[1], tries);
+  kv_free(&kv); model_free(&m);
+}
+
+// DEC_ONLY=ab: in-process A/B timing that is robust to background load: the
+// variants run interleaved (A B A B ...), 32 tokens each, many rounds; best and
+// median per variant at ctx 30 and 500. Variants (DEC_AB): "fuse" = dec_fuse 0/1,
+// "umwait" = WAITPKG off/on in the pool spin.
+extern int64_t dec_fuse, cpu_features;
+static int dcmp(const void *a, const void *b) { double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y; }
+static void ab(void) {
+  const char *path = getenv("DEC_MODEL") ? getenv("DEC_MODEL") : "../model/qwen/model_int8.bin";
+  const char *what = getenv("DEC_AB") ? getenv("DEC_AB") : "fuse";
+  Model m; memset(&m, 0, sizeof m); model_load(wpath(path), &m, 0);
+  KV kv; kv_create_len(&m, &kv, 1024);
+  int V = (int)m.vocab; float *l = falloc(V);
+  int32_t ids[1024]; for (int i = 0; i < 1024; i++) ids[i] = (i * 7919 + 13) % 30000;
+  int R = getenv("DEC_REPS") ? atoi(getenv("DEC_REPS")) : 9;
+  int64_t f0 = cpu_features;
+  int pctx[] = {30, 500};
+  for (int c = 0; c < 2; c++) {
+    double t[2][64];
+    for (int r = 0; r < R && r < 64; r++)
+      for (int v = 0; v < 2; v++) {
+        if (!strcmp(what, "fuse")) dec_fuse = v; else cpu_features = v ? f0 : (f0 & ~4);
+        kv.len = 0; A_prefill(&m, &kv, ids, pctx[c]); A_decode_step(&m, &kv, ids[pctx[c]], l);
+        double t0 = now_s();
+        for (int s = 0; s < 32; s++) A_decode_step(&m, &kv, ids[s], l);
+        t[v][r] = (now_s() - t0) / 32 * 1e3;
+      }
+    for (int v = 0; v < 2; v++) qsort(t[v], R, sizeof(double), dcmp);
+    printf("[ab %s] %s ctx %d: off best %.3f med %.3f | on best %.3f med %.3f ms/token\n", what, path, pctx[c],
+           t[0][0], t[0][R / 2], t[1][0], t[1][R / 2]);
+  }
+  dec_fuse = 1; cpu_features = f0;
+  kv_free(&kv); model_free(&m);
+}
+
+extern int64_t pool_pin;
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   int64_t f = cpu_init();
-  int64_t nt = pool_init(0);
+  if (getenv("DEC_PIN")) pool_pin = atoi(getenv("DEC_PIN"));
+  { extern int64_t dec_fuse; if (getenv("DEC_FUSE")) dec_fuse = atoi(getenv("DEC_FUSE")); }
+  { extern int64_t pool_prio; if (getenv("DEC_PRIO")) pool_prio = atoi(getenv("DEC_PRIO")); }
+  if (getenv("DEC_UMWAIT") && !atoi(getenv("DEC_UMWAIT"))) cpu_features &= ~4;
+  int64_t nt = pool_init(getenv("DEC_THREADS") ? atoi(getenv("DEC_THREADS")) : 0);
   printf("cpu features 0x%llx, pool threads %lld\n", (long long)f, (long long)nt);
   const char *only = getenv("DEC_ONLY");
   int all = !only;
@@ -708,6 +847,8 @@ int main(void) {
   if (only && strcmp(only, "dbg") == 0) dbg_layers();
   if (only && strcmp(only, "dbgp") == 0) dbg_prefill();
   if (only && strcmp(only, "prof") == 0) prof();
+  if (only && strcmp(only, "speed") == 0) speed();
+  if (only && strcmp(only, "ab") == 0) ab();
   if (RUN("sample")) test_sampler();
   if (RUN("decode")) {
     test_decode("../model/qwen/model_int8.bin", 1);

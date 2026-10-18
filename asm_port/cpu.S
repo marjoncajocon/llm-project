@@ -9,6 +9,10 @@
 // Feature bits
 //   1 = AVX2 + FMA usable (CPU has them AND the OS saves YMM state: XCR0 bits 1,2)
 //   2 = AVX-VNNI (VEX-encoded vpdpbusd, CPUID.(EAX=7,ECX=1):EAX bit 4)
+//   4 = WAITPKG (umonitor / umwait / tpause, CPUID.(EAX=7,ECX=0):ECX bit 5):
+//       lets the pool's idle workers wait for a new job in a light sleep state
+//       (C0.1) that wakes on a write to a watched cache line, instead of
+//       spinning with `pause` and stealing issue slots from the SMT sibling.
 //
 // The bits are only reported as usable when the OS has enabled AVX state
 // (CPUID.1:ECX.OSXSAVE and XGETBV(0) & 6 == 6) - otherwise executing a VEX
@@ -18,6 +22,7 @@
 
 #define CPU_AVX2 1
 #define CPU_VNNI 2
+#define CPU_WAITPKG 4
 
         .data
         .balign 8
@@ -58,8 +63,11 @@ cpu_init:
 
         mov     eax, 7
         xor     ecx, ecx
-        cpuid                           // leaf 7.0: ebx bit5 = AVX2
-        test    ebx, 1<<5
+        cpuid                           // leaf 7.0: ebx bit5 = AVX2, ecx bit5 = WAITPKG
+        test    ecx, 1<<5
+        jz      1f
+        or      r8d, CPU_WAITPKG        // (an integer feature: no OS state needed)
+1:      test    ebx, 1<<5
         jz      .Ldone
         or      r8d, CPU_AVX2
 
