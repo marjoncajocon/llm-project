@@ -18,31 +18,42 @@ printf 'The capital of France is' | \
   ./asm_port/build/llm.exe model/qwen/model_int8.bin model/qwen/tok.hf 64 0 1
 ```
 
-`llm.exe <model.bin> <tok.hf> [n_new] [temp] [seed] [--raw] [--bench] [--threads N] [--q8]`
+```
+llm.exe [hfgen] <model.bin> <tok.hf> [n_new] [temp] [seed] [--stop-tags] [--samples N]
+                [--raw] [--bench] [--threads N] [--q8]
+llm.exe hfchat  <model.bin> <tok.hf> [n_new]        (stdin: role, 0x1F, content; turns separated by 0x1E)
+```
 
-- Drop-in for `transformer hfgen`: same arguments, same `{"d":"..."}` / `{"done":true}` output,
-  same prompt fitting, stop rules and error messages (so `ai.py` can call it unchanged).
+- Drop-in for `transformer hfgen` / `transformer hfchat`: same arguments, same `{"d":"..."}` /
+  `{"done":true}` output, same prompt fitting, stop rules, chat templates (plain / ChatML /
+  Llama 3), `--stop-tags`, `--samples` framing and error messages. An unmodified copy of
+  `E:\llm-releasei.py` with `llm.exe` renamed to `transformer.exe` gives a byte-identical
+  transcript. Thread count: `--threads N`, else `TF_THREADS` (like the C engine), else auto.
 - `--raw` plain text instead of JSON lines · `--bench` timings on stderr ·
   `--threads N` pool size · `--q8` quantize an fp32 (LLMA) model to int8 at load (faster, not bit-exact vs C).
 - Models: LLMA v2–v4 (fp32; QK-norm, tied head, sliding windows) and LLMQ (int8).
   `model/smollm/model.bin` is a v1 file that the current C engine also rejects — use `model_v2.bin`.
-  GPT-2 (GPTC) and `--samples/--constrain/--stop-tags` are not ported yet.
+  Not ported yet: GPT-2 (GPTC) checkpoints and `--constrain*`.
 
-## Speed (i5-14400, DDR4-3200; 424-token prompt + 128 generated, greedy, best of 3)
+## Speed (i5-14400, DDR4-3200; 424-token prompt + 128 generated, greedy, best of 3, idle machine, 2026-10-18)
 
 | model | C engine (`transformer hfgen`) | asm `llm.exe` | speedup |
 |---|---|---|---|
-| Qwen2.5-0.5B int8 | 24.3 s | **3.4 s** | **7.1x** |
-| SmolLM2-135M int8 | 10.5 s | **1.37 s** | **7.6x** |
-| SmolLM2-135M fp32 | 21.3 s | **3.9 s** | **5.4x** |
+| Qwen2.5-0.5B int8 | 23.8 s | **3.08 s** | **7.7x** |
+| SmolLM2-135M int8 | 10.5 s | **1.26 s** | **8.3x** |
+| SmolLM2-135M fp32 | 20.6 s | **3.53 s** | **5.8x** |
 
-`--bench` breakdown for the same runs:
+`--bench` breakdown (best of 4; first version of 2026-10-17 in brackets):
 
-| model | load | prefill | decode |
-|---|---|---|---|
-| Qwen2.5-0.5B int8 | 0.33 s | 988 tok/s | 49 tok/s |
-| SmolLM2-135M int8 | 0.10 s | 1795 tok/s | 133 tok/s |
-| SmolLM2-135M fp32 | 0.11 s | 947 tok/s | 40 tok/s |
+| model | load | prefill (424 tok) | decode (ctx ~500) | decode (short prompt) |
+|---|---|---|---|---|
+| Qwen2.5-0.5B int8 | 0.36 s | **2300 tok/s** (988) | **53.6 tok/s** (49) | 53.8 tok/s |
+| SmolLM2-135M int8 | 0.10 s | **2600 tok/s** (1795) | **150 tok/s** (133) | 187 tok/s |
+| SmolLM2-135M fp32 | 0.12 s | **1400 tok/s** (947) | **43 tok/s** (40) | |
+
+Long prompts (measured under background load): SmolLM 7936-token prompt prefills at ~850 tok/s
+and decodes at ~50 tok/s; Qwen 4258-token prompt decodes at ~35 tok/s. At long context
+attention streams the K/V cache (189 MB per token for SmolLM at 4096) and sits at the memory limit.
 
 Decode is memory-bound: Qwen's int8 matvecs stream 494 MB per token at ~30 GB/s, 90–95% of
 what a pure streaming read reaches on this machine.
@@ -54,8 +65,13 @@ what a pure streaming read reaches on this machine.
   are offset to u8 and the offset is removed with a precomputed `128*colsum`. Integer sums are
   exact, so it is still bit-identical to C's `qmatmul`. AVX2 fallback without VNNI.
 - **Right thread count**: decode matvecs run on the 6 P-cores (16 threads is *slower* — memory
-  bound); prefill uses all 16.
-- **Batched prefill** (`decode.S`): the prompt runs 64 rows at a time through a 6x16
+  bound), pinned P-cores first at above-normal priority; prefill uses all 16.
+- **Fused decode jobs** (`matvec_q8_multi`): an int8 layer is 4 pool jobs — QKV+bias, Wo+residual,
+  gate+up+SiLU, down+residual — with x quantized once (169 -> 97 jobs per Qwen token).
+- **Split-key attention** (`ops.S`): long-context decode attention scores key chunks for all heads
+  of a KV group at once (each K block read once), then accumulates V per (head, 16-float slice),
+  keeping C's serial order so it stays exact.
+- **Batched prefill** (`decode.S`): the prompt runs 256 rows at a time through a 6x16
   register-blocked kernel, each weight line reused across rows — ~50x faster than token by token.
 - **Low-latency thread pool** (`pool.S`): spin on a generation word, then sleep on an event; one
   `lock cmpxchg` claims a chunk.
@@ -76,7 +92,8 @@ order in the int8 epilogue.
 
 | file | what |
 |---|---|
-| `main.S` | CLI (`hfgen`-compatible), generation loop, stop rules |
+| `main.S` | CLI (`hfgen`/`hfchat`), generation loop, stop rules, `--samples` |
+| `chat.S` | chat-template rendering (port of `hftok_chat_render`) |
 | `load.S` | LLMA/LLMQ checkpoint loader, KV-cache allocation |
 | `tok.S`, `tok_unitab.S` | Hugging Face byte-level BPE tokenizer (port of `hftok.c`) |
 | `decode.S` | `decode_step`, batched `prefill` |

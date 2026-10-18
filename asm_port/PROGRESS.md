@@ -43,3 +43,25 @@ Branch: `asm-port`. Contract: `DESIGN.md` + `model.inc`. Build: `./build.sh`.
   - attention (ops.S): split long-context attention across keys / d-slices with GQA K/V reuse, exact.
   - CLI features (main.S, load.S, new chat.S): `hfgen`/`hfchat` subcommands, `--stop-tags`,
     `--samples` (KV fork), chat template rendering; verify through a copy of ai.py.
+
+## 2026-10-18 11:45 — morning session result
+All three agents finished; everything committed. Output still identical to the C engine
+(greedy + sampled md5 on qwen int8 / smollm int8 / smollm fp32; att_test, dec_test, kern_test 5696,
+cli_chat_test 288k, cli_cmp 62/62).
+- CLI: `hfchat`, `--stop-tags`, `--samples`, TF_THREADS → drop-in for E:\llm-release\ai.py (verified on
+  a copy: identical transcript).
+- Decode latency: fused int8 jobs (4 per layer), P-core-first pinning + priority, umwait idle,
+  256-row prefill with threaded norm/SiLU.
+- Attention: split-key decode with GQA K reuse, tiled prefill attention.
+- Idle-machine benchmark (424-token prompt + 128): Qwen int8 23.8 s C → 3.08 s asm (7.7x),
+  SmolLM int8 10.5 → 1.26 s (8.3x), SmolLM fp32 20.6 → 3.53 s (5.8x).
+  Qwen: prefill 988 → 2300 tok/s, decode 49 → 53.6 tok/s since last night.
+
+### Left / ideas
+- Decode is at the RAM limit (~30 GB/s on this 8+4 GB mixed DIMM pair); further big wins need fewer
+  bytes per token, which means NOT bit-exact with C: an fp16/int8 KV cache, int4 weights, or
+  speculative decoding with SmolLM drafting for Qwen (exact output, more compute per weight read).
+- Release models E:\llm-release\models\qwen and qwen-agent are fp32 (2 GB): with `--q8` ~2x faster
+  replies, but ai.py can't pass it — converting them to LLMQ would need the user's OK (changes weights).
+- Not ported: `--constrain*`, GPT-2 (GPTC) checkpoints.
+- Repo-root transformer.exe is stale (rejects v2 files).

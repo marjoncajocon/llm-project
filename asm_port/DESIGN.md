@@ -111,3 +111,25 @@ tolerance (and greedy decode must produce the same token stream as `transformer.
   Q8 mat's raw int8.
 - **decode.S**: `decode_init(Model*)`, `decode_step(...)` returns 1 when the cache is full;
   `prefill(m, kv, ids, n)` batches 64 rows. head_dim must be a multiple of 8 (64 has a fast path).
+
+## Additions, 2026-10-18 morning
+
+- **matvec.S** `matvec_q8_multi(const MvTask* t, n, const float* x)`: MvTask = 32 bytes
+  `{Mat* m; float* y; float* add; i64 mode}`, n <= 8, all mats share K; x quantized once and all
+  their 16-column panels form one pool job. mode 0: `y = (as*scale)*acc (+ add[j] if add)` (bias, or
+  residual in place with y == add == x); mode 1: this task and the next are a SwiGLU pair,
+  `y = (g*s)*u`, s = 1/(1+expf(-g)), per panel.
+- **decode.S**: int8 layers use 4 fused jobs (`dec_fuse` = 0 turns it off for A/B); `PF_ROWS` = 256;
+  `par_rmsnorm_rows(x,g,out,n,eps,rows)`, `par_silu_rows(g,u,n,rows)` (row-parallel, for prefill);
+  `dec_prof_on` / `dec_prof[32]` rdtsc profile.
+- **cpu.S**: `cpu_features` bit 4 = WAITPKG (umonitor/umwait).
+- **pool.S**: `pool_cpu_order[]` / `pool_ncpu_order` (P-cores, then E-cores, then HT siblings);
+  `pool_pin` (0 OS, 1 ideal processor = default, 2 hard affinity), `pool_prio` (above-normal for the
+  first pool_mem_threads threads), idle wait via umwait; `pool_prof_on` / `pool_prof[8]`.
+- **ops.S attention**: interface unchanged. Decode with >= 64 keys and blocked K uses a split-key
+  task graph (score chunks -> per-head serial softmax -> per (kv head, 16-float slice) V pass);
+  decode thread count = pool_mem_threads unless n_heads > 2*pool_mem_threads (`att_dec_threads_n`
+  overrides). Tuning words `att_*`.
+- **load.S**: `kv_copy(dst, src)` (like llama_kv_copy, returns 1 on mismatch), `kv_clone(src, t,
+  only_rings)` for --samples snapshots. **main.S** honours `TF_THREADS`. **chat.S**: `chat_parse`,
+  `chat_render`.
