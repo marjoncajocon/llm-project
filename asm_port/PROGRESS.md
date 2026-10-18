@@ -33,3 +33,13 @@ Branch: `asm-port`. Contract: `DESIGN.md` + `model.inc`. Build: `./build.sh`.
    pool dispatch, fusing Wq/Wk/Wv and gate/up into one pool_run each, sampler 0.5 ms).
 3. Optional non-exact speed mode: fp16 KV cache, int8 lm_head shortcut for greedy (top-1 only).
 4. Port `--samples`, `--stop-tags`, `--constrain`, `hfchat`; GPT-2 (GPTC) models.
+
+## 2026-10-18 09:05 — morning session
+- Build clean, last night's agents all finished. Release wrapper `E:\llm-release\ai.py` calls
+  `hfchat` and `hfgen --stop-tags`, so those are needed for a true drop-in.
+- Three parallel agents launched (disjoint files):
+  - decode latency (decode.S, matvec.S, pool.S): profile, fuse QKV / gate+up+SiLU / residual
+    epilogues into fewer pool dispatches, hot-spin during a token, P-core pinning, prefill tuning.
+  - attention (ops.S): split long-context attention across keys / d-slices with GQA K/V reuse, exact.
+  - CLI features (main.S, load.S, new chat.S): `hfgen`/`hfchat` subcommands, `--stop-tags`,
+    `--samples` (KV fork), chat template rendering; verify through a copy of ai.py.
