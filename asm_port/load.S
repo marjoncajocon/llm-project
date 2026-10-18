@@ -14,6 +14,10 @@
 //   i64  kv_create(const Model*, KV*)              -> 0 ok, 1 out of memory
 //   i64  kv_create_len(const Model*, KV*, i64 max_len)
 //   void kv_free(KV*)
+//   i64  kv_clone(const KV* src, KV* t, i64 only_rings)  same geometry, len 0;
+//            only_rings = 1: buffers only for the layers that wrap (--samples)
+//   i64  kv_copy(KV* dst, const KV* src)   = llama.c llama_kv_copy (honours the
+//            8-slot channel-major K blocks); 0 ok, 1 geometry mismatch
 //   void q8_quant_percol(const float* w, i64 rows, i64 cols, i8* q, float* scale)
 //            = quant.c quantize_int8_percol, bit for bit (used for the embedding
 //              under flag 1: the embedding needs raw int8 + scale, not a packed layout)
@@ -1507,5 +1511,325 @@ kv_free:
     mov qword ptr [rbx + KV_K], rax
     mov qword ptr [rbx + KV_V], rax
     add rsp, 32
+    pop rbx
+    ret
+
+// ===========================================================================
+// KV forking (port of llama.c llama_kv_copy, used by --samples)
+// ---------------------------------------------------------------------------
+// --samples N prefills the prompt ONCE and then generates N continuations from
+// that same prefilled state. Each continuation writes new positions into the
+// cache, so before sample i+1 the cache must be put back the way the prefill
+// left it. Two facts make that cheap:
+//
+//   * a layer whose ring is at least as long as the whole run (cap >= max_seq of
+//     the cache) never wraps: positions keep..end land in slots keep..end and the
+//     prompt's slots 0..keep-1 are never written again -- setting len = keep is
+//     enough to "rewind" it;
+//   * a sliding-window layer (cap < max_seq) wraps (slot = pos % cap), so new
+//     tokens overwrite prompt slots. Only THOSE layers need a saved copy.
+//
+// So the snapshot is a KV with the same geometry whose buffers exist only for
+// the wrapping layers (kv_clone(src, t, 1)), and kv_copy copies just the layers
+// that have buffers on both sides.
+//
+// The K layout belongs to decode.S (DESIGN.md "Additions"): if cap % 8 == 0,
+// slots 8b..8b+7 form one channel-major block, K[s][c] at
+//     k + (s>>3)*8*kv_dim + c*8 + (s&7)          (floats)
+// otherwise K is row-major like V: K[s][c] at k + s*kv_dim + c.
+// A prefix of slots 0..used-1 is therefore a prefix of whole 8-slot blocks: we
+// copy ceil(used/8) blocks (a few unused slots ride along; they lie beyond len,
+// where nothing reads them before they are rewritten).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// i64 kv_clone(const KV* src, KV* t, i64 only_rings) -> 0 ok, 1 out of memory
+//   t gets the geometry of src (n_layers, max_seq, kv_dim, cap[]) and len = 0.
+//   only_rings = 0: every layer gets k/v buffers (cap * kv_dim floats each);
+//   only_rings = 1: only layers with cap < max_seq (the ones that wrap); the
+//                   others keep k[l] = v[l] = 0 and kv_copy skips them.
+//   Free t with kv_free (same arena scheme as kv_create_len).
+// ---------------------------------------------------------------------------
+    .globl kv_clone
+kv_clone:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 32                         // 8 + 56 + 32 = 96: aligned
+    mov rbx, rcx                        // rbx = src
+    mov rsi, rdx                        // rsi = t
+    mov r15, r8                         // r15 = only_rings
+    mov rdi, rsi                        // zero t
+    xor eax, eax
+    mov ecx, KV_SIZE
+    rep stosb
+    mov r13, qword ptr [rbx + KV_NLAYERS]
+    mov r12, qword ptr [rbx + KV_MAXSEQ]
+    mov r14, qword ptr [rbx + KV_KVDIM]
+    mov qword ptr [rsi + KV_NLAYERS], r13
+    mov qword ptr [rsi + KV_MAXSEQ], r12
+    mov qword ptr [rsi + KV_KVDIM], r14
+    // the i64[3*n_layers] block: cap | k | v (zeroed by mem_alloc)
+    lea rcx, [r13 + r13*2]
+    shl rcx, 3
+    call mem_alloc
+    test rax, rax
+    jz .Lkc_fail
+    mov qword ptr [rsi + KV_CAP], rax
+    lea rcx, [rax + r13*8]
+    mov qword ptr [rsi + KV_K], rcx
+    lea rcx, [rcx + r13*8]
+    mov qword ptr [rsi + KV_V], rcx
+    // pass 1: copy the caps, add up the arena bytes of the layers that need one
+    mov r8, qword ptr [rbx + KV_CAP]    // r8 = src cap[]
+    mov r9, rax                         // r9 = t cap[]
+    xor ecx, ecx                        // rcx = l
+    xor edi, edi                        // rdi = arena bytes
+1:  cmp rcx, r13
+    jae 3f
+    mov rax, qword ptr [r8 + rcx*8]
+    mov qword ptr [r9 + rcx*8], rax
+    test r15, r15
+    jz 2f
+    cmp rax, r12
+    jge 4f                              // never wraps: no buffer
+2:  imul rax, r14                       // cap * kv_dim floats ...
+    shl rax, 2                          // ... in bytes,
+    add rax, 63                         // rounded up to 64 for alignment
+    and rax, -64
+    lea rdi, [rdi + rax*2]              // k and v
+4:  inc rcx
+    jmp 1b
+3:  test rdi, rdi
+    jz .Lkc_ok                          // nothing to allocate (no wrapping layer)
+    lea rcx, [rdi + 64]
+    call mem_alloc
+    test rax, rax
+    jz .Lkc_fail
+    mov qword ptr [rsi + KV_SPARE], rax // the arena (kv_free releases it)
+    // pass 2: slice the arena
+    mov r9, qword ptr [rsi + KV_CAP]
+    mov r10, qword ptr [rsi + KV_K]
+    mov r11, qword ptr [rsi + KV_V]
+    xor ecx, ecx
+5:  cmp rcx, r13
+    jae .Lkc_ok
+    mov rdx, qword ptr [r9 + rcx*8]
+    test r15, r15
+    jz 6f
+    cmp rdx, r12
+    jge 7f
+6:  imul rdx, r14
+    shl rdx, 2
+    add rdx, 63
+    and rdx, -64
+    mov qword ptr [r10 + rcx*8], rax
+    add rax, rdx
+    mov qword ptr [r11 + rcx*8], rax
+    add rax, rdx
+7:  inc rcx
+    jmp 5b
+.Lkc_ok:
+    xor eax, eax
+    jmp .Lkc_ret
+.Lkc_fail:
+    mov rcx, qword ptr [rsi + KV_CAP]
+    call mem_free
+    mov qword ptr [rsi + KV_CAP], 0
+    mov eax, 1
+.Lkc_ret:
+    add rsp, 32
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+// ---------------------------------------------------------------------------
+// i64 kv_copy(KV* dst, const KV* src) -> 0 ok, 1 geometry mismatch (nothing copied)
+//   llama_kv_copy: positions 0..len-1 must land in the same slots of both caches,
+//   so for every layer either the caps are equal, or neither ring has wrapped yet
+//   (len <= both caps: slot == position in each). Per layer, the populated slots
+//   are 0..used-1 with used = min(len, cap) -- a prefix whether or not the ring
+//   wrapped. Layers with no buffer on either side (k[l] == 0, see kv_clone) are
+//   skipped. Then dst.len = src.len.
+//   If one side has a blocked K (cap % 8 == 0) and the other a row-major one,
+//   K is re-laid slot by slot; otherwise it is one straight copy.
+// ---------------------------------------------------------------------------
+    .globl kv_copy
+kv_copy:
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 40                         // 8 + 64 + 40 = 112: aligned
+    mov rbx, rcx                        // rbx = dst
+    mov rsi, rdx                        // rsi = src
+    // ---- geometry check ----
+    mov r13, qword ptr [rsi + KV_NLAYERS]
+    cmp r13, qword ptr [rbx + KV_NLAYERS]
+    jne .Lkcp_bad
+    mov r14, qword ptr [rsi + KV_KVDIM]   // r14 = kv_dim
+    cmp r14, qword ptr [rbx + KV_KVDIM]
+    jne .Lkcp_bad
+    mov r15, qword ptr [rsi + KV_LEN]     // r15 = len
+    cmp r15, qword ptr [rbx + KV_MAXSEQ]
+    jg .Lkcp_bad
+    mov r8, qword ptr [rsi + KV_CAP]
+    mov r9, qword ptr [rbx + KV_CAP]
+    xor ecx, ecx
+1:  cmp rcx, r13
+    jae 2f
+    mov rax, qword ptr [r8 + rcx*8]     // src cap
+    mov rdx, qword ptr [r9 + rcx*8]     // dst cap
+    cmp rax, rdx
+    je 3f                               // same caps: always fine
+    cmp r15, rax
+    jg .Lkcp_bad                        // src ring wrapped and the caps differ
+    cmp r15, rdx
+    jg .Lkcp_bad
+3:  inc rcx
+    jmp 1b
+2:  // ---- copy layer by layer ----
+    xor r12d, r12d                      // r12 = l
+.Lkcp_layer:
+    cmp r12, r13
+    jae .Lkcp_done
+    mov rax, qword ptr [rsi + KV_K]
+    mov rdi, qword ptr [rax + r12*8]    // rdi = src k[l]
+    mov rax, qword ptr [rbx + KV_K]
+    mov rbp, qword ptr [rax + r12*8]    // rbp = dst k[l]
+    test rdi, rdi
+    jz .Lkcp_next
+    test rbp, rbp
+    jz .Lkcp_next
+    mov rax, qword ptr [rsi + KV_CAP]
+    mov rax, qword ptr [rax + r12*8]    // src cap
+    mov rcx, r15
+    cmp rcx, rax
+    jle 4f
+    mov rcx, rax
+4:  mov qword ptr [rsp + 32], rcx       // [rsp+32] = used = min(len, cap)
+    test rcx, rcx
+    jz .Lkcp_next
+    // V: always row-major -> used * kv_dim floats
+    mov r8, rcx
+    imul r8, r14
+    shl r8, 2
+    mov rax, qword ptr [rbx + KV_V]
+    mov rcx, qword ptr [rax + r12*8]
+    mov rax, qword ptr [rsi + KV_V]
+    mov rdx, qword ptr [rax + r12*8]
+    call mem_copy
+    // K: which layout is each side in?  r10 = src cap & 7, r11 = dst cap & 7
+    // (0 means blocked)
+    mov rax, qword ptr [rsi + KV_CAP]
+    mov r10, qword ptr [rax + r12*8]
+    and r10d, 7
+    mov rax, qword ptr [rbx + KV_CAP]
+    mov r11, qword ptr [rax + r12*8]
+    and r11d, 7
+    test r10, r10
+    setz al
+    test r11, r11
+    setz dl
+    cmp al, dl
+    jne .Lkcp_relayout
+    // same layout: one copy (blocked: whole 8-slot blocks)
+    mov r8, qword ptr [rsp + 32]
+    test al, al
+    jz 5f
+    add r8, 7
+    and r8, -8                          // round up to whole blocks
+5:  imul r8, r14
+    shl r8, 2
+    mov rcx, rbp
+    mov rdx, rdi
+    call mem_copy
+    jmp .Lkcp_next
+.Lkcp_relayout:
+    // slot by slot, channel by channel: K[s][c] from the src layout to the dst
+    // layout. Float index of (s, c): blocked (s>>3)*8*kv_dim + (s&7) + c*8,
+    // row-major s*kv_dim + c. So each slot is a base plus a per-channel step
+    // (8 or 1). No calls in here, so we may use any volatile register.
+    xor ecx, ecx                        // rcx = s
+6:  cmp rcx, qword ptr [rsp + 32]
+    jae .Lkcp_next
+    // src side: r8 = base, r9 = step per channel
+    mov r8, rcx
+    imul r8, r14                        // row-major: s*kv_dim, step 1
+    mov r9d, 1
+    test r10, r10
+    jnz 7f
+    mov r8, rcx
+    shr r8, 3
+    imul r8, r14
+    shl r8, 3                           // (s>>3)*8*kv_dim
+    mov rax, rcx
+    and eax, 7
+    add r8, rax                         // + (s&7)
+    mov r9d, 8                          // step 8 per channel
+7:  // dst side: rax = base, rdx = step per channel
+    mov rax, rcx
+    imul rax, r14
+    mov edx, 1
+    test r11, r11
+    jnz 8f
+    mov rax, rcx
+    shr rax, 3
+    imul rax, r14
+    shl rax, 3
+    mov rdx, rcx
+    and edx, 7
+    add rax, rdx
+    mov edx, 8
+8:  // copy kv_dim floats with the two steps; r10 = channel counter, r11d = the
+    // float being moved (the layout flags are re-read from the caps afterwards)
+    xor r10d, r10d
+9:  cmp r10, r14
+    jae 10f
+    mov r11d, dword ptr [rdi + r8*4]
+    mov dword ptr [rbp + rax*4], r11d
+    add r8, r9
+    add rax, rdx
+    inc r10
+    jmp 9b
+10: mov rax, qword ptr [rsi + KV_CAP]   // restore the layout flags
+    mov r10, qword ptr [rax + r12*8]
+    and r10d, 7
+    mov rax, qword ptr [rbx + KV_CAP]
+    mov r11, qword ptr [rax + r12*8]
+    and r11d, 7
+    inc rcx
+    jmp 6b
+.Lkcp_next:
+    inc r12
+    jmp .Lkcp_layer
+.Lkcp_done:
+    mov qword ptr [rbx + KV_LEN], r15
+    xor eax, eax
+    jmp .Lkcp_ret
+.Lkcp_bad:
+    mov eax, 1
+.Lkcp_ret:
+    add rsp, 40
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
     pop rbx
     ret
