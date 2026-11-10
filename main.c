@@ -35,6 +35,7 @@
 #include "audiogen.h"
 #include "llama.h"
 #include "matrix.h"
+#include "quant.h"
 #include "gpu.h"
 #include "backend.h"
 #include "selftest.h"
@@ -1133,6 +1134,158 @@ static int run_hfgen(int argc, char **argv) {
   return rc;
 }
 
+// ============================================================================
+// `quant-report`: what int8 / int4 weights cost a REAL model, measured on text.
+//   transformer quant-report <model.bin (LLMA f32)> <tok.hf> [text.txt] [--group G] [--tokens N]
+// Fake-quantizes every big weight (quantize -> dequantize back into the f32
+// model) and reports, per scheme: weight relative error, bytes per weight,
+// perplexity on the text and top-1 next-token agreement with the f32 model.
+// ============================================================================
+typedef enum { FQ_INT8 = 8, FQ_INT4 = 4, FQ_INT4_MIX = 5 } FakeQuant;
+
+// Quantize then dequantize t in place. `inner_cols` = 1 when the matrix's INPUT
+// dimension is its columns (wte: rows are tokens, a row is a d_model vector), so
+// int4 groups run along d_model; otherwise groups run along the rows.
+static void fake_quant(Tensor *t, FakeQuant fq, int group, int inner_cols,
+                       double *err2, double *norm2, double *bytes) {
+  if (!t->data || t->ndim != 2) return;
+  const int R = t->shape[0], C = t->shape[1];
+  const size_t n = (size_t)R * C;
+  float *w = (float*)malloc(n * sizeof(float));
+  // Work on W^T when the input dimension is the columns.
+  const int r = inner_cols ? C : R, c = inner_cols ? R : C;
+  for (int i = 0; i < R; i++)
+    for (int j = 0; j < C; j++)
+      w[inner_cols ? (size_t)j * R + i : (size_t)i * C + j] = t->data[(size_t)i * C + j];
+  float *d = (float*)malloc(n * sizeof(float));
+  if (fq == FQ_INT8) {
+    signed char *q = (signed char*)malloc(n);
+    float *s = (float*)malloc((size_t)c * sizeof(float));
+    quantize_int8_percol(w, r, c, q, s);
+    dequantize_int8_percol(q, s, r, c, d);
+    *bytes += (double)n + (double)c * 4.0;
+    free(q); free(s);
+  } else {
+    Q4Tensor q = q4tensor_create(r, c, group);
+    q4tensor_quantize(&q, w);
+    q4tensor_dequantize(&q, d);
+    *bytes += (double)q4tensor_bytes(&q);
+    q4tensor_free(&q);
+  }
+  for (size_t k = 0; k < n; k++) {
+    const double e = (double)d[k] - (double)w[k];
+    *err2 += e * e;
+    *norm2 += (double)w[k] * (double)w[k];
+  }
+  for (int i = 0; i < R; i++)
+    for (int j = 0; j < C; j++)
+      t->data[(size_t)i * C + j] = d[inner_cols ? (size_t)j * R + i : (size_t)i * C + j];
+  free(w); free(d);
+}
+
+static void fake_quant_model(LlamaModel *m, FakeQuant fq, int group, double *rel, double *bpw) {
+  double e2 = 0.0, n2 = 0.0, bytes = 0.0, count = 0.0;
+  for (int l = 0; l < m->n_layers; l++) {
+    LlamaBlock *b = &m->blocks[l];
+    Tensor *ws[7] = {&b->Wq, &b->Wk, &b->Wv, &b->Wo, &b->Wgate, &b->Wup, &b->Wdown};
+    const FakeQuant bq = fq == FQ_INT4_MIX ? FQ_INT4 : fq;
+    for (int i = 0; i < 7; i++) { fake_quant(ws[i], bq, group, 0, &e2, &n2, &bytes); count += (double)ws[i]->size; }
+  }
+  // Q4_K_M-style mix: blocks int4, the embedding (and so a tied head) int8.
+  fake_quant(&m->wte, fq == FQ_INT4_MIX ? FQ_INT8 : fq, group, 1, &e2, &n2, &bytes);
+  count += (double)m->wte.size;
+  if (!m->tied && m->lm_head.data) {
+    fake_quant(&m->lm_head, fq == FQ_INT4_MIX ? FQ_INT8 : fq, group, 0, &e2, &n2, &bytes);
+    count += (double)m->lm_head.size;
+  }
+  *rel = sqrt(e2 / (n2 > 0 ? n2 : 1));
+  *bpw = bytes / (count > 0 ? count : 1);
+}
+
+// Perplexity of ids[1..n) and the argmax at every position.
+static double eval_text(const LlamaModel *m, const int *ids, int n, int *argmax) {
+  int ls[2] = {n, m->vocab};
+  Tensor logits = tensor_create_nograd(ls, 2);
+  llama_model_forward(m, ids, n, &logits);
+  double nll = 0.0;
+  for (int t = 0; t < n; t++) {
+    const float *row = &logits.data[(size_t)t * m->vocab];
+    int am = 0;
+    float mx = row[0];
+    for (int v = 1; v < m->vocab; v++) if (row[v] > mx) { mx = row[v]; am = v; }
+    argmax[t] = am;
+    if (t + 1 < n) {
+      double se = 0.0;
+      for (int v = 0; v < m->vocab; v++) se += exp((double)row[v] - mx);
+      nll += -((double)row[ids[t + 1]] - mx - log(se));
+    }
+  }
+  tensor_free(&logits);
+  return exp(nll / (n > 1 ? n - 1 : 1));
+}
+
+static int run_quant_report(int argc, char **argv) {
+  const char *pos[3];
+  int npos = 0, group = 32, max_tok = 256;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--group") == 0 && i + 1 < argc) group = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) max_tok = atoi(argv[++i]);
+    else if (npos < 3) pos[npos++] = argv[i];
+  }
+  if (npos < 2 || group < 2 || max_tok < 2) {
+    fprintf(stderr, "usage: transformer quant-report <model.bin (LLMA f32)> <tok.hf> [text.txt]"
+                    " [--group G (32)] [--tokens N (256)]\n");
+    return 2;
+  }
+  const char *text_path = npos > 2 ? pos[2] : "data/qa.txt";
+  HFTok tok;
+  if (hftok_load(&tok, pos[1]) != 0) return 1;
+  FILE *f = fopen(text_path, "rb");
+  if (!f) { fprintf(stderr, "cannot open %s\n", text_path); hftok_free(&tok); return 1; }
+  char *text = (char*)malloc(1 << 16);
+  const size_t tl = fread(text, 1, (1 << 16) - 1, f);
+  fclose(f);
+  text[tl] = '\0';
+  int *ids = (int*)malloc((size_t)(tl + 16) * sizeof(int));
+  int n = hftok_encode(&tok, text, ids, (int)tl + 16);
+  free(text);
+
+  LlamaModel m;
+  if (llama_model_load(pos[0], &m) != 0) {
+    fprintf(stderr, "cannot load %s (quant-report needs an f32 LLMA checkpoint)\n", pos[0]);
+    free(ids); hftok_free(&tok);
+    return 1;
+  }
+  if (n > max_tok) n = max_tok;
+  if (n > m.max_seq) n = m.max_seq;
+  int *am_ref = (int*)malloc((size_t)n * sizeof(int)), *am = (int*)malloc((size_t)n * sizeof(int));
+  printf("quant-report: %s | %d tokens of %s | int4 group %d\n", pos[0], n, text_path, group);
+  const double ppl_ref = eval_text(&m, ids, n, am_ref);
+  printf("  %-14s %10s %12s %12s %14s\n", "scheme", "bytes/wt", "weight err", "perplexity", "top-1 agree");
+  printf("  %-14s %10.3f %12s %12.3f %13.1f%%\n", "f32", 4.0, "-", ppl_ref, 100.0);
+  llama_model_free(&m);
+
+  const FakeQuant schemes[3] = {FQ_INT8, FQ_INT4, FQ_INT4_MIX};
+  for (int s = 0; s < 3; s++) {
+    if (llama_model_load(pos[0], &m) != 0) break;          // fresh f32 copy per scheme
+    double rel = 0.0, bpw = 0.0;
+    fake_quant_model(&m, schemes[s], group, &rel, &bpw);
+    const double ppl = eval_text(&m, ids, n, am);
+    int agree = 0;
+    for (int t = 0; t < n; t++) agree += am[t] == am_ref[t];
+    char name[32];
+    if (schemes[s] == FQ_INT8) snprintf(name, sizeof(name), "int8 per-col");
+    else if (schemes[s] == FQ_INT4) snprintf(name, sizeof(name), "int4 g%d", group);
+    else snprintf(name, sizeof(name), "int4 g%d+emb8", group);
+    printf("  %-14s %10.3f %11.2f%% %12.3f %13.1f%%\n", name, bpw, 100.0 * rel, ppl,
+           100.0 * agree / n);
+    fflush(stdout);
+    llama_model_free(&m);
+  }
+  free(am_ref); free(am); free(ids); hftok_free(&tok);
+  return 0;
+}
+
 // `hfchat`: pure-C chat that applies the model's OWN chat template. Reads the
 // conversation from stdin as turns — each turn "role\x1fcontent" separated by
 // "\x1e" — renders it via hftok_chat_render, tokenizes, and generates. This is
@@ -1524,6 +1677,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "gpu-bench") == 0) return run_gpu_bench(argc, argv);
   if (argc > 1 && strcmp(argv[1], "simd-bench") == 0) return run_simd_bench(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfgen") == 0) return run_hfgen(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "quant-report") == 0) return run_quant_report(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfchat") == 0) return run_hfchat(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);

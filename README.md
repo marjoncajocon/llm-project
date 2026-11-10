@@ -443,6 +443,27 @@ differently. Against a double-precision reference the SIMD `dA` is the *more* ac
 two (N=49152: 4.4e-06 vs 1.6e-05 relative). Selftest part `[34]` gates all of this on awkward
 shapes; the int8 kernel is integer arithmetic and must match exactly.
 
+### int4 weights, measured (`quant-report`)
+
+`quant.c` adds **group-wise int4** (`Q4Tensor`, `q4matmul`): every 32 input rows of a column share one
+scale, codes packed two per byte (0.625 bytes/weight vs 1 for int8, 4 for f32), and each group's scale
+is chosen by a small clipping search (minimum squared error) so one outlier only coarsens its own
+group. `transformer quant-report <model.bin> <tok.hf> [text]` fake-quantizes every weight of an f32
+checkpoint and measures what it costs **on text** — perplexity and top-1 next-token agreement with f32:
+
+| SmolLM2-135M (`reason_e2.bin`), 256 tokens of `data/qa.txt` | bytes/wt | weight err | perplexity | top-1 agree |
+| --- | --- | --- | --- | --- |
+| f32 | 4.000 | – | 15.35 | 100% |
+| int8 per-channel | 1.006 | 0.9% | 15.60 | 94.5% |
+| int4 g32 (clip search) | 0.625 | 10.1% | 24.62 | 59.0% |
+| int4 g32 + int8 embedding (Q4_K_M-style mix) | 0.758 | 8.5% | 21.35 | 67.2% |
+| int4 g16 + int8 embedding | 0.839 | 7.5% | 20.55 | 68.8% |
+
+The honest conclusion: **round-to-nearest int4 is not good enough for a 135M model** (int8 is nearly
+free). Small models have little redundancy; 4-bit works for 7B-class models, and below that it needs
+calibration (GPTQ/AWQ) or quantization-aware training. The kernel and the measuring tool are the
+groundwork for either. Selftest `[54]`.
+
 ### Cross-compiling
 
 Build **all** targets at once into `build/` (needs `zig` + a POSIX shell):

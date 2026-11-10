@@ -7755,6 +7755,59 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 54: int4 group quantization.
+  {
+    printf("[54] int4 group quantization: pack/unpack, per-group error bound, q4matmul =="
+           " matmul(dequantized), outlier isolation\n");
+    const int R = 70, C = 9, G = 32, M = 3;      // R not a multiple of G or 2: ragged tail
+    srand(54);
+    float *w = (float*)malloc((size_t)R * C * sizeof(float)), *d = (float*)malloc((size_t)R * C * sizeof(float));
+    for (int i = 0; i < R * C; i++) w[i] = 2.0f * (float)rand() / RAND_MAX - 1.0f;
+    w[5 * C + 2] = 40.0f;                        // an outlier in group 0 of column 2
+    Q4Tensor q = q4tensor_create(R, C, G);
+    q4tensor_quantize(&q, w);
+    q4tensor_dequantize(&q, d);
+    // Every weight within half a step of its group's scale (or clipped, at most
+    // the clip amount the search chose), and the outlier must not coarsen the
+    // OTHER groups of its column.
+    int bound_ok = 1;
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < C; j++) {
+        const float s = q.scale[(size_t)(i / G) * C + j];
+        const float lim = fabsf(w[i * C + j]) > 7.0f * s ? fabsf(w[i * C + j]) - 7.0f * s + 1e-6f : 0.5f * s + 1e-6f;
+        bound_ok &= fabsf(d[i * C + j] - w[i * C + j]) <= lim;
+      }
+    const int iso_ok = q.scale[0 * C + 2] > 1.0f && q.scale[1 * C + 2] < 0.2f && q.scale[2 * C + 2] < 0.2f;
+    const int size_ok = q4tensor_bytes(&q) == (size_t)((R + 1) / 2) * C + (size_t)3 * C * sizeof(float);
+    int as[2] = {M, R}, cs[2] = {M, C};
+    Tensor A = tensor_create(as, 2), C1 = tensor_create(cs, 2), C2 = tensor_create(cs, 2);
+    for (size_t i = 0; i < A.size; i++) A.data[i] = 2.0f * (float)rand() / RAND_MAX - 1.0f;
+    int ws_[2] = {R, C};
+    Tensor Wd = tensor_create(ws_, 2);
+    memcpy(Wd.data, d, (size_t)R * C * sizeof(float));
+    q4matmul(&A, &q, &C1);
+    matmul(&A, &Wd, &C2);
+    float mm = 0.0f;
+    for (size_t i = 0; i < C1.size; i++) {
+      const float e = fabsf(C1.data[i] - C2.data[i]) / (fabsf(C2.data[i]) + 1e-3f);
+      if (e > mm) mm = e;
+    }
+    const int mm_ok = mm < 1e-4f;
+    const int ok54 = bound_ok && iso_ok && size_ok && mm_ok;
+    printf("    error within the chosen step/clip: %s | outlier confined to its group (scales %.3f vs"
+           " %.3f): %s\n", bound_ok ? "yes" : "NO", (double)q.scale[2], (double)q.scale[C + 2],
+           iso_ok ? "yes" : "NO");
+    printf("    %d x %d @ g%d = %zu bytes (0.5 B codes + scales): %s | q4matmul vs matmul(deq) max"
+           " rel %.1e -> %s\n", R, C, G, q4tensor_bytes(&q), size_ok ? "OK" : "WRONG", (double)mm,
+           ok54 ? "OK" : "FAIL");
+    printf("\n");
+    all_ok &= ok54;
+    q4tensor_free(&q);
+    free(w); free(d);
+    tensor_free(&A); tensor_free(&C1); tensor_free(&C2); tensor_free(&Wd);
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

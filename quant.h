@@ -32,4 +32,33 @@ void qtensor_quantize(QTensor *t, const float *w);   // fill from a (rows, cols)
 // C[m,j] = scale[j] * sum_k A[m,k] * (float)q[k,j].  A f32 (M, rows), C f32 (M, cols).
 void qmatmul(const Tensor *A, const QTensor *W, Tensor *C);
 
+// ---------------------------------------------------------------------------
+// int4, GROUP-wise (the llama.cpp Q4 / GPTQ-style layout, symmetric): along the
+// input dimension, every `group` consecutive rows of a column share one scale,
+//   scale[g,j] = max_{i in group g} |w[i,j]| / 7
+//   q[i,j]     = round(w[i,j] / scale[g,j]) clamped to [-7, 7]
+// stored as q + 8 in a nibble, two rows per byte (row 2r in the low nibble of
+// byte (r, j), row 2r+1 in the high one). With group 32 that is 0.5 + 4/32 =
+// 0.625 bytes per weight vs 1 for int8 and 4 for f32. Per-GROUP scales are what
+// make 4 bits usable: one outlier only coarsens its own 32 weights, not the
+// whole column (a per-column int4 scale wrecks small models).
+// ---------------------------------------------------------------------------
+typedef struct {
+  int rows, cols, group, n_groups;   // n_groups = ceil(rows / group)
+  unsigned char *q;                  // ceil(rows/2) * cols bytes
+  float *scale;                      // n_groups * cols
+} Q4Tensor;
+
+Q4Tensor q4tensor_create(int rows, int cols, int group);
+void q4tensor_free(Q4Tensor *t);
+void q4tensor_quantize(Q4Tensor *t, const float *w);
+void q4tensor_dequantize(const Q4Tensor *t, float *w);
+// Bytes of weight storage (codes + scales).
+size_t q4tensor_bytes(const Q4Tensor *t);
+
+// C = A @ dequant(W), dequantizing a group of rows at a time (no full f32 copy).
+// A f32 (M, rows), C f32 (M, cols). Equals matmul(A, dequantized W) up to float
+// summation order.
+void q4matmul(const Tensor *A, const Q4Tensor *W, Tensor *C);
+
 #endif // QUANT_H
