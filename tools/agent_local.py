@@ -171,12 +171,73 @@ def render(goal, items):
     return flatten("\n".join(parts))
 
 
+# --- context editing (every step, not only when full) ------------------------------
+# flatten() joins EVERY line with SEP, which is also the turn separator the SFT data
+# uses -- so a 5-line `git status` reaches the model looking like 5 extra turns, and
+# the model was only ever trained on one-line observations. Context editing reshapes
+# observations toward the training distribution on every step:
+#   AGENT_OBS_JOIN=1   join an observation's lines with "; " (one item, as trained)
+#   AGENT_OBS_LINES=N  keep the first N non-empty lines, then "…[M more lines]"
+#   AGENT_KEEP_OBS=K   observations older than the newest K become "(output omitted)"
+#                      (the MODEL action that produced them stays, so the plan
+#                      history survives; only stale tool output is cleared)
+# Defaults = what tools/obs_probe.py measured best on reason_e2.bin (24 tasks whose
+# last observation is verbose, greedy-ish temp 0.1, 2026-11-10):
+#   old prompt 11/24 right (11 premature <done>) | join 11 | join+lines4 9 |
+#   join+lines2 15 (9 premature) | join+lines1 14 | lines2 without join 13
+# so JOIN=1, LINES=2. KEEP_OBS is not measured by that probe (one verbose step
+# per task) and stays off. Set all three to 0 for exactly the old prompt.
+OBS_JOIN = os.environ.get("AGENT_OBS_JOIN", "1") != "0"
+OBS_LINES = int(os.environ.get("AGENT_OBS_LINES", "2"))
+KEEP_OBS = int(os.environ.get("AGENT_KEEP_OBS", "0"))
+OBS_GLUE = "; "
+
+
+def edit_obs(body, join=None, lines=None):
+    join = OBS_JOIN if join is None else join
+    lines = OBS_LINES if lines is None else lines
+    ls = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    more = 0
+    if lines > 0 and len(ls) > lines:
+        more = len(ls) - lines
+        ls = ls[:lines]
+    if more:
+        ls.append("…[%d more lines]" % more)
+    return (OBS_GLUE if join else "\n").join(ls)
+
+
+def edit_items(items, join=None, lines=None, keep=None):
+    keep = KEEP_OBS if keep is None else keep
+    obs = [i for i, (k, _) in enumerate(items) if k == "obs"]
+    stale = set(obs[:-keep]) if keep > 0 else set()
+    out = []
+    for i, (k, t) in enumerate(items):
+        if k == "obs":
+            t = "(output omitted)" if i in stale else edit_obs(t, join, lines)
+        out.append((k, t))
+    return out
+
+
+def editing_on():
+    return OBS_JOIN or OBS_LINES > 0 or KEEP_OBS > 0
+
+
+def base_prompt(raw):
+    """The un-budgeted prompt: context-edited, or exactly flatten(unwrap(raw))."""
+    if not editing_on():
+        return flatten(unwrap(raw))
+    goal, items = parse_items(raw)
+    return render(goal, edit_items(items))
+
+
 def compact(raw, budget):
     """Flattened prompt of the framed transcript `raw`, compacted toward `budget`
     UTF-8 bytes: clip every OLD observation (head + tail), then drop the oldest
     turns (a MODEL item and what follows it up to the next one) -- never the GOAL
     line or the latest turn. Returns (prompt, turns_dropped)."""
     goal, items = parse_items(raw)
+    if editing_on():
+        items = edit_items(items)
     last_obs = max((i for i, (k, _) in enumerate(items) if k == "obs"), default=-1)
     items = [(k, clip(t) if k == "obs" and i != last_obs else t)
              for i, (k, t) in enumerate(items)]
@@ -210,13 +271,14 @@ def count_tokens(tok, text):
 
 def fit_prompt(raw, model, tok):
     """The prompt for this step. Returns (prompt, note); note is None when the
-    transcript fits as is -- then the prompt is exactly flatten(unwrap(raw)).
+    transcript fits as is -- then the prompt is base_prompt(raw) (context-edited;
+    exactly flatten(unwrap(raw)) when editing is off).
 
     The limit is the model's context minus the reply reserve (the same reserve
     hfgen keeps, so the engine never has to cut). AGENT_PROMPT_BYTES=N instead
     budgets by bytes. Byte-level BPE never makes more tokens than bytes, so a
     prompt with at most `limit` bytes fits without counting."""
-    prompt = flatten(unwrap(raw))
+    prompt = base_prompt(raw)
     size = len(prompt.encode("utf-8"))
     env_bytes = int(os.environ.get("AGENT_PROMPT_BYTES", "0"))
     if env_bytes > 0:
