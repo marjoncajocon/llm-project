@@ -55,6 +55,7 @@ LlamaActs llama_acts_create(const LlamaModel *m, int seq_len) {
   a.hc = act(seq_len, dm);
   a.lm_rows = (int*)malloc((size_t)(seq_len > 0 ? seq_len : 1) * sizeof(int));
   a.n_lm_rows = -1;
+  a.extra_dhn = NULL;
   return a;
 }
 
@@ -340,6 +341,10 @@ static void llama_backward_impl(LlamaModel *m, const int *ids, int seq_len,
 
   // logits = final_hn @ lm_head (all rows, or the compact rows' hc)
   lm_head_backward(m, a, logits, frozen);
+  if (a->extra_dhn) {                                 // auxiliary heads on final_hn (MTP)
+    const size_t nn = (size_t)a->seq_len * dm;
+    for (size_t j = 0; j < nn; j++) a->final_hn.grad[j] += a->extra_dhn[j];
+  }
   // final_hn = RMSNorm(block_out[L-1], final_norm)
   rmsnorm_backward(&a->block_out[m->n_layers - 1], &m->final_norm, &a->final_hn,
                    &m->final_norm, m->eps);

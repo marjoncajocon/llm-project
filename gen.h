@@ -34,6 +34,13 @@ typedef struct {
                              //    text stop is not applied (the grammar decides the end).
   ConstrainOpts con;         // its options (constrain_default_opts())
   const char *con_prompt;    // text the arguments are grounded in (NULL: the decoded prompt ids)
+  int spec_k;                // > 0: prompt-lookup speculative decoding, up to spec_k drafted
+                             //    tokens per verify pass (hfgen --spec K). Greedy only
+                             //    (temp <= 0), f32 llama, no constraint, no window rings;
+                             //    otherwise ignored. Output is IDENTICAL to spec_k = 0.
+  int spec_ngram;            // n-gram length matched to find a draft (0: default 3, falls back
+                             //    to shorter, down to 2)
+  int *spec_stats;           // optional int[3]: verify passes, drafted, accepted (tests/bench)
 } HFGenOpts;
 
 HFGenOpts hfgen_default_opts(void);   // 128 tokens, temp 0.8, k 40, p 0.95, seed 1234, 1 sample, emit,

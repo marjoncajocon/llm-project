@@ -16,6 +16,7 @@
 #include "llama.h"
 #include "llamatrain.h"
 #include "hftok.h"
+#include "mtp.h"
 
 // --sft-escapes: an SFT file holds one prompt<TAB>response pair per line, so a multi-line
 // response (code) cannot be written literally. With the flag, the two-character sequences
@@ -75,6 +76,7 @@ TrainConfig train_default_config(void) {
   c.window = 0;            // 0 => full causal attention (no sliding window)
   c.global_every = 0;
   c.muon = 0;              // Adam/AdamW unless --optim muon
+  c.mtp = 0.0f;            // no multi-token-prediction head unless --mtp
   return c;
 }
 
@@ -738,12 +740,33 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
   printf("  variable-length batching: mean seq %.1f / max %d -> ~%.1fx less padded work\n",
          meanL, maxL, maxL / (meanL > 0 ? meanL : 1));
 
+  // Multi-token prediction (--mtp): a t+2 head on the trunk's final hidden state,
+  // its gradient fed back into the trunk via acts.extra_dhn (mtp.h). Its own
+  // AdamW; same LR schedule and clip as the main parameters.
+  const int use_mtp = cfg->mtp > 0.0f;
+  MtpHead mh; MtpActs mact; Adam mopt; Tensor *mparams[2];
+  float *mdh = NULL;
+  int *t2 = NULL;
+  if (use_mtp) {
+    mh = mtp_create(model.d_model);
+    mact = mtp_acts_create(maxR, model.d_model, model.vocab);
+    mtp_collect_params(&mh, mparams);
+    mopt = adamw_create(mparams, 2, cfg->lr, 0.0f);
+    mdh = (float*)malloc((size_t)maxL * model.d_model * sizeof(float));
+    t2 = (int*)malloc((size_t)maxL * sizeof(int));
+    printf("  MTP: t+2 head (identity-init d x d + RMSNorm, shared output head), loss weight %g\n",
+           (double)cfg->mtp);
+  }
+  double mtp_loss_win = 0.0;
+  long mtp_hit_win = 0, mtp_rows_win = 0, mtp_n_win = 0;
+
   const int steps = cfg->steps;
   const int report = steps < 10 ? 1 : steps / 10;
   const int B = batch_of(cfg);
   for (int s = 0; s < steps; s++) {
     llama_zero_grad(&model);
     if (use_lora) llama_lora_zero_grad(&lora);
+    if (use_mtp) mtp_zero_grad(&mh);
     float loss = 0.0f;
     for (int b = 0; b < B; b++) {
       int e = rand() % nex;
@@ -761,6 +784,19 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
       loss += cross_entropy_forward(&logits, tgt_c, &probs);
       tensor_zero_grad(&logits);
       cross_entropy_backward(&probs, tgt_c, &logits);
+      acts.extra_dhn = NULL;
+      if (use_mtp) {
+        // Row t predicts t+2 where both t+1 and t+2 are supervised (tgt[t] = token
+        // t+1, so the t+2 target of row t is tgt[t+1]).
+        for (int j = 0; j < L; j++)
+          t2[j] = (j + 1 < L && tgt[e][j] >= 0 && tgt[e][j + 1] >= 0) ? tgt[e][j + 1] : -1;
+        memset(mdh, 0, (size_t)L * model.d_model * sizeof(float));
+        int hit = 0, nrr = 0;
+        mtp_loss_win += mtp_loss_backward(&mh, &model, &acts.final_hn, t2, L, cfg->mtp, &mact,
+                                          mdh, &hit, &nrr);
+        mtp_hit_win += hit; mtp_rows_win += nrr; mtp_n_win++;
+        acts.extra_dhn = mdh;
+      }
       llama_backward_accum(&model, seq[e], L, &acts, &logits,
                            use_lora ? &lora : NULL, use_lora ? &lacts : NULL);
     }
@@ -768,11 +804,32 @@ static int llama_train_sft(char *text, const TrainConfig *cfg) {
     if (B > 1) scale_grads(params, n_params, 1.0f / (float)B);
     if (cfg->grad_clip > 0.0f) clip_grad_norm(params, n_params, cfg->grad_clip);
     llama_opt_step(&opt, params, n_params, sched_lr(cfg, s));
+    if (use_mtp) {
+      if (B > 1) scale_grads(mparams, 2, 1.0f / (float)B);
+      if (cfg->grad_clip > 0.0f) clip_grad_norm(mparams, 2, cfg->grad_clip);
+      adam_set_lr(&mopt, sched_lr(cfg, s));
+      adam_step(&mopt, mparams, 2);
+    }
     // flush: see train_sft -- a redirected long run must not buffer its loss curve.
     if (s % report == 0 || s == steps - 1) {
-      printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+      if (use_mtp) {
+        printf("  step %5d/%d  sft-loss %.4f  mtp-loss %.4f  t+2 acc %.1f%%\n", s, steps, loss,
+               mtp_loss_win / (mtp_n_win > 0 ? mtp_n_win : 1),
+               mtp_rows_win ? 100.0 * mtp_hit_win / mtp_rows_win : 0.0);
+        mtp_loss_win = 0.0; mtp_hit_win = 0; mtp_rows_win = 0; mtp_n_win = 0;
+      } else {
+        printf("  step %5d/%d  sft-loss %.4f\n", s, steps, loss);
+      }
       fflush(stdout);
     }
+  }
+  if (use_mtp) {
+    char mpath[1024];
+    snprintf(mpath, sizeof(mpath), "%s.mtp", cfg->out_model);
+    if (mtp_save(mpath, &mh) == 0) printf("  MTP: head saved -> %s\n", mpath);
+    else fprintf(stderr, "error saving MTP head to %s\n", mpath);
+    mtp_free(&mh); mtp_acts_free(&mact); adam_free(&mopt);
+    free(mdh); free(t2);
   }
 
   // Fold the adapters into the weights so the result saves as an ordinary LLMA

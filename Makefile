@@ -52,7 +52,7 @@ OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o muon.o rmsnorm.o rope.o swiglu.o moe.o gqa.o quant.o llama.o lora.o llamatrain.o \
           toolcall.o toolexec.o risk.o approval.o agent.o corpus.o train.o reward.o grpo.o \
           backend.o backend_opencl.o backend_cuda.o backend_hip.o backend_mock.o \
-          image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o constrain.o gen.o selftest.o main.o
+          image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o constrain.o gen.o mtp.o selftest.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
 ZIG            ?= zig
@@ -90,6 +90,7 @@ quant.o:      quant.h matrix.h tensor.h
 llama.o:      llama.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h quant.h lora.h
 lora.o:       lora.h tensor.h matrix.h
 llamatrain.o: llamatrain.h llama.h lora.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h
+mtp.o:        mtp.h llama.h tensor.h loss.h matrix.h rmsnorm.h sampler.h
 feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h
 embedding.o:  embedding.h tensor.h check.h
@@ -104,7 +105,7 @@ toolexec.o:   toolexec.h toolcall.h
 approval.o:   approval.h
 agent.o:      agent.h approval.h toolcall.h toolexec.h
 corpus.o:     corpus.h
-train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h llama.h llamatrain.h hftok.h
+train.o:      train.h tensor.h tokenizer.h model.h loss.h optim.h checkpoint.h corpus.h llama.h llamatrain.h hftok.h mtp.h
 reward.o:     reward.h toolcall.h
 grpo.o:       grpo.h reward.h tensor.h llama.h llamatrain.h lora.h loss.h optim.h sampler.h hftok.h activation.h constrain.h
 image.o:      image.h

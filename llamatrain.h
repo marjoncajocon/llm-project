@@ -55,6 +55,10 @@ typedef struct {
   Tensor hc;          // (<= seq_len, d_model)
   int *lm_rows;       // seq_len capacity
   int n_lm_rows;
+  // Optional extra gradient on final_hn, (seq_len, d_model) floats, ADDED after
+  // the lm_head backward -- how an auxiliary head that reads final_hn (the MTP
+  // head, mtp.h) sends its gradient into the trunk. NULL (the default) = none.
+  const float *extra_dhn;
 } LlamaActs;
 
 LlamaActs llama_acts_create(const LlamaModel *m, int seq_len);

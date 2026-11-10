@@ -243,6 +243,21 @@ void llama_decode_step_lora(const LlamaModel *m, LlamaKV *kv, int token,
 void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const int *tok,
                              int n, Tensor *logits, const LlamaDecodeLora *lo);
 
+// CHUNK decode: n CONSECUTIVE tokens of ONE sequence in one pass — row i decodes
+// tok[i] at position kv->len + i and attends over 0..kv->len + i, so row i's
+// logits (row i of `logits`, (n, vocab)) are BIT-IDENTICAL to decoding the
+// tokens one at a time with llama_decode_step (same row-wise ops and row-count-
+// independent matmuls as the batched path). kv->len advances by n. The weights
+// are read once for all n rows, which is what makes speculative decoding pay:
+// verifying K drafted tokens costs about one decode step, not K.
+// To roll back rejected rows, just lower kv->len: full-attention slots are
+// written before they are read. That is only safe when no layer is a ring, so
+// a cache with any sliding-window layer (cap < max_seq) is refused, as is a
+// chunk that would not fit. Returns 0, or -1 (nothing decoded) when refused.
+int llama_decode_chunk(const LlamaModel *m, LlamaKV *kv, const int *tok, int n, Tensor *logits);
+// Would llama_decode_chunk accept n more tokens into kv? 1/0.
+int llama_decode_chunk_ok(const LlamaKV *kv, int n);
+
 // ---------------------------------------------------------------------------
 // Quantized (int8, in-memory) model: same architecture, but the big weights
 // (embedding, all block linears, output head) are kept as int8 QTensors and

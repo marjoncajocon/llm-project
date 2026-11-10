@@ -164,6 +164,100 @@ static void dec_rewind(Dec *d) {
   else llama_kv_copy(&d->kv, &d->tmpl);
 }
 
+// ---------------------------------------------------------------------------
+// Prompt-lookup speculative decoding (greedy). Agent replies copy heavily from
+// their prompt -- file names, commands, the write body -- so the tokens after
+// the latest n-gram's previous occurrence are a free draft. Verifying K drafted
+// tokens is ONE chunk pass (llama_decode_chunk: the weights are read once for
+// all K+1 rows), and every accepted token is exactly the greedy token, so the
+// output is identical to plain greedy decoding -- only faster.
+// ---------------------------------------------------------------------------
+
+// The draft: up to k tokens that followed the most recent earlier occurrence of
+// ctx's last n-gram, trying n = ngram down to 2. Returns the draft length.
+static int spec_lookup(const int *ctx, int nctx, int ngram, int k, int *draft) {
+  for (int n = ngram; n >= 2; n--) {
+    if (nctx < n + 1) continue;
+    const int *pat = ctx + nctx - n;
+    for (int s = nctx - n - 1; s >= 0; s--) {
+      if (memcmp(ctx + s, pat, (size_t)n * sizeof(int)) != 0) continue;
+      int c = 0;
+      while (c < k && s + n + c < nctx) { draft[c] = ctx[s + n + c]; c++; }
+      if (c > 0) return c;
+    }
+  }
+  return 0;
+}
+
+// Append one picked token, exactly as the plain loop does: an EOG token stops
+// without being kept; otherwise it is kept, decoded, stop-checked and streamed.
+// Returns 1 when generation must stop here.
+static int spec_push(const HFTok *tok, const HFGenOpts *o, int *gen, int *gn, char *dec,
+                     int *prevlen, int nx) {
+  if (tok && hftok_is_eog(tok, nx)) return 1;
+  gen[(*gn)++] = nx;
+  int stop = 0;
+  if (tok) {
+    hftok_decode(tok, gen, *gn, dec, 1 << 20);
+    stop = hf_stop(dec);
+    if (o->stop_tags && hfgen_cut_at_tag(dec)) stop = 1;
+    if (o->emit) hf_emit_delta(dec, prevlen);
+  }
+  return stop;
+}
+
+// One sample, greedy + speculative. `logits` holds the next-token logits after
+// the prompt (or the forked template). Returns the number of tokens generated.
+static int spec_sample(Dec *d, const HFTok *tok, const HFGenOpts *o, const int *prompt,
+                       int keep, Tensor *logits, int *gen) {
+  const int K = o->spec_k, cap = o->n_new;
+  const int ngram = o->spec_ngram > 0 ? o->spec_ngram : 3;
+  int *ctx = (int*)malloc((size_t)(keep + cap + 1) * sizeof(int));
+  int *feed = (int*)malloc((size_t)(K + 1) * sizeof(int));
+  char *dec = tok ? (char*)malloc(1 << 20) : NULL;
+  if (!ctx || !feed || (tok && !dec)) { free(ctx); free(feed); free(dec); return 0; }
+  memcpy(ctx, prompt, (size_t)keep * sizeof(int));
+  int nctx = keep, gn = 0, prevlen = 0, s = 0, pos = keep;
+  while (s < cap && pos < d->max_seq) {
+    const int nx = sample_token(logits, 0, 0.0f, 0, 0.0f, NULL);
+    if (spec_push(tok, o, gen, &gn, dec, &prevlen, nx)) break;
+    ctx[nctx++] = nx;
+    s++;
+    int k = K;
+    if (k > cap - s) k = cap - s;
+    if (k > d->max_seq - pos - 1) k = d->max_seq - pos - 1;
+    const int nd = k > 0 ? spec_lookup(ctx, nctx, ngram, k, feed + 1) : 0;
+    if (nd == 0 || !llama_decode_chunk_ok(&d->kv, nd + 1)) {
+      dec_step(d, nx, logits);
+      pos++;
+      continue;
+    }
+    feed[0] = nx;
+    int cz[2] = {nd + 1, d->vocab};
+    Tensor cl = tensor_create(cz, 2);
+    llama_decode_chunk(d->llama, &d->kv, feed, nd + 1, &cl);
+    int j = 0, stopped = 0;
+    while (j < nd) {
+      const int a = sample_token(&cl, j, 0.0f, 0, 0.0f, NULL);
+      if (a != feed[1 + j]) break;
+      if (spec_push(tok, o, gen, &gn, dec, &prevlen, a)) { stopped = 1; break; }
+      ctx[nctx++] = a;
+      s++;
+      j++;
+    }
+    if (o->spec_stats) { o->spec_stats[0]++; o->spec_stats[1] += nd; o->spec_stats[2] += j; }
+    if (stopped) { tensor_free(&cl); break; }
+    // Rows 0..j fed tokens that were kept (nx and the j accepted drafts); the
+    // rest are rolled back. Row j holds the logits for the next pick.
+    d->kv.len = pos + 1 + j;
+    pos += 1 + j;
+    memcpy(logits->data, &cl.data[(size_t)j * d->vocab], (size_t)d->vocab * sizeof(float));
+    tensor_free(&cl);
+  }
+  free(ctx); free(feed); free(dec);
+  return gn;
+}
+
 // Prefill, then sample opts->n_samples continuations.
 static int dec_generate(Dec *d, const HFTok *tok, const int *pids, int np,
                         const HFGenOpts *o) {
@@ -229,6 +323,13 @@ static int dec_generate(Dec *d, const HFTok *tok, const int *pids, int np,
     int pos = keep, gn = 0, prevlen = 0;
     Rng rng = rng_create(o->seed + (unsigned long long)smp);
     if (o->emit && N > 1) { printf("{\"sample\":%d,\"seed\":%llu}\n", smp, o->seed + (unsigned long long)smp); fflush(stdout); }
+    if (o->spec_k > 0 && o->temp <= 0.0f && !con && d->kind == DEC_LLAMA) {
+      gn = spec_sample(d, tok, o, pids + first, keep, &logits, gen);
+      if (o->out_ids) memcpy(o->out_ids + (size_t)smp * cap, gen, (size_t)gn * sizeof(int));
+      if (o->out_len) o->out_len[smp] = gn;
+      if (o->emit && N > 1) { printf("{\"end\":%d}\n", smp); fflush(stdout); }
+      continue;
+    }
     ConState cst;
     if (con) constrain_init(con, &cst);
     for (int s = 0; s < o->n_new && pos < d->max_seq; s++) {

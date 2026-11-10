@@ -731,6 +731,18 @@ and the unchanged Adam path.
 > can't fix that. The parameter saving is also only visible at scale: on the tiny smoke-test model
 > the adapters are 27.9% of the base, whereas at `d_model` 576 with `r=8` they are a few percent.
 
+#### Multi-token prediction (`--mtp F`)
+
+`llama-train --sft --mtp 0.3` also trains a depth-1 **multi-token-prediction** head (`mtp.c`), the
+DeepSeek-V3 / Nemotron 3 idea at its smallest: `z = RMSNorm(final_hn @ W, g)` through the model's own
+output head predicts token **t+2**, loss `CE(t+1) + F * CE(t+2)` on every row whose t+2 is
+supervised. The gradient reaches `W`, `g` **and the trunk** (via `LlamaActs.extra_dhn`), so the
+shared layers learn to carry the second token too; the output head is shared and gets no MTP
+gradient (frozen under LoRA anyway). `W` starts as the identity, so step 0 is "the t+1 head, one step
+late" rather than noise. The log adds `mtp-loss` and `t+2 acc`; the head is saved to `<out>.mtp`
+(the LLMA checkpoint is unchanged). Selftest `[52]`: gradient check through head + trunk (max rel
+err 5.9e-4), both losses fall, save/load bit-exact.
+
 ### `transformer grpo <tasks.txt> [flags]` — RL from **verifiable rewards**
 
 Every other trainer here is supervised: it is shown the right answer and pushed toward it. `grpo`
@@ -881,6 +893,21 @@ there the flag is **byte-identical** (same dump, same summary numbers), with or 
 and RNG, exactly as when it runs alone). Measured on a synthetic
 SmolLM2-135M-shaped model (G = 8, one thread; see the commit message): ~3.4x (6 layers) to ~4x
 (2 layers) less decode time per token per rollout. Verified by `[48]`.
+
+#### Speculative decoding (`hfgen --spec K`)
+
+Agent replies copy from their prompt (file names, commands, the write body), so the tokens that
+followed the latest n-gram's earlier occurrence are a free **draft** (prompt-lookup decoding).
+`llama_decode_chunk` verifies the K drafted tokens in **one pass** (K+1 rows share one read of the
+weights; row i is bit-identical to a single `llama_decode_step`), the longest matching prefix is kept
+plus one free token, and the rejected rows are rolled back by lowering `kv->len`. Greedy only
+(`temp 0`), f32 LLaMA-family models, no `--constrain`; a sliding-window ring cache is refused (later
+rows would overwrite slots earlier rows still read). **Output is identical to plain greedy** —
+selftest `[51]` checks chunk logits bit-for-bit and spec == greedy for K in {1, 4, 9}. Measured on
+SmolLM2-135M (`reason_e2.bin`, 3 runs): a write_file reply copying a long body went 1.53 s -> 1.32 s
+of generation (~14%; 42% of drafts accepted — the model re-tokenizes some prompt words, which breaks
+the n-gram match). The win grows with model size: per-token decode cost rises, verification stays one
+pass.
 
 ### `transformer generate [model.bin] [tok.bin]`
 
@@ -1064,6 +1091,28 @@ limited by the 135M base (`why is the sky blue → "…a transparent liquid"` is
 now correctly *distinguishes an instruction from a question* — the capability the tool-only fine-tune
 destroyed. A real assistant is built exactly this way: instruction-following data mixed with general
 data so one model does both.
+
+#### Context editing for the small agent (`tools/agent_local.py`)
+
+`flatten()` joins every line with ` | ` — also the **turn separator** of the SFT data — so a 5-line
+`git status` reached the model looking like 5 extra turns, and the model had only ever seen
+one-line observations. Every step now reshapes observations toward the training distribution:
+`AGENT_OBS_JOIN=1` joins an observation's lines with `; `, `AGENT_OBS_LINES=2` keeps the first 2 lines
+plus `…[N more lines]`, and opt-in `AGENT_KEEP_OBS=K` replaces observations older than the newest K
+with `(output omitted)` (the actions stay). `tools/obs_probe.py` measures it — 24 tasks whose last
+observation is real multi-line output and whose correct next step is still a tool call:
+
+| prompt rendering | right next action | premature `<done>` |
+| --- | --- | --- |
+| old (` | `-joined lines) | 11/24 | 11 |
+| join | 11/24 | 12 |
+| join + 4 lines | 9/24 | 15 |
+| **join + 2 lines (default)** | **15/24** | **9** |
+| join + 1 line | 14/24 | 10 |
+| 2 lines, no join | 13/24 | 11 |
+
+A real but partial fix (n = 24): the rest of the early stopping needs training on verbose
+observations. Set all three variables to 0 to get exactly the old prompt.
 
 ### `transformer imggen` / `audgen` (generate media to a file)
 

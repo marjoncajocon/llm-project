@@ -44,6 +44,8 @@ typedef struct {
                            // resumed checkpoint keeps the window it was saved with.
   int muon;                // 1 => Muon on the hidden weight matrices (muon.h), AdamW
                            // on the rest; 0 => Adam/AdamW everywhere (the default)
+  float mtp;               // > 0 => LLaMA SFT also trains a multi-token-prediction head
+                           // (mtp.h) with loss weight mtp, saved to <out>.mtp; 0 = off
 } TrainConfig;
 
 // Sensible defaults (a small-but-real model).

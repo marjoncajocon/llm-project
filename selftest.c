@@ -34,6 +34,7 @@
 #include "matrix.h"
 #include "activation.h"
 #include "reward.h"
+#include "mtp.h"
 #include "grpo.h"
 #include "gpu.h"
 #include "backend.h"
@@ -955,6 +956,19 @@ static void st40_transcript(char *t, int cap, int turns, int obs_len) {
     snprintf(t + l, (size_t)cap - l, "%s", blk);
   }
   free(obs); free(blk);
+}
+
+// [52] total loss = CE(t+1) + lambda * CE_mtp(t+2). Fills dh with the MTP
+// head's gradient on final_hn (and accumulates the head's own grads, which the
+// caller snapshots before using this for finite differences).
+static float st52_loss(LlamaModel *m, LlamaActs *a, const int *ids, int seq, const int *tgt,
+                       Tensor *logits, Tensor *probs, MtpHead *mh, MtpActs *ma, const int *t2,
+                       float lambda, float *dh) {
+  llama_forward_train(m, ids, seq, a, logits);
+  const float l1 = cross_entropy_forward(logits, tgt, probs);
+  memset(dh, 0, (size_t)seq * m->d_model * sizeof(float));
+  const float l2 = mtp_loss_backward(mh, m, &a->final_hn, t2, seq, lambda, ma, dh, NULL, NULL);
+  return l1 + lambda * l2;
 }
 
 static int st40_count(const char *s, const char *w) {
@@ -7460,6 +7474,183 @@ int run_selftest(void) {
            (double)r_loop, (double)r_loop2, (double)e.redundant, e.reason, (double)r_fix);
     printf("    -> %s\n\n", ok50 ? "OK" : "FAIL");
     all_ok &= ok50;
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 51: chunk decode + prompt-lookup speculative decoding.
+  {
+    printf("[51] Chunk decode (n positions, one pass) bit-exact vs one-at-a-time; speculative"
+           " greedy == plain greedy\n");
+    const int vocab = 20, dm = 16, nl = 2, nh = 4, nkv = 2, hd = 4, dff = 32, msq = 64;
+    srand(51);
+    LlamaModel m = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, msq, 10000.0f, 1e-5f);
+    llama_model_randomize(&m);
+    int pre[7] = {1, 4, 9, 2, 7, 3, 5}, ch[5] = {6, 0, 11, 6, 0};
+    LlamaKV a = llama_kv_create(&m), b = llama_kv_create(&m);
+    int lz[2] = {1, vocab}, cz[2] = {5, vocab};
+    Tensor l1 = tensor_create(lz, 2), lc = tensor_create(cz, 2);
+    for (int i = 0; i < 7; i++) { llama_decode_step(&m, &a, pre[i], &l1); llama_decode_step(&m, &b, pre[i], &l1); }
+    int chunk_ok = llama_decode_chunk(&m, &b, ch, 5, &lc) == 0 && b.len == 12;
+    for (int i = 0; i < 5; i++) {
+      llama_decode_step(&m, &a, ch[i], &l1);
+      chunk_ok &= memcmp(l1.data, &lc.data[(size_t)i * vocab], (size_t)vocab * sizeof(float)) == 0;
+    }
+    // Roll back 3 rows and re-decode different tokens: same as never having drafted them.
+    b.len = 9; a.len = 9;
+    llama_decode_step(&m, &a, 13, &l1);
+    Tensor l2 = tensor_create(lz, 2);
+    llama_decode_step(&m, &b, 13, &l2);
+    chunk_ok &= memcmp(l1.data, l2.data, (size_t)vocab * sizeof(float)) == 0;
+    llama_kv_free(&a); llama_kv_free(&b);
+
+    // A sliding-window ring cache is refused (nothing decoded).
+    LlamaModel wm = llama_model_create(vocab, dm, nl, nh, nkv, hd, dff, msq, 10000.0f, 1e-5f);
+    llama_model_randomize(&wm);
+    llama_model_set_window(&wm, 8, 2);
+    LlamaKV wk = llama_kv_create(&wm);
+    const int ring_refused = llama_decode_chunk(&wm, &wk, ch, 5, &lc) == -1 && wk.len == 0;
+    llama_kv_free(&wk); llama_model_free(&wm);
+
+    // Speculative greedy vs plain greedy: identical ids for several prompts and K.
+    int same = 1, drafted = 0, accepted = 0;
+    const int prompts[3][12] = {{1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4},
+                                {5, 9, 5, 9, 5, 9, 7, 7, 7, 7, 7, 7},
+                                {3, 14, 15, 9, 2, 6, 5, 3, 5, 8, 9, 7}};
+    const int Ks[3] = {1, 4, 9};
+    for (int p = 0; p < 3; p++) {
+      HFGenOpts o = hfgen_default_opts();
+      o.emit = 0; o.n_new = 40; o.temp = 0.0f;
+      int ref[40], got[40], nref = 0, ngot = 0;
+      o.out_ids = ref; o.out_len = &nref;
+      hfgen_llama(&m, NULL, prompts[p], 12, &o);
+      for (int ki = 0; ki < 3; ki++) {
+        int st[3] = {0, 0, 0};
+        o.spec_k = Ks[ki]; o.spec_stats = st; o.out_ids = got; o.out_len = &ngot;
+        hfgen_llama(&m, NULL, prompts[p], 12, &o);
+        same &= ngot == nref && memcmp(ref, got, (size_t)nref * sizeof(int)) == 0;
+        drafted += st[1]; accepted += st[2];
+      }
+      o.spec_k = 0;
+    }
+    const int ok51 = chunk_ok && ring_refused && same && accepted > 0;
+    printf("    chunk logits bit-identical to 5 single steps + rollback: %s | window ring refused: %s\n",
+           chunk_ok ? "yes" : "NO", ring_refused ? "yes" : "NO");
+    printf("    speculative == greedy on 3 prompts x K {1,4,9}: %s (%d drafted, %d accepted)\n",
+           same ? "IDENTICAL" : "DIFFER", drafted, accepted);
+    printf("    -> %s\n\n", ok51 ? "OK" : "FAIL");
+    all_ok &= ok51;
+    tensor_free(&l1); tensor_free(&l2); tensor_free(&lc);
+    llama_model_free(&m);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 52: multi-token prediction head -- gradient check through head AND trunk.
+  {
+    printf("[52] MTP head (t+2): gradient check of CE + lambda*CE_mtp through W, g and the trunk;"
+           " training lowers both losses\n");
+    const int vocab = 24, dm = 8, nl = 2, nh = 4, nkv = 2, hd = 2, dff = 16, seq = 6;
+    const float lambda = 0.5f;
+    srand(52);
+    LlamaModel tm = llama_model_create_train(vocab, dm, nl, nh, nkv, hd, dff, 64, 10000.0f, 1e-5f);
+    llama_model_randomize(&tm);
+    LlamaActs acts = llama_acts_create(&tm, seq);
+    MtpHead mh = mtp_create(dm);
+    for (size_t i = 0; i < mh.W.size; i++) mh.W.data[i] += 0.1f * ((float)rand() / RAND_MAX - 0.5f);
+    MtpActs ma = mtp_acts_create(seq, dm, vocab);
+    int ids[6] = {2, 9, 4, 1, 7, 5}, tgt[6] = {9, 4, 1, 7, 5, 3}, t2[6] = {4, 1, 7, 5, 3, -1};
+    int ls[2] = {seq, vocab};
+    Tensor logits = tensor_create(ls, 2), probs = tensor_create(ls, 2);
+    float dh[6 * 8];
+
+    // Analytic: main CE backward + the MTP gradient injected via extra_dhn.
+    mtp_zero_grad(&mh);
+    st52_loss(&tm, &acts, ids, seq, tgt, &logits, &probs, &mh, &ma, t2, lambda, dh);
+    tensor_zero_grad(&logits);
+    cross_entropy_backward(&probs, tgt, &logits);
+    acts.extra_dhn = dh;
+    llama_backward(&tm, ids, seq, &acts, &logits);
+    acts.extra_dhn = NULL;
+    float *gW = (float*)malloc(mh.W.size * sizeof(float)), gG[8];
+    memcpy(gW, mh.W.grad, mh.W.size * sizeof(float));
+    memcpy(gG, mh.g.grad, sizeof(gG));
+
+    Tensor **lps = (Tensor**)malloc((size_t)(llama_param_count(&tm) + 2) * sizeof(Tensor*));
+    int n_lp = llama_collect_params(&tm, lps);
+    const int n_model = n_lp;
+    lps[n_lp++] = &mh.W;
+    lps[n_lp++] = &mh.g;
+    float scratch[6 * 8];
+    const float eps = 1e-2f;
+    float max_cond = 0.0f;
+    int checked = 0;
+    for (int p = 0; p < n_lp; p++) {
+      Tensor *param = lps[p];
+      // The shared output head gets NO MTP gradient by design (mtp.h: shared with
+      // the main loss, frozen under LoRA), so the full loss's finite difference
+      // through it is deliberately not what the analytic gradient computes.
+      if (param == &tm.lm_head) continue;
+      const float *an = p < n_model ? param->grad : (p == n_model ? gW : gG);
+      size_t step = param->size > 3 ? param->size / 3 : 1;
+      for (size_t k = 0; k < param->size; k += step) {
+        const float base = param->data[k];
+        param->data[k] = base + eps;
+        const float lp = st52_loss(&tm, &acts, ids, seq, tgt, &logits, &probs, &mh, &ma, t2, lambda, scratch);
+        param->data[k] = base - eps;
+        const float lm = st52_loss(&tm, &acts, ids, seq, tgt, &logits, &probs, &mh, &ma, t2, lambda, scratch);
+        param->data[k] = base;
+        const float num = (lp - lm) / (2.0f * eps);
+        const float rel = fabsf(an[k] - num) / (fabsf(an[k]) + fabsf(num) + 1e-8f);
+        if (fabsf(an[k]) > 1e-2f) { checked++; if (rel > max_cond) max_cond = rel; }
+        if (getenv("ST52_DEBUG") && rel > 1e-2f)
+          printf("      p%d k%zu an %.5f num %.5f\n", p, k, (double)an[k], (double)num);
+      }
+    }
+    const int grad_ok = max_cond < 1e-2f && checked > 10;
+
+    // Training: Adam on trunk + head; both losses must fall.
+    Adam opt = adam_create(lps, n_lp, 0.02f);
+    float l_mtp0 = 0.0f, l_mtp1 = 0.0f, l_main0 = 0.0f, l_main1 = 0.0f;
+    for (int it = 0; it < 80; it++) {
+      llama_zero_grad(&tm);
+      mtp_zero_grad(&mh);
+      llama_forward_train(&tm, ids, seq, &acts, &logits);
+      const float lmain = cross_entropy_forward(&logits, tgt, &probs);
+      memset(dh, 0, sizeof(dh));
+      const float lmtp = mtp_loss_backward(&mh, &tm, &acts.final_hn, t2, seq, lambda, &ma, dh, NULL, NULL);
+      if (it == 0) { l_main0 = lmain; l_mtp0 = lmtp; }
+      l_main1 = lmain; l_mtp1 = lmtp;
+      tensor_zero_grad(&logits);
+      cross_entropy_backward(&probs, tgt, &logits);
+      acts.extra_dhn = dh;
+      llama_backward_accum(&tm, ids, seq, &acts, &logits, NULL, NULL);
+      acts.extra_dhn = NULL;
+      adam_step(&opt, lps, n_lp);
+    }
+    const int train_ok = l_mtp1 < 0.5f * l_mtp0 && l_main1 < 0.5f * l_main0;
+
+    // Save / load round trip.
+    const char *mp = "selftest_mtp.tmp";
+    MtpHead back;
+    int io_ok = mtp_save(mp, &mh) == 0 && mtp_load(mp, &back) == 0;
+    if (io_ok) {
+      io_ok = back.d_model == dm && memcmp(back.W.data, mh.W.data, mh.W.size * sizeof(float)) == 0 &&
+              memcmp(back.g.data, mh.g.data, mh.g.size * sizeof(float)) == 0;
+      mtp_free(&back);
+    }
+    remove(mp);
+
+    const int ok52 = grad_ok && train_ok && io_ok;
+    printf("    gradient check (%d model tensors + W, g; %d entries with |grad|>1e-2): max rel err"
+           " %.2e -> %s\n", n_model, checked, (double)max_cond, grad_ok ? "OK" : "FAIL");
+    printf("    80 Adam steps: main CE %.3f -> %.3f, t+2 CE %.3f -> %.3f | save/load %s\n",
+           (double)l_main0, (double)l_main1, (double)l_mtp0, (double)l_mtp1, io_ok ? "bit-exact" : "FAIL");
+    printf("    -> %s\n\n", ok52 ? "OK" : "FAIL");
+    all_ok &= ok52;
+    adam_free(&opt);
+    free(lps); free(gW);
+    mtp_acts_free(&ma); mtp_free(&mh);
+    tensor_free(&logits); tensor_free(&probs);
+    llama_acts_free(&acts); llama_model_free(&tm);
   }
 
   // --------------------------------------------------------------------------

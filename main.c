@@ -349,6 +349,9 @@ static void train_usage(void) {
     "                    (\"LoRA Without Regret\", 2025). Default off.\n"
     "  --lora-plus F     LoRA+: adapter B matrices train at F x --lr (A keeps\n"
     "                    --lr); 16 is the paper's choice. Default off.\n"
+    "  --mtp F           (with --sft) also train a multi-token-prediction head that\n"
+    "                    predicts token t+2 (mtp.h), loss weight F (0.3 typical);\n"
+    "                    it trains W, g and the trunk; saved to <out>.mtp. Default off.\n"
     "  --hf-tok F        fine-tune with a REAL model's own vocabulary (.hf, see\n"
     "                    tools/export_tokenizer.py) instead of training a byte BPE.\n"
     "                    Its real EOS token is used, so no vocab slot is added.\n"
@@ -402,6 +405,7 @@ static int run_train_arch(int argc, char **argv, int llama) {
     else if (strcmp(f, "--lora-alpha") == 0 && llama) { NEED_VAL(); cfg.lora_alpha = (float)atof(argv[++i]); }
     else if (strcmp(f, "--lora-mlp") == 0 && llama) { cfg.lora_mlp = 1; }
     else if (strcmp(f, "--lora-plus") == 0 && llama) { NEED_VAL(); cfg.lora_plus = (float)atof(argv[++i]); }
+    else if (strcmp(f, "--mtp") == 0 && llama) { NEED_VAL(); cfg.mtp = (float)atof(argv[++i]); }
     else if (strcmp(f, "--hf-tok") == 0 && llama) { NEED_VAL(); cfg.hf_tok = argv[++i]; }
     else if (strcmp(f, "--optim") == 0 && llama) {
       NEED_VAL(); const char *o = argv[++i];
@@ -1046,12 +1050,12 @@ static int run_llama(int argc, char **argv) {
 // generation core (prompt fitting, stop-at-tag, multi-sample) is gen.c.
 //   transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]
 //                     [--stop-tags] [--samples N] [--constrain[-body|-cmd]]
-//                     [--constrain-think N]
+//                     [--constrain-think N] [--spec K]
 // ============================================================================
 static int run_hfgen(int argc, char **argv) {
   // Flags may appear anywhere after <tok.hf>; the rest stay positional.
   const char *pos[8];
-  int npos = 0, stop_tags = 0, n_samples = 1, bad = 0, constrain = 0;
+  int npos = 0, stop_tags = 0, n_samples = 1, bad = 0, constrain = 0, spec_k = 0;
   ConstrainOpts con = constrain_default_opts();
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--stop-tags") == 0) stop_tags = 1;
@@ -1060,10 +1064,11 @@ static int run_hfgen(int argc, char **argv) {
     else if (strcmp(argv[i], "--constrain-body") == 0) { constrain = 1; con.ground_body = 1; }
     else if (strcmp(argv[i], "--constrain-cmd") == 0) { constrain = 1; con.ground_cmd = 1; }
     else if (strcmp(argv[i], "--constrain-think") == 0 && i + 1 < argc) con.think_max = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--spec") == 0 && i + 1 < argc) spec_k = atoi(argv[++i]);
     else if (strncmp(argv[i], "--", 2) == 0) bad = 1;
     else if (npos < 8) pos[npos++] = argv[i];
   }
-  if (npos < 2 || bad || n_samples < 1 || n_samples > 64) {
+  if (npos < 2 || bad || n_samples < 1 || n_samples > 64 || spec_k < 0 || spec_k > 64) {
     fprintf(stderr, "usage: transformer hfgen <model.bin> <tok.hf> [n_new] [temp] [seed]"
                     " [--stop-tags] [--samples N] [--constrain]\n"
                     "  temp defaults to 0.8; use a low value (e.g. 0.1) for an\n"
@@ -1081,6 +1086,10 @@ static int run_hfgen(int argc, char **argv) {
                     "               --constrain-body (write body = prompt span), --constrain-cmd\n"
                     "               (command args = prompt spans), --constrain-think N (think\n"
                     "               bytes before </think> is forced; default 256, 0 = no cap).\n"
+                    "  --spec K     prompt-lookup speculative decoding (greedy, temp 0, f32\n"
+                    "               LLaMA-family): draft up to K (1..64) tokens by matching the\n"
+                    "               last n-gram earlier in the context, verify them in one pass.\n"
+                    "               Output is identical to plain greedy; stats on stderr.\n"
                     "  A prompt longer than the context keeps its most recent tokens (with a\n"
                     "  warning on stderr); if nothing can be generated it prints\n"
                     "  {\"error\":...} and exits nonzero.\n");
@@ -1094,6 +1103,9 @@ static int run_hfgen(int argc, char **argv) {
   o.n_samples = n_samples;
   o.constrain = constrain;
   o.con = con;
+  int spec_stats[3] = {0, 0, 0};
+  o.spec_k = spec_k;
+  o.spec_stats = spec_stats;
   HFTok tok;
   if (hftok_load(&tok, pos[1]) != 0) return 1;
 
@@ -1112,6 +1124,10 @@ static int run_hfgen(int argc, char **argv) {
   int np = hftok_encode(&tok, prompt, pids, cap);
   o.con_prompt = prompt;                     // grounding text for --constrain
   int rc = hfgen_file(&tok, pos[0], pids, np, &o);
+  if (spec_k > 0)
+    fprintf(stderr, "hfgen: spec: %d verify passes, %d drafted, %d accepted (%.0f%%)\n",
+            spec_stats[0], spec_stats[1], spec_stats[2],
+            spec_stats[1] ? 100.0 * spec_stats[2] / spec_stats[1] : 0.0);
   free(prompt);
   free(pids); hftok_free(&tok);
   return rc;

@@ -606,26 +606,18 @@ static Tensor row_view(const Tensor *x, int i, int *shape) {
   return v;
 }
 
-void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const int *tok,
-                             int n, Tensor *logits, const LlamaDecodeLora *lo) {
-  if (n <= 0) return;
+// The shared body of llama_decode_batch_lora and llama_decode_chunk: row i
+// decodes tok[i] at absolute position pos[i] into cache kvs[i]. Every row's K/V
+// is appended (per layer) BEFORE any row attends, so rows that share one cache
+// at consecutive positions (a chunk) see each other causally, exactly as if
+// decoded one at a time. Does not touch any kv->len; the callers set it.
+static void decode_rows(const LlamaModel *m, LlamaKV *const kvs[], const int *pos,
+                        const int *tok, int n, Tensor *logits, const LlamaDecodeLora *lo) {
   const int dm = m->d_model, hd = m->head_dim;
   const int qd = m->n_heads * hd, kvd = m->n_kv * hd;
-  if (logits && (logits->ndim != 2 || logits->shape[0] != n || logits->shape[1] != m->vocab)) {
-    fprintf(stderr, "llama_decode_batch_lora: logits must be (%d, %d)\n", n, m->vocab);
-    abort();
-  }
-
-  int *pos = (int*)malloc((size_t)n * sizeof(int));
   int maxpos = 0;
-  for (int i = 0; i < n; i++) {
-    pos[i] = kvs[i]->len;                      // row i's own position
-    if (pos[i] >= kvs[i]->max_seq) {
-      fprintf(stderr, "llama_decode_batch_lora: row %d cache is full (%d)\n", i, pos[i]);
-      abort();
-    }
+  for (int i = 0; i < n; i++)
     if (pos[i] > maxpos) maxpos = pos[i];
-  }
 
   Tensor x = mat(n, dm);                       // n residual streams
   for (int i = 0; i < n; i++)
@@ -700,9 +692,7 @@ void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const in
     rmsnorm(&x, &m->final_norm, &hn, m->eps);
     llama_head_forward(m, &hn, logits);        // (n, vocab); tied -> hn @ wte^T
   }
-  for (int i = 0; i < n; i++) kvs[i]->len = pos[i] + 1;
-
-  free(sc); free(pos); swiglu_cache_free(&sc_ff);
+  free(sc); swiglu_cache_free(&sc_ff);
   if (lo) {
     lora_cache_free(&lcq); lora_cache_free(&lck);
     lora_cache_free(&lcv); lora_cache_free(&lco);
@@ -710,6 +700,49 @@ void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const in
   if (mlp) { lora_cache_free(&lcg); lora_cache_free(&lcu); lora_cache_free(&lcd); }
   tensor_free(&x); tensor_free(&xn); tensor_free(&q); tensor_free(&k); tensor_free(&v);
   tensor_free(&o); tensor_free(&ao); tensor_free(&hn); tensor_free(&f);
+}
+
+void llama_decode_batch_lora(const LlamaModel *m, LlamaKV *const kvs[], const int *tok,
+                             int n, Tensor *logits, const LlamaDecodeLora *lo) {
+  if (n <= 0) return;
+  if (logits && (logits->ndim != 2 || logits->shape[0] != n || logits->shape[1] != m->vocab)) {
+    fprintf(stderr, "llama_decode_batch_lora: logits must be (%d, %d)\n", n, m->vocab);
+    abort();
+  }
+  int *pos = (int*)malloc((size_t)n * sizeof(int));
+  for (int i = 0; i < n; i++) {
+    pos[i] = kvs[i]->len;                      // row i's own position
+    if (pos[i] >= kvs[i]->max_seq) {
+      fprintf(stderr, "llama_decode_batch_lora: row %d cache is full (%d)\n", i, pos[i]);
+      abort();
+    }
+  }
+  decode_rows(m, kvs, pos, tok, n, logits, lo);
+  for (int i = 0; i < n; i++) kvs[i]->len = pos[i] + 1;
+  free(pos);
+}
+
+int llama_decode_chunk_ok(const LlamaKV *kv, int n) {
+  if (n <= 0 || kv->len + n > kv->max_seq) return 0;
+  for (int l = 0; l < kv->n_layers; l++)
+    if (kv->cap[l] < kv->max_seq) return 0;    // a ring: later rows would overwrite earlier reads
+  return 1;
+}
+
+int llama_decode_chunk(const LlamaModel *m, LlamaKV *kv, const int *tok, int n, Tensor *logits) {
+  if (!llama_decode_chunk_ok(kv, n)) return -1;
+  if (logits && (logits->ndim != 2 || logits->shape[0] != n || logits->shape[1] != m->vocab)) {
+    fprintf(stderr, "llama_decode_chunk: logits must be (%d, %d)\n", n, m->vocab);
+    abort();
+  }
+  int *pos = (int*)malloc((size_t)n * sizeof(int));
+  LlamaKV **kvs = (LlamaKV**)malloc((size_t)n * sizeof(LlamaKV*));
+  if (!pos || !kvs) { free(pos); free(kvs); return -1; }
+  for (int i = 0; i < n; i++) { pos[i] = kv->len + i; kvs[i] = kv; }
+  decode_rows(m, (LlamaKV *const *)kvs, pos, tok, n, logits, NULL);
+  kv->len += n;
+  free(pos); free(kvs);
+  return 0;
 }
 
 // Read the optional per-layer window block that follows the float config (and,
