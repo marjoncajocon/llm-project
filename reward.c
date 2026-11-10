@@ -433,8 +433,99 @@ static int grounding_ok_v2(const char *prompt_norm, const ToolCall *tc,
   return 1;
 }
 
-float reward_score_v2(const char *prompt, const char *response,
-                      const char *reference, int capped, RewardParts *parts) {
+// ===========================================================================
+// Reward v3 helpers (see reward.h). v3 is v2's body with two switches flipped,
+// so v2 itself is untouched and reproduces.
+// ===========================================================================
+
+#define W3_REDUNDANT 0.25f
+
+// Character-level LCS F1 of two already-normalized strings. Two-row DP: the
+// arguments are short (paths, one-line commands, small write bodies), and the
+// 4096-byte body cap bounds the worst case.
+static float lcs_f1_norm(const char *a, const char *b) {
+  const int al = (int)strlen(a), bl = (int)strlen(b);
+  if (al == 0 && bl == 0) return 1.0f;
+  if (al == 0 || bl == 0) return 0.0f;
+  int *prev = (int*)calloc((size_t)bl + 1, sizeof(int));
+  int *cur = (int*)calloc((size_t)bl + 1, sizeof(int));
+  if (!prev || !cur) { free(prev); free(cur); return 0.0f; }
+  for (int i = 1; i <= al; i++) {
+    for (int j = 1; j <= bl; j++) {
+      if (a[i - 1] == b[j - 1]) cur[j] = prev[j - 1] + 1;
+      else cur[j] = prev[j] > cur[j - 1] ? prev[j] : cur[j - 1];
+    }
+    int *t = prev; prev = cur; cur = t;
+  }
+  const int lcs = prev[bl];
+  free(prev); free(cur);
+  return 2.0f * (float)lcs / (float)(al + bl);
+}
+
+float reward_lcs_f1(const char *a, const char *b) {
+  const size_t al = strlen(a) + 1, bl = strlen(b) + 1;
+  char *an = (char*)malloc(al), *bn = (char*)malloc(bl);
+  float f = 0.0f;
+  if (an && bn) {
+    norm_into(a, an, (int)al);
+    norm_into(b, bn, (int)bl);
+    f = lcs_f1_norm(an, bn);
+  }
+  free(an); free(bn);
+  return f;
+}
+
+// v3's match: like action_match, but the right tool earns 0.3 + 0.7 * argument
+// similarity instead of a flat 0.4 / 0.7. An identical action is exactly 1.0
+// (F1 of equal normalized strings is 1), so the exact-match threshold holds.
+static float action_match_soft(const ToolCall *got, const ToolCall *want) {
+  if (got->kind != want->kind) return 0.0f;
+  float s = 1.0f;
+  switch (want->kind) {
+    case TOOL_DONE:
+    case TOOL_NONE:        return 1.0f;
+    case TOOL_READ_FILE:   s = reward_lcs_f1(got->path, want->path); break;
+    case TOOL_RUN_COMMAND: s = reward_lcs_f1(got->command, want->command); break;
+    case TOOL_WRITE_FILE:
+      s = 0.5f * (reward_lcs_f1(got->path, want->path) +
+                  reward_lcs_f1(got->body, want->body));
+      break;
+  }
+  return s >= 1.0f ? 1.0f : 0.3f + 0.7f * s;
+}
+
+// Same tool, same normalized arguments.
+static int same_action(const ToolCall *a, const ToolCall *b) {
+  if (a->kind != b->kind) return 0;
+  switch (a->kind) {
+    case TOOL_READ_FILE:   return same_norm(a->path, b->path);
+    case TOOL_RUN_COMMAND: return same_norm(a->command, b->command);
+    case TOOL_WRITE_FILE:  return same_norm(a->path, b->path) && same_norm(a->body, b->body);
+    default:               return 1;
+  }
+}
+
+// Does the transcript in `prompt` already show `tc` as a past MODEL: action?
+// Only tool calls count — <done> and prose end a turn, they cannot be repeated.
+static int repeats_past_action(const char *prompt, const ToolCall *tc) {
+  if (tc->kind == TOOL_DONE || tc->kind == TOOL_NONE) return 0;
+  ToolCall *past = (ToolCall*)malloc(sizeof(ToolCall));
+  if (!past) return 0;
+  int hit = 0;
+  for (const char *p = strstr(prompt, "MODEL:"); p && !hit; p = strstr(p + 6, "MODEL:")) {
+    // The block right after this marker: parse from here, but only accept it if
+    // it starts before the next marker (else it belongs to a later turn).
+    const char *next = strstr(p + 6, "MODEL:");
+    const char *blk = strstr(p, "<tool");
+    if (!blk || (next && blk > next)) continue;
+    if (toolcall_parse(blk, past) && same_action(past, tc)) hit = 1;
+  }
+  free(past);
+  return hit;
+}
+
+static float score_v2_or_v3(int v3, const char *prompt, const char *response,
+                            const char *reference, int capped, RewardParts *parts) {
   RewardParts p;
   memset(&p, 0, sizeof(p));
   p.action = REWARD_ACT_MALFORMED;
@@ -500,15 +591,23 @@ float reward_score_v2(const char *prompt, const char *response,
   // (ungated) remainder, rescaled so a perfect response still scores 1.0.
   float gscale = 1.0f;
   if (has_ref) {
-    const float m = action_match(&tc, &ref);
+    const float m = v3 ? action_match_soft(&tc, &ref) : action_match(&tc, &ref);
     p.match = W2_MATCH * m;
     if (m < 1.0f && !p.reason[0])
-      snprintf(p.reason, sizeof(p.reason), "action-mismatch(%.1f)", (double)m);
+      snprintf(p.reason, sizeof(p.reason), v3 ? "action-mismatch(%.2f)" : "action-mismatch(%.1f)",
+               (double)m);
   } else {
     gscale = 1.0f / W2_GROUND;
   }
 
   p.total = p.format * (p.grounded * gscale + p.match);
+  if (v3 && fmt && repeats_past_action(prompt, &tc) &&
+      !(has_ref && same_action(&tc, &ref))) {
+    p.redundant = W3_REDUNDANT;
+    p.total = p.total > W3_REDUNDANT ? p.total - W3_REDUNDANT : 0.0f;
+    if (!p.reason[0] || strncmp(p.reason, "action-mismatch", 15) == 0)
+      snprintf(p.reason, sizeof(p.reason), "redundant-repeat");
+  }
   if (capped) {
     // Cut off at --max-new: whatever was produced is not a finished action, and a
     // truncated rollout must never be a safe score to fall back on.
@@ -520,14 +619,25 @@ float reward_score_v2(const char *prompt, const char *response,
   return p.total;
 }
 
+float reward_score_v2(const char *prompt, const char *response,
+                      const char *reference, int capped, RewardParts *parts) {
+  return score_v2_or_v3(0, prompt, response, reference, capped, parts);
+}
+
+float reward_score_v3(const char *prompt, const char *response,
+                      const char *reference, int capped, RewardParts *parts) {
+  return score_v2_or_v3(1, prompt, response, reference, capped, parts);
+}
+
 float reward_score_version(int version, const char *prompt, const char *response,
                            const char *reference, int capped, RewardParts *parts) {
   if (version == 2) return reward_score_v2(prompt, response, reference, capped, parts);
+  if (version == 3) return reward_score_v3(prompt, response, reference, capped, parts);
   return reward_score(prompt, response, reference, parts);
 }
 
 float reward_match_max(int version) {
-  return version == 2 ? W2_MATCH : W_MATCH;
+  return (version == 2 || version == 3) ? W2_MATCH : W_MATCH;
 }
 
 const char *reward_action_name(int action) {

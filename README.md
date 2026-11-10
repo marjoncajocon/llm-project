@@ -804,6 +804,16 @@ Verified in the smoke test: `[26]` the LoRA decode matches the LoRA training for
 `pg_backward(1/N) == cross_entropy_backward` identity, and `[29]` a numerical gradient check of the
 surrogate plus a closed GRPO loop that drives a toy reward from chance (0.083) to 1.000.
 
+#### Reward v3 (`--reward v3`): soft match + loop penalty
+
+2026 RLVR work on sub-1B models found exact-match rewards train worst and partial credit plus a
+penalty for wasted tool calls train best. v3 keeps v2's format gate and grounding, and changes two
+things: the right tool earns `0.3 + 0.7 × LCS-F1(arguments)` instead of a flat 0.4, so a char-slip
+(`demo_note.txt → demonstra_note.txt`, 0.62) outranks an unrelated path (0.42) where v2 scores both
+0.28; and an action that repeats a past `MODEL:` turn **and is not the reference** loses 0.25
+(re-running a finished step is a loop; re-writing after a bad read-back is recovery and is not
+penalized). Selftest `[50]`.
+
 #### How to compare two checkpoints (`grpo --eval-only` + `tools/evalcard.py`)
 
 `grpo --lr 0` is **not** an evaluation: it draws tasks *with replacement* (40 draws cover ~36 of 200

@@ -104,6 +104,8 @@ typedef struct {
                             // score 0, <done>/prose earn grounding only when the
                             // reference is the same kind, stricter command grounding
                             // (reward.h). Opt-in so v1 runs reproduce.
+                            // 3 => reward_score_v3: v2 + soft LCS-F1 match +
+                            // redundant-repeat penalty (reward.h).
 
   // --- Evaluation (grpo --eval-only; see grpo_eval_run) ---
   int eval_only;            // 1 => grpo_eval_run: no optimizer, no LoRA, no backward

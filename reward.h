@@ -34,6 +34,8 @@ typedef struct {
   float match;
   float total;        // v1: format + grounded + match, in [0, 1]
                       // v2: format * (grounded + match) (0 if capped), in [0, 1]
+                      // v3: v2 with soft match, minus redundant, floored at 0
+  float redundant;    // v3 only: penalty subtracted for repeating a past action
   char reason[96];    // short note on the first term that failed ("" if perfect)
   int action;         // what the response WAS — a RewardAction (both versions)
 } RewardParts;
@@ -98,13 +100,43 @@ float reward_score(const char *prompt, const char *response,
 float reward_score_v2(const char *prompt, const char *response,
                       const char *reference, int capped, RewardParts *parts);
 
-// Dispatch: version 2 => reward_score_v2, anything else => reward_score (v1,
-// which ignores `capped`).
+// ---------------------------------------------------------------------------
+// Reward v3 — opt-in (grpo --reward v3). v2's gate and grounding, unchanged, plus
+// the two lessons of the 2026 small-model RLVR work (exact-match rewards train
+// worst below 1B; partial credit and a penalty for wasted calls train best):
+//
+//   match      SOFT. Right tool => 0.3 + 0.7 * similarity of the arguments, where
+//              similarity is the character-level LCS F1 = 2·LCS / (|a| + |b|) of
+//              the normalized strings (write_file: mean of path and body F1). An
+//              identical action still scores exactly 1. A char-slip
+//              (demo_note.txt -> demonstra_note.txt, F1 0.84) now earns more than
+//              an unrelated path, so the group advantage can point at the fix
+//              instead of flattening both to v2's 0.4. Wrong tool => 0, as before.
+//              <done>/prose: routing only, as before.
+//   redundant  0.25 subtracted when the action repeats one the transcript already
+//              shows (a prior "MODEL:" turn) AND it is not the reference action.
+//              Repeating a write after a bad read-back is error recovery and is
+//              the reference there, so it is not penalized; re-running a step
+//              that already succeeded is a loop, and is.
+//
+//   total = max(0, format * (0.30 * grounded + 0.70 * match) - redundant)
+//
+// Grounding still gates the soft match from being a free lunch: a char-slipped
+// path is not in the prompt, so it loses the 0.30 grounding term regardless.
+float reward_score_v3(const char *prompt, const char *response,
+                      const char *reference, int capped, RewardParts *parts);
+
+// Exposed for the self-test: character-level LCS F1 of the normalized strings,
+// in [0, 1]; 1 for identical (including both empty).
+float reward_lcs_f1(const char *a, const char *b);
+
+// Dispatch: version 2 => reward_score_v2, 3 => reward_score_v3, anything else =>
+// reward_score (v1, which ignores `capped`).
 float reward_score_version(int version, const char *prompt, const char *response,
                            const char *reference, int capped, RewardParts *parts);
 
 // The largest value the (weighted) match term can take under `version`: 0.50 for
-// v1, 0.70 for v2. A rollout is an EXACT match when parts.match reaches it.
+// v1, 0.70 for v2 and v3. A rollout is an EXACT match when parts.match reaches it.
 float reward_match_max(int version);
 
 // "done", "prose", "read", "write", "run", "malformed".

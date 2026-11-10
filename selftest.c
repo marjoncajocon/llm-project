@@ -7414,6 +7414,55 @@ int run_selftest(void) {
   }
 
   // --------------------------------------------------------------------------
+  // Part 50: reward v3 -- soft (LCS-F1) match + redundant-repeat penalty.
+  {
+    printf("[50] Reward v3: soft LCS-F1 match, redundant-repeat penalty, v2 unchanged\n");
+    int ok50 = 1;
+    const char *pr = "GOAL: read demo_note.txt";
+    const char *ref = "<tool name=\"read_file\" path=\"demo_note.txt\"></tool>";
+    const char *slip = "<tool name=\"read_file\" path=\"demonstra_note.txt\"></tool>";
+    const char *far = "<tool name=\"read_file\" path=\"zz.txt\"></tool>";
+    RewardParts a, b, c, d;
+    const float exact = reward_score_v3(pr, ref, ref, 0, &a);
+    const float rs = reward_score_v3(pr, slip, ref, 0, &b);
+    const float rf = reward_score_v3(pr, far, ref, 0, &c);
+    const float v2s = reward_score_v2(pr, slip, ref, 0, &d);
+    // Exact is still 1 and hits the match max; a char-slip beats an unrelated
+    // path; v2 still flattens the slip to its 0.4 step (0.70 * 0.4 = 0.28).
+    ok50 &= fabsf(exact - 1.0f) < 1e-6f && fabsf(a.match - reward_match_max(3)) < 1e-6f;
+    ok50 &= rs > rf && rf > 0.0f && fabsf(v2s - 0.28f) < 1e-5f;
+    const float f1 = reward_lcs_f1("demo_note.txt", "demonstra_note.txt");
+    ok50 &= fabsf(f1 - 26.0f / 31.0f) < 1e-5f && reward_lcs_f1("", "") == 1.0f &&
+            reward_lcs_f1("abc", "") == 0.0f && reward_lcs_f1("A  B", "a b") == 1.0f;
+
+    // Redundancy: re-running a step that already ran (and is not the reference)
+    // loses 0.25; repeating a write as error recovery (it IS the reference) does not.
+    const char *loop_pr = "GOAL: write a.txt with hi then run ls | MODEL: <tool name=\"write_file\""
+                          " path=\"a.txt\">hi</tool> | OBSERVATION: wrote 2 bytes to a.txt";
+    const char *again = "<tool name=\"write_file\" path=\"a.txt\">hi</tool>";
+    const char *ls = "<tool name=\"run_command\" command=\"ls\"></tool>";
+    RewardParts e, f, g;
+    const float r_loop = reward_score_v3(loop_pr, again, ls, 0, &e);
+    const float r_loop2 = reward_score_v2(loop_pr, again, ls, 0, &f);
+    const float r_fix = reward_score_v3(loop_pr, again, again, 0, &g);
+    ok50 &= fabsf(e.redundant - 0.25f) < 1e-6f && r_loop < r_loop2 + 1e-6f && r_loop >= 0.0f;
+    ok50 &= g.redundant == 0.0f && fabsf(r_fix - 1.0f) < 1e-6f;
+    ok50 &= strcmp(e.reason, "redundant-repeat") == 0;
+    // A <done> is never "redundant", and a capped rollout is still 0.
+    RewardParts h;
+    ok50 &= reward_score_v3(loop_pr, "<done>ok</done>", ls, 0, &h) == 0.0f && h.redundant == 0.0f;
+    ok50 &= reward_score_v3(pr, ref, ref, 1, NULL) == 0.0f;
+    ok50 &= reward_score_version(3, pr, slip, ref, 0, NULL) == rs;
+
+    printf("    exact %.3f | char-slip %.3f (F1 %.3f) > unrelated %.3f | v2 slip %.3f\n",
+           (double)exact, (double)rs, (double)f1, (double)rf, (double)v2s);
+    printf("    repeat a finished step: v3 %.3f (v2 %.3f, -%.2f %s) | repeat as recovery: %.3f\n",
+           (double)r_loop, (double)r_loop2, (double)e.redundant, e.reason, (double)r_fix);
+    printf("    -> %s\n\n", ok50 ? "OK" : "FAIL");
+    all_ok &= ok50;
+  }
+
+  // --------------------------------------------------------------------------
   printf("Output validation: %s\n\n", all_ok ? "PASSED" : "FAILED");
   printf("Done! All memory freed successfully.\n");
   return all_ok ? 0 : 1;

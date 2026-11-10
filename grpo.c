@@ -984,6 +984,9 @@ int grpo_run(const char *tasks_path, const GrpoConfig *cfg) {
 
   if (cfg->reward_version == 2)
     printf("  reward: v2 = format * (0.30 grounded + 0.70 match), capped rollout => 0\n");
+  else if (cfg->reward_version == 3)
+    printf("  reward: v3 = max(0, format * (0.30 grounded + 0.70 soft-match) - 0.25 redundant),"
+           " capped rollout => 0\n");
   RewardMonitor mon_win, mon_run;               // since the last report / whole run
   memset(&mon_win, 0, sizeof(mon_win));
   memset(&mon_run, 0, sizeof(mon_run));
@@ -1561,7 +1564,7 @@ int grpo_eval_run(const char *tasks_path, const GrpoConfig *cfg) {
   char *etext = (char*)malloc(TEXT_CAP);
   char *line = (char*)malloc(LINE_CAP);
   const float match_max = reward_match_max(cfg->reward_version);
-  const int rv = cfg->reward_version == 2 ? 2 : 1;
+  const int rv = (cfg->reward_version == 2 || cfg->reward_version == 3) ? cfg->reward_version : 1;
   ConVocab cvoc;
   memset(&cvoc, 0, sizeof(cvoc));
   ConCtx cx;
