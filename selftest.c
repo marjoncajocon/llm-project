@@ -35,6 +35,7 @@
 #include "activation.h"
 #include "reward.h"
 #include "mtp.h"
+#include "deltanet.h"
 #include "grpo.h"
 #include "gpu.h"
 #include "backend.h"
@@ -7651,6 +7652,106 @@ int run_selftest(void) {
     mtp_acts_free(&ma); mtp_free(&mh);
     tensor_free(&logits); tensor_free(&probs);
     llama_acts_free(&acts); llama_model_free(&tm);
+  }
+
+  // --------------------------------------------------------------------------
+  // Part 53: Gated DeltaNet layer.
+  {
+    printf("[53] Gated DeltaNet: gradient check (all params + input), O(1)-state decode =="
+           " forward, teacher-student fit\n");
+    const int dm = 6, H = 2, hd = 3, n = 7;
+    srand(53);
+    DeltaNet dn = deltanet_create(dm, H, hd);
+    deltanet_randomize(&dn);
+    for (int h = 0; h < H; h++) dn.ba.data[h] = 0.5f;   // alpha ~0.6: gate grads not tiny
+    DeltaNetCache dc = deltanet_cache_create(&dn, n);
+    int xs[2] = {n, dm};
+    Tensor x = tensor_create(xs, 2), out = tensor_create(xs, 2), R = tensor_create(xs, 2);
+    for (size_t i = 0; i < x.size; i++) { x.data[i] = 2.0f * (float)rand() / RAND_MAX - 1.0f;
+                                          R.data[i] = 2.0f * (float)rand() / RAND_MAX - 1.0f; }
+    // loss = sum(out * R): dL/dout = R.
+    deltanet_zero_grad(&dn);
+    tensor_zero_grad(&x);
+    deltanet_forward(&dn, &x, &out, &dc);
+    memcpy(out.grad, R.data, R.size * sizeof(float));
+    deltanet_backward(&dn, &x, &out, &dc);
+
+    Tensor *ps[9];
+    int np_ = deltanet_collect_params(&dn, ps);
+    ps[np_++] = &x;
+    const float eps = 1e-2f;
+    float max_cond = 0.0f;
+    int checked = 0;
+    for (int p = 0; p < np_; p++) {
+      for (size_t k = 0; k < ps[p]->size; k++) {
+        const float base = ps[p]->data[k];
+        float lp = 0.0f, lm = 0.0f;
+        ps[p]->data[k] = base + eps;
+        deltanet_forward(&dn, &x, &out, &dc);
+        for (size_t i = 0; i < out.size; i++) lp += out.data[i] * R.data[i];
+        ps[p]->data[k] = base - eps;
+        deltanet_forward(&dn, &x, &out, &dc);
+        for (size_t i = 0; i < out.size; i++) lm += out.data[i] * R.data[i];
+        ps[p]->data[k] = base;
+        const float num = (lp - lm) / (2.0f * eps), an = ps[p]->grad[k];
+        const float rel = fabsf(an - num) / (fabsf(an) + fabsf(num) + 1e-8f);
+        if (fabsf(an) > 1e-2f) { checked++; if (rel > max_cond) max_cond = rel; }
+      }
+    }
+    const int grad_ok = max_cond < 1e-2f && checked > 50;
+
+    // Decode with a fixed-size state == the full forward, row by row, bit for bit.
+    deltanet_forward(&dn, &x, &out, &dc);
+    float *state = (float*)calloc((size_t)H * hd * hd, sizeof(float));
+    int rs[2] = {1, dm};
+    Tensor xr = tensor_create(rs, 2), orow = tensor_create(rs, 2);
+    int dec_ok = 1;
+    for (int t = 0; t < n; t++) {
+      memcpy(xr.data, &x.data[t * dm], dm * sizeof(float));
+      deltanet_step(&dn, state, &xr, &orow);
+      dec_ok &= memcmp(orow.data, &out.data[t * dm], dm * sizeof(float)) == 0;
+    }
+
+    // Teacher-student: a fresh layer learns to imitate a random one (MSE).
+    DeltaNet tea = deltanet_create(dm, H, hd), stu = deltanet_create(dm, H, hd);
+    deltanet_randomize(&tea); deltanet_randomize(&stu);
+    Tensor tgt = tensor_create(xs, 2);
+    Tensor *sp[8];
+    deltanet_collect_params(&stu, sp);
+    Adam opt = adam_create(sp, 8, 0.02f);
+    float mse0 = 0.0f, mse1 = 0.0f;
+    for (int it = 0; it < 600; it++) {
+      for (size_t i = 0; i < x.size; i++) x.data[i] = 2.0f * (float)rand() / RAND_MAX - 1.0f;
+      deltanet_forward(&tea, &x, &tgt, &dc);
+      deltanet_zero_grad(&stu);
+      deltanet_forward(&stu, &x, &out, &dc);
+      float mse = 0.0f;
+      for (size_t i = 0; i < out.size; i++) {
+        const float d = out.data[i] - tgt.data[i];
+        mse += d * d;
+        out.grad[i] = 2.0f * d / (float)out.size;
+      }
+      mse /= (float)out.size;
+      if (it < 10) mse0 += mse / 10.0f;
+      if (it >= 590) mse1 += mse / 10.0f;
+      deltanet_backward(&stu, &x, &out, &dc);
+      adam_step(&opt, sp, 8);
+    }
+    const int fit_ok = mse1 < 0.25f * mse0;
+
+    const int ok53 = grad_ok && dec_ok && fit_ok;
+    printf("    gradient check (8 param tensors + input, %d entries with |grad|>1e-2): max rel err"
+           " %.2e -> %s\n", checked, (double)max_cond, grad_ok ? "OK" : "FAIL");
+    printf("    decode with a %d-float state == forward rows: %s | teacher-student MSE %.4f -> %.4f\n",
+           H * hd * hd, dec_ok ? "bit-identical" : "DIFFER", (double)mse0, (double)mse1);
+    printf("    -> %s\n\n", ok53 ? "OK" : "FAIL");
+    all_ok &= ok53;
+    adam_free(&opt);
+    free(state);
+    tensor_free(&x); tensor_free(&out); tensor_free(&R); tensor_free(&xr); tensor_free(&orow);
+    tensor_free(&tgt);
+    deltanet_cache_free(&dc);
+    deltanet_free(&dn); deltanet_free(&tea); deltanet_free(&stu);
   }
 
   // --------------------------------------------------------------------------

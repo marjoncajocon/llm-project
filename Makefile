@@ -52,7 +52,7 @@ OBJS    = tensor.o matrix.o activation.o layernorm.o feedforward.o attention.o \
           embedding.o sampler.o model.o checkpoint.o tokenizer.o loss.o optim.o muon.o rmsnorm.o rope.o swiglu.o moe.o gqa.o quant.o llama.o lora.o llamatrain.o \
           toolcall.o toolexec.o risk.o approval.o agent.o corpus.o train.o reward.o grpo.o \
           backend.o backend_opencl.o backend_cuda.o backend_hip.o backend_mock.o \
-          image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o constrain.o gen.o mtp.o selftest.o main.o
+          image.o patch.o video.o audio.o imagegen.o audiogen.o caption.o text2media.o t2i.o vqvae.o hftok.o constrain.o gen.o mtp.o deltanet.o selftest.o main.o
 
 # --- Cross-compilation (uses `zig cc`; outputs to build/) ---
 ZIG            ?= zig
@@ -91,6 +91,7 @@ llama.o:      llama.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h quant.h 
 lora.o:       lora.h tensor.h matrix.h
 llamatrain.o: llamatrain.h llama.h lora.h tensor.h matrix.h rmsnorm.h rope.h gqa.h swiglu.h
 mtp.o:        mtp.h llama.h tensor.h loss.h matrix.h rmsnorm.h sampler.h
+deltanet.o:   deltanet.h tensor.h matrix.h
 feedforward.o: feedforward.h tensor.h matrix.h activation.h
 attention.o:  attention.h tensor.h matrix.h activation.h layernorm.h feedforward.h
 embedding.o:  embedding.h tensor.h check.h
@@ -120,7 +121,7 @@ t2i.o:        t2i.h tensor.h image.h vqvae.h model.h loss.h optim.h sampler.h ch
 vqvae.o:      vqvae.h tensor.h image.h matrix.h optim.h
 hftok.o:      hftok.h
 constrain.o:  constrain.h hftok.h sampler.h tensor.h
-selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h moe.h agent.h approval.h toolcall.h toolexec.h constrain.h gen.h gpu.h backend.h
+selftest.o:   selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h image.h patch.h video.h audio.h imagegen.h audiogen.h rmsnorm.h rope.h swiglu.h gqa.h quant.h llama.h lora.h llamatrain.h matrix.h activation.h reward.h grpo.h moe.h agent.h approval.h toolcall.h toolexec.h constrain.h gen.h gpu.h backend.h mtp.h deltanet.h
 main.o:       selftest.h tensor.h loss.h optim.h sampler.h model.h checkpoint.h tokenizer.h train.h grpo.h agent.h imagegen.h audiogen.h caption.h text2media.h t2i.h vqvae.h hftok.h toolexec.h constrain.h gen.h gpu.h backend.h
 
 # Cross-compile a binary for every target in CROSS_TARGETS into build/.

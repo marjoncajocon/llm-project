@@ -67,6 +67,8 @@ defined in the matching `.c`.
 | `llama.h` / `llama.c`             | Modern (LLaMA-family) block + `LlamaModel` + `LLMA` checkpoint + KV-cache decode. Optional per-model features: q/k/v biases (Qwen2), per-layer sliding window with a ring-buffer cache (LLMA v3), QK-norm (Qwen3: per-head q/k RMSNorm before RoPE, `llama_model_set_qk_norm`; LLMA v4 flags word bit 0). v2/v3 files still load |
 | `llamatrain.h` / `llamatrain.c`   | **Training** the LLaMA-family model: cached-activation forward + full backward (incl. QK-norm gains) |
 | `lora.h` / `lora.c`               | LoRA low-rank adapters (`y += scale·(x·A)·B`) for fine-tuning a frozen base |
+| `mtp.h` / `mtp.c`                 | Multi-token prediction head: predicts token t+2 from the final hidden state (identity-init d x d + RMSNorm, shared output head), gradient into the trunk; `llama-train --mtp F` |
+| `deltanet.h` / `deltanet.c`       | Gated DeltaNet layer (Qwen3.5-style linear attention): delta-rule state `S_t = a(S - b k k^T S) + b k v^T`, hand-derived backward, O(1)-state decode bit-identical to the forward. Standalone (not yet a LlamaModel block) |
 | `feedforward.h` / `feedforward.c` | Position-wise feed-forward MLP: Linear → GELU → Linear        |
 | `attention.h` / `attention.c`     | `multihead_attention_forward` (causal), `transformer_block_forward` |
 | `embedding.h` / `embedding.c`     | Token + positional embedding lookup                           |
@@ -1104,7 +1106,7 @@ observation is real multi-line output and whose correct next step is still a too
 
 | prompt rendering | right next action | premature `<done>` |
 | --- | --- | --- |
-| old (` | `-joined lines) | 11/24 | 11 |
+| old (lines joined by the turn separator) | 11/24 | 11 |
 | join | 11/24 | 12 |
 | join + 4 lines | 9/24 | 15 |
 | **join + 2 lines (default)** | **15/24** | **9** |
