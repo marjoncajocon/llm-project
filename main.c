@@ -1286,6 +1286,108 @@ static int run_quant_report(int argc, char **argv) {
   return 0;
 }
 
+// ============================================================================
+// `hfscore`: log-probability of candidate continuations given a prompt (teacher
+// forcing) -- the scoring half of a verifier / process reward model.
+//   transformer hfscore <model.bin (LLMA|LLMQ)> <tok.hf>
+// stdin: one or more RECORDS separated by \x1d (ASCII GS); a record is a prompt
+// then its candidates, separated by \x1e (ASCII RS). The model loads ONCE. Prints
+// one line per candidate: {"r":<record>,"i":<cand>,"logp":<sum log p>,"n":<tokens>}.
+// Each record's prompt is prefilled once; each candidate restarts from a copy of
+// that cache. A prompt longer than the context keeps its newest tokens.
+// ============================================================================
+static int run_hfscore(int argc, char **argv) {
+  if (argc < 4) {
+    fprintf(stderr, "usage: transformer hfscore <model.bin> <tok.hf>\n"
+                    "  stdin: prompt\\x1ecand1\\x1ecand2...[\\x1dprompt2\\x1e...]\n");
+    return 2;
+  }
+  HFTok tok;
+  if (hftok_load(&tok, argv[3]) != 0) return 1;
+  size_t cap = 1 << 16, len = 0, r;
+  char *in = (char*)malloc(cap);
+  while ((r = fread(in + len, 1, cap - 1 - len, stdin)) > 0) {
+    len += r;
+    if (len == cap - 1) { cap *= 2; in = (char*)realloc(in, cap); }
+  }
+  in[len] = '\0';
+
+  unsigned int magic = 0;
+  FILE *mf = fopen(argv[2], "rb");
+  if (!mf || fread(&magic, 4, 1, mf) != 1) magic = 0;
+  if (mf) fclose(mf);
+  LlamaModel m;
+  QLlamaModel qm;
+  const int quant = (magic == 0x514D4C4Cu);
+  if (quant ? q_llama_model_load(argv[2], &qm) != 0 : llama_model_load(argv[2], &m) != 0) {
+    fprintf(stderr, "hfscore: cannot load %s (LLMA or LLMQ)\n", argv[2]);
+    free(in); hftok_free(&tok);
+    return 1;
+  }
+  const int vocab = quant ? qm.vocab : m.vocab, max_seq = quant ? qm.max_seq : m.max_seq;
+  LlamaKV kv = quant ? q_llama_kv_create(&qm) : llama_kv_create(&m);
+  LlamaKV base = quant ? q_llama_kv_create(&qm) : llama_kv_create(&m);
+  int lz[2] = {1, vocab};
+  Tensor logits = tensor_create_nograd(lz, 2), plog = tensor_create_nograd(lz, 2);
+  int *ids = (int*)malloc((size_t)(len + 16) * sizeof(int));
+
+  int rec = 0, rc = 0;
+  char *next = in;
+  while (next) {
+    char *recs = next;
+    char *gs = strchr(recs, '\x1d');
+    if (gs) { *gs = '\0'; next = gs + 1; } else next = NULL;
+    char *parts[65];
+    int np = 0;
+    parts[np++] = recs;
+    for (char *p = recs; *p && np < 65; p++)
+      if (*p == '\x1e') { *p = '\0'; parts[np++] = p + 1; }
+    if (np < 2) {
+      fprintf(stderr, "hfscore: record %d has no candidates (separate them with \\x1e)\n", rec);
+      rc = 2;
+      rec++;
+      continue;
+    }
+    int n = hftok_encode(&tok, parts[0], ids, (int)len + 16), first = 0;
+    if (n > max_seq - 16) { first = n - (max_seq - 16); n = max_seq - 16; }   // keep the newest
+    kv.len = 0;
+    for (int i = 0; i < n; i++) {
+      if (quant) q_llama_decode_step(&qm, &kv, ids[first + i], &logits);
+      else llama_decode_step(&m, &kv, ids[first + i], &logits);
+    }
+    llama_kv_copy(&base, &kv);
+    memcpy(plog.data, logits.data, (size_t)vocab * sizeof(float));
+    for (int c = 1; c < np; c++) {
+      llama_kv_copy(&kv, &base);
+      memcpy(logits.data, plog.data, (size_t)vocab * sizeof(float));
+      const int nc = hftok_encode(&tok, parts[c], ids, (int)len + 16);
+      double lp = 0.0;
+      int used = 0;
+      for (int i = 0; i < nc && kv.len < max_seq; i++) {
+        float mx = logits.data[0];
+        for (int v = 1; v < vocab; v++) if (logits.data[v] > mx) mx = logits.data[v];
+        double se = 0.0;
+        for (int v = 0; v < vocab; v++) se += exp((double)logits.data[v] - mx);
+        lp += (double)logits.data[ids[i]] - mx - log(se);
+        used++;
+        if (i + 1 < nc) {
+          if (quant) q_llama_decode_step(&qm, &kv, ids[i], &logits);
+          else llama_decode_step(&m, &kv, ids[i], &logits);
+        }
+      }
+      printf("{\"r\":%d,\"i\":%d,\"logp\":%.6f,\"n\":%d}\n", rec, c - 1, lp, used);
+    }
+    fflush(stdout);
+    rec++;
+  }
+  free(ids); free(in);
+  tensor_free(&logits); tensor_free(&plog);
+  llama_kv_free(&kv); llama_kv_free(&base);
+  if (quant) q_llama_model_free(&qm); else llama_model_free(&m);
+  hftok_free(&tok);
+  return rc;
+}
+
 // `hfchat`: pure-C chat that applies the model's OWN chat template. Reads the
 // conversation from stdin as turns — each turn "role\x1fcontent" separated by
 // "\x1e" — renders it via hftok_chat_render, tokenizes, and generates. This is
@@ -1678,6 +1780,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "simd-bench") == 0) return run_simd_bench(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfgen") == 0) return run_hfgen(argc, argv);
   if (argc > 1 && strcmp(argv[1], "quant-report") == 0) return run_quant_report(argc, argv);
+  if (argc > 1 && strcmp(argv[1], "hfscore") == 0) return run_hfscore(argc, argv);
   if (argc > 1 && strcmp(argv[1], "hfchat") == 0) return run_hfchat(argc, argv);
   if (argc > 1 && strcmp(argv[1], "llama") == 0) return run_llama(argc, argv);
   if (argc > 1 && strcmp(argv[1], "generate") == 0) return run_generate(argc, argv);
